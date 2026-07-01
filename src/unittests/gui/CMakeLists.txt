@@ -31,3 +31,10 @@ create_test(
   SOURCE CoordinationStatusTests.cpp
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/gui"
 )
+
+create_test(
+  NAME SettingsDialogTabTests
+  DEPENDS gui
+  SOURCE SettingsDialogTabTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/gui"
+)
