@@ -9,12 +9,10 @@
 #include "OSXKeyStateTests.h"
 
 #include "base/EventQueue.h"
+#include "OSXMainQueueTestHarness.h"
 
-#include <atomic>
-#include <chrono>
-#include <thread>
-
-#include <CoreFoundation/CoreFoundation.h>
+#include <ApplicationServices/ApplicationServices.h>
+#include <Carbon/Carbon.h>
 
 #define SHIFT_ID_L kKeyShift_L
 #define SHIFT_ID_R kKeyShift_R
@@ -119,39 +117,107 @@ void OSXKeyStateTests::fakePollCharWithModifier()
   keyState.fakeKeyUp(2);
 }
 
-void OSXKeyStateTests::mapKeyFromEventOffMainThreadDoesNotCrash()
+namespace {
+
+struct MapKeyResult
+{
+  KeyButton button = 0;
+  OSXKeyState::KeyIDs ids;
+  KeyModifierMask mask = 0;
+};
+
+MapKeyResult mapKeyFromEvent(OSXKeyState &keyState, CGEventRef event)
+{
+  MapKeyResult result;
+  result.button = keyState.mapKeyFromEvent(result.ids, &result.mask, event);
+  return result;
+}
+
+} // namespace
+
+void OSXKeyStateTests::mapKeyFromEventOffMainThread_keyDown()
 {
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
   keyState.updateKeyMap();
 
-  CGEventRef event = CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, true);
-  QVERIFY(event != nullptr);
+  deskflow::test::osx::ScopedCGEvent event(CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, true));
+  QVERIFY2(event.get() != nullptr, "CGEventCreateKeyboardEvent failed");
 
-  std::atomic<bool> finished{false};
-  std::atomic<KeyButton> button{0};
-  std::thread worker([&]() {
-    OSXKeyState::KeyIDs ids;
-    KeyModifierMask mask = 0;
-    button.store(keyState.mapKeyFromEvent(ids, &mask, event), std::memory_order_relaxed);
-    finished.store(true, std::memory_order_relaxed);
+  const auto offMainOpt = deskflow::test::osx::runOffMainThreadWithMainQueuePump([&]() {
+    return mapKeyFromEvent(keyState, event.get());
   });
+  QVERIFY2(offMainOpt.has_value(), "off-main-thread task did not complete within timeout");
+  const MapKeyResult offMain = *offMainOpt;
 
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!finished.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < deadline) {
-    // Pump the main CFRunLoop so dispatch_sync(main_queue) from the worker can run.
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
-  }
-  if (!finished.load(std::memory_order_relaxed)) {
-    worker.detach();
-    QFAIL("mapKeyFromEvent did not complete within 5 seconds");
-  }
-  worker.join();
-  CFRelease(event);
+  QVERIFY2(offMain.button != 0, "expected non-zero button for key down");
+  QVERIFY2(!offMain.ids.empty(), "expected key ids for letter key down");
+  QCOMPARE(offMain.ids.front(), static_cast<KeyID>('a'));
+}
 
-  QVERIFY(finished.load(std::memory_order_relaxed));
-  QVERIFY(button.load(std::memory_order_relaxed) != 0);
+void OSXKeyStateTests::mapKeyFromEventOffMainThread_keyUp()
+{
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  keyState.updateKeyMap();
+
+  deskflow::test::osx::ScopedCGEvent event(CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, false));
+  QVERIFY2(event.get() != nullptr, "CGEventCreateKeyboardEvent failed");
+
+  const auto offMainOpt = deskflow::test::osx::runOffMainThreadWithMainQueuePump([&]() {
+    return mapKeyFromEvent(keyState, event.get());
+  });
+  QVERIFY2(offMainOpt.has_value(), "off-main-thread task did not complete within timeout");
+  const MapKeyResult offMain = *offMainOpt;
+
+  QVERIFY2(!offMain.ids.empty(), "key up should populate ids with kKeyNone placeholder");
+  QCOMPARE(offMain.ids.front(), kKeyNone);
+  QVERIFY2(offMain.button != 0, "key up should still resolve virtual key to button");
+}
+
+void OSXKeyStateTests::mapKeyFromEventOffMainThread_autorepeat()
+{
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  keyState.updateKeyMap();
+
+  deskflow::test::osx::ScopedCGEvent event(CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, true));
+  QVERIFY2(event.get() != nullptr, "CGEventCreateKeyboardEvent failed");
+  CGEventSetIntegerValueField(event.get(), kCGKeyboardEventAutorepeat, 1);
+
+  const auto offMainOpt = deskflow::test::osx::runOffMainThreadWithMainQueuePump([&]() {
+    return mapKeyFromEvent(keyState, event.get());
+  });
+  QVERIFY2(offMainOpt.has_value(), "off-main-thread task did not complete within timeout");
+  const MapKeyResult offMain = *offMainOpt;
+
+  QVERIFY2(offMain.button != 0, "autorepeat should map to the same virtual key button");
+  QVERIFY2(!offMain.ids.empty(), "autorepeat should produce key ids");
+}
+
+void OSXKeyStateTests::mapKeyFromEventOffMainThread_matchesMainThread()
+{
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  keyState.updateKeyMap();
+
+  deskflow::test::osx::ScopedCGEvent event(CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, true));
+  QVERIFY2(event.get() != nullptr, "CGEventCreateKeyboardEvent failed");
+
+  const MapKeyResult onMain = mapKeyFromEvent(keyState, event.get());
+  const auto offMainOpt = deskflow::test::osx::runOffMainThreadWithMainQueuePump([&]() {
+    return mapKeyFromEvent(keyState, event.get());
+  });
+  QVERIFY2(offMainOpt.has_value(), "off-main-thread task did not complete within timeout");
+  const MapKeyResult offMain = *offMainOpt;
+
+  QCOMPARE(offMain.button, onMain.button);
+  QCOMPARE(offMain.ids, onMain.ids);
+  QCOMPARE(offMain.mask, onMain.mask);
 }
 
 bool OSXKeyStateTests::isKeyPressed(const OSXKeyState &keyState, KeyButton button)

@@ -8,6 +8,7 @@
 #include "platform/OSXKeyState.h"
 #include "arch/Arch.h"
 #include "base/Log.h"
+#include "platform/OSXKeyLayout.h"
 #include "platform/OSXMainQueue.h"
 #include "platform/OSXMediaKeySupport.h"
 #include "platform/OSXUchrKeyResource.h"
@@ -294,26 +295,8 @@ KeyButton OSXKeyState::mapKeyFromEvent(KeyIDs &ids, KeyModifierMask *maskOut, CG
     return mapVirtualKeyToKeyButton(vkCode);
   }
 
-  // TIS APIs assert the main dispatch queue on macOS 14+; mapKeyFromEvent runs
-  // on the CGEventTap thread, so fetch layout data via runOnMainQueue (same
-  // pattern as getKeyMap/getGroups; see pollActiveGroup for async cache variant).
-  CFDataRef layoutRef = deskflow::platform::osx::runOnMainQueue([]() -> CFDataRef {
-    std::lock_guard<std::mutex> lock(g_tisMutex);
-    AutoTISInputSourceRef currentKeyboardLayout(TISCopyCurrentKeyboardLayoutInputSource(), CFRelease);
-    if (!currentKeyboardLayout) {
-      return nullptr;
-    }
-    CFDataRef ref = (CFDataRef)TISGetInputSourceProperty(
-        currentKeyboardLayout.get(), kTISPropertyUnicodeKeyLayoutData
-    );
-    if (ref) {
-      CFRetain(ref);
-    }
-    return ref;
-  });
-  AutoCFData layoutData(layoutRef, CFRelease);
-
-  if (!layoutData) {
+  const auto layoutSnapshot = deskflow::platform::osx::copyUnicodeKeyLayoutOnMainQueue();
+  if (layoutSnapshot.layoutBytes == nullptr) {
     return kKeyNone;
   }
 
@@ -343,7 +326,7 @@ KeyButton OSXKeyState::mapKeyFromEvent(KeyIDs &ids, KeyModifierMask *maskOut, CG
   }
 
   // translate via uchr resource
-  const UCKeyboardLayout *layout = (const UCKeyboardLayout *)CFDataGetBytePtr(layoutData.get());
+  const UCKeyboardLayout *layout = (const UCKeyboardLayout *)CFDataGetBytePtr(layoutSnapshot.layoutBytes);
   const bool layoutValid = (layout != nullptr);
 
   if (layoutValid) {
@@ -352,7 +335,7 @@ KeyButton OSXKeyState::mapKeyFromEvent(KeyIDs &ids, KeyModifierMask *maskOut, CG
     UniChar chars[2];
     LOG_VERBOSE("modifiers: %08x", modifiers & 0xffu);
     OSStatus status = UCKeyTranslate(
-        layout, vkCode & 0xffu, action, (modifiers >> 8) & 0xffu, LMGetKbdType(), 0, &m_deadKeyState,
+        layout, vkCode & 0xffu, action, (modifiers >> 8) & 0xffu, layoutSnapshot.keyboardType, 0, &m_deadKeyState,
         sizeof(chars) / sizeof(chars[0]), &count, chars
     );
 

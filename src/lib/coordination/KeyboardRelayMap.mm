@@ -7,8 +7,7 @@
 #include "coordination/KeyboardRelayMap.h"
 
 #include "deskflow/KeyTypes.h"
-#include "platform/OSXAutoTypes.h"
-#include "platform/OSXMainQueue.h"
+#include "platform/OSXKeyLayout.h"
 
 #include <ApplicationServices/ApplicationServices.h>
 #include <Carbon/Carbon.h>
@@ -114,30 +113,17 @@ bool mapRelayKeyFromCgEvent(
   button = static_cast<KeyButton>(vk);
   mask = mapModifiers(CGEventGetFlags(event));
 
+  // Key-up does not consult TIS; relay only needs button/mask for release events.
   if (type == kCGEventKeyUp) {
     id = kKeyNone;
     return true;
   }
 
-  // TIS APIs assert the main dispatch queue on macOS 14+; relay tap runs on a
-  // dedicated CFRunLoop thread (see OSXKeyboardRelayMonitor).
-  const UInt32 keyboardType = LMGetKbdType();
-  CFDataRef layoutRef = deskflow::platform::osx::runOnMainQueue([]() -> CFDataRef {
-    std::lock_guard<std::mutex> lock(g_tisMutex);
-    AutoTISInputSourceRef source(TISCopyCurrentKeyboardInputSource(), CFRelease);
-    if (!source) {
-      return nullptr;
-    }
-    CFDataRef ref = static_cast<CFDataRef>(TISGetInputSourceProperty(source.get(), kTISPropertyUnicodeKeyLayoutData));
-    if (ref) {
-      CFRetain(ref);
-    }
-    return ref;
-  });
-  AutoCFData layoutData(layoutRef, CFRelease);
-  const auto *layout =
-      layoutData ? reinterpret_cast<const UCKeyboardLayout *>(CFDataGetBytePtr(layoutData.get())) : nullptr;
-  id = translateVirtualKey(vk, layout, keyboardType);
+  const auto layoutSnapshot = deskflow::platform::osx::copyUnicodeKeyLayoutOnMainQueue();
+  const auto *layout = layoutSnapshot.layoutBytes
+      ? reinterpret_cast<const UCKeyboardLayout *>(CFDataGetBytePtr(layoutSnapshot.layoutBytes))
+      : nullptr;
+  id = translateVirtualKey(vk, layout, layoutSnapshot.keyboardType);
 
   return id != kKeyNone || phase == Message::KeyPhase::Repeat;
 }

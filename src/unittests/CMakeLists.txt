@@ -35,6 +35,7 @@ function(create_test)
 
   add_executable(${m_NAME} ${m_SOURCE})
   target_link_libraries(${m_NAME} ${m_DEPENDS} ${m_LIBS} Qt::Test)
+  target_include_directories(${m_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/src/unittests/helpers)
   if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
     target_compile_definitions(${m_NAME} PUBLIC WORDS_BIGENDIAN=1)
   endif()

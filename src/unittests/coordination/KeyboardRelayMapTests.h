@@ -12,5 +12,8 @@ class KeyboardRelayMapTests : public QObject
 {
   Q_OBJECT
 private Q_SLOTS:
-  void mapRelayKeyFromCgEventOffMainThreadDoesNotCrash();
+  void mapRelayKeyFromCgEventOffMainThread_keyDown();
+  void mapRelayKeyFromCgEventOffMainThread_keyUp();
+  void mapRelayKeyFromCgEventOffMainThread_autorepeat();
+  void mapRelayKeyFromCgEventOffMainThread_matchesMainThread();
 };

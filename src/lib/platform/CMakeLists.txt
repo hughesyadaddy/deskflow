@@ -86,6 +86,8 @@ elseif(APPLE)
     OSXEventQueueBuffer.h
     OSXKeyState.cpp
     OSXKeyState.h
+    OSXKeyLayout.h
+    OSXMainQueue.h
     OSXMediaKeySupport.h
     OSXMediaKeySupport.m
     OSXPasteboardPeeker.h
@@ -170,6 +172,17 @@ elseif(UNIX)
   endif()
 endif()
 
+if(APPLE)
+  add_library(platform_osx_keys STATIC
+    OSXKeyLayout.mm
+  )
+  target_link_libraries(
+    platform_osx_keys
+    PUBLIC common
+    PRIVATE "-framework Carbon" "-framework ApplicationServices"
+  )
+endif()
+
 # wayland.h is included to check for wayland support
 add_library(platform STATIC ${PLATFORM_SOURCES})
 
@@ -186,7 +199,7 @@ if(UNIX)
 
   if(APPLE)
     find_library(COCOA_LIBRARY Cocoa)
-    target_link_libraries(platform ${COCOA_LIBRARY})
+    target_link_libraries(platform ${COCOA_LIBRARY} platform_osx_keys)
   else()
     if(${LIBXKBCOMMON_VERSION} VERSION_GREATER_EQUAL "1.10")
       target_compile_definitions(platform PRIVATE HAVE_XKB_KEYMAP_MOD_GET_MASK=1)
