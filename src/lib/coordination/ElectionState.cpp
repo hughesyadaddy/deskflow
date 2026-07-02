@@ -6,6 +6,8 @@
 
 #include "coordination/ElectionState.h"
 
+#include "common/FleetCursor.h"
+
 #include <algorithm>
 #include <utility>
 
@@ -79,7 +81,7 @@ ElectionState::onClaim(const std::string &senderName, const std::string &ip, con
 {
   m_seq = std::max(m_seq, seq);
 
-  if (senderName == m_selfName) {
+  if (deskflow::common::namesEqual(senderName, m_selfName)) {
     return ClaimAction::Ignore;
   }
 

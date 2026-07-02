@@ -187,4 +187,58 @@ void CoordinatorFleetPublishTests::hello_rejectsV1Peer()
   coordinator.stop();
 }
 
+void CoordinatorFleetPublishTests::followClaim_resolvesEmptyAddressFromPeers()
+{
+  auto config = testConfig();
+  config.selfName = "macbookpro";
+  // Same-address ip/lan skips the LAN probe, keeping the test offline.
+  config.peers.push_back({"hackintosh", "hackintosh.test.example", "hackintosh.test.example"});
+  config.peers.push_back({"macbookpro", "macbookpro.test.example", "macbookpro.test.example"});
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+
+  // Regression: a claim with empty ip/lan and mismatched casing
+  // ("Hackintosh" vs peer entry "hackintosh") must resolve the address
+  // from the configured peer list instead of following "" (which left
+  // clients with server_ip=null and dead keyboard forwarding).
+  Message claim;
+  claim.type = Message::Type::Claim;
+  claim.name = "Hackintosh";
+
+  coordinator.followSender(claim);
+
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QCOMPARE(coordinator.m_election.role(), Role::Client);
+    QCOMPARE(coordinator.m_election.serverAddress(), std::string("hackintosh.test.example"));
+  }
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::followClaim_dropsUnknownClaimWithoutAddress()
+{
+  EventQueue events;
+  Coordinator coordinator(testConfig());
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsServer(coordinator, "server");
+
+  Message claim;
+  claim.type = Message::Type::Claim;
+  claim.name = "stranger";
+
+  coordinator.followSender(claim);
+
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QCOMPARE(coordinator.m_election.role(), Role::Server);
+  }
+
+  coordinator.stop();
+}
+
 QTEST_MAIN(CoordinatorFleetPublishTests)

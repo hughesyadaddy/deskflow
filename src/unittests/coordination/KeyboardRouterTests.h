@@ -13,6 +13,7 @@ class KeyboardRouterTests : public QObject
   Q_OBJECT
 private Q_SLOTS:
   void cursorOnSelf_isLocal();
+  void cursorOnSelf_caseInsensitive();
   void cursorOnRemote_forwardsToHost();
   void unknownCursor_usesBootGrace();
   void matrix_serverLocal_slaveForwards();

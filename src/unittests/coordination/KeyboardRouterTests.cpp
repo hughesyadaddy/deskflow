@@ -39,6 +39,15 @@ void KeyboardRouterTests::cursorOnSelf_isLocal()
   QVERIFY(decision.forwardHost.empty());
 }
 
+void KeyboardRouterTests::cursorOnSelf_caseInsensitive()
+{
+  // Regression: computerName=Hackintosh vs fleet cursor host "hackintosh"
+  // must still resolve as local, not forward into a loop.
+  const auto decision = routeKeyboard(makeInput("Hackintosh", "hackintosh", true));
+  QCOMPARE(decision.route, KeyboardRoute::Local);
+  QVERIFY(decision.forwardHost.empty());
+}
+
 void KeyboardRouterTests::cursorOnRemote_forwardsToHost()
 {
   const auto decision = routeKeyboard(makeInput("laptop", "desktop", true));

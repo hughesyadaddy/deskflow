@@ -22,6 +22,8 @@
 
 namespace deskflow::coordination {
 
+using deskflow::common::namesEqual;
+
 namespace {
 
 const double kHeartbeatIntervalS = 3.0;
@@ -67,12 +69,12 @@ std::string peerMeshAddress(const std::string &hostName, const FleetState &fleet
 {
   auto matchConfigured = [&](const std::string &name) -> std::string {
     for (const auto &peer : fleet.peers) {
-      if (peer.name == name) {
+      if (namesEqual(peer.name, name)) {
         return peer.lan.empty() ? peer.ip : peer.lan;
       }
     }
     for (const auto &peer : peers) {
-      if (peer.name == name) {
+      if (namesEqual(peer.name, name)) {
         return peer.lan.empty() ? peer.ip : peer.lan;
       }
     }
@@ -82,7 +84,8 @@ std::string peerMeshAddress(const std::string &hostName, const FleetState &fleet
   if (const auto direct = matchConfigured(hostName); !direct.empty()) {
     return direct;
   }
-  if (!fleet.server.empty() && (hostName == fleet.server || hostName == fleet.cursorScreen || hostName == fleet.cursorHost)) {
+  if (!fleet.server.empty() && (namesEqual(hostName, fleet.server) || namesEqual(hostName, fleet.cursorScreen) ||
+                                namesEqual(hostName, fleet.cursorHost))) {
     return matchConfigured(fleet.server);
   }
   return {};
@@ -246,7 +249,7 @@ std::vector<FleetPeer> Coordinator::buildFleetPeersLocked()
 void Coordinator::sendFleetLineToPeers(const std::string &line, const PeerList &peers)
 {
   for (const auto &peer : peers) {
-    if (peer.name == m_config.selfName) {
+    if (namesEqual(peer.name, m_config.selfName)) {
       continue;
     }
     m_mesh->sendTo(peer.ip, line);
@@ -357,7 +360,7 @@ void Coordinator::broadcastCursor(const std::string &host)
     peers = m_config.peers;
   }
   for (const auto &peer : peers) {
-    if (peer.name == m_config.selfName) {
+    if (namesEqual(peer.name, m_config.selfName)) {
       continue;
     }
     m_mesh->sendTo(peer.ip, line);
@@ -668,7 +671,7 @@ void Coordinator::sendKeyForward(
 bool Coordinator::isKnownPeer(const std::string &name) const
 {
   for (const auto &peer : m_config.peers) {
-    if (peer.name == name) {
+    if (namesEqual(peer.name, name)) {
       return true;
     }
   }
@@ -743,11 +746,30 @@ void Coordinator::promoteSelf(const char *reason)
 
 void Coordinator::followSender(const Message &claim)
 {
+  // A claimant that cannot find itself in its own peer list (for example a
+  // computerName/peers casing mismatch) broadcasts empty addresses; recover
+  // by resolving the sender in *our* configured peer list by name.
+  std::string stable = claim.ip;
+  std::string lan = claim.lan;
+  if (stable.empty() && lan.empty()) {
+    for (const auto &peer : m_config.peers) {
+      if (namesEqual(peer.name, claim.name)) {
+        stable = peer.ip;
+        lan = peer.lan;
+        break;
+      }
+    }
+  }
+  if (stable.empty() && lan.empty()) {
+    LOG_WARN("coordination: claim from \"%s\" has no address and is not a configured peer", claim.name.c_str());
+    return;
+  }
+
   // LAN-first: prefer the sender's LAN address when its coordination
   // port answers there; otherwise use the stable address.
-  std::string address = claim.ip;
-  if (!claim.lan.empty() && claim.lan != claim.ip && m_mesh->probe(claim.lan, kLanProbeTimeoutMs)) {
-    address = claim.lan;
+  std::string address = stable.empty() ? lan : stable;
+  if (!lan.empty() && lan != stable && m_mesh->probe(lan, kLanProbeTimeoutMs)) {
+    address = lan;
   }
   LOG_INFO("coordination: following \"%s\" at %s", claim.name.c_str(), address.c_str());
   decide(Role::Client, address);
@@ -785,7 +807,7 @@ void Coordinator::broadcastClaim()
     std::string selfIp;
     std::string selfLan;
     for (const auto &peer : m_config.peers) {
-      if (peer.name == m_config.selfName) {
+      if (namesEqual(peer.name, m_config.selfName)) {
         selfIp = peer.ip;
         selfLan = peer.lan;
         break;
@@ -794,7 +816,7 @@ void Coordinator::broadcastClaim()
     line = protocol::encodeClaim(m_config.selfName, selfIp, selfLan, m_election.nextClaimSeq(), m_config.token);
   }
   for (const auto &peer : m_config.peers) {
-    if (peer.name == m_config.selfName) {
+    if (namesEqual(peer.name, m_config.selfName)) {
       continue;
     }
     m_mesh->sendTo(peer.ip, line);
@@ -858,7 +880,7 @@ void Coordinator::workerLoop()
           if (!cursorHost.empty()) {
             const auto cursorLine = protocol::encodeCursor(cursorHost, seq, token);
             for (const auto &peer : peers) {
-              if (peer.name == selfName) {
+              if (namesEqual(peer.name, selfName)) {
                 continue;
               }
               m_mesh->sendTo(peer.ip, cursorLine);
@@ -905,7 +927,7 @@ void Coordinator::probePeerMeshVersions()
     peers = m_config.peers;
   }
   for (const auto &peer : peers) {
-    if (peer.name == m_config.selfName) {
+    if (namesEqual(peer.name, m_config.selfName)) {
       continue;
     }
     const std::string host = peer.lan.empty() ? peer.ip : peer.lan;
@@ -948,7 +970,7 @@ void Coordinator::discoverOnce()
   // a status object which we parse here.)
   const std::string line = protocol::encodeStatus(m_config.token);
   for (const auto &peer : m_config.peers) {
-    if (peer.name == m_config.selfName) {
+    if (namesEqual(peer.name, m_config.selfName)) {
       continue;
     }
     const auto replyLine = m_mesh->query(peer.lan.empty() ? peer.ip : peer.lan, line);
