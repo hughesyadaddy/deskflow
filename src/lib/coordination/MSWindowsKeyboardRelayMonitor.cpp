@@ -19,6 +19,10 @@ namespace deskflow::coordination {
 
 namespace {
 
+class MSWindowsKeyboardRelayMonitor;
+
+MSWindowsKeyboardRelayMonitor *g_relayInstance = nullptr;
+
 class MSWindowsKeyboardRelayMonitor : public IKeyboardRelayMonitor
 {
 public:
@@ -119,8 +123,6 @@ private:
   DWORD m_threadId = 0;
   HHOOK m_hook = nullptr;
 };
-
-MSWindowsKeyboardRelayMonitor *g_relayInstance = nullptr;
 
 } // namespace
 

@@ -23,3 +23,13 @@ if(APPLE)
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
   )
 endif()
+
+if(WIN32)
+  create_test(
+    NAME MSWindowsKeyboardRelayMonitorTests
+    DEPENDS coordination
+    LIBS arch version
+    SOURCE MSWindowsKeyboardRelayMonitorTests.cpp
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+  )
+endif()
