@@ -24,6 +24,13 @@ elseif(APPLE)
     SOURCE OSXKeyStateTests.cpp
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
   )
+  create_test(
+    NAME OSXKeyLayoutTests
+    DEPENDS platform
+    LIBS base arch
+    SOURCE OSXKeyLayoutTests.cpp
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
+  )
 elseif(UNIX)
   if (BUILD_X11_SUPPORT)
     create_test(

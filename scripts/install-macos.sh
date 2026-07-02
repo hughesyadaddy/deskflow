@@ -141,7 +141,18 @@ install_bundle() {
   fi
 }
 
+copy_login_bridge_script() {
+  local script="$ROOT/scripts/install-login-bridge-macos.sh"
+  local dest="$INSTALL_APP/Contents/Resources/install-login-bridge-macos.sh"
+  if [[ -f "$script" ]]; then
+    mkdir -p "$INSTALL_APP/Contents/Resources"
+    install -m 755 "$script" "$dest"
+    echo "== Installed login bridge helper: $dest =="
+  fi
+}
+
 quit_deskflow
 install_bundle
+copy_login_bridge_script
 restart_deskflow
 echo "== Done: $INSTALL_APP =="

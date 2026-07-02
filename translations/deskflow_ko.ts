@@ -889,6 +889,22 @@ Additionally, check you are able to %1 the server config file: %2</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
+        <source>install script not found in the application bundle</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the install script timed out</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the administrator prompt was cancelled</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the install script failed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>no coordination peers configured -- add the other computers first</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1401,6 +1417,14 @@ Enabling this setting will disable the server config GUI.</source>
         <translation type="unfinished">기본값으로 재설정</translation>
     </message>
     <message>
+        <source>Could not install the login-window bridge: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Login agent installed. Log out or restart this Mac, then control it from your elected server.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>Automatic</source>
         <translation type="unfinished">자동</translation>
     </message>
@@ -1522,6 +1546,14 @@ Enabling this setting will disable the server config GUI.</source>
     </message>
     <message>
         <source>Refresh</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Install login agent…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save settings and install the login-window LaunchAgent (admin prompt). Takes effect after logout or restart.</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

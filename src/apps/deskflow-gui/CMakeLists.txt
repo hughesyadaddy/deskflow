@@ -33,6 +33,10 @@ elseif(BUILD_OSX_BUNDLE)
 
   set(platform_extra ../res/Deskflow.icns)
   set_source_files_properties(${platform_extra} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+
+  set(login_bridge_install_script "${CMAKE_SOURCE_DIR}/scripts/install-login-bridge-macos.sh")
+  set_source_files_properties(${login_bridge_install_script} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+  list(APPEND platform_extra "${login_bridge_install_script}")
 endif()
 
 add_executable(${target} WIN32 MACOSX_BUNDLE

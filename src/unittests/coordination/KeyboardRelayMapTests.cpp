@@ -108,4 +108,21 @@ void KeyboardRelayMapTests::mapRelayKeyFromCgEventOffMainThread_matchesMainThrea
   QCOMPARE(offMain.button, onMain.button);
 }
 
+void KeyboardRelayMapTests::mapRelayKeyFromCgEvent_invalidEventType()
+{
+  deskflow::test::osx::ScopedCGEvent event(
+      CGEventCreateMouseEvent(nullptr, kCGEventLeftMouseDown, CGPointZero, kCGMouseButtonLeft)
+  );
+  QVERIFY2(event.get() != nullptr, "CGEventCreateMouseEvent failed");
+
+  Message::KeyPhase phase = Message::KeyPhase::Down;
+  KeyID id = kKeyNone;
+  KeyModifierMask mask = 0;
+  KeyButton button = 0;
+  const bool mapped = deskflow::coordination::mapRelayKeyFromCgEvent(
+      event.get(), phase, id, mask, button
+  );
+  QVERIFY2(!mapped, "non-keyboard events should not map");
+}
+
 QTEST_MAIN(KeyboardRelayMapTests)

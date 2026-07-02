@@ -889,6 +889,22 @@ Además, verifique que puede %1 el archivo de configuración del servidor: %2</t
         <translation type="unfinished"></translation>
     </message>
     <message>
+        <source>install script not found in the application bundle</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the install script timed out</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the administrator prompt was cancelled</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the install script failed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>no coordination peers configured -- add the other computers first</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1385,6 +1401,14 @@ Al habilitar esta opción, se deshabilitará la interfaz gráfica de usuario (GU
         <translation type="unfinished"></translation>
     </message>
     <message>
+        <source>Could not install the login-window bridge: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Login agent installed. Log out or restart this Mac, then control it from your elected server.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>TLS Certificate Regenerated</source>
         <translation type="unfinished">Certificado TLS regenerado</translation>
     </message>
@@ -1522,6 +1546,14 @@ Al habilitar esta opción, se deshabilitará la interfaz gráfica de usuario (GU
     </message>
     <message>
         <source>Refresh</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Install login agent…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save settings and install the login-window LaunchAgent (admin prompt). Takes effect after logout or restart.</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

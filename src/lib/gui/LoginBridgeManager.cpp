@@ -9,6 +9,9 @@
 #include "common/Settings.h"
 
 #include <QCoreApplication>
+#include <QDir>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
@@ -37,6 +40,40 @@ QString appleScriptQuote(const QString &shellCommand)
   return escaped;
 }
 
+/// Keep the Qt event loop alive while osascript shows the admin password sheet.
+bool waitForProcessWithEvents(QProcess &proc, int timeoutMs, QString *error)
+{
+  QElapsedTimer timer;
+  timer.start();
+  while (!proc.waitForFinished(100)) {
+    if (QCoreApplication::instance() != nullptr) {
+      QCoreApplication::processEvents(QEventLoop::AllEvents);
+    }
+    if (timer.elapsed() > timeoutMs) {
+      proc.kill();
+      if (error)
+        *error = QStringLiteral("timed out waiting for administrator approval");
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Run a shell command with an admin prompt (osascript). Returns true on
+/// success; fills @p error with stderr / cancellation reason otherwise.
+bool runPrivileged(const QString &shellCommand, QString *error);
+
+/// Install the staged LaunchAgent plist (admin prompt).
+bool installAgentPlist(const QString &stagedPath, QString *error)
+{
+  const auto agentPlist = QStringLiteral("/Library/LaunchAgents/%1.plist").arg(kAgentLabel);
+  const auto command =
+      QStringLiteral("install -d /Library/LaunchAgents && install -m 644 -o root -g wheel '%1' '%2' && "
+                     "rm -f '%3'; pkill -f '.kvm-autoswitch/coordinator.py' || true")
+          .arg(stagedPath, agentPlist, kLegacyAgentPlist);
+  return runPrivileged(command, error);
+}
+
 /// Run a shell command with an admin prompt (osascript). Returns true on
 /// success; fills @p error with stderr / cancellation reason otherwise.
 bool runPrivileged(const QString &shellCommand, QString *error)
@@ -45,10 +82,7 @@ bool runPrivileged(const QString &shellCommand, QString *error)
                              .arg(appleScriptQuote(shellCommand));
   QProcess osascript;
   osascript.start(QStringLiteral("/usr/bin/osascript"), {QStringLiteral("-e"), script});
-  if (!osascript.waitForFinished(120000)) {
-    osascript.kill();
-    if (error)
-      *error = QStringLiteral("the privileged helper timed out");
+  if (!waitForProcessWithEvents(osascript, 120000, error)) {
     return false;
   }
   if (osascript.exitCode() != 0) {
@@ -173,6 +207,66 @@ QString LoginBridgeManager::plistContent(double scale)
       .arg(kAgentLabel, bridgePath(), hosts.join(','), screenName, QString::number(port), QString::number(scale));
 }
 
+QString LoginBridgeManager::installScriptPath()
+{
+  const QFileInfo bundled(
+      QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("../Resources/install-login-bridge-macos.sh"))
+  );
+  if (bundled.exists())
+    return bundled.canonicalFilePath();
+
+  // Dev builds without a bundled copy: repo script relative to build output.
+  const QFileInfo devTree(QDir(QCoreApplication::applicationDirPath()).filePath(
+      QStringLiteral("../../../../../scripts/install-login-bridge-macos.sh")
+  ));
+  if (devTree.exists())
+    return devTree.canonicalFilePath();
+
+  return {};
+}
+
+bool LoginBridgeManager::canInstall(QString *reason)
+{
+  if (!driverInstalled()) {
+    if (reason)
+      *reason = QObject::tr("Karabiner driver not installed");
+    return false;
+  }
+  if (!QFile::exists(bridgePath())) {
+    if (reason)
+      *reason = QObject::tr("bridge binary not found at %1").arg(bridgePath());
+    return false;
+  }
+  if (serverCandidates().isEmpty()) {
+    if (reason)
+      *reason = QObject::tr("no coordination peers configured — add the other computers first");
+    return false;
+  }
+  return true;
+}
+
+bool LoginBridgeManager::runInstallScript(double scale, QString *error)
+{
+  if (!canInstall(error))
+    return false;
+
+  Settings::setValue(Settings::Coordination::LoginBridgeScale, scale);
+  Settings::setValue(Settings::Coordination::LoginBridgeEnabled, true);
+  Settings::save(false);
+
+  QTemporaryFile staged;
+  if (!staged.open() || staged.write(plistContent(scale).toUtf8()) < 0) {
+    if (error)
+      *error = QObject::tr("could not stage the agent plist");
+    return false;
+  }
+  staged.flush();
+
+  if (!installAgentPlist(staged.fileName(), error))
+    return false;
+  return agentInstalled();
+}
+
 bool LoginBridgeManager::apply(bool enabled, double scale, QString *error)
 {
   if (enabled == agentInstalled() && !enabled)
@@ -183,35 +277,7 @@ bool LoginBridgeManager::apply(bool enabled, double scale, QString *error)
     return runPrivileged(command, error);
   }
 
-  if (serverCandidates().isEmpty()) {
-    if (error)
-      *error = QObject::tr("no coordination peers configured -- add the other computers first");
-    return false;
-  }
-  if (!QFile::exists(bridgePath())) {
-    if (error)
-      *error = QObject::tr("bridge binary not found at %1").arg(bridgePath());
-    return false;
-  }
-
-  QTemporaryFile staged;
-  if (!staged.open() || staged.write(plistContent(scale).toUtf8()) < 0) {
-    if (error)
-      *error = QObject::tr("could not stage the agent plist");
-    return false;
-  }
-  staged.flush();
-
-  // install(1) sets root:wheel 644 in one step; launchd ignores plists with
-  // looser ownership. The agent loads at the next login-window session
-  // (logout or restart) -- LoginWindow agents cannot be bootstrapped from a
-  // user session. The same privileged pass retires the legacy coordinator
-  // agent so enabling is a clean one-click migration.
-  const auto command =
-      QStringLiteral("install -d /Library/LaunchAgents && install -m 644 -o root -g wheel '%1' '%2' && "
-                     "rm -f '%3'; pkill -f '.kvm-autoswitch/coordinator.py' || true")
-          .arg(staged.fileName(), agentPlistPath(), kLegacyAgentPlist);
-  return runPrivileged(command, error);
+  return runInstallScript(scale, error);
 }
 
 bool LoginBridgeManager::installedAgentMatchesCurrentSettings(double scale)

@@ -27,6 +27,11 @@ private Q_SLOTS:
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);
+  bool probeOsKeyInjection();
+  bool probeOsShiftInjection();
+
   Arch m_arch;
   Log m_log;
+  bool m_osKeyInjectionWorks = false;
+  bool m_osShiftInjectionWorks = false;
 };

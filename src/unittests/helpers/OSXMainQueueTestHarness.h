@@ -47,7 +47,8 @@ auto runOffMainThreadWithMainQueuePump(Fn &&fn, std::chrono::milliseconds timeou
 
   pumpMainQueueUntil(*finished, timeout);
   if (!finished->load(std::memory_order_acquire)) {
-    worker.detach();
+    // Join rather than detach: a detached worker may still hold captures while the test returns.
+    worker.join();
     return std::nullopt;
   }
   worker.join();

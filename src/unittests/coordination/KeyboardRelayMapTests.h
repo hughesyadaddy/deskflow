@@ -16,4 +16,5 @@ private Q_SLOTS:
   void mapRelayKeyFromCgEventOffMainThread_keyUp();
   void mapRelayKeyFromCgEventOffMainThread_autorepeat();
   void mapRelayKeyFromCgEventOffMainThread_matchesMainThread();
+  void mapRelayKeyFromCgEvent_invalidEventType();
 };

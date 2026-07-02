@@ -16,14 +16,42 @@
 
 #define SHIFT_ID_L kKeyShift_L
 #define SHIFT_ID_R kKeyShift_R
-#define SHIFT_BUTTON 57
+#define SHIFT_BUTTON 56
 #define A_CHAR_ID 0x00000061
-#define A_CHAR_BUTTON 001
+#define A_CHAR_BUTTON 1
 
 void OSXKeyStateTests::initTestCase()
 {
   m_arch.init();
   m_log.setFilter(LogLevel::Level::Verbose);
+  m_osKeyInjectionWorks = probeOsKeyInjection();
+  m_osShiftInjectionWorks = probeOsShiftInjection();
+}
+
+bool OSXKeyStateTests::probeOsKeyInjection()
+{
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  keyState.updateKeyMap();
+
+  keyState.fakeKeyDown(A_CHAR_ID, 0, 1, "en");
+  const bool pressed = isKeyPressed(keyState, A_CHAR_BUTTON);
+  keyState.fakeKeyUp(1);
+  return pressed;
+}
+
+bool OSXKeyStateTests::probeOsShiftInjection()
+{
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  keyState.updateKeyMap();
+
+  keyState.fakeKeyDown(SHIFT_ID_L, 0, 1, "en");
+  const bool pressed = isKeyPressed(keyState, SHIFT_BUTTON);
+  keyState.fakeKeyUp(1);
+  return pressed;
 }
 
 void OSXKeyStateTests::mapModifiersFromOSX_OSXMask()
@@ -61,6 +89,12 @@ void OSXKeyStateTests::mapModifiersFromOSX_OSXMask()
 
 void OSXKeyStateTests::fakePollShift()
 {
+  if (!m_osShiftInjectionWorks) {
+    QSKIP(
+        "GetKeys does not reflect injected shift keys (grant Input Monitoring or run in an interactive GUI session)"
+    );
+  }
+
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -81,6 +115,12 @@ void OSXKeyStateTests::fakePollShift()
 
 void OSXKeyStateTests::fakePollChar()
 {
+  if (!m_osKeyInjectionWorks) {
+    QSKIP(
+        "GetKeys does not reflect injected keys (grant Input Monitoring or run in an interactive GUI session)"
+    );
+  }
+
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -100,6 +140,12 @@ void OSXKeyStateTests::fakePollChar()
 
 void OSXKeyStateTests::fakePollCharWithModifier()
 {
+  if (!m_osKeyInjectionWorks) {
+    QSKIP(
+        "GetKeys does not reflect injected keys (grant Input Monitoring or run in an interactive GUI session)"
+    );
+  }
+
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -144,6 +190,7 @@ void OSXKeyStateTests::mapKeyFromEventOffMainThread_keyDown()
 
   deskflow::test::osx::ScopedCGEvent event(CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, true));
   QVERIFY2(event.get() != nullptr, "CGEventCreateKeyboardEvent failed");
+  CGEventSetFlags(event.get(), 0);
 
   const auto offMainOpt = deskflow::test::osx::runOffMainThreadWithMainQueuePump([&]() {
     return mapKeyFromEvent(keyState, event.get());
@@ -165,6 +212,7 @@ void OSXKeyStateTests::mapKeyFromEventOffMainThread_keyUp()
 
   deskflow::test::osx::ScopedCGEvent event(CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, false));
   QVERIFY2(event.get() != nullptr, "CGEventCreateKeyboardEvent failed");
+  CGEventSetFlags(event.get(), 0);
 
   const auto offMainOpt = deskflow::test::osx::runOffMainThreadWithMainQueuePump([&]() {
     return mapKeyFromEvent(keyState, event.get());
@@ -186,6 +234,7 @@ void OSXKeyStateTests::mapKeyFromEventOffMainThread_autorepeat()
 
   deskflow::test::osx::ScopedCGEvent event(CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, true));
   QVERIFY2(event.get() != nullptr, "CGEventCreateKeyboardEvent failed");
+  CGEventSetFlags(event.get(), 0);
   CGEventSetIntegerValueField(event.get(), kCGKeyboardEventAutorepeat, 1);
 
   const auto offMainOpt = deskflow::test::osx::runOffMainThreadWithMainQueuePump([&]() {
@@ -207,6 +256,7 @@ void OSXKeyStateTests::mapKeyFromEventOffMainThread_matchesMainThread()
 
   deskflow::test::osx::ScopedCGEvent event(CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_A, true));
   QVERIFY2(event.get() != nullptr, "CGEventCreateKeyboardEvent failed");
+  CGEventSetFlags(event.get(), 0);
 
   const MapKeyResult onMain = mapKeyFromEvent(keyState, event.get());
   const auto offMainOpt = deskflow::test::osx::runOffMainThreadWithMainQueuePump([&]() {

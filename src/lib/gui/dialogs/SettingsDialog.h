@@ -91,6 +91,7 @@ private:
 
 #ifdef Q_OS_MAC
   void updateLoginBridgePanel();
+  void installLoginBridgeAgent();
   void reapplyLoginBridgeAgent();
 #endif
 

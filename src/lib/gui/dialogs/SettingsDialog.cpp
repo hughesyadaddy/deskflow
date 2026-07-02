@@ -17,6 +17,7 @@
 #include "gui/TlsUtility.h"
 #include "gui/core/NetworkMonitor.h"
 
+#include <QApplication>
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QDir>
@@ -168,6 +169,7 @@ void SettingsDialog::initConnections() const
     QDesktopServices::openUrl(QUrl(deskflow::gui::LoginBridgeManager::driverDownloadUrl()));
   });
   connect(ui->btnRefreshBridgeLog, &QPushButton::clicked, this, &SettingsDialog::updateLoginBridgePanel);
+  connect(ui->btnInstallLoginBridge, &QPushButton::clicked, this, &SettingsDialog::installLoginBridgeAgent);
   connect(ui->btnReapplyLoginBridge, &QPushButton::clicked, this, &SettingsDialog::reapplyLoginBridgeAgent);
   connect(ui->groupLoginBridge, &QGroupBox::toggled, this, &SettingsDialog::updateLoginBridgePanel);
   connect(ui->sbBridgeScale, &QDoubleSpinBox::valueChanged, this, &SettingsDialog::updateLoginBridgePanel);
@@ -461,26 +463,73 @@ void SettingsDialog::updateLoginBridgePanel()
   ui->lblBridgeStatus->setText(LoginBridgeManager::statusText());
   const bool enabled = ui->groupLoginBridge->isChecked();
   const double scale = ui->sbBridgeScale->value();
-  const bool stale =
-      enabled && LoginBridgeManager::agentInstalled() && !LoginBridgeManager::installedAgentMatchesCurrentSettings(scale);
+  const bool installed = LoginBridgeManager::agentInstalled();
+  const bool stale = enabled && installed && !LoginBridgeManager::installedAgentMatchesCurrentSettings(scale);
   ui->lblBridgeStaleWarning->setVisible(stale);
-  ui->btnReapplyLoginBridge->setVisible(stale);
+  ui->btnInstallLoginBridge->setVisible(enabled);
+  QString installLabel = tr("Install login agent…");
+  if (installed && stale) {
+    installLabel = tr("Update login agent…");
+  } else if (installed) {
+    installLabel = tr("Reinstall login agent…");
+  }
+  ui->btnInstallLoginBridge->setText(installLabel);
+  QString installReason;
+  ui->btnInstallLoginBridge->setEnabled(LoginBridgeManager::canInstall(&installReason));
+  ui->btnInstallLoginBridge->setToolTip(
+      installReason.isEmpty()
+          ? tr("Install the login-window LaunchAgent (admin prompt). Takes effect after logout or restart.")
+          : installReason
+  );
+  ui->btnReapplyLoginBridge->setVisible(false);
   ui->plainBridgeLog->setPlainText(LoginBridgeManager::recentLogText());
 }
 
-void SettingsDialog::reapplyLoginBridgeAgent()
+void SettingsDialog::installLoginBridgeAgent()
 {
   using deskflow::gui::LoginBridgeManager;
 
-  QString bridgeError;
+  QString installReason;
+  if (!LoginBridgeManager::canInstall(&installReason)) {
+    QMessageBox::warning(this, tr("Login Window Bridge"), installReason);
+    return;
+  }
+
+  ui->groupLoginBridge->setChecked(true);
   const double bridgeScale = ui->sbBridgeScale->value();
-  if (!LoginBridgeManager::apply(ui->groupLoginBridge->isChecked(), bridgeScale, &bridgeError)) {
+
+  if (LoginBridgeManager::agentInstalled() && LoginBridgeManager::installedAgentMatchesCurrentSettings(bridgeScale)) {
+    QMessageBox::information(
+        this, tr("Login Window Bridge"),
+        tr("Login agent is already installed and up to date. Log out or restart this Mac to use it at the login "
+           "screen.")
+    );
+    updateLoginBridgePanel();
+    return;
+  }
+
+  QApplication::setOverrideCursor(Qt::WaitCursor);
+  QString bridgeError;
+  const bool installed = LoginBridgeManager::runInstallScript(bridgeScale, &bridgeError);
+  QApplication::restoreOverrideCursor();
+
+  if (!installed) {
     QMessageBox::warning(
-        this, tr("Login Window Bridge"), tr("Could not update the login-window bridge: %1").arg(bridgeError)
+        this, tr("Login Window Bridge"), tr("Could not install the login-window bridge: %1").arg(bridgeError)
+    );
+  } else {
+    QMessageBox::information(
+        this, tr("Login Window Bridge"),
+        tr("Login agent installed. Log out or restart this Mac, then control it from your elected server.")
     );
   }
   ui->groupLoginBridge->setChecked(LoginBridgeManager::agentInstalled());
   updateLoginBridgePanel();
+}
+
+void SettingsDialog::reapplyLoginBridgeAgent()
+{
+  installLoginBridgeAgent();
 }
 #endif
 

@@ -36,7 +36,28 @@
       "windows": {
         "command": "cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $signtool = (Get-ChildItem 'C:\\Program Files*\\Windows Kits\\10\\bin\\*\\x64\\signtool.exe' -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1).FullName; $thumb = $env:DESKFLOW_SIGN_THUMBPRINT; if (-not $thumb) { $cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey -and $_.Subject -match 'Mariner License Prep' } | Select-Object -First 1; if ($cert) { $thumb = $cert.Thumbprint } }; if ($thumb -and $signtool) { Get-ChildItem build\\bin\\*.exe, build\\bin\\Release\\*.exe -ErrorAction SilentlyContinue | ForEach-Object { & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /sha1 $thumb $_.FullName; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; Write-Host '== Signed with developer certificate ==' } else { Write-Host 'Built unsigned (no cert found; fine for local use).' }"
       },
-      "problemMatcher": ["$gcc"]
+      "problemMatcher": {
+        "owner": "cpp",
+        "fileLocation": ["autoDetect", "${workspaceFolder}"],
+        "pattern": [
+          {
+            "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error|fatal error):\\s+(.*)$",
+            "file": 1,
+            "line": 2,
+            "column": 3,
+            "severity": 4,
+            "message": 5
+          },
+          {
+            "regexp": "^(.+)\\((\\d+)\\):\\s+(error|warning)\\s+(C\\d+):\\s+(.*)$",
+            "file": 1,
+            "line": 2,
+            "severity": 3,
+            "code": 4,
+            "message": 5
+          }
+        ]
+      }
     },
     {
       "label": "Deskflow: Install locally",
@@ -75,7 +96,28 @@
       "windows": {
         "command": "cmake --build build-debug --config Debug -j $env:NUMBER_OF_PROCESSORS"
       },
-      "problemMatcher": ["$gcc"]
+      "problemMatcher": {
+        "owner": "cpp",
+        "fileLocation": ["autoDetect", "${workspaceFolder}"],
+        "pattern": [
+          {
+            "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error|fatal error):\\s+(.*)$",
+            "file": 1,
+            "line": 2,
+            "column": 3,
+            "severity": 4,
+            "message": 5
+          },
+          {
+            "regexp": "^(.+)\\((\\d+)\\):\\s+(error|warning)\\s+(C\\d+):\\s+(.*)$",
+            "file": 1,
+            "line": 2,
+            "severity": 3,
+            "code": 4,
+            "message": 5
+          }
+        ]
+      }
     },
     {
       "label": "Deskflow: Configure (Debug) + Build",
