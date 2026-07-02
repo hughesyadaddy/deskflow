@@ -35,6 +35,7 @@
 
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QCoreApplication>
 #include <QDesktopServices>
 #include <QHideEvent>
 #include <QFileDialog>
@@ -50,7 +51,9 @@
 #include <QRegularExpressionValidator>
 #include <QScreen>
 #include <QScrollBar>
+#include <QDir>
 #include <QSettings>
+#include <QShortcut>
 #include <QShowEvent>
 
 #include <memory>
@@ -171,6 +174,21 @@ MainWindow::MainWindow()
   // opt-out in System Settings > Login Items is respected.
   if (!Settings::value(Settings::Gui::LoginItemConfigured).toBool()) {
     macSetStartAtLogin(true);
+    Settings::setValue(Settings::Gui::LoginItemConfigured, true);
+    Settings::save();
+  }
+#elif defined(Q_OS_WIN)
+  // Self-managed launch: register the GUI in the user's Run key once so the
+  // tray icon is present after login. The daemon service only runs the core;
+  // without this the app works in the background but has no tray presence.
+  // Gated on a one-time flag so removing the Run entry later is respected.
+  if (!Settings::value(Settings::Gui::LoginItemConfigured).toBool()) {
+    QSettings runKey(
+        QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+        QSettings::NativeFormat
+    );
+    const auto guiPath = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
+    runKey.setValue(kAppName, QStringLiteral("\"%1\"").arg(guiPath));
     Settings::setValue(Settings::Gui::LoginItemConfigured, true);
     Settings::save();
   }
@@ -305,7 +323,16 @@ void MainWindow::connectSlots()
   connect(m_actionReportBug, &QAction::triggered, this, &MainWindow::openHelpUrl);
   connect(m_actionMinimize, &QAction::triggered, this, &MainWindow::hide);
 
+#if defined(Q_OS_MACOS)
+  // Menu-bar app: Cmd+Q (app menu quit) sends the window back to the
+  // background instead of quitting; a real quit is only offered from the
+  // tray menu. Cmd+W does the same for window-close muscle memory.
+  connect(m_actionQuit, &QAction::triggered, this, &MainWindow::hide);
+  auto *closeShortcut = new QShortcut(QKeySequence::Close, this);
+  connect(closeShortcut, &QShortcut::activated, this, &MainWindow::hide);
+#else
   connect(m_actionQuit, &QAction::triggered, this, &MainWindow::close);
+#endif
   connect(m_actionTrayQuit, &QAction::triggered, this, &MainWindow::close);
   connect(m_actionRestore, &QAction::triggered, this, &MainWindow::showAndActivate);
   connect(m_actionSettings, &QAction::triggered, this, [this] { openSettings(); });
@@ -798,7 +825,16 @@ void MainWindow::createMenuBar()
 void MainWindow::setupTrayIcon()
 {
   if (!QSystemTrayIcon::isSystemTrayAvailable()) {
-    qWarning("system tray is not available on this platform");
+    // At login the GUI can start before the system tray / taskbar exists
+    // (common on Windows via the Run key). Giving up here left the app
+    // running with no tray presence at all; keep retrying until the tray
+    // arrives instead.
+    static int retries = 0;
+    if (++retries <= 150) { // ~5 minutes; covers slow logins
+      QTimer::singleShot(2000, this, &MainWindow::setupTrayIcon);
+    } else {
+      qWarning("system tray is not available on this platform");
+    }
     return;
   }
 
@@ -1021,7 +1057,11 @@ void MainWindow::handlePeerFingerprint(const QString &fingerprint)
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-  if (Settings::value(Settings::Gui::CloseToTray).toBool() && event->spontaneous()) {
+  // macOS is a menu-bar app: closing the window always returns to the
+  // background regardless of the close-to-tray setting; quit lives in the
+  // tray menu only.
+  const bool closeToTray = Settings::value(Settings::Gui::CloseToTray).toBool() || deskflow::platform::isMac();
+  if (closeToTray && event->spontaneous()) {
     if (Settings::value(Settings::Gui::CloseReminder).toBool()) {
       messages::showCloseReminder(this);
       Settings::setValue(Settings::Gui::CloseReminder, false);

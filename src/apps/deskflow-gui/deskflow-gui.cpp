@@ -66,6 +66,10 @@ int main(int argc, char *argv[])
   QGuiApplication::setDesktopFileName(kRevFqdnName);
 
   QApplication app(argc, argv);
+  // Tray-resident app: hiding the last window (or closing a stray dialog
+  // while the main window is hidden) must never terminate the process.
+  // Quit happens explicitly via the tray menu (QApplication::quit()).
+  QApplication::setQuitOnLastWindowClosed(false);
 
   // Ensure the I18N object is made before strings
   QTextStream(stdout) << "initial language: " << I18N::currentLanguage() << '\n';
