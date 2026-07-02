@@ -23,6 +23,10 @@
 #include "arch/win32/ArchMiscWindows.h"
 #endif
 
+#if defined(Q_OS_MAC)
+#include <ApplicationServices/ApplicationServices.h>
+#endif
+
 #include <QApplication>
 #include <QFileInfo>
 #include <QSharedMemory>
@@ -79,6 +83,18 @@ int main(int argc, char **argv)
 
   QApplication::setApplicationName(QStringLiteral("%1 Core").arg(kAppName));
   QApplication app(argc, argv);
+
+#if defined(Q_OS_MAC)
+  // The core is always a background process; without this transform the
+  // auto-mode core registers as a Foreground app and shows a Dock icon
+  // (App::run() only applies it on the GUI-spawned server/client path).
+  ProcessSerialNumber psn = {0, kCurrentProcess};
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  GetCurrentProcess(&psn);
+  TransformProcessType(&psn, kProcessTransformToBackgroundApplication);
+#pragma GCC diagnostic pop
+#endif
 
   Arch arch;
   arch.init();
