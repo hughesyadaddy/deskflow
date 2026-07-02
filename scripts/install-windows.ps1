@@ -16,7 +16,8 @@
 param(
   [switch]$NoRestart,
   [string]$BuildDir,
-  [string]$InstallDir
+  [string]$InstallDir,
+  [string]$TranscriptPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +26,12 @@ $root = Split-Path $PSScriptRoot -Parent
 $script:DeskflowProcessNames = @(
   'deskflow', 'deskflow-core', 'deskflow-daemon', 'deskflow-vhid-bridge'
 )
+
+function Invoke-TaskKill {
+  param([string]$ImageName)
+  # taskkill writes to stderr on failure; must not trip $ErrorActionPreference = 'Stop'
+  cmd.exe /c "taskkill /F /T /IM `"$ImageName`" >nul 2>&1"
+}
 
 function Import-DeskflowEnv {
   $envFile = Join-Path $root '.env'
@@ -47,13 +54,22 @@ function Assert-Admin {
   Write-Host 'Re-launching elevated for Program Files install...'
   $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
   if (-not $scriptPath) { throw 'Could not resolve install script path for elevation.' }
+  $logPath = Join-Path $env:TEMP 'deskflow-install.log'
   $argList = @(
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
+    '-TranscriptPath', $logPath
   )
   if ($NoRestart) { $argList += '-NoRestart' }
   if ($BuildDir) { $argList += @('-BuildDir', $BuildDir) }
   if ($InstallDir) { $argList += @('-InstallDir', $InstallDir) }
-  $proc = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -Wait -PassThru
+  # Note: -Wait would block on the whole process tree (the installer launches
+  # the GUI, which keeps running). WaitForExit() waits on the direct child only.
+  $proc = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -PassThru
+  $proc.WaitForExit()
+  if ($proc.ExitCode -ne 0 -and (Test-Path $logPath)) {
+    Write-Host "Install failed (exit $($proc.ExitCode)). Elevated log: $logPath"
+    Get-Content $logPath -Tail 30 | ForEach-Object { Write-Host $_ }
+  }
   exit $proc.ExitCode
 }
 
@@ -89,7 +105,7 @@ function Stop-DeskflowAll {
     foreach ($name in $script:DeskflowProcessNames) {
       Get-Process -Name $name -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
-      taskkill /F /T /IM "$name.exe" 2>$null | Out-Null
+      Invoke-TaskKill "$name.exe"
     }
 
     Start-Sleep -Milliseconds 750
@@ -227,6 +243,10 @@ function Assert-CanonicalRuntime {
 }
 
 Import-DeskflowEnv
+if ($TranscriptPath) {
+  Start-Transcript -Path $TranscriptPath -Force | Out-Null
+}
+try {
 Assert-Admin
 
 if (-not $BuildDir) {
@@ -281,3 +301,6 @@ Assert-CanonicalRuntime -InstallDir $InstallDir
 Write-Host "== Done: single install at $InstallDir =="
 $svcPath = (Get-CimInstance Win32_Service -Filter "Name='Deskflow'" -ErrorAction SilentlyContinue).PathName
 Write-Host "== Service: $svcPath =="
+} finally {
+  if ($TranscriptPath) { Stop-Transcript | Out-Null }
+}

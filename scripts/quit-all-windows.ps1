@@ -10,6 +10,11 @@ $ErrorActionPreference = 'Stop'
 
 $processNames = @('deskflow', 'deskflow-core', 'deskflow-daemon', 'deskflow-vhid-bridge')
 
+function Invoke-TaskKill {
+  param([string]$ImageName)
+  cmd.exe /c "taskkill /F /T /IM `"$ImageName`" >nul 2>&1"
+}
+
 function Get-DeskflowProcesses {
   Get-CimInstance Win32_Process -Filter "Name LIKE 'deskflow%'" -ErrorAction SilentlyContinue
 }
@@ -39,7 +44,7 @@ while ((Get-Date) -lt $deadline) {
   foreach ($name in $processNames) {
     Get-Process -Name $name -ErrorAction SilentlyContinue |
       Stop-Process -Force -ErrorAction SilentlyContinue
-    taskkill /F /T /IM "$name.exe" 2>$null | Out-Null
+    Invoke-TaskKill "$name.exe"
   }
 
   Start-Sleep -Milliseconds 750

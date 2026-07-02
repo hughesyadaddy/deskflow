@@ -1599,6 +1599,21 @@ L&apos;abilitazione di questa impostazione disabiliterà l&apos;interfaccia graf
     </message>
 </context>
 <context>
+    <name>WindowsDaemonService</name>
+    <message>
+        <source>Background service: not installed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Background service: running</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Background service: installed but stopped</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>i18n</name>
     <message>
         <source>LocalizedName</source>
