@@ -384,8 +384,10 @@ void Coordinator::updateCursorHost(const std::string &screenName)
   {
     std::scoped_lock lock{m_mutex};
     if (m_election.role() != Role::Server) {
+      LOG_DEBUG("coordination: cursor host update \"%s\" ignored (not server)", screenName.c_str());
       return;
     }
+    LOG_DEBUG("coordination: fleet cursor host -> \"%s\"", screenName.c_str());
     fragment.server = m_fleetState.server.empty() ? m_config.selfName : m_fleetState.server;
     fragment.seq = ++m_fleetSeq;
     fragment.cursorHost = screenName;

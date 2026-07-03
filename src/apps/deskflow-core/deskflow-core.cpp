@@ -134,6 +134,26 @@ int main(int argc, char **argv)
     return s_exitDuplicate;
   }
 
+#if defined(Q_OS_WIN)
+  // QSharedMemory lives in the per-session Local\ kernel namespace, so a
+  // login-screen (SYSTEM/elevated) core and a user-session core can coexist
+  // and fight over keyboard hooks and the mesh identity. A Global\ mutex
+  // dedupes across sessions; the watchdog owns replacing a stale core.
+  HANDLE globalMutex = CreateMutexW(nullptr, TRUE, L"Global\\deskflow-core-single-instance");
+  const DWORD mutexError = GetLastError();
+  if (parser.singleInstanceOnly() &&
+      ((globalMutex != nullptr && mutexError == ERROR_ALREADY_EXISTS) ||
+       (globalMutex == nullptr && mutexError == ERROR_ACCESS_DENIED))) {
+    // ACCESS_DENIED: the mutex exists but was created at a higher integrity
+    // level (elevated/SYSTEM core) -- still a duplicate.
+    LOG_WARN("an instance of deskflow core is already running in another session");
+    if (globalMutex != nullptr) {
+      CloseHandle(globalMutex);
+    }
+    return s_exitDuplicate;
+  }
+#endif
+
   parser.parse();
 
   EventQueue events;

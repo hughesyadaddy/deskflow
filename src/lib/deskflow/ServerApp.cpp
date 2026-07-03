@@ -554,12 +554,15 @@ Server *ServerApp::openServer(ServerConfig &config, PrimaryClient *primaryClient
 void ServerApp::handleScreenSwitched(const Event &event)
 {
   if (!m_cursorBroadcastCallback) {
+    LOG_DEBUG("coordination: screen switched but no cursor broadcast callback");
     return;
   }
   const auto *info = static_cast<const Server::SwitchToScreenInfo *>(event.getData());
   if (info == nullptr || info->m_screen.empty()) {
+    LOG_DEBUG("coordination: screen switched with empty screen info");
     return;
   }
+  LOG_DEBUG("coordination: screen switched to \"%s\"; updating fleet cursor", info->m_screen.c_str());
   m_cursorBroadcastCallback(info->m_screen);
 }
 
