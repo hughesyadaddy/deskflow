@@ -19,4 +19,5 @@ private Q_SLOTS:
   void cursorUpdatePreservesOrdering();
   void topologyBecameReadyFlag();
   void topologyBecameReady_notSetWhenAlreadyReady();
+  void newServerAuthorityAcceptsLowerSeq();
 };

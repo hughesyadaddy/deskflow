@@ -22,6 +22,7 @@
 #include "server/TopologyLink.h"
 
 #include <QCoreApplication>
+#include <QTemporaryDir>
 #include <QTest>
 
 #include <memory>
@@ -405,6 +406,7 @@ std::unique_ptr<Arch> g_arch;
 Log g_log;
 std::unique_ptr<QCoreApplication> g_app;
 std::unique_ptr<deskflow::core::ipc::CoreIpcServer> g_ipc;
+std::unique_ptr<QTemporaryDir> g_settingsDir;
 
 void ServerTests::initTestCase()
 {
@@ -415,6 +417,14 @@ void ServerTests::initTestCase()
   g_ipc = std::make_unique<deskflow::core::ipc::CoreIpcServer>(g_app.get());
   g_arch = std::make_unique<Arch>();
   g_log.setFilter(LogLevel::Level::Error);
+  // CRITICAL: isolate settings before any write. Without this the writes
+  // below land in the developer's real ~/Library/Deskflow/Deskflow.conf,
+  // renaming their machine to "server" and disabling the Mouser bridge on
+  // every test/debug run.
+  g_settingsDir = std::make_unique<QTemporaryDir>();
+  QVERIFY(g_settingsDir->isValid());
+  Settings::setSettingsFile(g_settingsDir->filePath(QStringLiteral("Deskflow.conf")));
+  QVERIFY(Settings::settingsFile().startsWith(g_settingsDir->path()));
   Settings::setValue(Settings::Server::MouserBridgeEnabled, false);
   Settings::setValue(Settings::Core::ComputerName, QStringLiteral("server"));
 }
@@ -424,6 +434,7 @@ void ServerTests::cleanupTestCase()
   g_ipc.reset();
   g_app.reset();
   g_arch.reset();
+  g_settingsDir.reset();
 }
 
 void ServerTests::SwitchToScreenInfo_alloc_screen()

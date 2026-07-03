@@ -6,6 +6,8 @@
 
 #include "coordination/FleetStateMerge.h"
 
+#include "common/FleetCursor.h"
+
 namespace deskflow::coordination {
 
 namespace {
@@ -68,7 +70,12 @@ FleetMergeResult applyServerFragment(FleetState &state, const FleetFragment &fra
   if (fragment.server.empty()) {
     return result;
   }
-  if (fragment.seq < state.seq) {
+  // Sequence ordering is per author. A fragment from a *different* server is
+  // a change of authority (election moved) and must be accepted even with a
+  // lower seq -- otherwise an ex-server's high-seq snapshot rejects the new
+  // server's fragments forever and the fleet cursor freezes.
+  const bool sameAuthor = deskflow::common::namesEqual(state.server, fragment.server);
+  if (sameAuthor && fragment.seq < state.seq) {
     return result;
   }
 

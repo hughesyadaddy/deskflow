@@ -146,4 +146,36 @@ void FleetStateMergeTests::topologyBecameReady_notSetWhenAlreadyReady()
   QVERIFY(!result.topologyBecameReady);
 }
 
+void FleetStateMergeTests::newServerAuthorityAcceptsLowerSeq()
+{
+  // Ex-server holds its own high-seq snapshot; when the election moves,
+  // the new server restarts publishing from a low seq and must win.
+  FleetState state;
+  state.server = "macbookpro";
+  state.seq = 19;
+  state.cursorHost = "macbookpro";
+  state.links = {FleetLink{"macbookpro", "hackintosh", "right"}};
+
+  FleetFragment fragment;
+  fragment.server = "hackintosh";
+  fragment.seq = 2;
+  fragment.cursorHost = "hackintosh";
+  fragment.links = state.links;
+
+  const auto result = applyServerFragment(state, fragment);
+
+  QVERIFY(result.changed);
+  QCOMPARE(state.server, std::string("hackintosh"));
+  QCOMPARE(state.cursorHost, std::string("hackintosh"));
+  QCOMPARE(state.seq, static_cast<int64_t>(2));
+
+  // Same author, lower seq: still rejected as stale.
+  FleetFragment stale;
+  stale.server = "hackintosh";
+  stale.seq = 1;
+  stale.cursorHost = "tiny11";
+  QVERIFY(!applyServerFragment(state, stale).changed);
+  QCOMPARE(state.cursorHost, std::string("hackintosh"));
+}
+
 QTEST_MAIN(FleetStateMergeTests)
