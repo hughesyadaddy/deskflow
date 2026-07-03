@@ -13,6 +13,7 @@
 #include "coordination/CoordinationProtocol.h"
 #include "coordination/FleetStateMerge.h"
 #include "coordination/KeyboardRelayDecision.h"
+#include "coordination/KeyboardRescue.h"
 #include "coordination/KeyboardRouter.h"
 #include "coordination/RelayKeyEvent.h"
 #include "base/EventTypes.h"
@@ -451,6 +452,8 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
       m_loggedKeyForward = false;
       m_loggedKeyForwardReceive = false;
       m_loggedRelayUnknownForward = false;
+      m_relayLocalOverride = false;
+      m_overrideCursorHost.clear();
       // Epoch restart does not call becameClient(); clear stale screen sync.
       m_election.resetCursorScreen();
       m_clientRelayStartedAt = monotonicSeconds();
@@ -628,6 +631,19 @@ void Coordinator::sendKeyForward(
       return;
     }
 
+    // Keyboard rescue: force this keyboard local until the fleet cursor
+    // host next changes. Works even when routing state is stale, because
+    // every swallowed key passes through here.
+    if (phase == Message::KeyPhase::Down && isKeyboardRescueChord(id, mask)) {
+      m_relayLocalOverride = true;
+      m_overrideCursorHost = m_fleetState.cursorHost;
+      LOG_INFO("coordination: keyboard rescue chord: keyboard forced local");
+      return;
+    }
+    if (m_relayLocalOverride) {
+      return; // override active: never forward
+    }
+
     if (m_config.meshVersion < 2) {
       destination = m_election.serverAddress();
       line = protocol::encodeKeyFwd(
@@ -686,6 +702,18 @@ bool Coordinator::relayPassThroughLocal()
 {
   std::scoped_lock lock{m_mutex};
   const double elapsed = monotonicSeconds() - m_clientRelayStartedAt;
+
+  // Rescue override: keyboard stays local until the fleet cursor host
+  // changes value (fresh authoritative state supersedes the override).
+  if (m_relayLocalOverride) {
+    if (m_fleetState.cursorHost != m_overrideCursorHost) {
+      m_relayLocalOverride = false;
+      LOG_INFO("coordination: keyboard rescue override cleared (fleet cursor moved)");
+    } else {
+      return true;
+    }
+  }
+
   if (m_config.meshVersion < 2) {
     const bool known = m_election.cursorScreenKnown();
     const bool passLocal = passKeyToLocalOs(m_election.cursorHere(), known, elapsed);

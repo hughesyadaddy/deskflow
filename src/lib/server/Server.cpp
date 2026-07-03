@@ -20,6 +20,7 @@
 #include "deskflow/Screen.h"
 #include "deskflow/StreamChunker.h"
 #include "deskflow/ipc/CoreIpc.h"
+#include "coordination/KeyboardRescue.h"
 #include "net/TCPSocket.h"
 #include "server/ClientListener.h"
 #include "server/ClientProxy.h"
@@ -1786,6 +1787,15 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
 {
   LOG_VERBOSE("onKeyDown id=%d mask=0x%04x button=0x%04x lang=%s", id, mask, button, lang.c_str());
   assert(m_active != nullptr);
+
+  // Keyboard rescue: Ctrl+Alt+Shift+Escape yanks the cursor (and with it
+  // the keyboard) back to this machine's own screen, whatever state the
+  // active-screen relay is in. Escape hatch for a wedged or stale switch.
+  if (deskflow::coordination::isKeyboardRescueChord(id, mask) && m_active != m_primaryClient) {
+    LOG_INFO("keyboard rescue chord: switching back to primary screen \"%s\"", getName(m_primaryClient).c_str());
+    jumpToScreen(m_primaryClient);
+    return;
+  }
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {

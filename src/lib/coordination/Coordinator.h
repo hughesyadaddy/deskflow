@@ -176,6 +176,9 @@ private:
   bool m_loggedKeyForwardReceive = false;
   bool m_loggedRelayUnknownForward = false;
   double m_clientRelayStartedAt = 0.0;
+  //! Rescue chord engaged: pass keys locally until the cursor host changes.
+  bool m_relayLocalOverride = false;
+  std::string m_overrideCursorHost;
   std::set<std::string> m_versionMismatchPeers;
 };
 
