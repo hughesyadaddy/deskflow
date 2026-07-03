@@ -241,4 +241,39 @@ void CoordinatorFleetPublishTests::followClaim_dropsUnknownClaimWithoutAddress()
   coordinator.stop();
 }
 
+void CoordinatorFleetPublishTests::serverTakeover_continuesFleetSeq()
+{
+  auto config = testConfig();
+  config.selfName = "macbookpro";
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsClient(coordinator);
+
+  // As a client, merge the previous server's snapshot up to seq 6.
+  FleetFragment inbound;
+  inbound.server = "hackintosh";
+  inbound.seq = 6;
+  inbound.cursorHost = "hackintosh";
+  inbound.links = {FleetLink{"hackintosh", "macbookpro", "left"}};
+  inbound.screens = {FleetScreen{"hackintosh"}, FleetScreen{"macbookpro"}};
+  coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
+  QCOMPARE(coordinator.fleetSnapshot().seq, static_cast<int64_t>(6));
+
+  // Take over as server: publishes must continue above the merged seq or
+  // every peer (and our own merge) rejects them as stale, freezing the
+  // fleet cursor on the previous server.
+  coordinator.decide(Role::Server, {});
+  coordinator.updateCursorHost("macbookpro");
+
+  const auto snapshot = coordinator.fleetSnapshot();
+  QVERIFY(snapshot.seq > 6);
+  QCOMPARE(snapshot.server, std::string("macbookpro"));
+  QCOMPARE(snapshot.cursorHost, std::string("macbookpro"));
+
+  coordinator.stop();
+}
+
 QTEST_MAIN(CoordinatorFleetPublishTests)

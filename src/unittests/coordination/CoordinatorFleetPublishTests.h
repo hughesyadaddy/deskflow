@@ -27,6 +27,7 @@ private Q_SLOTS:
   void hello_rejectsV1Peer();
   void followClaim_resolvesEmptyAddressFromPeers();
   void followClaim_dropsUnknownClaimWithoutAddress();
+  void serverTakeover_continuesFleetSeq();
 
 private:
   static void armAsServer(deskflow::coordination::Coordinator &coordinator, const std::string &selfName);

@@ -388,7 +388,9 @@ void Coordinator::updateCursorHost(const std::string &screenName)
       return;
     }
     LOG_DEBUG("coordination: fleet cursor host -> \"%s\"", screenName.c_str());
-    fragment.server = m_fleetState.server.empty() ? m_config.selfName : m_fleetState.server;
+    // Always author as self: after a server takeover m_fleetState.server
+    // still names the previous server until our first publish lands.
+    fragment.server = m_config.selfName;
     fragment.seq = ++m_fleetSeq;
     fragment.cursorHost = screenName;
     fragment.cursorScreen = screenName;
@@ -781,6 +783,11 @@ void Coordinator::decide(Role role, const std::string &serverAddress)
     }
     if (role == Role::Server) {
       m_election.becameServer();
+      // Fragment sequence must stay monotonic across server changes: this
+      // node may have merged the previous server's fragments up to
+      // m_fleetState.seq, and publishing below that would be rejected as
+      // stale by every peer (and by our own merge), freezing fleet state.
+      m_fleetSeq = std::max(m_fleetSeq, m_fleetState.seq);
     } else {
       m_election.becameClient(serverAddress);
     }
@@ -861,11 +868,13 @@ void Coordinator::workerLoop()
           // Rebroadcast the current fleet fragment so late-joining clients
           // converge without waiting for the next topology/cursor change.
           // Same seq: applyServerFragment treats equal seq as idempotent.
+          // Only when we authored the snapshot: after a takeover the state
+          // may still carry the previous server until our first publish.
           std::string line;
           PeerList peers;
           {
             std::scoped_lock lock{m_mutex};
-            if (!m_fleetState.server.empty() && !m_fleetState.screens.empty()) {
+            if (namesEqual(m_fleetState.server, m_config.selfName) && !m_fleetState.screens.empty()) {
               FleetFragment fragment;
               fragment.server = m_fleetState.server;
               fragment.seq = m_fleetState.seq;
