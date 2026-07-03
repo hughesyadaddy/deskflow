@@ -245,7 +245,7 @@ void MSWindowsDesks::getCursorPos(int32_t &x, int32_t &y) const
 
 void MSWindowsDesks::fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool /*isAutoRepeat*/) const
 {
-  sendMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey));
+  sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey));
 }
 
 void MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
@@ -297,22 +297,22 @@ void MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
   }
 
   // do it
-  sendMessage(DESKFLOW_MSG_FAKE_BUTTON, flags, data);
+  sendInputMessage(DESKFLOW_MSG_FAKE_BUTTON, flags, data);
 }
 
 void MSWindowsDesks::fakeMouseMove(int32_t x, int32_t y) const
 {
-  sendMessage(DESKFLOW_MSG_FAKE_MOVE, static_cast<WPARAM>(x), static_cast<LPARAM>(y));
+  sendInputMessage(DESKFLOW_MSG_FAKE_MOVE, static_cast<WPARAM>(x), static_cast<LPARAM>(y));
 }
 
 void MSWindowsDesks::fakeMouseRelativeMove(int32_t dx, int32_t dy) const
 {
-  sendMessage(DESKFLOW_MSG_FAKE_REL_MOVE, static_cast<WPARAM>(dx), static_cast<LPARAM>(dy));
+  sendInputMessage(DESKFLOW_MSG_FAKE_REL_MOVE, static_cast<WPARAM>(dx), static_cast<LPARAM>(dy));
 }
 
 void MSWindowsDesks::fakeMouseWheel(int32_t xDelta, int32_t yDelta) const
 {
-  sendMessage(DESKFLOW_MSG_FAKE_WHEEL, xDelta, yDelta);
+  sendInputMessage(DESKFLOW_MSG_FAKE_WHEEL, xDelta, yDelta);
 }
 
 void MSWindowsDesks::saveRelativeRestorePosition(Desk *desk) const
@@ -351,8 +351,29 @@ bool MSWindowsDesks::restoreRelativeCursorPosition(Desk *desk) const
 void MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
 {
   if (m_activeDesk != nullptr && m_activeDesk->m_window != nullptr) {
+    // If the post fails we must NOT wait, or the caller blocks forever on a
+    // ready signal that will never arrive.
+    if (PostThreadMessage(m_activeDesk->m_threadID, msg, wParam, lParam)) {
+      waitForDesk();
+    } else {
+      LOG_WARN("failed to post desk message %u: %lu", msg, GetLastError());
+    }
+  }
+}
+
+void MSWindowsDesks::sendInputMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
+{
+  // Fire-and-forget for self-contained fake-input messages (move/button/
+  // wheel/key). The payload is entirely in wParam/lParam and there is no
+  // readback, so blocking the caller on a cross-thread round trip per event
+  // (the old sendMessage path) only adds latency -- catastrophically so on a
+  // VM where each context switch is subject to vCPU scheduling jitter, which
+  // then trips ServerProxy mouse-move compression and drops positions. The
+  // desk thread does NOT ack these (see deskThread), so a stale ready signal
+  // can never satisfy a later synchronous waiter. FIFO ordering per thread
+  // queue preserves key down/up and move sequencing.
+  if (m_activeDesk != nullptr && m_activeDesk->m_window != nullptr) {
     PostThreadMessage(m_activeDesk->m_threadID, msg, wParam, lParam);
-    waitForDesk();
   }
 }
 
@@ -457,9 +478,11 @@ void MSWindowsDesks::deskMouseMove(int32_t x, int32_t y) const
   // the primary screen.
   int32_t w = GetSystemMetrics(SM_CXSCREEN);
   int32_t h = GetSystemMetrics(SM_CYSCREEN);
+  // MOVE_NOCOALESCE: deliver every injected position instead of letting the
+  // OS merge queued moves, so fast cursor motion is not decimated into jumps.
   send_mouse_input(
-      MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, (DWORD)((65535.0f * x) / (w - 1) + 0.5f),
-      (DWORD)((65535.0f * y) / (h - 1) + 0.5f), 0
+      MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE_NOCOALESCE,
+      (DWORD)((65535.0f * x) / (w - 1) + 0.5f), (DWORD)((65535.0f * y) / (h - 1) + 0.5f), 0
   );
 }
 
@@ -479,11 +502,14 @@ void MSWindowsDesks::deskMouseRelativeMove(int32_t dx, int32_t dy) const
   bool accelChanged =
       SystemParametersInfo(SPI_GETMOUSE, 0, oldSpeed, 0) && SystemParametersInfo(SPI_GETMOUSESPEED, 0, oldSpeed + 3, 0);
 
-  // use 1:1 motion
+  // use 1:1 motion. Both calls must run; `||` short-circuits the speed reset
+  // whenever the accel disable succeeds, so relative moves kept OS mouse
+  // acceleration and landed in the wrong place.
   if (accelChanged) {
     int newSpeed[4] = {0, 0, 0, 1};
-    accelChanged = SystemParametersInfo(SPI_SETMOUSE, 0, newSpeed, 0) ||
-                   SystemParametersInfo(SPI_SETMOUSESPEED, 0, newSpeed + 3, 0);
+    const bool accelOff = SystemParametersInfo(SPI_SETMOUSE, 0, newSpeed, 0);
+    const bool speedSet = SystemParametersInfo(SPI_SETMOUSESPEED, 0, newSpeed + 3, 0);
+    accelChanged = accelOff && speedSet;
   }
 
   // move relative to mouse position
@@ -655,6 +681,10 @@ void MSWindowsDesks::deskThread(const void *vdesk)
   desk->m_threadID = GetCurrentThreadId();
   desk->m_window = nullptr;
   desk->m_foregroundWindow = nullptr;
+  // This thread performs every SendInput. It was running at default priority
+  // while the app's main thread runs near-realtime -- a priority inversion
+  // that lets the injector be preempted mid-motion, worst on a busy VM.
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   if (desk->m_desk != nullptr && SetThreadDesktop(desk->m_desk) != 0) {
     // create a message queue
     PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
@@ -677,6 +707,13 @@ void MSWindowsDesks::deskThread(const void *vdesk)
   }
 
   while (GetMessage(&msg, nullptr, 0, 0)) {
+    // Fire-and-forget fake-input messages must not touch the ready signal:
+    // their senders (sendInputMessage) do not wait, so acking them could
+    // leave a stale "ready" that prematurely wakes a later synchronous
+    // waiter before its own message is processed. Injection order is still
+    // preserved by the FIFO thread queue.
+    bool ackNeeded = true;
+
     switch (msg.message) {
     default:
       TranslateMessage(&msg);
@@ -726,20 +763,24 @@ void MSWindowsDesks::deskThread(const void *vdesk)
     case DESKFLOW_MSG_FAKE_KEY:
       // Note, this is intended to be HI/LOWORD and not HI/LOBYTE
       send_keyboard_input(HIWORD(msg.lParam), LOWORD(msg.lParam), (DWORD)msg.wParam);
+      ackNeeded = false;
       break;
 
     case DESKFLOW_MSG_FAKE_BUTTON:
       if (msg.wParam != 0) {
         send_mouse_input((DWORD)msg.wParam, 0, 0, (DWORD)msg.lParam);
       }
+      ackNeeded = false;
       break;
 
     case DESKFLOW_MSG_FAKE_MOVE:
       deskMouseMove(static_cast<int32_t>(msg.wParam), static_cast<int32_t>(msg.lParam));
+      ackNeeded = false;
       break;
 
     case DESKFLOW_MSG_FAKE_REL_MOVE:
       deskMouseRelativeMove(static_cast<int32_t>(msg.wParam), static_cast<int32_t>(msg.lParam));
+      ackNeeded = false;
       break;
 
     case DESKFLOW_MSG_FAKE_WHEEL:
@@ -750,6 +791,7 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       if (msg.wParam != 0) {
         send_mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, (DWORD)msg.wParam);
       }
+      ackNeeded = false;
       break;
 
     case DESKFLOW_MSG_CURSOR_POS: {
@@ -780,6 +822,10 @@ void MSWindowsDesks::deskThread(const void *vdesk)
           DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY, DESKFLOW_HOOK_FAKE_INPUT_SCANCODE, msg.wParam ? 0 : KEYEVENTF_KEYUP
       );
       break;
+    }
+
+    if (!ackNeeded) {
+      continue;
     }
 
     // notify that message was processed

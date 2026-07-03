@@ -186,7 +186,7 @@ private:
     HDESK m_desk;
     HWND m_window;
     HWND m_foregroundWindow;
-    bool m_lowLevel;
+    bool m_lowLevel = false;
     bool m_hasRelativeRestorePosition = false;
     int32_t m_relativeRestoreX = 0;
     int32_t m_relativeRestoreY = 0;
@@ -219,7 +219,10 @@ private:
 
   // communication with desk threads
   void waitForDesk() const;
+  //! Post a message to the active desk thread and block until it is processed.
   void sendMessage(UINT, WPARAM, LPARAM) const;
+  //! Post a self-contained fake-input message without waiting (latency path).
+  void sendInputMessage(UINT, WPARAM, LPARAM) const;
 
   // work around for messed up keyboard events from low-level hooks
   HWND getForegroundWindow() const;
@@ -249,7 +252,7 @@ private:
 
   // screen shape stuff
   int32_t m_x = 0;
-  int32_t m_y = 9;
+  int32_t m_y = 0;
   int32_t m_w = 0;
   int32_t m_h = 0;
   int32_t m_xCenter = 0;

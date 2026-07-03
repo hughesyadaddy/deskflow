@@ -1,277 +1,151 @@
-# Code Simplicity Review — Fleet State Hub (mesh v2)
+# Code Simplicity Review — Windows Input Injection Path
 
-**Scope:** `refactor/fleet-state-hub` vs `master`, plus uncommitted P2–P5 working-tree changes  
-**Reviewed:** Production and test code under `src/` (docs excluded from removal recommendations)  
-**Date:** 2026-07-02
+**Date**: 2026-07-03
+**Reviewer**: Code Simplicity Review Agent (VGV)
+**Scope**: `src/lib/platform/MSWindowsDesks.{cpp,h}`, `MSWindowsScreen.{cpp,h}`, `MSWindowsVhidPipeClient.{cpp,h}`, `MSWindowsCursorVisibility.{cpp,h}`, `src/lib/coordination/KeyboardRouter.{h,cpp}`, `RelayKeyEvent.h`, `KeyboardRescue.h`, relay glue in `Server.cpp` / `Coordinator.cpp`
 
----
+## Verdict
 
-## Simplification Analysis
+The live injection path is in decent shape — the desk-thread message hop is essential Win32 complexity and should stay. The problem is a large body of **dead scaffolding checked in but never wired into the build** (~850 lines from one WIP commit), plus a scattering of dead fields, dead duplicate functions, and vestigial parameters left behind by refactors. Roughly **~920 lines are removable today** with zero behavior change.
 
-### Core Purpose
-
-Make the elected server the single source of truth for fleet topology, cursor host, and keyboard routing; replicate that snapshot to clients via mesh v2 `fleet` messages; let Server, clients, GUI, login bridge, watchdog, and vhid-bridge consume the snapshot instead of ad-hoc peer lists and legacy mesh side-channels.
-
-The implementation largely achieves this. Complexity comes from **transitional v1/v2 dual paths**, **parallel data models for the same topology**, and **three independent localhost status pollers** parsing the same JSON line.
-
----
-
-### Unnecessary Complexity Found
-
-#### 1. Triple localhost status polling (Critical)
-
-| Location | Mechanism |
-|----------|-----------|
-| `src/lib/gui/CoordinationStatus.cpp:89–138` | Async `QTcpSocket`, manual JSON parse, `formatFleetGraph` |
-| `src/lib/coordination/CoordinationLocalStatus.cpp:55–87` | Sync `QTcpSocket`, manual JSON parse, host extraction |
-| `src/apps/deskflow-vhid-bridge/deskflow-vhid-bridge.cpp:330–430` | Raw TCP + **string-scraping JSON parser** (`json_quoted_value`) |
-
-All three send `{"t":"status"}\n` to `127.0.0.1:<coord-port>` and parse the same reply shape. The vhid-bridge parser is especially fragile (regex-free substring walks, no schema validation) and will drift when status JSON evolves.
-
-**Suggested simplification:** One shared fetch layer. Qt consumers (`CoordinationStatus`, `LoginBridgeManager`, `MSWindowsWatchdog`) should call `pollLocalFleetStatus` (or a thin async wrapper). For vhid-bridge, extract a **non-Qt** status parser (or a minimal JSON helper) into `src/lib/coordination/` and reuse the same field mapping as `CoordinationLocalStatus.cpp`.
-
-**Estimated LOC reduction:** ~90–120
-
----
-
-#### 2. Incomplete v1/v2 dual paths — plan P4.8 not landed (Critical)
-
-Plan phase P4.8 explicitly calls for deprecating `m_fleetCursorHost`, standalone mesh `cursor`, and dual relay branching. Uncommitted code still maintains:
-
-- **Parallel cursor channels:** `Coordinator::broadcastCursor` + heartbeat rebroadcast (`Coordinator.cpp:327–353`, `811–841`) alongside mesh v2 `updateCursorHost` / `fleet` fragments.
-- **Dual keyboard wire formats:** v1 `keyfwd` → elected server vs v2 `key` → cursor host (`Coordinator.cpp:529–534`, `600–622`).
-- **Dual client relay gating:** v1 `ElectionState::cursorHere()` vs v2 `KeyboardRouter` + `fleetState.cursorHost` (`relayPassThroughLocal`, `651–677`).
-- **Cached cursor host:** `m_fleetCursorHost` / `m_cursorSeq` shadow `m_fleetState.cursorHost` / `m_fleetState.seq`.
-
-This is justified **during** migration but is the largest ongoing complexity tax (~150–200 LOC + branch surface). It should be tracked as **time-boxed debt**, not permanent architecture.
-
-**Suggested simplification:** Finish P4.8/P6 cutover behind `meshVersion >= 2` guard, then delete v1 branches in one pass rather than accumulating more v1-aware call sites.
-
-**Estimated LOC reduction (post-cutover):** ~150–200
-
----
-
-#### 3. `FleetLink` vs `TopologyLink` duplicate adjacency types (Important)
-
-| Type | Package | Direction representation |
-|------|---------|--------------------------|
-| `FleetLink` | `coordination/FleetState.h:24–29` | `std::string direction` ("left", "right", …) |
-| `TopologyLink` | `server/TopologyLink.h:16–21` | `Direction` enum |
-
-`ServerApp::applyFleetTopologyFromSnapshot` (`ServerApp.cpp:726–758`) converts string → enum in a loop. Server already understands `Direction` via `Config`.
-
-**Suggested simplification:** Use one link struct end-to-end. Prefer `Direction` in fleet wire decode (map once in `CoordinationProtocol.cpp`) and drop `TopologyLink`, **or** typedef `TopologyLink` as `FleetLink` with a single conversion helper used at the Server boundary only.
-
-**Estimated LOC reduction:** ~35–50
-
----
-
-#### 4. `FleetFragment` duplicates `FleetState` (Important)
-
-`FleetState.h:38–59` defines two nearly identical structs differing only in naming intent (snapshot vs wire fragment). `fleetFragmentFromMessage` (`CoordinationProtocol.cpp:328–331`) is a one-line alias.
-
-Merge logic copies all fields wholesale (`FleetStateMerge.cpp:78–84`). The fragment type adds a type alias and conversion surface without distinct behavior.
-
-**Suggested simplification:** Use `FleetState` (or a single `FleetSnapshot`) for both merge target and publish payload; pass partial updates as optional fields or a dedicated `FleetPatch` only if partial updates are actually needed (they are not today — server always sends full fragment).
-
-**Estimated LOC reduction:** ~25–40
-
----
-
-#### 5. `CoordinationStatus` does not reuse `CoordinationLocalStatus` (Important)
-
-`CoordinationStatus::poll()` reimplements connect → write status → read line → parse JSON. `CoordinationLocalStatus::pollLocalFleetStatus` already does the same synchronously.
-
-GUI polling could call `pollLocalFleetStatus` on a thread pool / `QtConcurrent` and emit results, keeping JSON field knowledge in one module.
-
-**Estimated LOC reduction:** ~40–55
-
----
-
-#### 6. Peer send loops still duplicated (Important)
-
-`sendFleetLineToPeers` (`Coordinator.cpp:245–256`) centralizes fleet broadcast, but identical ip/lan fan-out appears in:
-
-- `broadcastCursor` (348–352)
-- `broadcastClaim` (769–777)
-- Heartbeat cursor rebroadcast (832–839)
-
-**Suggested simplification:** One `broadcastLineToPeers(const std::string &line)` private helper; all outbound mesh fan-out goes through it.
-
-**Estimated LOC reduction:** ~30–40
-
----
-
-#### 7. `friend class CoordinatorFleetPublishTests` for white-box testing (Important)
-
-`CoordinatorFleetPublishTests.cpp:53–58` locks `coordinator.m_mutex` and calls `m_election.becameServer()` directly. This couples tests to private layout and makes refactors expensive.
-
-**Suggested simplification:** Test via public API (`decide` is private, but role transitions can be driven through mesh `Claim` messages or a package-visible test hook). At minimum, expose a narrow `testOnlyArmServer()` in test builds.
-
----
-
-#### 8. `ServerApp` topology extraction is heavy (Important)
-
-`linksFromConfig` (`ServerApp.cpp:92–118`) samples **five fractional positions × four directions × every screen**, deduplicates with `std::set<std::tuple<…>>`. Correct for irregular edges, but expensive and hard to reason about.
-
-**Suggested simplification:** If deskflow configs only define edges at `0.0` and `1.0`, sample those two points only. If fractional edges are rare, document the assumption and reduce samples to `{0.0f, 1.0f}` (~80% less work). Keep full sampling only if unit tests prove it is required.
-
-**Estimated LOC reduction:** ~15–25 (or clarity gain with same LOC)
-
----
-
-#### 9. Three `std::function` callbacks on `ServerApp` (Suggestion)
-
-`setCursorBroadcastCallback`, `setFleetTopologyPublishCallback`, `setFleetSnapshotCallback` (`ServerApp.h:97–113`) wire AutoModeRunner → Coordinator. Works, but scatters coordination wiring across three injection points.
-
-**Alternative:** Pass a single `ICoordinationFleet*` (or `Coordinator&`) into `ServerApp` for mesh v2 builds. Only worth doing if more callbacks appear; otherwise current pattern is acceptable.
-
----
-
-#### 10. `RelayKeyPhase` + `Message::KeyPhase` + conversion helpers (Suggestion — acceptable)
-
-`relayPhaseFromMessage` / `relayEventFromMessage` (`Coordinator.cpp:41–63`) exist because plan P4.1 deliberately decoupled server from protocol. The duplication is **intentional layering**, not YAGNI — keep unless protocol and relay merge later.
-
----
-
-#### 11. `KeyboardRouter` as standalone 35-line module (Suggestion — keep)
-
-`KeyboardRouter.cpp` is thin but **pure and well-tested** (`KeyboardRouterTests.cpp`). Extraction aids P4 matrix testing. Do not inline back into `Coordinator`.
-
----
-
-#### 12. One-shot log flags (Suggestion)
-
-Three booleans (`m_loggedKeyForward`, `m_loggedKeyForwardReceive`, `m_loggedRelayUnknownForward`) reset in four places in `updateKeyboardRelayForRole`. A single `enum class RelayLogOnce { Forward, Receive, UnknownForward }` with a small helper would reduce reset churn.
-
-**Estimated LOC reduction:** ~10–15
-
----
-
-#### 13. Redundant fleet events on ServerApp (Suggestion)
-
-`registerFleetTopologyHandlers` registers **both** `CoordinationFleetStateChanged` and `CoordinationTopologyReady` with the **same** handler (`ServerApp.cpp:710–712`). Server only needs topology apply on any fleet change; `TopologyReady` is primarily for client pre-connect (`AutoModeRunner.cpp:232–239`). ServerApp can listen to `CoordinationFleetStateChanged` only.
-
-**Estimated LOC reduction:** ~4–6
-
----
-
-#### 14. `fleetFragmentFromMessage` one-liner (Suggestion)
-
-`CoordinationProtocol.cpp:328–331` returns `message.fleet` — inline at the single call site in `Coordinator.cpp:317`.
-
-**Estimated LOC reduction:** ~5
-
----
-
-### Code to Remove (post-migration / safe now)
-
-| Location | Reason | Est. LOC |
-|----------|--------|----------|
-| `deskflow-vhid-bridge.cpp:333–430` | Replace with shared status parser | 90 |
-| `CoordinationProtocol.cpp:328–331` | Trivial wrapper | 5 |
-| `ServerApp.cpp:712` | Duplicate event handler registration | 2 |
-| `Coordinator.cpp` broadcastCursor heartbeat block | After v2-only cutover (P4.8) | 30 |
-| `Coordinator.cpp` keyfwd branch | After v2-only cutover | 40 |
-| `TopologyLink.h` + conversion loop | After FleetLink uses Direction | 25 |
-| `FleetFragment` struct | After merge with FleetState | 20 |
-
----
-
-### Simplification Recommendations (prioritized)
-
-1. **Consolidate localhost status polling** (Critical)
-   - Current: Three independent TCP+JSON implementations
-   - Proposed: `CoordinationLocalStatus` for Qt; shared C parser for vhid-bridge
-   - Impact: ~100 LOC, eliminates drift bug class
-
-2. **Time-box and finish v1 path removal** (Critical)
-   - Current: Parallel cursor, relay, and gating for mesh v1 and v2
-   - Proposed: Single code path when `meshVersion >= 2`; delete v1 branches in P6
-   - Impact: ~180 LOC, major clarity win
-
-3. **Unify topology link types** (Important)
-   - Current: String-direction fleet links → enum-direction server links
-   - Proposed: Decode to `Direction` once in protocol layer
-   - Impact: ~45 LOC, one mental model
-
-4. **Merge FleetFragment into FleetState** (Important)
-   - Current: Two identical structs + alias function
-   - Proposed: One snapshot type for wire and merge
-   - Impact: ~35 LOC
-
-5. **Extract `broadcastLineToPeers`** (Important)
-   - Current: Four copy-pasted ip/lan send loops in Coordinator
-   - Proposed: Single helper used everywhere
-   - Impact: ~35 LOC, fewer send bugs
-
-6. **Rewire CoordinationStatus through CoordinationLocalStatus** (Important)
-   - Current: Duplicate poll/parse in GUI module
-   - Proposed: Shared fetch, GUI-only formatting stays local
-   - Impact: ~50 LOC
-
-7. **Reduce linksFromConfig sampling** (Important, verify first)
-   - Current: 5 samples × 4 dirs × N screens
-   - Proposed: 2 samples unless tests require 5
-   - Impact: Runtime + readability
-
----
-
-### YAGNI Violations
-
-| Feature / abstraction | Why it violates YAGNI | What to do instead |
-|-----------------------|----------------------|-------------------|
-| vhid-bridge bespoke JSON scraper | Solves same problem as `CoordinationLocalStatus` without reuse | Shared parser module |
-| `FleetFragment` separate from `FleetState` | No distinct lifecycle or fields | Single struct |
-| `TopologyLink` separate from `FleetLink` | Conversion-only difference | One type with `Direction` |
-| Standalone `cursor` mesh messages on v2 server heartbeat | Superseded by `fleet` cursor fields (plan P4.8) | Remove after cutover |
-| `fleetFragmentFromMessage()` | No logic | Inline |
-| Dual fleet events on ServerApp | Same handler for both | One event subscription |
-| `friend CoordinatorFleetPublishTests` | Tests private members not behavior | Public/message-driven setup |
-
-**Not YAGNI (keep):**
-
-- `KeyboardRouter` — pure routing with matrix tests
-- `RelayKeyEvent` — protocol decoupling for Server
-- `CoordinationLocalStatus` — legitimate shared consumer API
-- Queued switch / fleet topology on Server — required for offline-neighbor handoff
-- `FleetStateMerge` + equality helpers — needed for change detection
-
----
-
-### Test Code Notes
-
-Tests are generally proportionate. Observations:
-
-- **`ServerTests.cpp`** (+390 LOC committed, +178 uncommitted): High but tests real fleet-topology and queued-switch behavior. Keep; avoid further white-box tests against `m_active` / `m_clients` where public outcomes suffice.
-- **`KeyboardRouterTests.cpp`**: Lean, valuable — model for pure logic tests.
-- **`CoordinatorFleetPublishTests`**: Useful coverage but **`friend` + private mutex** is a maintainability smell — refactor before adding more coordinator tests.
-- **`CoordinationLocalStatusTests` / `CoordinationStatusTests`**: Small, focused — good.
-
-No test files flagged for removal.
-
----
-
-### Final Assessment
-
-| Metric | Value |
-|--------|-------|
-| **Production + test delta (approx.)** | ~2,800 LOC (branch + working tree, excl. docs) |
-| **Total potential LOC reduction** | ~350–450 LOC now; ~180 more after v2-only cutover |
-| **Reduction percentage** | ~12–18% immediate; ~25% after P6 |
-| **Complexity score** | **Medium–High** (dual mesh versions, triple status poll, duplicate types) |
-| **Recommended action** | **Proceed with simplifications** — architecture is sound; consolidate polling and types now, schedule v1 path deletion for P6 |
-
-### Verdict
-
-**Needs work** before calling the refactor "minimal." No rethink required — the fleet hub model is the right shape. Priority: (1) unify status polling, (2) merge duplicate types, (3) finish P4.8/P6 v1 removal so dual paths do not ossify.
-
----
-
-## Issue Counts
+**Estimated removable lines: ~920**
 
 | Severity | Count |
-|----------|-------|
+| --- | --- |
 | Critical | 2 |
-| Important | 7 |
+| Important | 5 |
 | Suggestions | 6 |
+
+---
+
+## Critical
+
+### C1. ~850 lines of unbuilt VHID phase-2 scaffolding — remove or move to a branch
+
+Commit `76047f7cd` ("wip(windows): vhid core-pipe phase 2 scaffolding (not yet wired into build)") added six source files and four test files that appear in **no `CMakeLists.txt` anywhere in the tree**:
+
+| File | Lines | In build? |
+| --- | --- | --- |
+| `src/lib/platform/MSWindowsVhidPipeClient.cpp` | 352 | No — absent from `src/lib/platform/CMakeLists.txt:25-61` |
+| `src/lib/platform/MSWindowsVhidPipeClient.h` | 126 | No |
+| `src/lib/platform/MSWindowsCursorVisibility.cpp` | 43 | No |
+| `src/lib/platform/MSWindowsCursorVisibility.h` | 14 | No |
+| `src/lib/gui/WindowsDaemonService.cpp` | 191 | No — absent from `src/lib/gui/CMakeLists.txt:18-125` |
+| `src/lib/gui/WindowsDaemonService.h` | 39 | No |
+| `src/unittests/platform/MSWindowsVhidPipeClientTests.{cpp,h}` | 39 | No — `src/unittests/platform/CMakeLists.txt` registers only clipboard tests |
+| `src/unittests/platform/MSWindowsCursorVisibilityTests.{cpp,h}` | 42 | No |
+
+Worse, the code **cannot compile if wired in**:
+
+- `src/lib/platform/MSWindowsVhidPipeClient.cpp:222` reads `Settings::Daemon::VhidBridgeEnabled` — this settings key does not exist anywhere in `src/lib/common/Settings.{h,cpp}` (only the plan doc mentions it).
+- `src/lib/platform/MSWindowsVhidPipeClient.cpp:214,225` reference `kSecureDesktopEventName` — defined nowhere in the tree (the plan doc at `docs/plan/2026-06-30-feat-windows-vhid-core-pipe-phase2-plan.md:107` says it *should* be added).
+
+No production code calls `MSWindowsVhidRouting::instance()`, `WindowsDaemonService::*`, or `deskflow::platform::mswindows::setCursorVisibility` — the only references are the files' own definitions and the unregistered test files.
+
+**Recommendation**: Delete all ten files (or park them on the phase-2 feature branch). Checked-in code that doesn't compile is worse than no code: it bit-rots silently, misleads readers into thinking the VHID path is live, and this review had to run three searches to prove it isn't. If keeping in-tree is required, add them to the WIN32 source list behind an `option(DESKFLOW_VHID_PHASE2 OFF)` gate so they at least compile in CI — but that means creating the missing settings key and event-name constant first.
+
+**Removable: ~846 lines.**
+
+### C2. Dead duplicate cursor/window helpers in `MSWindowsScreen`
+
+`MSWindowsScreen` carries private copies of desk-window helpers that only `MSWindowsDesks` actually uses:
+
+- `MSWindowsScreen::createBlankCursor` (`MSWindowsScreen.cpp:748-763`) — defined, never called; the live copy is `MSWindowsDesks::createBlankCursor` (`MSWindowsDesks.cpp:360-373`), byte-for-byte identical logic.
+- `MSWindowsScreen::destroyCursor` (`MSWindowsScreen.cpp:765-770`) — defined, never called.
+- `MSWindowsScreen.h:139` declares `ATOM createDeskWindowClass(bool isPrimary) const;` — **never defined in `MSWindowsScreen.cpp` at all**. Dead declaration.
+- `MSWindowsScreen.h:26` forward-declares `class MSWindowsDropTarget;` — no member, parameter, or usage anywhere in the class.
+
+Separately, the unbuilt `MSWindowsCursorVisibility.cpp` (C1) is a copy-paste of the static `setCursorVisibility` already living in `MSWindowsDesks.cpp:499-532` — an extraction that was started but never finished (the Desks copy was never deleted, the new file was never built).
+
+**Removable: ~30 lines** (on top of C1), and it eliminates a real trap: someone "fixing" the retry loop in one copy and not the other.
+
+---
+
+## Important
+
+### I1. Three input injection paths on Windows; one is dead weight
+
+1. **SendInput via desk thread** (`MSWindowsDesks.cpp:84-107`, `send_keyboard_input` / `send_mouse_input`) — the live, load-bearing path.
+2. **Mouser HID passthrough** (`MouserBridge` server-side, `HidConsumer`/`MouserClient` client-side) — live but settings-gated (`Settings::Server::MouserBridgeEnabled`, checked at `Server.cpp:518`); a genuinely separate feature (raw HID++ device relay to an external Mouser instance), acceptably isolated.
+3. **VHID pipe** (`MSWindowsVhidPipeClient` → `deskflow-vhid-bridge.exe pipe` → `deskflow-vhid.sys`) — the core-side half is dead (C1), while the bridge exe (`src/apps/deskflow-vhid-bridge-win/`, built via `src/apps/CMakeLists.txt:54`) and the driver (`src/driver/deskflow-vhid/`, own vcxproj) ship anyway.
+
+The confusing part isn't having a secure-desktop strategy — it's that the tree currently ships the *outer* two-thirds of path 3 (bridge exe + driver) with no core code able to talk to it, plus unbuildable core code pretending to. Until phase 2 lands for real, readers tracing "how does input get injected on Windows" hit three candidate answers where only one works. Resolving C1 resolves this; alternatively, document in the bridge app header that the core-side client does not exist yet.
+
+### I2. `RelayKeyEvent::from` is write-only
+
+`RelayKeyEvent.h:31` declares `std::string from;`. It is populated at `Coordinator.cpp:65` (`event.from = message.name;`) and **read nowhere** — not in `Server::relayForwardedKey` (`Server.cpp:1853-1871`), `PrimaryClient::injectForwardedKey` (`PrimaryClient.cpp:152-168`), or `ClientApp::injectRelayedKey` (`ClientApp.cpp:385-403`). Sender identity is already logged at receive time (`Coordinator.cpp:609-611`) before the event is constructed. Delete the field and the assignment. (~3 lines, plus one less string copy per relayed keystroke.)
+
+### I3. `KeyboardRouteInput::secondsSinceRelayStart` is vestigial
+
+`KeyboardRouter.h:36` declares it; `routeKeyboard()` (`KeyboardRouter.cpp:16-29`) never reads it. The boot-grace behavior it fed was deliberately removed — unknown cursor host is now *always* Local (see the comment at `KeyboardRouter.cpp:18-22` and the test at `KeyboardRouterTests.cpp:59-77`, whose name `unknownCursor_usesBootGrace` no longer matches what it asserts). Yet both call sites still compute it: `Coordinator.cpp:658` and `Coordinator.cpp:731`. Note the v1 path legitimately still uses elapsed time via `passKeyToLocalOs` (`KeyboardRelayDecision.h:22`) — only the v2 `KeyboardRouteInput` field is dead. Remove the field, the two assignments, and rename the test. (~10 lines, and it stops implying grace-window behavior that doesn't exist.)
+
+### I4. Commented-out code and no-op overrides in `MSWindowsKeyState`
+
+- `MSWindowsKeyState.cpp:1197-1200`: a commented-out older signature of `m_desks->fakeKeyEvent(...)` directly below the live call, plus the orphaned breadcrumb comment `// vk,sc,flags,keystroke.m_data.m_button.m_repeat` at line 1193. Delete both.
+- `MSWindowsKeyState.cpp:740-750`: `fakeKeyDown` and `fakeKeyRepeat` overrides that do nothing but call the base class. They add a stack frame's worth of indirection to every injected key for zero value. Delete the overrides (and their declarations).
+
+(~18 lines.)
+
+### I5. `deskMouseRelativeMove` fires 4–6 `SystemParametersInfo` syscalls per mouse move, and has a save/restore asymmetry
+
+`MSWindowsDesks.cpp:477-496`: every relative move does `SPI_GETMOUSE` + `SPI_GETMOUSESPEED`, two `SPI_SET*`, moves, then two more `SPI_SET*` to restore. Relative mode is per-event, so during a drag this is hundreds of system-wide settings writes per second (and each `SPI_SET*` can broadcast `WM_SETTINGCHANGE`).
+
+Also, line 485 combines the two setter calls with `||` while the getter pair at line 480 uses `&&` — short-circuit means **`SPI_SETMOUSESPEED` is never called when `SPI_SETMOUSE` succeeds**, so speed isn't actually zeroed (and correspondingly gets "restored" anyway at 494-495). This is either a long-standing bug or accidental cleverness; either way the code doesn't do what the comment says.
+
+Pragmatic fix: disable acceleration once on `deskLeave` and restore on `deskEnter` when `m_relativeMouseMoves` is set, rather than per event — and make the setter use `&&`. This is upstream-inherited code, so treat it as a deliberate, tested change, not a drive-by.
+
+---
+
+## Suggestions
+
+### S1. Per-call `GetSystemMetrics` in the absolute-move hot path
+
+`MSWindowsDesks.cpp:458-459` (`deskMouseMove`) queries `SM_CXSCREEN`/`SM_CYSCREEN` on every absolute move. These are cheap cached lookups, but the class already receives shape updates via `setShape()` (`MSWindowsDesks.cpp:207-218`) driven by `WM_DISPLAYCHANGE` — primary-monitor width/height could be cached there. Same pattern in `fakeMouseButton` (`MSWindowsDesks.cpp:257`, `SM_SWAPBUTTON` per click) — that one is per-click, fine to leave.
+
+### S2. Dead members and a typo default in `MSWindowsDesks`
+
+- `MSWindowsDesks.h:252`: `int32_t m_y = 9;` — clearly a typo for `0`. Harmless only because `setShape` runs before any use; still, fix it.
+- `m_multimon` (`MSWindowsDesks.h:259`) is assigned at `MSWindowsDesks.cpp:217` and never read. Delete member + the `isMultimon` constructor plumbing through `setShape`.
+- `Desk::m_targetID` (`MSWindowsDesks.h:185`) is assigned at `MSWindowsDesks.cpp:806` and never read. Delete.
+
+(~8 lines.)
+
+### S3. Duplicate source entries in coordination CMakeLists
+
+`src/lib/coordination/CMakeLists.txt:7-10` lists `CoordinationProtocol.cpp` / `CoordinationProtocol.h` twice. Harmless to CMake, confusing to humans. (2 lines.)
+
+### S4. `MSWindowsVhidPipeClient.h` formatting rot
+
+Every logical line in the header is separated by a blank line (126 lines for ~45 lines of content) — a mangled generation/paste artifact. Moot if C1 deletes the file; if the file survives, reformat.
+
+### S5. Misleading API in dead pipe client
+
+`MSWindowsVhidPipeClient::sendKeyboardState(uint8_t modifiers, const unsigned char keys[6])` (`MSWindowsVhidPipeClient.cpp:125-134`) accepts a 6-key HID array but only ever inspects `keys[0]`, and the single production-adjacent caller passes `nullptr` (`MSWindowsVhidPipeClient.cpp:340`). A one-key API pretending to be a full HID boot report. Moot under C1; noted so the phase-2 branch doesn't inherit it.
+
+### S6. Blank-cursor mask math is copy-pasted cleverness
+
+Both `MSWindowsDesks.cpp:365-368` and the dead `MSWindowsScreen.cpp:755-758` size the AND/XOR masks as `ch * ((cw + 31) >> 2)` — that's width-rounded-to-32 *times 8 bytes* per row, roughly 8× what a 1-bpp mask needs (`((cw + 31) / 32) * 4`). Over-allocation is harmless but the expression looks like it means something it doesn't. After C2 removes the duplicate, either correct the arithmetic or add a comment admitting it over-allocates.
+
+---
+
+## Load-bearing complexity — keep it
+
+Explicitly assessed and **not** flagged:
+
+- **The desk message-queue hop** (`fakeMouseMove` → `sendMessage` → `PostThreadMessage` → `deskThread` → `deskMouseMove` → `send_mouse_input`, `MSWindowsDesks.cpp:303-357,649-799`): five layers, each thin, and the hop is essential — `SendInput` must run on a thread attached via `SetThreadDesktop` to the current input desktop (`MSWindowsDesks.cpp:658`) or injection fails on secure/winlogon desktops. The synchronous `waitForDesk()` handshake per message is also required to keep event ordering. Do not flatten.
+- **Keyboard rescue chord duplication** (`Server.cpp:1794`, `Coordinator.cpp:637`, `Coordinator.cpp:708-715`): three checks of `isKeyboardRescueChord` look redundant but are deliberate defense-in-depth at each grab layer, per the doc comment in `KeyboardRescue.h:15-19`. The predicate itself lives in exactly one header. Keep.
+- **`routeKeyboard` vs `passKeyToLocalOs` coexistence** (`KeyboardRouter.cpp` vs `KeyboardRelayDecision.h`): two deciders, but they serve mesh v1 vs v2 protocol epochs, branched explicitly at `Coordinator.cpp:647/717`. Fine for a migration window; schedule v1 removal when mesh v2 becomes the floor.
+- **`RelayKeyEvent` as a neutral struct**: three consumers (`Server`, `PrimaryClient`, `ClientApp`) with a shared payload type is the right amount of abstraction; the switch statements at each injection site are honest and obvious.
+
+## Removable-lines summary
+
+| Finding | Lines |
+| --- | --- |
+| C1 dead VHID/daemon/cursor scaffolding + tests | ~846 |
+| C2 dead duplicates in MSWindowsScreen | ~30 |
+| I2 `RelayKeyEvent::from` | ~3 |
+| I3 `secondsSinceRelayStart` | ~10 |
+| I4 commented-out code + no-op overrides | ~18 |
+| S2 dead members / typo | ~8 |
+| S3 CMake duplicates | 2 |
+| **Total** | **~917** |
