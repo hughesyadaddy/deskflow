@@ -554,12 +554,14 @@ Server *ServerApp::openServer(ServerConfig &config, PrimaryClient *primaryClient
 void ServerApp::handleScreenSwitched(const Event &event)
 {
   if (!m_cursorBroadcastCallback) {
-    LOG_DEBUG("coordination: screen switched but no cursor broadcast callback");
     return;
   }
-  const auto *info = static_cast<const Server::SwitchToScreenInfo *>(event.getData());
+  // SwitchToScreenInfo derives from EventData, so Event(type, target, info)
+  // binds the EventData* constructor: the payload lives in the data OBJECT
+  // slot, not the POD getData() slot.
+  const auto *info = dynamic_cast<const Server::SwitchToScreenInfo *>(event.getDataObject());
   if (info == nullptr || info->m_screen.empty()) {
-    LOG_DEBUG("coordination: screen switched with empty screen info");
+    LOG_WARN("coordination: screen switched without screen info; fleet cursor not updated");
     return;
   }
   LOG_DEBUG("coordination: screen switched to \"%s\"; updating fleet cursor", info->m_screen.c_str());
