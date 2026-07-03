@@ -57,6 +57,9 @@ void KeyboardRouterTests::cursorOnRemote_forwardsToHost()
 
 void KeyboardRouterTests::unknownCursor_usesBootGrace()
 {
+  // Unknown cursor host is always Local: swallowing the physical keyboard
+  // of an unsynced client (fleet fragment not yet received) locked users
+  // out of their own machine. See tiny11 incident 2026-07-03.
   KeyboardRouteInput duringGrace;
   duringGrace.selfName = "laptop";
   duringGrace.cursorHostKnown = false;
@@ -66,9 +69,9 @@ void KeyboardRouterTests::unknownCursor_usesBootGrace()
   KeyboardRouteInput afterGrace;
   afterGrace.selfName = "laptop";
   afterGrace.cursorHostKnown = false;
-  afterGrace.secondsSinceRelayStart = 1.0;
+  afterGrace.secondsSinceRelayStart = 60.0;
   const auto decision = routeKeyboard(afterGrace);
-  QCOMPARE(decision.route, KeyboardRoute::Forward);
+  QCOMPARE(decision.route, KeyboardRoute::Local);
   QVERIFY(decision.forwardHost.empty());
 }
 

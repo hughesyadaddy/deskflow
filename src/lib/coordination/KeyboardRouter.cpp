@@ -15,14 +15,13 @@ using deskflow::common::cursorHostIsLocal;
 
 KeyboardRouteDecision routeKeyboard(const KeyboardRouteInput &input)
 {
-  if (!input.cursorHostKnown) {
-    if (passKeyToLocalOs(false, false, input.secondsSinceRelayStart)) {
-      return {KeyboardRoute::Local, {}};
-    }
-    return {KeyboardRoute::Forward, {}};
-  }
-
-  if (input.cursorHost.empty() || cursorHostIsLocal(input.selfName, input.cursorHost)) {
+  // Unknown cursor host must NEVER swallow the local keyboard: a client
+  // that has not yet received a fleet fragment (late join, dropped
+  // broadcast) would otherwise eat every physical keystroke and forward
+  // it blindly. Local is always the safe default; the server's heartbeat
+  // rebroadcast converges the snapshot within seconds.
+  if (!input.cursorHostKnown || input.cursorHost.empty() ||
+      cursorHostIsLocal(input.selfName, input.cursorHost)) {
     return {KeyboardRoute::Local, {}};
   }
 

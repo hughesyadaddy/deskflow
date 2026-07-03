@@ -697,13 +697,7 @@ bool Coordinator::relayPassThroughLocal()
   input.cursorHost = m_fleetState.cursorHost;
   input.cursorHostKnown = !m_fleetState.cursorHost.empty();
   input.secondsSinceRelayStart = elapsed;
-  const auto decision = routeKeyboard(input);
-  if (decision.route == KeyboardRoute::Forward && !input.cursorHostKnown &&
-      elapsed >= kCursorRelayBootGraceS && !m_loggedRelayUnknownForward) {
-    LOG_INFO("coordination: forwarding keyboard before fleet cursor sync");
-    m_loggedRelayUnknownForward = true;
-  }
-  return decision.route == KeyboardRoute::Local;
+  return routeKeyboard(input).route == KeyboardRoute::Local;
 }
 
 std::string Coordinator::fleetCursorHost()
@@ -861,6 +855,31 @@ void Coordinator::workerLoop()
       if (now - lastHeartbeatAt >= kHeartbeatIntervalS) {
         lastHeartbeatAt = now;
         broadcastClaim();
+        if (m_config.meshVersion >= 2) {
+          // Rebroadcast the current fleet fragment so late-joining clients
+          // converge without waiting for the next topology/cursor change.
+          // Same seq: applyServerFragment treats equal seq as idempotent.
+          std::string line;
+          PeerList peers;
+          {
+            std::scoped_lock lock{m_mutex};
+            if (!m_fleetState.server.empty() && !m_fleetState.screens.empty()) {
+              FleetFragment fragment;
+              fragment.server = m_fleetState.server;
+              fragment.seq = m_fleetState.seq;
+              fragment.cursorHost = m_fleetState.cursorHost;
+              fragment.cursorScreen = m_fleetState.cursorScreen;
+              fragment.peers = m_fleetState.peers;
+              fragment.links = m_fleetState.links;
+              fragment.screens = m_fleetState.screens;
+              line = protocol::encodeFleet(fragment, m_config.token);
+              peers = m_config.peers;
+            }
+          }
+          if (!line.empty()) {
+            sendFleetLineToPeers(line, peers);
+          }
+        }
         if (m_config.meshVersion < 2) {
           std::string cursorHost;
           PeerList peers;
