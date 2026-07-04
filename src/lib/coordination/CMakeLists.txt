@@ -29,7 +29,13 @@ if(APPLE)
     OSXKeyboardRelayMonitor.mm
     KeyboardRelayMap.mm
   )
-  target_link_libraries(coordination PUBLIC "-framework ApplicationServices" "-framework Carbon")
+  # AppKit is needed for NSEvent (media-key decode); it re-exports Foundation.
+  # ev_keymap.h (NX_* constants) is macros-only, so no IOKit link is required.
+  target_link_libraries(coordination PUBLIC
+    "-framework ApplicationServices"
+    "-framework Carbon"
+    "-framework AppKit"
+  )
 elseif(WIN32)
   target_sources(coordination PRIVATE
     MSWindowsLocalInputMonitor.cpp

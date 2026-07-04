@@ -12,6 +12,8 @@
 
 #include <ApplicationServices/ApplicationServices.h>
 #include <Carbon/Carbon.h>
+#import <Cocoa/Cocoa.h>
+#import <IOKit/hidsystem/ev_keymap.h>
 
 namespace deskflow::coordination {
 
@@ -140,6 +142,65 @@ bool mapRelayKeyFromCgEvent(
   id = translateVirtualKey(vk, layout, keyboardType);
 
   return id != kKeyNone || phase == Message::KeyPhase::Repeat;
+}
+
+// NX key type -> neutral media KeyID. Kept in sync with the inverse table in
+// platform/OSXMediaKeySupport.m (convertNXKeyTypeToKeyID); duplicated here so
+// coordination stays independent of the platform layer and remains testable.
+KeyID mediaKeyIdFromNxType(uint32_t nxKeyType)
+{
+  switch (nxKeyType) {
+  case NX_KEYTYPE_SOUND_UP:
+    return kKeyAudioUp;
+  case NX_KEYTYPE_SOUND_DOWN:
+    return kKeyAudioDown;
+  case NX_KEYTYPE_MUTE:
+    return kKeyAudioMute;
+  case NX_KEYTYPE_PLAY:
+    return kKeyAudioPlay;
+  case NX_KEYTYPE_FAST:
+  case NX_KEYTYPE_NEXT:
+    return kKeyAudioNext;
+  case NX_KEYTYPE_REWIND:
+  case NX_KEYTYPE_PREVIOUS:
+    return kKeyAudioPrev;
+  case NX_KEYTYPE_BRIGHTNESS_UP:
+    return kKeyBrightnessUp;
+  case NX_KEYTYPE_BRIGHTNESS_DOWN:
+    return kKeyBrightnessDown;
+  case NX_KEYTYPE_EJECT:
+    return kKeyEject;
+  default:
+    return kKeyNone;
+  }
+}
+
+bool mapRelayMediaKeyFromCgEvent(void *cgEvent, KeyID &id, bool &down)
+{
+  auto *event = static_cast<CGEventRef>(cgEvent);
+  // System-defined events carry consumer/media keys (NX_SYSDEFINED == 14).
+  if (CGEventGetType(event) != static_cast<CGEventType>(NX_SYSDEFINED)) {
+    return false;
+  }
+  // The tap thread has no ambient autorelease pool; +eventWithCGEvent: returns
+  // an autoreleased NSEvent that would otherwise leak on every media event.
+  @autoreleasepool {
+    NSEvent *nsEvent = nil;
+    @try {
+      nsEvent = [NSEvent eventWithCGEvent:event];
+    } @catch (NSException *e) {
+      return false;
+    }
+    // subtype 8 == NX_SUBTYPE_AUX_CONTROL_BUTTONS (media/consumer keys).
+    if (nsEvent == nil || [nsEvent subtype] != NX_SUBTYPE_AUX_CONTROL_BUTTONS) {
+      return false;
+    }
+    const NSInteger data1 = [nsEvent data1];
+    const uint32_t nxType = static_cast<uint32_t>((data1 & 0xFFFF0000) >> 16);
+    id = mediaKeyIdFromNxType(nxType);
+    down = (data1 & 0x100) == 0; // bit 8 set == key up
+  }
+  return id != kKeyNone;
 }
 
 } // namespace deskflow::coordination

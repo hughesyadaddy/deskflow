@@ -13,4 +13,6 @@ class KeyboardRelayMapTests : public QObject
   Q_OBJECT
 private Q_SLOTS:
   void mapRelayKeyFromCgEventOffMainThreadDoesNotCrash();
+  void mediaKeyIdFromNxType_mapsConsumerKeys();
+  void mapRelayMediaKeyFromCgEvent_ignoresPlainKey();
 };

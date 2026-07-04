@@ -11,6 +11,7 @@
 #include "base/Log.h"
 
 #include <ApplicationServices/ApplicationServices.h>
+#import <IOKit/hidsystem/ev_keymap.h>
 
 #include <atomic>
 #include <thread>
@@ -62,6 +63,34 @@ private:
       return event;
     }
 
+    // Consumer/media keys (volume, brightness, play/pause, ...) arrive as
+    // system-defined events, not key down/up. Forward a single Down per
+    // press; the injector's fakeMediaKey emits the full down+up on the target.
+    if (type == static_cast<CGEventType>(NX_SYSDEFINED)) {
+      // Ignore our own injected media events (genuine hardware has pid 0),
+      // matching the standard-key path's guard against feedback loops.
+      if (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0) {
+        return event;
+      }
+      KeyID mediaId = kKeyNone;
+      bool down = false;
+      if (!mapRelayMediaKeyFromCgEvent(event, mediaId, down)) {
+        return event;
+      }
+      const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
+      if (passLocal) {
+        return event;
+      }
+      // Forward a matched Down/Up pair. A macOS target's fakeMediaKey emits a
+      // full tap on the Down (the Up is a no-op there); a Windows target maps
+      // the media KeyID like a normal key and needs the Up to release the VK,
+      // otherwise it stays logically held. Both halves are swallowed locally.
+      if (self->m_send) {
+        self->m_send(down ? Message::KeyPhase::Down : Message::KeyPhase::Up, mediaId, 0, 0, {});
+      }
+      return nullptr; // swallow so the key does not also act locally
+    }
+
     if (type != kCGEventKeyDown && type != kCGEventKeyUp) {
       return event;
     }
@@ -91,7 +120,8 @@ private:
 
   void runLoop()
   {
-    const CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp);
+    const CGEventMask mask =
+        CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(NX_SYSDEFINED);
 
     m_tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, tapCallback, this);
     if (m_tap == nullptr) {

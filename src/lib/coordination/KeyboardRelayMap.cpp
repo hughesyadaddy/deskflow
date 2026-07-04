@@ -66,6 +66,25 @@ KeyID mapVirtualKey(int vkCode)
     return kKeyPageUp;
   case VK_NEXT:
     return kKeyPageDown;
+  // Consumer-control keys: the LL keyboard hook delivers these VKs, but they
+  // are non-printable so ToUnicodeEx below yields nothing. Map them to neutral
+  // media KeyIDs so the fleet relay forwards them to the cursor host, where the
+  // media-VK inject table actuates them. (Brightness has no VK -- it is
+  // firmware/consumer-HID and never reaches this hook.)
+  case VK_VOLUME_MUTE:
+    return kKeyAudioMute;
+  case VK_VOLUME_DOWN:
+    return kKeyAudioDown;
+  case VK_VOLUME_UP:
+    return kKeyAudioUp;
+  case VK_MEDIA_NEXT_TRACK:
+    return kKeyAudioNext;
+  case VK_MEDIA_PREV_TRACK:
+    return kKeyAudioPrev;
+  case VK_MEDIA_PLAY_PAUSE:
+    return kKeyAudioPlay;
+  // VK_MEDIA_STOP intentionally omitted: the macOS injector has no NX key
+  // type for stop, so it cannot actuate on a Mac target.
   default:
     break;
   }
