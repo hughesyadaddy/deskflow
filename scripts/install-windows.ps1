@@ -257,7 +257,11 @@ if (-not $InstallDir) {
 }
 
 $buildPath = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $root $BuildDir }
+# Multi-config generators (MSVC) emit bin\Release; single-config (Ninja) emits bin.
 $releaseDir = Join-Path $buildPath 'bin\Release'
+if (-not (Test-Path (Join-Path $releaseDir 'deskflow.exe'))) {
+  $releaseDir = Join-Path $buildPath 'bin'
+}
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
 if (-not (Test-Path (Join-Path $releaseDir 'deskflow.exe'))) {
