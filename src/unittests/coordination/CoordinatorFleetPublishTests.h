@@ -28,6 +28,8 @@ private Q_SLOTS:
   void followClaim_resolvesEmptyAddressFromPeers();
   void followClaim_dropsUnknownClaimWithoutAddress();
   void serverTakeover_continuesFleetSeq();
+  void wakePeer_rateLimitsPerPeer();
+  void wakePeer_ignoredForClientsAndPeersWithoutHints();
 
 private:
   static void armAsServer(deskflow::coordination::Coordinator &coordinator, const std::string &selfName);

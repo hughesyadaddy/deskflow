@@ -15,8 +15,10 @@
 #include "coordination/Peer.h"
 #include "deskflow/KeyTypes.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -112,6 +114,14 @@ public:
   //! Server epoch (mesh v2): publish screen topology to fleet peers.
   void publishFleetTopology(std::vector<FleetLink> links, std::vector<FleetScreen> screens);
 
+  //! Server epoch: fire the wake action for a configured peer (asleep).
+  /*!
+  Sends a Wake-on-LAN magic packet when the peer has a \c mac and spawns
+  its \c wakeCommand (detached) when set. Rate-limited to one wake per
+  peer per 30 seconds; no-op for clients and peers without wake hints.
+  */
+  void wakePeer(const std::string &name);
+
   //! Start/stop the keyboard relay monitor for the current role epoch.
   void updateKeyboardRelayForRole(Role role);
 
@@ -129,9 +139,8 @@ private:
   void sendFleetLineToPeers(const std::string &line, const PeerList &peers);
   bool mergeAndBroadcastFleetFragment(const FleetFragment &fragment, bool sendEvenIfUnchanged);
   void handleKeyForwardMessage(const Message &message);
-  void sendKeyForward(
-      Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang
-  );
+  void
+  sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
   bool isKnownPeer(const std::string &name) const;
   bool relayPassThroughLocal();
   //! Cached mesh cursor host; used for heartbeat rebroadcast, not relay gating.
@@ -180,6 +189,8 @@ private:
   bool m_relayLocalOverride = false;
   std::string m_overrideCursorHost;
   std::set<std::string> m_versionMismatchPeers;
+  //! Last wake action per peer (rate limit; guarded by m_mutex).
+  std::map<std::string, std::chrono::steady_clock::time_point> m_lastWakeAt;
 };
 
 } // namespace deskflow::coordination

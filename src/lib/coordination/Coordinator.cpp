@@ -8,6 +8,7 @@
 
 #include "base/Event.h"
 #include "base/EventQueue.h"
+#include "base/EventTypes.h"
 #include "base/Log.h"
 #include "coordination/CoordinationEvents.h"
 #include "coordination/CoordinationProtocol.h"
@@ -16,10 +17,13 @@
 #include "coordination/KeyboardRescue.h"
 #include "coordination/KeyboardRouter.h"
 #include "coordination/RelayKeyEvent.h"
-#include "base/EventTypes.h"
+#include "coordination/WakeOnLan.h"
 
-#include <chrono>
+#include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace deskflow::coordination {
 
@@ -311,9 +315,7 @@ void Coordinator::handleHelloMessage(const Message &message, const std::function
   if (!message.name.empty()) {
     clearVersionMismatch(message.name);
   }
-  LOG_DEBUG(
-      "coordination: mesh v2 hello from \"%s\" (v=%d)", message.name.c_str(), message.meshVersion
-  );
+  LOG_DEBUG("coordination: mesh v2 hello from \"%s\" (v=%d)", message.name.c_str(), message.meshVersion);
   reply(protocol::encodeHello(m_config.meshVersion, m_config.selfName, m_config.token));
 }
 
@@ -435,6 +437,47 @@ void Coordinator::publishFleetTopology(std::vector<FleetLink> links, std::vector
   }
 }
 
+void Coordinator::wakePeer(const std::string &name)
+{
+  Peer target;
+  {
+    std::scoped_lock lock{m_mutex};
+    if (m_election.role() != Role::Server) {
+      return;
+    }
+    const auto match = std::find_if(m_config.peers.begin(), m_config.peers.end(), [&name](const Peer &peer) {
+      return namesEqual(peer.name, name);
+    });
+    if (match == m_config.peers.end() || (match->mac.empty() && match->wakeCommand.empty())) {
+      return;
+    }
+    target = *match;
+    const auto now = std::chrono::steady_clock::now();
+    if (const auto lastWake = m_lastWakeAt.find(target.name);
+        lastWake != m_lastWakeAt.end() && now - lastWake->second < std::chrono::seconds(30)) {
+      return;
+    }
+    m_lastWakeAt[target.name] = now;
+  }
+
+  if (!target.mac.empty()) {
+    sendWakeOnLan(target.mac);
+  }
+  if (!target.wakeCommand.empty()) {
+    LOG_INFO("coordination: waking peer %s: %s", target.name.c_str(), target.wakeCommand.c_str());
+    // Detached: wake commands (e.g. ssh to a hypervisor) can take seconds
+    // and must never block the event loop or the coordination worker. The
+    // exit report uses stderr, not LOG_WARN: a detached thread can outlive
+    // main() and must not touch the Log singleton during static teardown.
+    std::thread([command = target.wakeCommand, peerName = target.name] {
+      const int status = std::system(command.c_str()); // NOSONAR -- operator-configured wake hook
+      if (status != 0) {
+        std::fprintf(stderr, "coordination: wake command for %s exited with status %d\n", peerName.c_str(), status);
+      }
+    }).detach();
+  }
+}
+
 void Coordinator::updateKeyboardRelayForRole(Role role)
 {
   if (!m_config.keyboardFollowCursor) {
@@ -509,8 +552,8 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
         mismatches.assign(m_versionMismatchPeers.begin(), m_versionMismatchPeers.end());
       }
       snapshot = protocol::encodeStatusReply(
-          m_election.role(), m_election.serverAddress(), m_election.seq(), m_election.lastSwitchAt(),
-          m_config.selfName, fleet, m_config.meshVersion, mismatches
+          m_election.role(), m_election.serverAddress(), m_election.seq(), m_election.lastSwitchAt(), m_config.selfName,
+          fleet, m_config.meshVersion, mismatches
       );
     }
     reply(snapshot);

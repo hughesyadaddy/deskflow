@@ -22,8 +22,8 @@ using deskflow::coordination::FleetPeer;
 using deskflow::coordination::FleetScreen;
 using deskflow::coordination::FleetState;
 using deskflow::coordination::Message;
-using deskflow::coordination::RelayKeyPhase;
 using deskflow::coordination::parsePeerList;
+using deskflow::coordination::RelayKeyPhase;
 using deskflow::coordination::Role;
 namespace protocol = deskflow::coordination::protocol;
 
@@ -127,8 +127,7 @@ void CoordinationProtocolTests::statusReplyIncludesFleetSnapshot()
 
 void CoordinationProtocolTests::statusReplyIncludesMeshVersion()
 {
-  const auto reply =
-      protocol::encodeStatusReply(Role::Client, "10.0.0.1", 9, 0.0, "gamma", nullptr, 2, {"legacy"});
+  const auto reply = protocol::encodeStatusReply(Role::Client, "10.0.0.1", 9, 0.0, "gamma", nullptr, 2, {"legacy"});
   const auto object = QJsonDocument::fromJson(QByteArray::fromStdString(reply)).object();
 
   QCOMPARE(object[QStringLiteral("mesh_version")].toInt(), 2);
@@ -166,6 +165,21 @@ void CoordinationProtocolTests::peerListParsing()
   QCOMPARE(bare[1].lan, std::string("laptop.local"));
   QCOMPARE(bare[2].name, std::string("studio"));
   QCOMPARE(bare[2].ip, std::string("studio.example.net"));
+
+  // Wake hints: optional 3rd (mac) and 4th (wakeCommand) pipe segments.
+  const auto wake = parsePeerList("vm=10.0.0.5|vm.local|bc:24:11:aa:bb:cc|ssh proxmox qm wakeup 100, plain=10.0.0.6");
+  QCOMPARE(wake.size(), static_cast<size_t>(2));
+  QCOMPARE(wake[0].mac, std::string("bc:24:11:aa:bb:cc"));
+  QCOMPARE(wake[0].wakeCommand, std::string("ssh proxmox qm wakeup 100"));
+  QCOMPARE(wake[0].lan, std::string("vm.local"));
+  QVERIFY(wake[1].mac.empty());
+  QVERIFY(wake[1].wakeCommand.empty());
+
+  // Mac may be skipped with an empty segment; command keeps any '|'.
+  const auto commandOnly = parsePeerList("vm=10.0.0.5|vm.local||echo a | grep a");
+  QCOMPARE(commandOnly.size(), static_cast<size_t>(1));
+  QVERIFY(commandOnly[0].mac.empty());
+  QCOMPARE(commandOnly[0].wakeCommand, std::string("echo a | grep a"));
 }
 
 void CoordinationProtocolTests::cursorRoundTrip()
@@ -181,9 +195,7 @@ void CoordinationProtocolTests::cursorRoundTrip()
 
 void CoordinationProtocolTests::keyFwdRoundTrip()
 {
-  const auto line = protocol::encodeKeyFwd(
-      "windows-pc", RelayKeyPhase::Down, 65543, 8, 0, "en", "secret"
-  );
+  const auto line = protocol::encodeKeyFwd("windows-pc", RelayKeyPhase::Down, 65543, 8, 0, "en", "secret");
   const auto message = protocol::decode(line);
 
   QCOMPARE(message.type, Message::Type::KeyFwd);

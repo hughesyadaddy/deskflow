@@ -11,6 +11,7 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "common/Settings.h"
+#include "coordination/KeyboardRescue.h"
 #include "deskflow/AppUtil.h"
 #include "deskflow/DeskflowException.h"
 #include "deskflow/IPlatformScreen.h"
@@ -20,7 +21,6 @@
 #include "deskflow/Screen.h"
 #include "deskflow/StreamChunker.h"
 #include "deskflow/ipc/CoreIpc.h"
-#include "coordination/KeyboardRescue.h"
 #include "net/TCPSocket.h"
 #include "server/ClientListener.h"
 #include "server/ClientProxy.h"
@@ -548,9 +548,9 @@ void Server::setMouserBridgeActive(bool active)
 void Server::detachOtherVirtualHosts(const VirtualHostTracker *keep)
 {
   if (keep != &m_mouserVirtualHostTracker && m_mouserVirtualHostTracker.host() != nullptr) {
-    m_mouserVirtualHostTracker.detach(
-        [this](BaseClientProxy *client, const std::string &payload) { sendMouserLine(client, payload); }
-    );
+    m_mouserVirtualHostTracker.detach([this](BaseClientProxy *client, const std::string &payload) {
+      sendMouserLine(client, payload);
+    });
     m_mouserVirtualHostTracker.setConnectLine({});
   }
 }
@@ -777,6 +777,19 @@ void Server::clearQueuedSwitch()
 {
   m_queuedSwitchScreen.clear();
   m_queuedSwitchDir = Direction::NoDirection;
+}
+
+void Server::requestWakePeer(const std::string &screenName)
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (now - m_lastWakeRequest < std::chrono::seconds(1)) {
+    return;
+  }
+  m_lastWakeRequest = now;
+
+  LOG_DEBUG("posting ServerWakePeerRequested for \"%s\"", screenName.c_str());
+  auto *info = new Server::SwitchToScreenInfo(screenName);
+  m_events->addEvent(Event(EventTypes::ServerWakePeerRequested, this, info));
 }
 
 void Server::resyncEnterIfActiveClient(BaseClientProxy *client)
@@ -1977,6 +1990,7 @@ bool Server::onMouseMovePrimary(int32_t x, int32_t y)
       const std::string pending = peekConfiguredNeighbor(m_active, dir, x, y);
       if (!pending.empty()) {
         queueSwitchForScreen(pending, dir, x, y);
+        requestWakePeer(pending);
       }
     }
 

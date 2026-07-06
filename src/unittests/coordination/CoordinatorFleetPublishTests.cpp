@@ -9,12 +9,14 @@
 #include "arch/Arch.h"
 #include "base/EventQueue.h"
 #include "base/Log.h"
-#include "coordination/Coordinator.h"
 #include "coordination/CoordinationProtocol.h"
+#include "coordination/Coordinator.h"
 #include "coordination/FleetState.h"
+#include "coordination/Peer.h"
 
 #include <QTest>
 
+#include <chrono>
 #include <memory>
 
 using deskflow::coordination::Coordinator;
@@ -272,6 +274,69 @@ void CoordinatorFleetPublishTests::serverTakeover_continuesFleetSeq()
   QVERIFY(snapshot.seq > 6);
   QCOMPARE(snapshot.server, std::string("macbookpro"));
   QCOMPARE(snapshot.cursorHost, std::string("macbookpro"));
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::wakePeer_rateLimitsPerPeer()
+{
+  auto config = testConfig();
+  // Deliberately invalid MAC: counts as a wake hint (rate-limit state is
+  // exercised) but sendWakeOnLan rejects it, so the test neither
+  // broadcasts UDP nor spawns a child that could hold the test mesh port.
+  config.peers = deskflow::coordination::parsePeerList("sleepy=10.0.0.9|sleepy.local|invalid-mac");
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsServer(coordinator, "server");
+
+  coordinator.wakePeer("sleepy");
+  std::chrono::steady_clock::time_point firstWakeAt;
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QCOMPARE(coordinator.m_lastWakeAt.size(), static_cast<size_t>(1));
+    firstWakeAt = coordinator.m_lastWakeAt.at("sleepy");
+  }
+
+  // A second request inside the 30 s window must not re-fire (timestamp
+  // unchanged). Case-insensitive name matching applies, as everywhere.
+  coordinator.wakePeer("SLEEPY");
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QCOMPARE(coordinator.m_lastWakeAt.at("sleepy"), firstWakeAt);
+  }
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::wakePeer_ignoredForClientsAndPeersWithoutHints()
+{
+  auto config = testConfig();
+  config.peers = deskflow::coordination::parsePeerList("plain=10.0.0.7, sleepy=10.0.0.9|sleepy.local|invalid-mac");
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+
+  // Clients never fire wake actions, even for peers with hints.
+  armAsClient(coordinator);
+  coordinator.wakePeer("sleepy");
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_lastWakeAt.empty());
+  }
+
+  // The server ignores peers without mac/wakeCommand and unknown names.
+  armAsServer(coordinator, "server");
+  coordinator.wakePeer("plain");
+  coordinator.wakePeer("unknown");
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_lastWakeAt.empty());
+  }
 
   coordinator.stop();
 }

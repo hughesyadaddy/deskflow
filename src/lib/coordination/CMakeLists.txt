@@ -21,6 +21,8 @@ add_library(coordination STATIC
   Peer.cpp
   Peer.h
   RelayKeyEvent.h
+  WakeOnLan.cpp
+  WakeOnLan.h
 )
 
 if(APPLE)

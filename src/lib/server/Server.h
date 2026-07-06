@@ -20,6 +20,7 @@
 #include "server/TopologyLink.h"
 #include "server/VirtualHostTracker.h"
 
+#include <chrono>
 #include <climits>
 #include <map>
 #include <memory>
@@ -269,6 +270,10 @@ private:
   void clearQueuedSwitch();
   void resyncEnterIfActiveClient(BaseClientProxy *client);
 
+  // post ServerWakePeerRequested for a configured-but-disconnected screen
+  // (throttled; the coordination layer applies its own per-peer rate limit)
+  void requestWakePeer(const std::string &screenName);
+
   // lookup neighboring screen.  given a position relative to the
   // source screen, find the screen we should move onto and where.
   // if the position is sufficiently far from the source then we
@@ -353,7 +358,8 @@ private:
   void detachOtherVirtualHosts(const VirtualHostTracker *keep);
   void virtualHostAttachIfRemote(VirtualHostTracker &tracker, const std::string &connectPayload);
   void virtualHostDetach(VirtualHostTracker &tracker, const std::string &disconnectLine, bool clearCachedLine = true);
-  void virtualHostOnFocusChange(VirtualHostTracker &tracker, BaseClientProxy *dst, const std::string &connectPayload = {});
+  void
+  virtualHostOnFocusChange(VirtualHostTracker &tracker, BaseClientProxy *dst, const std::string &connectPayload = {});
   void handleClientCloseTimeout(BaseClientProxy *client);
   void handleSwitchToScreenEvent(const Event &event);
   void handleSwitchInDirectionEvent(const Event &event);
@@ -500,6 +506,10 @@ private:
   int32_t m_queuedSwitchX = 0;
   int32_t m_queuedSwitchY = 0;
   Direction m_queuedSwitchDir = Direction::NoDirection;
+
+  // wake-request throttle: pushing the cursor at a dead edge fires
+  // onMouseSwitch per move; only post a wake event once per second
+  std::chrono::steady_clock::time_point m_lastWakeRequest{};
 
   bool m_useFleetTopology = false;
   std::vector<deskflow::server::TopologyLink> m_fleetLinks;

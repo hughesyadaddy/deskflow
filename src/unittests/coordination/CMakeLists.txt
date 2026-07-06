@@ -31,6 +31,14 @@ create_test(
 )
 
 create_test(
+  NAME WakeOnLanTests
+  DEPENDS coordination
+  SOURCE WakeOnLanTests.cpp
+  LIBS base arch mt
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+)
+
+create_test(
   NAME KeyboardRouterTests
   DEPENDS coordination
   SOURCE KeyboardRouterTests.cpp

@@ -6,6 +6,8 @@
 
 #include "coordination/Peer.h"
 
+#include <array>
+
 namespace deskflow::coordination {
 
 namespace {
@@ -57,14 +59,26 @@ PeerList parsePeerList(const std::string &setting)
 
     Peer peer;
     peer.name = trimmed(entry.substr(0, equals));
-    std::string addresses = entry.substr(equals + 1);
-    const auto pipe = addresses.find('|');
-    if (pipe == std::string::npos) {
-      peer.ip = trimmed(addresses);
-    } else {
-      peer.ip = trimmed(addresses.substr(0, pipe));
-      peer.lan = trimmed(addresses.substr(pipe + 1));
+    // Pipe-separated segments after the name: ip|lan|mac|wakeCommand.
+    std::string rest = entry.substr(equals + 1);
+    std::array<std::string, 4> segments;
+    std::size_t segment = 0;
+    std::string::size_type segmentStart = 0;
+    while (segment < segments.size()) {
+      const auto pipe = rest.find('|', segmentStart);
+      // The final segment (wakeCommand) keeps everything remaining so a
+      // command containing '|' survives intact.
+      if (pipe == std::string::npos || segment == segments.size() - 1) {
+        segments[segment++] = trimmed(rest.substr(segmentStart));
+        break;
+      }
+      segments[segment++] = trimmed(rest.substr(segmentStart, pipe - segmentStart));
+      segmentStart = pipe + 1;
     }
+    peer.ip = segments[0];
+    peer.lan = segments[1];
+    peer.mac = segments[2];
+    peer.wakeCommand = segments[3];
     if (peer.name.empty() || peer.ip.empty()) {
       continue;
     }

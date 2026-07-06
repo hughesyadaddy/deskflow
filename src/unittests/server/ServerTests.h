@@ -18,4 +18,5 @@ private Q_SLOTS:
   void peekConfiguredNeighbor_returnsLinkedScreen();
   void peekConfiguredNeighbor_usesFleetTopology();
   void queuedSwitch_executesWhenNeighborConnects();
+  void requestWakePeer_postsEventOncePerThrottleWindow();
 };

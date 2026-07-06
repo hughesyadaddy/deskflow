@@ -390,7 +390,9 @@ struct LeakedServerFixture
   deskflow::Screen *screen = nullptr;
   PrimaryClient *primary = nullptr;
 
-  explicit LeakedServerFixture() : config(&events) {}
+  explicit LeakedServerFixture() : config(&events)
+  {
+  }
 
   void init(const char *primaryName)
   {
@@ -503,9 +505,7 @@ void ServerTests::peekConfiguredNeighbor_usesFleetTopology()
   {
     Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
     server.setFleetTopologySource(true);
-    server.setFleetTopologyLinks(
-        {deskflow::server::TopologyLink{"server", "remote", Direction::Right}}
-    );
+    server.setFleetTopologyLinks({deskflow::server::TopologyLink{"server", "remote", Direction::Right}});
 
     int32_t x = 1023;
     int32_t y = 384;
@@ -534,6 +534,38 @@ void ServerTests::queuedSwitch_executesWhenNeighborConnects()
 
     QCOMPARE(server.m_active, &remote);
     server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::requestWakePeer_postsEventOncePerThrottleWindow()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  fixture.init("server");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+
+    int wakeEvents = 0;
+    fixture.events.addHandler(EventTypes::ServerWakePeerRequested, &server, [&wakeEvents](const Event &event) {
+      const auto *info = dynamic_cast<const Server::SwitchToScreenInfo *>(event.getDataObject());
+      QVERIFY(info != nullptr);
+      QCOMPARE(info->m_screen, std::string("remote"));
+      ++wakeEvents;
+    });
+
+    // Pushing the cursor at a dead edge calls this per mouse move; only
+    // the first request inside the 1 s throttle window posts an event.
+    server.requestWakePeer("remote");
+    server.requestWakePeer("remote");
+    server.requestWakePeer("remote");
+
+    // Drain the queue: posted events sit pending until a loop runs.
+    fixture.events.addEvent(Event(EventTypes::Quit));
+    fixture.events.loop();
+
+    QCOMPARE(wakeEvents, 1);
+    fixture.events.removeHandler(EventTypes::ServerWakePeerRequested, &server);
   }
 }
 

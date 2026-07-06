@@ -100,7 +100,8 @@ public:
   }
 
   void setFleetTopologyPublishCallback(
-      std::function<void(std::vector<deskflow::coordination::FleetLink>, std::vector<deskflow::coordination::FleetScreen>)>
+      std::function<
+          void(std::vector<deskflow::coordination::FleetLink>, std::vector<deskflow::coordination::FleetScreen>)>
           callback
   )
   {
@@ -110,6 +111,11 @@ public:
   void setFleetSnapshotCallback(std::function<deskflow::coordination::FleetState()> callback)
   {
     m_fleetSnapshotCallback = std::move(callback);
+  }
+
+  void setWakePeerCallback(std::function<void(const std::string &name)> callback)
+  {
+    m_wakePeerCallback = std::move(callback);
   }
 
   //
@@ -124,6 +130,7 @@ public:
 
 private:
   void handleScreenSwitched(const Event &event);
+  void handleWakePeerRequested(const Event &event);
   void publishFleetTopologyFromConfig();
   void applyFleetTopologyFromSnapshot();
   void registerFleetTopologyHandlers();
@@ -148,6 +155,7 @@ private:
   std::function<void(std::vector<deskflow::coordination::FleetLink>, std::vector<deskflow::coordination::FleetScreen>)>
       m_fleetTopologyPublishCallback;
   std::function<deskflow::coordination::FleetState()> m_fleetSnapshotCallback;
+  std::function<void(const std::string &name)> m_wakePeerCallback;
   bool m_fleetTopologyHandlersRegistered = false;
   bool m_keyForwardHandlerRegistered = false;
 };

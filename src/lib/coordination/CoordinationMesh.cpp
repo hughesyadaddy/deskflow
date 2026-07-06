@@ -157,6 +157,12 @@ bool CoordinationMesh::start()
     LOG_WARN("coordination: mesh socket() failed: %s", std::strerror(errno));
     return false;
   }
+#if !defined(_WIN32)
+  // Close-on-exec: spawned children (e.g. peer wakeCommand hooks) must not
+  // inherit the listen socket, or a hung child holds the mesh port across
+  // deskflow restarts.
+  ::fcntl(m_listenFd, F_SETFD, FD_CLOEXEC);
+#endif
   const int reuse = 1;
   ::setsockopt(m_listenFd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse), sizeof(reuse));
 
@@ -347,8 +353,7 @@ void CoordinationMesh::handleClient(int clientFd)
         LOG_DEBUG("coordination: dropping message with bad token");
         continue;
       }
-      if (m_meshVersion >= 2 &&
-          (message.type == Message::Type::Cursor || message.type == Message::Type::KeyFwd)) {
+      if (m_meshVersion >= 2 && (message.type == Message::Type::Cursor || message.type == Message::Type::KeyFwd)) {
         LOG_DEBUG("coordination: dropping legacy mesh v1 message");
         return;
       }

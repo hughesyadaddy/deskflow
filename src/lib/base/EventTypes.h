@@ -150,6 +150,13 @@ enum class EventTypes : uint32_t
   /// This event is sent when the computer has been switched to a client.
   ServerScreenSwitched,
 
+  /** This event is sent when the cursor tries to switch to a configured but
+      disconnected screen (likely asleep). The event data is a pointer to
+      SwitchToScreenInfo naming the screen; the coordination layer may fire
+      a wake action (Wake-on-LAN / wake command) for the matching peer.
+  */
+  ServerWakePeerRequested,
+
   ServerAppReloadConfig,
   ServerAppForceReconnect,
   ServerAppResetServer,

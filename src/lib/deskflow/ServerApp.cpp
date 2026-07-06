@@ -29,8 +29,8 @@
 #include "server/PrimaryClient.h"
 #include "server/Server.h"
 
-#include <coordination/FleetState.h>
 #include "server/TopologyLink.h"
+#include <coordination/FleetState.h>
 
 // must be before screen header includes
 #include <QFileInfo>
@@ -542,6 +542,9 @@ Server *ServerApp::openServer(ServerConfig &config, PrimaryClient *primaryClient
     getEvents()->addHandler(EventTypes::ServerScreenSwitched, server, [this](const auto &event) {
       handleScreenSwitched(event);
     });
+    getEvents()->addHandler(EventTypes::ServerWakePeerRequested, server, [this](const auto &event) {
+      handleWakePeerRequested(event);
+    });
 
   } catch (std::bad_alloc &ba) {
     delete server;
@@ -566,6 +569,18 @@ void ServerApp::handleScreenSwitched(const Event &event)
   }
   LOG_DEBUG("coordination: screen switched to \"%s\"; updating fleet cursor", info->m_screen.c_str());
   m_cursorBroadcastCallback(info->m_screen);
+}
+
+void ServerApp::handleWakePeerRequested(const Event &event)
+{
+  if (!m_wakePeerCallback) {
+    return;
+  }
+  const auto *info = dynamic_cast<const Server::SwitchToScreenInfo *>(event.getDataObject());
+  if (info == nullptr || info->m_screen.empty()) {
+    return;
+  }
+  m_wakePeerCallback(info->m_screen);
 }
 
 std::unique_ptr<ISocketFactory> ServerApp::getSocketFactory() const

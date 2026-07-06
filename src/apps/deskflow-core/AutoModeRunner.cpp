@@ -33,7 +33,8 @@ using deskflow::coordination::RoleDecision;
 
 namespace {
 
-QStringList preConnectHostsFromFleet(const FleetState &fleet, const std::string &serverAddress, const std::string &selfName)
+QStringList
+preConnectHostsFromFleet(const FleetState &fleet, const std::string &serverAddress, const std::string &selfName)
 {
   using deskflow::common::namesEqual;
   QStringList hosts;
@@ -242,6 +243,7 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
       m_coordinator->publishFleetTopology(std::move(links), std::move(screens));
     });
     serverApp->setFleetSnapshotCallback([this] { return m_coordinator->fleetSnapshot(); });
+    serverApp->setWakePeerCallback([this](const std::string &name) { m_coordinator->wakePeer(name); });
     app = std::move(serverApp);
   } else {
     auto clientApp = std::make_unique<ClientApp>(&m_events, m_processName);
@@ -254,9 +256,7 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
         }
         clientAppPtr->appendPreConnectHosts(preConnectHostsFromFleet(fleet, serverAddress, selfName));
       };
-      m_events.addHandler(
-          EventTypes::CoordinationTopologyReady, m_events.getSystemTarget(), topologyReadyHandler
-      );
+      m_events.addHandler(EventTypes::CoordinationTopologyReady, m_events.getSystemTarget(), topologyReadyHandler);
       trackTopologyReady = true;
     }
     app = std::move(clientApp);
