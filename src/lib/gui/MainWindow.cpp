@@ -37,8 +37,9 @@
 #include <QCloseEvent>
 #include <QCoreApplication>
 #include <QDesktopServices>
-#include <QHideEvent>
+#include <QDir>
 #include <QFileDialog>
+#include <QHideEvent>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMenu>
@@ -51,7 +52,6 @@
 #include <QRegularExpressionValidator>
 #include <QScreen>
 #include <QScrollBar>
-#include <QDir>
 #include <QSettings>
 #include <QShortcut>
 #include <QShowEvent>
@@ -59,8 +59,8 @@
 #include <memory>
 
 #if defined(Q_OS_MACOS)
-#include <ApplicationServices/ApplicationServices.h>
 #include "OSXHelpers.h"
+#include <ApplicationServices/ApplicationServices.h>
 #endif
 
 using namespace deskflow::gui;
@@ -184,8 +184,7 @@ MainWindow::MainWindow()
   // Gated on a one-time flag so removing the Run entry later is respected.
   if (!Settings::value(Settings::Gui::LoginItemConfigured).toBool()) {
     QSettings runKey(
-        QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
-        QSettings::NativeFormat
+        QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"), QSettings::NativeFormat
     );
     const auto guiPath = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
     runKey.setValue(kAppName, QStringLiteral("\"%1\"").arg(guiPath));
@@ -300,21 +299,24 @@ void MainWindow::connectSlots()
   // real fleet role, whether the core was started here or by a background
   // agent. Falls back to the normal process status when nothing answers.
   m_coordStatus = new deskflow::gui::CoordinationStatus(this);
-  connect(m_coordStatus, &deskflow::gui::CoordinationStatus::online, this, [this](const QString &role, const QString &server, const QString &fleetGraph) {
-    QString text;
-    if (role == QLatin1String("server"))
-      text = tr("Auto switch: this computer is in control");
-    else if (role == QLatin1String("client"))
-      text = tr("Auto switch: following %1").arg(server.isEmpty() ? tr("the active computer") : server);
-    else
-      text = tr("Auto switch: finding the active computer…");
-    if (!fleetGraph.isEmpty()) {
-      text += QStringLiteral(" · %1").arg(fleetGraph);
-    }
-    m_statusBar->setMessage(text);
-    if (m_trayIcon)
-      m_trayIcon->setToolTip(QStringLiteral("%1 — %2").arg(kAppName, text));
-  });
+  connect(
+      m_coordStatus, &deskflow::gui::CoordinationStatus::online, this,
+      [this](const QString &role, const QString &server, const QString &fleetGraph) {
+        QString text;
+        if (role == QLatin1String("server"))
+          text = tr("Auto switch: this computer is in control");
+        else if (role == QLatin1String("client"))
+          text = tr("Auto switch: following %1").arg(server.isEmpty() ? tr("the active computer") : server);
+        else
+          text = tr("Auto switch: finding the active computer…");
+        if (!fleetGraph.isEmpty()) {
+          text += QStringLiteral(" · %1").arg(fleetGraph);
+        }
+        m_statusBar->setMessage(text);
+        if (m_trayIcon)
+          m_trayIcon->setToolTip(QStringLiteral("%1 — %2").arg(kAppName, text));
+      }
+  );
   connect(m_coordStatus, &deskflow::gui::CoordinationStatus::offline, this, &MainWindow::updateStatus);
   m_coordStatus->start(static_cast<quint16>(Settings::value(Settings::Coordination::Port).toInt()));
 
@@ -829,8 +831,7 @@ void MainWindow::setupTrayIcon()
     // (common on Windows via the Run key). Giving up here left the app
     // running with no tray presence at all; keep retrying until the tray
     // arrives instead.
-    static int retries = 0;
-    if (++retries <= 150) { // ~5 minutes; covers slow logins
+    if (++m_trayRetries <= 150) { // ~5 minutes; covers slow logins
       QTimer::singleShot(2000, this, &MainWindow::setupTrayIcon);
     } else {
       qWarning("system tray is not available on this platform");
@@ -898,9 +899,7 @@ void MainWindow::setTrayIcon()
   QString themeIcon = kRevFqdnName;
   if (!Settings::value(Settings::Gui::SymbolicTrayIcon).toBool()) {
     if (deskflow::platform::isMac()) {
-      const auto icon = QIcon::fromTheme(
-          themeIcon, QIcon(fallbackPath.arg(kAppId, iconMode(), themeIcon))
-      );
+      const auto icon = QIcon::fromTheme(themeIcon, QIcon(fallbackPath.arg(kAppId, iconMode(), themeIcon)));
       m_trayIcon->setIcon(icon);
       if (icon.pixmap(22, 22).isNull()) {
         qWarning("tray icon is empty after loading %s (colorful mode)", qPrintable(themeIcon));

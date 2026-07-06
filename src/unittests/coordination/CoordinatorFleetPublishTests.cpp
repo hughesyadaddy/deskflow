@@ -30,7 +30,6 @@ namespace protocol = deskflow::coordination::protocol;
 
 namespace {
 
-constexpr int kTestMeshPort = 59871;
 Log g_log;
 std::unique_ptr<Arch> g_arch;
 
@@ -38,9 +37,8 @@ CoordinatorConfig testConfig()
 {
   CoordinatorConfig config;
   config.selfName = "server";
-  config.meshPort = kTestMeshPort;
+  config.meshPort = 0; // ephemeral: parallel test runs must not collide
   config.token = "test-token";
-  config.meshVersion = 2;
   return config;
 }
 
@@ -185,6 +183,39 @@ void CoordinatorFleetPublishTests::hello_rejectsV1Peer()
   coordinator.handleHelloMessage(inbound, [&](const std::string &line) { reply = line; });
 
   QVERIFY(reply.empty());
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_versionMismatchPeers.contains("legacy"));
+  }
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::hello_acceptClearsVersionMismatch()
+{
+  EventQueue events;
+  Coordinator coordinator(testConfig());
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+
+  // A previously mismatched peer that reappears at the current protocol
+  // version must get a reply and be cleared from the mismatch list.
+  coordinator.noteVersionMismatch("legacy");
+
+  Message inbound;
+  inbound.type = Message::Type::Hello;
+  inbound.meshVersion = deskflow::coordination::kMeshProtocolVersion;
+  inbound.name = "legacy";
+
+  std::string reply;
+  coordinator.handleHelloMessage(inbound, [&](const std::string &line) { reply = line; });
+
+  QVERIFY(!reply.empty());
+  QCOMPARE(protocol::decode(reply).type, Message::Type::Hello);
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(!coordinator.m_versionMismatchPeers.contains("legacy"));
+  }
 
   coordinator.stop();
 }
@@ -308,6 +339,137 @@ void CoordinatorFleetPublishTests::wakePeer_rateLimitsPerPeer()
     QCOMPARE(coordinator.m_lastWakeAt.at("sleepy"), firstWakeAt);
   }
 
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::wakePeer_refiresAfterRateLimitWindow()
+{
+  auto config = testConfig();
+  config.peers = deskflow::coordination::parsePeerList("sleepy=10.0.0.9|sleepy.local|invalid-mac");
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsServer(coordinator, "server");
+
+  coordinator.wakePeer("sleepy");
+  std::chrono::steady_clock::time_point firstWakeAt;
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    firstWakeAt = coordinator.m_lastWakeAt.at("sleepy");
+    // Simulate the 30 s window expiring; the limiter must re-arm or a
+    // peer that failed to wake is never retried.
+    coordinator.m_lastWakeAt["sleepy"] = firstWakeAt - std::chrono::seconds(31);
+  }
+
+  coordinator.wakePeer("sleepy");
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_lastWakeAt.at("sleepy") > firstWakeAt - std::chrono::seconds(1));
+  }
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::rescueChord_forcesRelayLocalUntilCursorMoves()
+{
+  auto config = testConfig();
+  config.selfName = "macbookpro";
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsClient(coordinator);
+
+  // Fleet cursor sits on a remote host: keys would normally forward.
+  FleetFragment inbound;
+  inbound.server = "hackintosh";
+  inbound.seq = 1;
+  inbound.cursorHost = "hackintosh";
+  inbound.links = {FleetLink{"hackintosh", "macbookpro", "left"}};
+  inbound.screens = {FleetScreen{"hackintosh"}, FleetScreen{"macbookpro"}};
+  coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
+  QVERIFY(!coordinator.relayPassThroughLocal());
+
+  // Chord (Down) engages the override: every key stays local, nothing
+  // forwards, whatever the fleet state says.
+  constexpr KeyModifierMask chord = KeyModifierShift | KeyModifierControl | KeyModifierAlt;
+  coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, chord, 1, "en");
+  QVERIFY(coordinator.relayPassThroughLocal());
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_relayLocalOverride);
+  }
+
+  // Fresh authoritative cursor state (host changed) clears the override.
+  inbound.seq = 2;
+  inbound.cursorHost = "tiny11";
+  coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
+  QVERIFY(!coordinator.relayPassThroughLocal());
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(!coordinator.m_relayLocalOverride);
+  }
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::keyForward_gatingMatrix()
+{
+  auto config = testConfig();
+  config.selfName = "macbookpro";
+  config.peers = deskflow::coordination::parsePeerList("hackintosh=10.0.0.1, macbookpro=10.0.0.2, tiny11=10.0.0.3");
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+
+  int forwarded = 0;
+  events.addHandler(EventTypes::CoordinationKeyForward, events.getSystemTarget(), [&forwarded](const Event &) {
+    ++forwarded;
+  });
+  const auto drainEvents = [&events] {
+    events.addEvent(Event(EventTypes::Quit));
+    events.loop();
+  };
+  const auto keyFrom = [](const char *from) {
+    return protocol::decode(
+        protocol::encodeKey(from, deskflow::coordination::RelayKeyPhase::Down, 65, 0, 1, "en", "test-token")
+    );
+  };
+
+  // Client that is NOT the fleet cursor host: key dropped.
+  armAsClient(coordinator);
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_fleetState.cursorHost = "tiny11";
+  }
+  coordinator.handleKeyForwardMessage(keyFrom("hackintosh"));
+  drainEvents();
+  QCOMPARE(forwarded, 0);
+
+  // Client that IS the cursor host: key injected -- but only from a
+  // configured peer; unknown senders are dropped even with a valid token.
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_fleetState.cursorHost = "macbookpro";
+  }
+  coordinator.handleKeyForwardMessage(keyFrom("hackintosh"));
+  coordinator.handleKeyForwardMessage(keyFrom("stranger"));
+  drainEvents();
+  QCOMPARE(forwarded, 1);
+
+  // Server epoch: key injected from known peers only.
+  armAsServer(coordinator, "macbookpro");
+  coordinator.handleKeyForwardMessage(keyFrom("tiny11"));
+  coordinator.handleKeyForwardMessage(keyFrom("stranger"));
+  drainEvents();
+  QCOMPARE(forwarded, 2);
+
+  events.removeHandler(EventTypes::CoordinationKeyForward, events.getSystemTarget());
   coordinator.stop();
 }
 

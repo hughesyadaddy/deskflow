@@ -22,8 +22,7 @@ private Q_SLOTS:
   void statusReplyIncludesFleetSnapshot();
   void statusReplyIncludesMeshVersion();
   void peerListParsing();
-  void cursorRoundTrip();
-  void keyFwdRoundTrip();
+  void legacyMessagesDecodeForDrop();
   void keyRoundTrip();
   void keyFwdPhasesDecode();
   void helloRoundTrip();

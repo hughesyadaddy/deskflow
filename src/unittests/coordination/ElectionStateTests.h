@@ -27,9 +27,6 @@ private Q_SLOTS:
   void claimMergesSequenceNumbers();
   void transitionsResetBurstAndCursor();
   void cursorHereTracksScreenPresenceForRelay();
-  void relayPassesKeyWhenCursorOnSelf();
-  void relayForwardsKeyWhenCursorElsewhere();
-  void relayBootGraceWhileScreenSyncUnknown();
   void relayStartClearsStaleCursorScreenKnown();
   void becameServerClearsCursorScreenKnown();
   void resetCursorScreenClearsInputBurst();

@@ -6,8 +6,8 @@
 
 #include "LoginBridgeManager.h"
 
-#include "common/Settings.h"
 #include "common/CoordinationLocalStatus.h"
+#include "common/Settings.h"
 
 #include <QCoreApplication>
 #include <QFile>
@@ -42,8 +42,8 @@ QString appleScriptQuote(const QString &shellCommand)
 /// success; fills @p error with stderr / cancellation reason otherwise.
 bool runPrivileged(const QString &shellCommand, QString *error)
 {
-  const QString script = QStringLiteral("do shell script \"%1\" with administrator privileges")
-                             .arg(appleScriptQuote(shellCommand));
+  const QString script =
+      QStringLiteral("do shell script \"%1\" with administrator privileges").arg(appleScriptQuote(shellCommand));
   QProcess osascript;
   osascript.start(QStringLiteral("/usr/bin/osascript"), {QStringLiteral("-e"), script});
   if (!osascript.waitForFinished(120000)) {
@@ -56,8 +56,8 @@ bool runPrivileged(const QString &shellCommand, QString *error)
     if (error) {
       const auto stderrText = QString::fromUtf8(osascript.readAllStandardError()).trimmed();
       *error = stderrText.contains(QStringLiteral("User cancelled"), Qt::CaseInsensitive)
-          ? QStringLiteral("the administrator prompt was cancelled")
-          : stderrText;
+                   ? QStringLiteral("the administrator prompt was cancelled")
+                   : stderrText;
     }
     return false;
   }
@@ -74,7 +74,9 @@ bool LoginBridgeManager::driverInstalled()
 bool LoginBridgeManager::daemonRunning()
 {
   QProcess pgrep;
-  pgrep.start(QStringLiteral("/usr/bin/pgrep"), {QStringLiteral("-f"), QStringLiteral("Karabiner-VirtualHIDDevice-Daemon")});
+  pgrep.start(
+      QStringLiteral("/usr/bin/pgrep"), {QStringLiteral("-f"), QStringLiteral("Karabiner-VirtualHIDDevice-Daemon")}
+  );
   pgrep.waitForFinished(3000);
   return pgrep.exitCode() == 0;
 }
@@ -119,7 +121,10 @@ QStringList LoginBridgeManager::serverCandidates()
   if (Settings::value(Settings::Coordination::Enabled).toBool()) {
     const auto port = static_cast<quint16>(Settings::value(Settings::Coordination::Port).toUInt());
     if (port > 0) {
-      if (const auto snapshot = deskflow::common::pollLocalFleetStatus(port)) {
+      // Short timeout: this runs on the GUI thread during settings apply;
+      // 250 ms is ample for localhost and a dead coordinator must not
+      // freeze the UI for the default multi-second waits.
+      if (const auto snapshot = deskflow::common::pollLocalFleetStatus(port, 250)) {
         if (!snapshot->peerHosts.isEmpty()) {
           return snapshot->peerHosts;
         }
@@ -192,7 +197,10 @@ QString LoginBridgeManager::plistContent(double scale)
 </dict>
 </plist>
 )")
-      .arg(kAgentLabel, bridgePath(), hosts.join(','), screenName, QString::number(port), QString::number(scale), coordArg);
+      .arg(
+          kAgentLabel, bridgePath(), hosts.join(','), screenName, QString::number(port), QString::number(scale),
+          coordArg
+      );
 }
 
 bool LoginBridgeManager::apply(bool enabled, double scale, QString *error)
@@ -229,10 +237,11 @@ bool LoginBridgeManager::apply(bool enabled, double scale, QString *error)
   // (logout or restart) -- LoginWindow agents cannot be bootstrapped from a
   // user session. The same privileged pass retires the legacy coordinator
   // agent so enabling is a clean one-click migration.
-  const auto command =
-      QStringLiteral("install -d /Library/LaunchAgents && install -m 644 -o root -g wheel '%1' '%2' && "
-                     "rm -f '%3'; pkill -f '.kvm-autoswitch/coordinator.py' || true")
-          .arg(staged.fileName(), agentPlistPath(), kLegacyAgentPlist);
+  const auto command = QStringLiteral(
+                           "install -d /Library/LaunchAgents && install -m 644 -o root -g wheel '%1' '%2' && "
+                           "rm -f '%3'; pkill -f '.kvm-autoswitch/coordinator.py' || true"
+  )
+                           .arg(staged.fileName(), agentPlistPath(), kLegacyAgentPlist);
   return runPrivileged(command, error);
 }
 

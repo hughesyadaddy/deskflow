@@ -80,8 +80,8 @@ private:
     KeyModifierMask mask = 0;
     KeyButton button = 0;
     if (!mapRelayKeyFromHook(
-            static_cast<int>(info->vkCode), static_cast<int>(info->scanCode),
-            (info->flags & LLKHF_EXTENDED) != 0, keyUp, isRepeat, id, mask, button, phase
+            static_cast<int>(info->vkCode), static_cast<int>(info->scanCode), (info->flags & LLKHF_EXTENDED) != 0,
+            keyUp, isRepeat, id, mask, button, phase
         )) {
       return CallNextHookEx(nullptr, code, wParam, lParam);
     }

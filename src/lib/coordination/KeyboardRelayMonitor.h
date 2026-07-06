@@ -23,9 +23,8 @@ public:
   using RelayPassThroughQuery = std::function<bool()>;
   //! Deprecated alias; returns true when the key should reach the local OS.
   using CursorOnSelfQuery = RelayPassThroughQuery;
-  using KeyForwardSend = std::function<void(
-      Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang
-  )>;
+  using KeyForwardSend = std::function<
+      void(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang)>;
 
   virtual ~IKeyboardRelayMonitor() = default;
 

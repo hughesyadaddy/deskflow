@@ -14,6 +14,7 @@
 #include "coordination/Coordinator.h"
 #include "coordination/FleetState.h"
 #include "coordination/Peer.h"
+#include "coordination/PreConnectHosts.h"
 #include "deskflow/ClientApp.h"
 #include "deskflow/DeskflowException.h"
 #include "deskflow/DisplayInvalidException.h"
@@ -33,73 +34,12 @@ using deskflow::coordination::RoleDecision;
 
 namespace {
 
-QStringList
-preConnectHostsFromFleet(const FleetState &fleet, const std::string &serverAddress, const std::string &selfName)
+QStringList settingsPreConnectHosts(const std::string &serverAddress, const std::string &selfName)
 {
-  using deskflow::common::namesEqual;
-  QStringList hosts;
-  const auto addHost = [&hosts](const std::string &address) {
-    if (address.empty()) {
-      return;
-    }
-    const auto host = QString::fromStdString(address);
-    if (!hosts.contains(host)) {
-      hosts << host;
-    }
-  };
-
-  // Candidate order is connect order, and each dead candidate costs a
-  // connect timeout. Elected server's LAN address first (lowest-latency
-  // route), then its stable address; other peers only as takeover
-  // fallbacks. Never list ourselves.
-  for (const auto &peer : fleet.peers) {
-    if (namesEqual(peer.name, fleet.server)) {
-      addHost(peer.lan);
-      addHost(peer.ip);
-    }
-  }
-  addHost(serverAddress);
-  for (const auto &peer : fleet.peers) {
-    if (namesEqual(peer.name, selfName) || namesEqual(peer.name, fleet.server)) {
-      continue;
-    }
-    addHost(peer.lan);
-    addHost(peer.ip);
-  }
-  return hosts;
-}
-
-QStringList defaultPreConnectHosts(const std::string &serverAddress, const std::string &selfName)
-{
-  using deskflow::common::namesEqual;
-  QStringList hosts;
-  if (!serverAddress.empty()) {
-    const auto primary = QString::fromStdString(serverAddress);
-    if (!hosts.contains(primary)) {
-      hosts << primary;
-    }
-  }
   const auto peers = deskflow::coordination::parsePeerList(
       Settings::value(Settings::Coordination::Peers).toStringList().join(QLatin1Char(',')).toStdString()
   );
-  for (const auto &peer : peers) {
-    if (namesEqual(peer.name, selfName)) {
-      continue; // connecting to ourselves only burns a connect timeout
-    }
-    if (!peer.lan.empty()) {
-      const auto lan = QString::fromStdString(peer.lan);
-      if (!hosts.contains(lan)) {
-        hosts << lan;
-      }
-    }
-    if (!peer.ip.empty()) {
-      const auto ip = QString::fromStdString(peer.ip);
-      if (!hosts.contains(ip)) {
-        hosts << ip;
-      }
-    }
-  }
-  return hosts;
+  return deskflow::coordination::defaultPreConnectHosts(serverAddress, selfName, peers);
 }
 
 CoordinatorConfig configFromSettings()
@@ -116,7 +56,6 @@ CoordinatorConfig configFromSettings()
   );
   const auto followCursor = Settings::value(Settings::Coordination::KeyboardFollowCursor);
   config.keyboardFollowCursor = followCursor.isValid() ? followCursor.toBool() : true;
-  config.meshVersion = Settings::value(Settings::Coordination::MeshVersion).toInt();
   return config;
 }
 
@@ -200,17 +139,12 @@ void AutoModeRunner::epochLoop()
 
 int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
 {
-  const auto meshVersion = Settings::value(Settings::Coordination::MeshVersion).toInt();
-  const bool meshV2 = meshVersion >= 2;
-
   const std::string selfName = Settings::value(Settings::Core::ComputerName).toString().toStdString();
   if (role == Role::Client) {
-    QStringList hosts = defaultPreConnectHosts(serverAddress, selfName);
-    if (meshV2) {
-      const auto fleet = m_coordinator->fleetSnapshot();
-      if (!fleet.links.empty()) {
-        hosts = preConnectHostsFromFleet(fleet, serverAddress, selfName);
-      }
+    QStringList hosts = settingsPreConnectHosts(serverAddress, selfName);
+    const auto fleet = m_coordinator->fleetSnapshot();
+    if (!fleet.links.empty()) {
+      hosts = deskflow::coordination::preConnectHostsFromFleet(fleet, serverAddress, selfName);
     }
     Settings::setValue(Settings::Client::RemoteHost, hosts.join(QLatin1Char(',')));
   }
@@ -248,13 +182,15 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
   } else {
     auto clientApp = std::make_unique<ClientApp>(&m_events, m_processName);
     clientAppPtr = clientApp.get();
-    if (meshV2) {
+    {
       topologyReadyHandler = [this, clientAppPtr, serverAddress, selfName](const Event &) {
         const auto fleet = m_coordinator->fleetSnapshot();
         if (fleet.links.empty()) {
           return;
         }
-        clientAppPtr->appendPreConnectHosts(preConnectHostsFromFleet(fleet, serverAddress, selfName));
+        clientAppPtr->appendPreConnectHosts(
+            deskflow::coordination::preConnectHostsFromFleet(fleet, serverAddress, selfName)
+        );
       };
       m_events.addHandler(EventTypes::CoordinationTopologyReady, m_events.getSystemTarget(), topologyReadyHandler);
       trackTopologyReady = true;

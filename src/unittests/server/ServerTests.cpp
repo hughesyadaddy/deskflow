@@ -569,4 +569,104 @@ void ServerTests::requestWakePeer_postsEventOncePerThrottleWindow()
   }
 }
 
+void ServerTests::requestWakePeer_refiresAfterThrottleWindow()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  fixture.init("server");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+
+    int wakeEvents = 0;
+    fixture.events.addHandler(EventTypes::ServerWakePeerRequested, &server, [&wakeEvents](const Event &) {
+      ++wakeEvents;
+    });
+
+    server.requestWakePeer("remote");
+    // Simulate the 1 s window expiring; the throttle must re-arm or a
+    // sleeping peer is never woken again after the first attempt.
+    server.m_lastWakeRequest = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+    server.requestWakePeer("remote");
+
+    fixture.events.addEvent(Event(EventTypes::Quit));
+    fixture.events.loop();
+
+    QCOMPARE(wakeEvents, 2);
+    fixture.events.removeHandler(EventTypes::ServerWakePeerRequested, &server);
+  }
+}
+
+void ServerTests::rescueChord_jumpsBackToPrimaryScreen()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  fixture.init("server");
+  TestClientProxy remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    QCOMPARE(server.m_active, &remote);
+
+    // The escape hatch for a wedged relay: the chord must yank the cursor
+    // (and keyboard) back to the primary screen and swallow the key.
+    constexpr KeyModifierMask chord = KeyModifierShift | KeyModifierControl | KeyModifierAlt;
+    server.onKeyDown(kKeyEscape, chord, 1, "en", nullptr);
+
+    QCOMPARE(server.m_active, fixture.primary);
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::fleetWalk_skipsDisconnectedScreens()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  fixture.init("server");
+  TestClientProxy far("far");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    server.setFleetTopologySource(true);
+    // server -> middle -> far; middle never connects and must be hopped.
+    server.setFleetTopologyLinks({
+        deskflow::server::TopologyLink{"server", "middle", Direction::Right},
+        deskflow::server::TopologyLink{"middle", "far", Direction::Right},
+    });
+    QVERIFY(server.m_clients.emplace("far", &far).second);
+
+    int32_t x = 1023;
+    int32_t y = 384;
+    QCOMPARE(server.getNeighbor(fixture.primary, Direction::Right, x, y), &far);
+    server.m_clients.erase("far");
+  }
+}
+
+void ServerTests::fleetWalk_cyclicLinksTerminate()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  fixture.init("server");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    server.setFleetTopologySource(true);
+    // server -> ghostA -> ghostB -> ghostA...: neither ghost is connected;
+    // the maxHops bound must terminate the walk with no neighbor.
+    server.setFleetTopologyLinks({
+        deskflow::server::TopologyLink{"server", "ghostA", Direction::Right},
+        deskflow::server::TopologyLink{"ghostA", "ghostB", Direction::Right},
+        deskflow::server::TopologyLink{"ghostB", "ghostA", Direction::Right},
+    });
+
+    int32_t x = 1023;
+    int32_t y = 384;
+    QCOMPARE(server.getNeighbor(fixture.primary, Direction::Right, x, y), nullptr);
+  }
+}
+
 QTEST_MAIN(ServerTests)

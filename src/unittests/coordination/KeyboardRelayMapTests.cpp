@@ -14,14 +14,14 @@
 #include <chrono>
 #include <thread>
 
-#include <CoreFoundation/CoreFoundation.h>
 #include <ApplicationServices/ApplicationServices.h>
 #include <Carbon/Carbon.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/hidsystem/ev_keymap.h>
 
-using deskflow::coordination::Message;
 using deskflow::coordination::mapRelayMediaKeyFromCgEvent;
 using deskflow::coordination::mediaKeyIdFromNxType;
+using deskflow::coordination::Message;
 
 void KeyboardRelayMapTests::mapRelayKeyFromCgEventOffMainThreadDoesNotCrash()
 {

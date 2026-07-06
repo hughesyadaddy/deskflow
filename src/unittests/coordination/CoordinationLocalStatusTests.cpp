@@ -65,11 +65,12 @@ void CoordinationLocalStatusTests::pollLocalFleetStatus_readsSnapshot()
   QVERIFY(server.listen(QHostAddress::LocalHost));
 
   const auto port = static_cast<quint16>(server.serverPort());
-  const QByteArray reply =
-      QByteArray(R"({"role":"client","server_ip":"10.0.0.9","name":"macbookpro","fleet":)"
-                 R"({"server":"hackintosh","cursor_host":"hackintosh","cursor_screen":"hackintosh",)"
-                 R"("peers":[{"name":"hackintosh","ip":"10.0.0.9","lan":"hackintosh.local"}]}})") +
-      '\n';
+  const QByteArray reply = QByteArray(
+                               R"({"role":"client","server_ip":"10.0.0.9","name":"macbookpro","fleet":)"
+                               R"({"server":"hackintosh","cursor_host":"hackintosh","cursor_screen":"hackintosh",)"
+                               R"("peers":[{"name":"hackintosh","ip":"10.0.0.9","lan":"hackintosh.local"}]}})"
+                           ) +
+                           '\n';
 
   std::optional<deskflow::common::LocalStatusFleet> snapshot;
   std::thread pollThread([&]() { snapshot = deskflow::common::pollLocalFleetStatus(port, 2000); });

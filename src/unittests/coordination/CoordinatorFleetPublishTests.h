@@ -29,7 +29,11 @@ private Q_SLOTS:
   void followClaim_dropsUnknownClaimWithoutAddress();
   void serverTakeover_continuesFleetSeq();
   void wakePeer_rateLimitsPerPeer();
+  void wakePeer_refiresAfterRateLimitWindow();
   void wakePeer_ignoredForClientsAndPeersWithoutHints();
+  void rescueChord_forcesRelayLocalUntilCursorMoves();
+  void keyForward_gatingMatrix();
+  void hello_acceptClearsVersionMismatch();
 
 private:
   static void armAsServer(deskflow::coordination::Coordinator &coordinator, const std::string &selfName);

@@ -15,7 +15,9 @@ class CoordinationKeyForwardInfo : public EventData
 public:
   deskflow::coordination::RelayKeyEvent event;
 
-  explicit CoordinationKeyForwardInfo(deskflow::coordination::RelayKeyEvent event) : event(std::move(event)) {}
+  explicit CoordinationKeyForwardInfo(deskflow::coordination::RelayKeyEvent event) : event(std::move(event))
+  {
+  }
 
   ~CoordinationKeyForwardInfo() override = default;
 };

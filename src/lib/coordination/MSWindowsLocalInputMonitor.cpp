@@ -72,9 +72,8 @@ private:
   {
     RAWINPUTHEADER header;
     UINT size = sizeof(header);
-    const auto rc = GetRawInputData(
-        reinterpret_cast<HRAWINPUT>(lParam), RID_HEADER, &header, &size, sizeof(RAWINPUTHEADER)
-    );
+    const auto rc =
+        GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_HEADER, &header, &size, sizeof(RAWINPUTHEADER));
     if (rc == static_cast<UINT>(-1)) {
       return;
     }

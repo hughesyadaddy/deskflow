@@ -567,7 +567,6 @@ void ServerApp::handleScreenSwitched(const Event &event)
     LOG_WARN("coordination: screen switched without screen info; fleet cursor not updated");
     return;
   }
-  LOG_DEBUG("coordination: screen switched to \"%s\"; updating fleet cursor", info->m_screen.c_str());
   m_cursorBroadcastCallback(info->m_screen);
 }
 
@@ -744,10 +743,6 @@ void ServerApp::applyFleetTopologyFromSnapshot()
   if (m_server == nullptr || m_fleetSnapshotCallback == nullptr) {
     return;
   }
-  if (Settings::value(Settings::Coordination::MeshVersion).toInt() < 2) {
-    m_server->setFleetTopologySource(false);
-    return;
-  }
 
   const auto fleet = m_fleetSnapshotCallback();
   if (fleet.links.empty()) {
@@ -784,9 +779,13 @@ void ServerApp::registerKeyForwardHandler()
   if (m_keyForwardHandlerRegistered) {
     return;
   }
-  getEvents()->addHandler(EventTypes::CoordinationKeyForward, this, [this](const Event &event) {
-    handleCoordinationKeyForward(event);
-  });
+  // The Coordinator posts CoordinationKeyForward to the SYSTEM target;
+  // EventQueue dispatch is an exact (target, type) match, so the handler
+  // must live on the system target too or every relayed key is dropped.
+  getEvents()->addHandler(
+      EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget(),
+      [this](const Event &event) { handleCoordinationKeyForward(event); }
+  );
   m_keyForwardHandlerRegistered = true;
 }
 
@@ -795,7 +794,7 @@ void ServerApp::unregisterKeyForwardHandler()
   if (!m_keyForwardHandlerRegistered) {
     return;
   }
-  getEvents()->removeHandler(EventTypes::CoordinationKeyForward, this);
+  getEvents()->removeHandler(EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget());
   m_keyForwardHandlerRegistered = false;
 }
 
@@ -804,7 +803,7 @@ void ServerApp::handleCoordinationKeyForward(const Event &event)
   if (m_server == nullptr) {
     return;
   }
-  const auto *info = static_cast<const CoordinationKeyForwardInfo *>(event.getData());
+  const auto *info = dynamic_cast<const CoordinationKeyForwardInfo *>(event.getDataObject());
   if (info == nullptr) {
     return;
   }

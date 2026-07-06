@@ -6,7 +6,6 @@
 
 #include "KeyboardRouterTests.h"
 
-#include "coordination/KeyboardRelayDecision.h"
 #include "coordination/KeyboardRescue.h"
 #include "coordination/KeyboardRouter.h"
 
@@ -19,15 +18,12 @@ using deskflow::coordination::routeKeyboard;
 
 namespace {
 
-KeyboardRouteInput makeInput(
-    const char *self, const char *cursorHost, bool known, double elapsed = 1.0
-)
+KeyboardRouteInput makeInput(const char *self, const char *cursorHost, bool known)
 {
   KeyboardRouteInput input;
   input.selfName = self;
   input.cursorHost = cursorHost;
   input.cursorHostKnown = known;
-  input.secondsSinceRelayStart = elapsed;
   return input;
 }
 
@@ -56,24 +52,21 @@ void KeyboardRouterTests::cursorOnRemote_forwardsToHost()
   QCOMPARE(decision.forwardHost, std::string("desktop"));
 }
 
-void KeyboardRouterTests::unknownCursor_usesBootGrace()
+void KeyboardRouterTests::unknownCursor_alwaysLocal()
 {
   // Unknown cursor host is always Local: swallowing the physical keyboard
   // of an unsynced client (fleet fragment not yet received) locked users
   // out of their own machine. See tiny11 incident 2026-07-03.
-  KeyboardRouteInput duringGrace;
-  duringGrace.selfName = "laptop";
-  duringGrace.cursorHostKnown = false;
-  duringGrace.secondsSinceRelayStart = 0.1;
-  QCOMPARE(routeKeyboard(duringGrace).route, KeyboardRoute::Local);
-
-  KeyboardRouteInput afterGrace;
-  afterGrace.selfName = "laptop";
-  afterGrace.cursorHostKnown = false;
-  afterGrace.secondsSinceRelayStart = 60.0;
-  const auto decision = routeKeyboard(afterGrace);
+  KeyboardRouteInput unknown;
+  unknown.selfName = "laptop";
+  unknown.cursorHostKnown = false;
+  const auto decision = routeKeyboard(unknown);
   QCOMPARE(decision.route, KeyboardRoute::Local);
   QVERIFY(decision.forwardHost.empty());
+
+  // Known flag but empty host string is equally unknown.
+  const auto emptyHost = routeKeyboard(makeInput("laptop", "", true));
+  QCOMPARE(emptyHost.route, KeyboardRoute::Local);
 }
 
 void KeyboardRouterTests::matrix_serverLocal_slaveForwards()
@@ -107,34 +100,34 @@ void KeyboardRouterTests::matrix_planAcceptance_data()
   const auto forward = static_cast<int>(KeyboardRoute::Forward);
 
   // hackintosh as elected server / local cursor host
-  QTest::newRow("hackintosh-local-macbookpro-types") << QStringLiteral("macbookpro") << QStringLiteral("hackintosh")
-                                                     << forward << QStringLiteral("hackintosh");
-  QTest::newRow("hackintosh-local-hackintosh-types") << QStringLiteral("hackintosh") << QStringLiteral("hackintosh")
-                                                     << local << QString();
-  QTest::newRow("tiny11-remote-macbookpro-types") << QStringLiteral("macbookpro") << QStringLiteral("tiny11") << forward
-                                                  << QStringLiteral("tiny11");
-  QTest::newRow("tiny11-remote-hackintosh-types") << QStringLiteral("hackintosh") << QStringLiteral("tiny11") << forward
-                                                  << QStringLiteral("tiny11");
+  QTest::newRow("hackintosh-local-macbookpro-types")
+      << QStringLiteral("macbookpro") << QStringLiteral("hackintosh") << forward << QStringLiteral("hackintosh");
+  QTest::newRow("hackintosh-local-hackintosh-types")
+      << QStringLiteral("hackintosh") << QStringLiteral("hackintosh") << local << QString();
+  QTest::newRow("tiny11-remote-macbookpro-types")
+      << QStringLiteral("macbookpro") << QStringLiteral("tiny11") << forward << QStringLiteral("tiny11");
+  QTest::newRow("tiny11-remote-hackintosh-types")
+      << QStringLiteral("hackintosh") << QStringLiteral("tiny11") << forward << QStringLiteral("tiny11");
 
   // macbookpro as elected server / local cursor host
-  QTest::newRow("macbookpro-local-hackintosh-types") << QStringLiteral("hackintosh") << QStringLiteral("macbookpro")
-                                                     << forward << QStringLiteral("macbookpro");
-  QTest::newRow("macbookpro-local-macbookpro-types") << QStringLiteral("macbookpro") << QStringLiteral("macbookpro")
-                                                     << local << QString();
-  QTest::newRow("tiny11-remote-hackintosh-from-macbookpro") << QStringLiteral("hackintosh") << QStringLiteral("tiny11")
-                                                            << forward << QStringLiteral("tiny11");
-  QTest::newRow("tiny11-remote-macbookpro-from-macbookpro") << QStringLiteral("macbookpro") << QStringLiteral("tiny11")
-                                                            << forward << QStringLiteral("tiny11");
+  QTest::newRow("macbookpro-local-hackintosh-types")
+      << QStringLiteral("hackintosh") << QStringLiteral("macbookpro") << forward << QStringLiteral("macbookpro");
+  QTest::newRow("macbookpro-local-macbookpro-types")
+      << QStringLiteral("macbookpro") << QStringLiteral("macbookpro") << local << QString();
+  QTest::newRow("tiny11-remote-hackintosh-from-macbookpro")
+      << QStringLiteral("hackintosh") << QStringLiteral("tiny11") << forward << QStringLiteral("tiny11");
+  QTest::newRow("tiny11-remote-macbookpro-from-macbookpro")
+      << QStringLiteral("macbookpro") << QStringLiteral("tiny11") << forward << QStringLiteral("tiny11");
 
   // tiny11 as elected server / local cursor host
-  QTest::newRow("tiny11-local-hackintosh-types") << QStringLiteral("hackintosh") << QStringLiteral("tiny11") << forward
-                                                 << QStringLiteral("tiny11");
-  QTest::newRow("tiny11-local-tiny11-types") << QStringLiteral("tiny11") << QStringLiteral("tiny11") << local
-                                             << QString();
-  QTest::newRow("hackintosh-remote-macbookpro-types") << QStringLiteral("macbookpro") << QStringLiteral("hackintosh")
-                                                      << forward << QStringLiteral("hackintosh");
-  QTest::newRow("hackintosh-remote-tiny11-types") << QStringLiteral("tiny11") << QStringLiteral("hackintosh") << forward
-                                                  << QStringLiteral("hackintosh");
+  QTest::newRow("tiny11-local-hackintosh-types")
+      << QStringLiteral("hackintosh") << QStringLiteral("tiny11") << forward << QStringLiteral("tiny11");
+  QTest::newRow("tiny11-local-tiny11-types")
+      << QStringLiteral("tiny11") << QStringLiteral("tiny11") << local << QString();
+  QTest::newRow("hackintosh-remote-macbookpro-types")
+      << QStringLiteral("macbookpro") << QStringLiteral("hackintosh") << forward << QStringLiteral("hackintosh");
+  QTest::newRow("hackintosh-remote-tiny11-types")
+      << QStringLiteral("tiny11") << QStringLiteral("hackintosh") << forward << QStringLiteral("hackintosh");
 }
 
 void KeyboardRouterTests::matrix_planAcceptance()

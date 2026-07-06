@@ -13,6 +13,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -117,8 +118,19 @@ private:
    *
    * When coordination is available, elevation is limited to epochs where the
    * fleet cursor is on this machine so UAC/login injection targets the right host.
+   *
+   * Reads the cached result of refreshWantsElevatedCore(); safe to call under
+   * m_processStateMutex (no blocking I/O).
    */
-  bool wantsElevatedCore();
+  bool wantsElevatedCore() const;
+
+  /**
+   * @brief Re-poll the fleet cursor host for the elevation decision.
+   *
+   * Blocks up to 500 ms on a localhost TCP poll -- must be called WITHOUT
+   * m_processStateMutex held, or daemon IPC stalls behind the poll.
+   */
+  void refreshWantsElevatedCore();
 
   /**
    * @brief Controls whether the process should restart immediately or delay start.
@@ -163,8 +175,9 @@ private:
   std::string m_selfName;
   uint16_t m_coordPort = 0;
   bool m_lastElevated = false; // integrity the running core was launched at (for auto-elevate transitions)
-  std::optional<bool> m_pendingElevated; // debounced secure-desktop target integrity
-  std::optional<double> m_pendingElevatedSince; // Arch::time() when pending transition began
+  std::atomic<bool> m_cachedWantsElevated{false}; // refreshed outside the lock each loop iteration
+  std::optional<bool> m_pendingElevated;          // debounced secure-desktop target integrity
+  std::optional<double> m_pendingElevatedSince;   // Arch::time() when pending transition began
   static constexpr double kSecureDesktopDebounceSeconds = 1.5;
   MSWindowsSession m_session;
   int m_startFailures = 0;

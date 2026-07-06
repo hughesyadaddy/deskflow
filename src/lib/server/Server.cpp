@@ -505,7 +505,6 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
 
     updateMouserVirtualHost(m_active);
 
-    LOG_DEBUG("posting ServerScreenSwitched for \"%s\"", getName(m_active).c_str());
     auto *info = new Server::SwitchToScreenInfo(m_active->getName());
     m_events->addEvent(Event(EventTypes::ServerScreenSwitched, this, info));
   } else {
@@ -787,7 +786,6 @@ void Server::requestWakePeer(const std::string &screenName)
   }
   m_lastWakeRequest = now;
 
-  LOG_DEBUG("posting ServerWakePeerRequested for \"%s\"", screenName.c_str());
   auto *info = new Server::SwitchToScreenInfo(screenName);
   m_events->addEvent(Event(EventTypes::ServerWakePeerRequested, this, info));
 }

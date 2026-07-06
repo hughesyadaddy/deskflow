@@ -178,10 +178,12 @@ the login window uses the normal server transport.
    the in-process role controller configures them directly instead of
    regenerating conf files).
 
-## 11. Mesh v2 extensions (`coordination/meshVersion=2`)
+## 11. Mesh v2 protocol
 
-Production default is mesh v2 (`meshVersion=2`). Set `coordination/meshVersion=1`
-only for emergency rollback while upgrading a mixed fleet.
+Mesh v2 is the only supported protocol (`kMeshProtocolVersion = 2` in
+`Coordinator.h`); there is no runtime setting and no v1 compatibility mode.
+Nodes that announce a lower version in their `hello` are rejected and
+surfaced as `version_mismatch` — upgrade them.
 
 ### `hello` — capability handshake
 
@@ -189,9 +191,9 @@ only for emergency rollback while upgrading a mixed fleet.
 {"t": "hello", "v": 2, "name": "<sender>", "token": "<optional>"}
 ```
 
-Receiver replies with its own `hello` when `meshVersion=2`. v2 nodes reject
-peers that advertise `v` < 2. The GUI status poll surfaces mismatches via
-`version_mismatch` in the localhost status reply.
+Receiver replies with its own `hello`. Nodes reject peers that advertise
+`v` < 2. The GUI status poll surfaces mismatches via `version_mismatch`
+in the localhost status reply.
 
 ### `fleet` — server-authoritative state fragment
 
@@ -214,5 +216,7 @@ The elected server is authoritative: each newer fragment replaces
 coordinator emits `CoordinationFleetStateChanged`; the first non-empty
 `links[]` also emits `CoordinationTopologyReady`.
 
-Legacy `cursor` and `keyfwd` messages are rejected on mesh v2 nodes. Roll back
-to `coordination/meshVersion=1` on every machine if a straggler cannot upgrade.
+Legacy `cursor` and `keyfwd` messages are dropped at the transport (the
+connection stays open for pipelined valid messages). Stragglers that can
+only speak mesh v1 must upgrade; rolling the fleet back means installing
+an older build.

@@ -10,12 +10,12 @@
 
 #include <QTest>
 
+using deskflow::coordination::applyServerFragment;
 using deskflow::coordination::FleetFragment;
 using deskflow::coordination::FleetLink;
 using deskflow::coordination::FleetPeer;
 using deskflow::coordination::FleetScreen;
 using deskflow::coordination::FleetState;
-using deskflow::coordination::applyServerFragment;
 
 void FleetStateMergeTests::emptyFragmentIsNoop()
 {

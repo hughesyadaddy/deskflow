@@ -37,13 +37,19 @@ public:
   //! ``reply`` writes a status response back on the same connection.
   using Receiver = std::function<void(const Message &message, const std::function<void(const std::string &)> &reply)>;
 
-  CoordinationMesh(int port, std::string token, int meshVersion, Receiver receiver);
+  CoordinationMesh(int port, std::string token, Receiver receiver);
   CoordinationMesh(const CoordinationMesh &) = delete;
   CoordinationMesh &operator=(const CoordinationMesh &) = delete;
   ~CoordinationMesh();
 
   bool start();
   void stop();
+
+  //! Bound listen port (resolves an ephemeral port 0 after start()).
+  int port() const
+  {
+    return m_port;
+  }
 
   //! Fire-and-forget send to ``host:port`` (connect timeout bounded).
   void sendTo(const std::string &host, const std::string &line);
@@ -66,7 +72,6 @@ private:
 
   int m_port;
   std::string m_token;
-  int m_meshVersion = 1;
   Receiver m_receiver;
   std::thread m_thread;
   std::atomic<bool> m_running{false};

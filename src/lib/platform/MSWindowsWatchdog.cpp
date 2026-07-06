@@ -12,9 +12,9 @@
 #include "base/LogOutputters.h"
 #include "base/TMethodJob.h"
 #include "common/Constants.h"
-#include "common/LogLevel.h"
 #include "common/CoordinationLocalStatus.h"
 #include "common/FleetCursor.h"
+#include "common/LogLevel.h"
 #include "deskflow/App.h"
 #include "mt/Thread.h"
 #include "platform/MSWindowsHandle.h"
@@ -179,6 +179,18 @@ void MSWindowsWatchdog::mainLoop(const void *)
 
   LOG_DEBUG("starting watchdog main loop");
   while (m_running) {
+    // Refresh the elevation decision BEFORE taking the lock: the fleet
+    // poll blocks up to 500 ms and daemon IPC (setProcessConfig /
+    // setElevationContext) must never stall behind it.
+    bool refreshElevation = false;
+    {
+      std::scoped_lock configLock(m_processStateMutex);
+      refreshElevation = m_elevateProcess && !m_foreground;
+    }
+    if (refreshElevation) {
+      refreshWantsElevatedCore();
+    }
+
     LOG_VERBOSE("locking process state mutex in watchdog main loop");
     std::unique_lock lock(m_processStateMutex);
 
@@ -203,8 +215,8 @@ void MSWindowsWatchdog::mainLoop(const void *)
           m_pendingElevated = secureNow;
           m_pendingElevatedSince = Arch::time();
           LOG_DEBUG(
-              "secure-desktop transition pending (target elevated=%s), debouncing %.1fs",
-              secureNow ? "yes" : "no", kSecureDesktopDebounceSeconds
+              "secure-desktop transition pending (target elevated=%s), debouncing %.1fs", secureNow ? "yes" : "no",
+              kSecureDesktopDebounceSeconds
           );
         } else if (Arch::time() - m_pendingElevatedSince.value() >= kSecureDesktopDebounceSeconds) {
           LOG_DEBUG("secure-desktop transition stable, queueing process start");
@@ -394,22 +406,34 @@ bool MSWindowsWatchdog::secureDesktopActive()
   return false;
 }
 
-bool MSWindowsWatchdog::wantsElevatedCore()
+bool MSWindowsWatchdog::wantsElevatedCore() const
+{
+  return m_cachedWantsElevated.load();
+}
+
+void MSWindowsWatchdog::refreshWantsElevatedCore()
 {
   if (!secureDesktopActive()) {
-    return false;
+    m_cachedWantsElevated = false;
+    return;
   }
-  if (m_coordPort == 0 || m_selfName.empty()) {
-    return true;
+  std::string selfName;
+  uint16_t coordPort = 0;
+  {
+    std::scoped_lock lock{m_processStateMutex};
+    selfName = m_selfName;
+    coordPort = m_coordPort;
   }
-  const auto fleet = deskflow::common::pollLocalFleetStatus(m_coordPort, 500);
-  if (!fleet.has_value()) {
-    return true;
+  if (coordPort == 0 || selfName.empty()) {
+    m_cachedWantsElevated = true;
+    return;
   }
-  if (fleet->cursorHost.isEmpty()) {
-    return true;
+  const auto fleet = deskflow::common::pollLocalFleetStatus(coordPort, 500);
+  if (!fleet.has_value() || fleet->cursorHost.isEmpty()) {
+    m_cachedWantsElevated = true;
+    return;
   }
-  return deskflow::common::cursorHostIsLocal(m_selfName, fleet->cursorHost.toStdString());
+  m_cachedWantsElevated = deskflow::common::cursorHostIsLocal(selfName, fleet->cursorHost.toStdString());
 }
 
 void MSWindowsWatchdog::setProcessConfig(const std::string_view &command, bool elevate)

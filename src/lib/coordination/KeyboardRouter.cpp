@@ -4,10 +4,9 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 
-#include "common/FleetCursor.h"
 #include "coordination/KeyboardRouter.h"
 
-#include "coordination/KeyboardRelayDecision.h"
+#include "common/FleetCursor.h"
 
 namespace deskflow::coordination {
 
@@ -20,8 +19,7 @@ KeyboardRouteDecision routeKeyboard(const KeyboardRouteInput &input)
   // broadcast) would otherwise eat every physical keystroke and forward
   // it blindly. Local is always the safe default; the server's heartbeat
   // rebroadcast converges the snapshot within seconds.
-  if (!input.cursorHostKnown || input.cursorHost.empty() ||
-      cursorHostIsLocal(input.selfName, input.cursorHost)) {
+  if (!input.cursorHostKnown || input.cursorHost.empty() || cursorHostIsLocal(input.selfName, input.cursorHost)) {
     return {KeyboardRoute::Local, {}};
   }
 

@@ -8,12 +8,12 @@
 
 #include "gui/CoordinationStatus.h"
 
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
-#include <QElapsedTimer>
 #include <QTest>
 
 using deskflow::gui::CoordinationStatus;
@@ -28,16 +28,12 @@ void CoordinationStatusTests::formatFleetGraph_emptyFleet()
 void CoordinationStatusTests::formatFleetGraph_screensAndEdges()
 {
   QJsonObject fleet;
-  fleet[QStringLiteral("screens")] = QJsonArray{
-      QStringLiteral("alpha"), QStringLiteral("beta")
-  };
-  fleet[QStringLiteral("links")] = QJsonArray{
-      QJsonObject{
-          {QStringLiteral("from"), QStringLiteral("alpha")},
-          {QStringLiteral("to"), QStringLiteral("beta")},
-          {QStringLiteral("dir"), QStringLiteral("right")},
-      }
-  };
+  fleet[QStringLiteral("screens")] = QJsonArray{QStringLiteral("alpha"), QStringLiteral("beta")};
+  fleet[QStringLiteral("links")] = QJsonArray{QJsonObject{
+      {QStringLiteral("from"), QStringLiteral("alpha")},
+      {QStringLiteral("to"), QStringLiteral("beta")},
+      {QStringLiteral("dir"), QStringLiteral("right")},
+  }};
 
   const QString graph = formatFleetGraph(fleet);
   QCOMPARE(graph, QStringLiteral("alpha · beta — alpha→beta (right)"));
@@ -49,8 +45,10 @@ void CoordinationStatusTests::poll_emitsOnlineWithFleetGraph()
   QVERIFY(server.listen(QHostAddress::LocalHost));
   const auto port = static_cast<quint16>(server.serverPort());
   const QByteArray reply =
-      QByteArray(R"({"role":"client","server_ip":"hackintosh.tail.ts.net","name":"macbookpro","fleet":)"
-                 R"({"screens":["hackintosh","macbookpro"],"links":[{"from":"hackintosh","to":"macbookpro","dir":"right"}]}})")
+      QByteArray(
+          R"({"role":"client","server_ip":"hackintosh.tail.ts.net","name":"macbookpro","fleet":)"
+          R"({"screens":["hackintosh","macbookpro"],"links":[{"from":"hackintosh","to":"macbookpro","dir":"right"}]}})"
+      )
           .append('\n');
 
   CoordinationStatus status;
@@ -92,9 +90,18 @@ void CoordinationStatusTests::poll_emitsOnlineWithFleetGraph()
 
 void CoordinationStatusTests::poll_emitsOfflineWhenNoCoordinator()
 {
+  // Reserve an ephemeral port, then close it: a port that was just bound
+  // is known-free, unlike a hardcoded number something else may own.
+  quint16 freePort = 0;
+  {
+    QTcpServer reserver;
+    QVERIFY(reserver.listen(QHostAddress::LocalHost, 0));
+    freePort = reserver.serverPort();
+  }
+
   CoordinationStatus status;
   QSignalSpy offlineSpy(&status, &CoordinationStatus::offline);
-  status.start(59999, 60000);
+  status.start(freePort, 60000);
 
   for (int attempt = 0; attempt < 40 && offlineSpy.count() < 1; ++attempt) {
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);

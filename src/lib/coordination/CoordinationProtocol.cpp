@@ -49,22 +49,10 @@ RelayKeyPhase phaseFromString(const QString &phase)
   return RelayKeyPhase::Down;
 }
 
-Message::KeyPhase toMessageKeyPhase(RelayKeyPhase phase)
-{
-  switch (phase) {
-  case RelayKeyPhase::Up:
-    return Message::KeyPhase::Up;
-  case RelayKeyPhase::Repeat:
-    return Message::KeyPhase::Repeat;
-  default:
-    return Message::KeyPhase::Down;
-  }
-}
-
 void decodeKeyBody(const QJsonObject &object, Message &message)
 {
   message.name = object[QStringLiteral("from")].toString().toStdString();
-  message.keyPhase = toMessageKeyPhase(phaseFromString(object[QStringLiteral("phase")].toString()));
+  message.keyPhase = phaseFromString(object[QStringLiteral("phase")].toString());
   message.keyId = static_cast<uint16_t>(object[QStringLiteral("id")].toInt());
   message.keyMask = static_cast<uint16_t>(object[QStringLiteral("mask")].toInt());
   message.keyButton = static_cast<uint16_t>(object[QStringLiteral("button")].toInt());
@@ -255,27 +243,9 @@ std::string encodeStatus(const std::string &token)
   return serialize(object);
 }
 
-std::string encodeCursor(const std::string &host, int64_t seq, const std::string &token)
-{
-  QJsonObject object;
-  object[QStringLiteral("t")] = QStringLiteral("cursor");
-  object[QStringLiteral("host")] = QString::fromStdString(host);
-  object[QStringLiteral("seq")] = static_cast<qint64>(seq);
-  putToken(object, token);
-  return serialize(object);
-}
-
-std::string encodeKeyFwd(
-    const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button,
-    const std::string &lang, const std::string &token
-)
-{
-  return encodeKeyMessage("keyfwd", from, phase, id, mask, button, lang, token);
-}
-
 std::string encodeKey(
-    const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button,
-    const std::string &lang, const std::string &token
+    const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button, const std::string &lang,
+    const std::string &token
 )
 {
   return encodeKeyMessage("key", from, phase, id, mask, button, lang, token);
@@ -323,11 +293,6 @@ std::string encodeFleet(const FleetFragment &fragment, const std::string &token)
 
   putToken(object, token);
   return serialize(object);
-}
-
-FleetFragment fleetFragmentFromMessage(const Message &message)
-{
-  return message.fleet;
 }
 
 std::string encodeStatusReply(

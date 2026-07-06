@@ -6,13 +6,9 @@
 
 #pragma once
 
-#include "common/FleetCursor.h"
-
 #include <string>
 
 namespace deskflow::coordination {
-
-using deskflow::common::cursorHostIsLocal;
 
 //! Where a physical key event should be delivered.
 enum class KeyboardRoute
@@ -33,7 +29,6 @@ struct KeyboardRouteInput
   std::string selfName;
   std::string cursorHost;
   bool cursorHostKnown = false;
-  double secondsSinceRelayStart = 0;
 };
 
 //! Pure cursor-host routing: local synthesize vs forward to fleet cursor host.

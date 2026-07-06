@@ -94,9 +94,9 @@ If a mesh token is set, add `"token":"<secret>"` to the JSON those scripts send.
 
 ## 5. Mesh v2 fleet upgrade
 
-Mesh v2 is the production default (`coordination/meshVersion=2`). Upgrade every
-machine in the fleet before relying on fleet topology, keyboard routing, and
-capability consumers (login bridge, Mouser, UAC).
+Mesh v2 is the only supported protocol. Upgrade every machine in the fleet
+before relying on fleet topology, keyboard routing, and capability
+consumers (login bridge, Mouser, UAC).
 
 1. Install the mesh v2 build on **all** machines (hackintosh, macbookpro,
    tiny11, …).
@@ -105,7 +105,6 @@ capability consumers (login bridge, Mouser, UAC).
    `echo '{"t":"status"}' | nc 127.0.0.1 24851`
 3. The GUI status bar shows the fleet graph (`screens · edges`). If a peer is
    still on mesh v1, you'll see `mesh version mismatch: <peer>`.
-4. Only after the full fleet is on v2 should you remove rollback settings.
 
 `kvmctl status` uses the same `status` message. On mesh v2 the reply includes:
 
@@ -114,8 +113,8 @@ capability consumers (login bridge, Mouser, UAC).
   `screens`) matching the GUI fleet graph
 - `version_mismatch` — peer names still answering with mesh v1 (when present)
 
-Emergency rollback: set `coordination/meshVersion=1` on **every** machine and
-restart `deskflow-core auto`.
+Emergency rollback: install the previous build on **every** machine and
+restart `deskflow-core auto` (there is no runtime protocol switch).
 
 ## 6. Known follow-ups
 

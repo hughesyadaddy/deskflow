@@ -15,7 +15,7 @@ private Q_SLOTS:
   void cursorOnSelf_isLocal();
   void cursorOnSelf_caseInsensitive();
   void cursorOnRemote_forwardsToHost();
-  void unknownCursor_usesBootGrace();
+  void unknownCursor_alwaysLocal();
   void matrix_serverLocal_slaveForwards();
   void matrix_remoteCursor_serverForwards();
   void matrix_planAcceptance_data();

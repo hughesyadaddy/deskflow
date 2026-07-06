@@ -31,6 +31,10 @@ class CoordinatorFleetPublishTests;
 
 namespace deskflow::coordination {
 
+//! Mesh protocol version spoken by this build. Peers announcing a lower
+//! version in their hello are rejected; there is no v1 compatibility mode.
+inline constexpr int kMeshProtocolVersion = 2;
+
 //! Coordinator configuration (from Settings; see design.md).
 struct CoordinatorConfig
 {
@@ -41,7 +45,6 @@ struct CoordinatorConfig
   PeerList peers;
   ElectionTuning tuning;
   bool keyboardFollowCursor = true;
-  int meshVersion = 2;
 };
 
 //! What the epoch loop should run next.
@@ -102,12 +105,7 @@ public:
   //! Main-thread event queue for cross-thread coordination events.
   void setEventQueue(IEventQueue *events);
 
-  //! Server epoch: publish which screen currently holds the fleet cursor.
-  //! Mesh \c cursor messages are a parallel fleet signal (heartbeat rebroadcast);
-  //! client keyboard relay uses ElectionState::cursorHere() instead.
-  void broadcastCursor(const std::string &host);
-
-  //! Server epoch: update cursor host/screen in fleet state (mesh v2 fleet message; v1 cursor).
+  //! Server epoch: update cursor host/screen in fleet state.
   //! \p screenName is the active screen name (deskflow screen names identify cursor host).
   void updateCursorHost(const std::string &screenName);
 
@@ -131,20 +129,17 @@ public:
 private:
   void onMessage(const Message &message, const std::function<void(const std::string &)> &reply);
   void onGenuineInput();
-  void handleCursorMessage(const Message &message);
   void handleHelloMessage(const Message &message, const std::function<void(const std::string &)> &reply);
   void handleFleetMessage(const Message &message);
   void postFleetStateEvents(IEventQueue *events, const FleetMergeResult &merge);
   std::vector<FleetPeer> buildFleetPeersLocked();
-  void sendFleetLineToPeers(const std::string &line, const PeerList &peers);
+  void sendLineToPeers(const std::string &line, const PeerList &peers);
   bool mergeAndBroadcastFleetFragment(const FleetFragment &fragment, bool sendEvenIfUnchanged);
   void handleKeyForwardMessage(const Message &message);
   void
   sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
   bool isKnownPeer(const std::string &name) const;
   bool relayPassThroughLocal();
-  //! Cached mesh cursor host; used for heartbeat rebroadcast, not relay gating.
-  std::string fleetCursorHost();
   void promoteSelf(const char *reason);
   void followSender(const Message &claim);
   void decide(Role role, const std::string &serverAddress);
@@ -162,8 +157,7 @@ private:
 
   IEventQueue *m_events = nullptr;
   std::string m_fleetCursorHost;
-  int64_t m_cursorSeq = 0;
-  //! Monotonic fleet fragment sequence (authoritative on mesh v2).
+  //! Monotonic fleet fragment sequence (authoritative).
   int64_t m_fleetSeq = 0;
   FleetState m_fleetState;
 
@@ -179,12 +173,14 @@ private:
   std::condition_variable m_workerWake;
   bool m_workerStop = false;
   bool m_broadcastPending = false;
+  //! Encoded fleet fragment awaiting broadcast by the worker (guarded by
+  //! m_mutex); set by mergeAndBroadcastFleetFragment so event-loop callers
+  //! never pay per-peer connect timeouts.
+  std::string m_pendingFleetLine;
   double m_startedAt = 0.0;
   int m_wedgeStrikes = 0;
   bool m_loggedKeyForward = false;
   bool m_loggedKeyForwardReceive = false;
-  bool m_loggedRelayUnknownForward = false;
-  double m_clientRelayStartedAt = 0.0;
   //! Rescue chord engaged: pass keys locally until the cursor host changes.
   bool m_relayLocalOverride = false;
   std::string m_overrideCursorHost;

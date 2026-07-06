@@ -210,9 +210,6 @@ QVariant Settings::defaultValue(const QString &key)
   if (key == Coordination::Port)
     return 24851;
 
-  if (key == Coordination::MeshVersion)
-    return 2;
-
   // Login-window bridge sensitivity: counts-per-point multiplier. 4.0 is the
   // calibrated full-reach 1:1 on a 2x Retina panel.
   if (key == Coordination::LoginBridgeScale)
@@ -246,10 +243,6 @@ QVariant Settings::defaultValue(const QString &key)
 
   if (key == Server::SwitchDelay || key == Server::SwitchDoubleTap)
     return 250;
-
-  // Fleet/auto mode: switch delay and double-tap default off (see
-  // Settings::m_defaultFalseValues for EnableSwitchDelay/DoubleTap).
-  // Jump-zone friction is layout-specific; keep defaults unchanged here.
 
   if (key == Server::ClipboardSize)
     return 3; // 3 MiB

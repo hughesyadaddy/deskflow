@@ -182,30 +182,15 @@ void CoordinationProtocolTests::peerListParsing()
   QCOMPARE(commandOnly[0].wakeCommand, std::string("echo a | grep a"));
 }
 
-void CoordinationProtocolTests::cursorRoundTrip()
+void CoordinationProtocolTests::legacyMessagesDecodeForDrop()
 {
-  const auto line = protocol::encodeCursor("macbook", 9, "secret");
-  const auto message = protocol::decode(line);
+  // Legacy mesh v1 messages are never sent, but must stay classifiable so
+  // the transport can identify and drop them (CoordinationMesh::handleClient).
+  const auto cursor = protocol::decode(R"({"t":"cursor","host":"macbook","seq":9,"token":"secret"})");
+  QCOMPARE(cursor.type, Message::Type::Cursor);
 
-  QCOMPARE(message.type, Message::Type::Cursor);
-  QCOMPARE(message.host, std::string("macbook"));
-  QCOMPARE(message.seq, 9);
-  QCOMPARE(message.token, std::string("secret"));
-}
-
-void CoordinationProtocolTests::keyFwdRoundTrip()
-{
-  const auto line = protocol::encodeKeyFwd("windows-pc", RelayKeyPhase::Down, 65543, 8, 0, "en", "secret");
-  const auto message = protocol::decode(line);
-
-  QCOMPARE(message.type, Message::Type::KeyFwd);
-  QCOMPARE(message.name, std::string("windows-pc"));
-  QCOMPARE(message.keyPhase, Message::KeyPhase::Down);
-  QCOMPARE(message.keyId, static_cast<uint16_t>(65543));
-  QCOMPARE(message.keyMask, static_cast<uint16_t>(8));
-  QCOMPARE(message.keyButton, static_cast<uint16_t>(0));
-  QCOMPARE(message.keyLang, std::string("en"));
-  QCOMPARE(message.token, std::string("secret"));
+  const auto keyFwd = protocol::decode(R"({"t":"keyfwd","from":"windows-pc","phase":"down","id":7,"mask":8})");
+  QCOMPARE(keyFwd.type, Message::Type::KeyFwd);
 }
 
 void CoordinationProtocolTests::keyRoundTrip()

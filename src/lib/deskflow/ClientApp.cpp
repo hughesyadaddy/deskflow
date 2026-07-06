@@ -9,13 +9,13 @@
 #include "deskflow/ClientApp.h"
 
 #include "base/Event.h"
-#include "coordination/CoordinationEvents.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "client/Client.h"
 #include "common/ExitCodes.h"
 #include "common/PlatformInfo.h"
 #include "common/Settings.h"
+#include "coordination/CoordinationEvents.h"
 #include "deskflow/Screen.h"
 #include "deskflow/ScreenException.h"
 #include "deskflow/ipc/CoreIpc.h"
@@ -358,9 +358,12 @@ void ClientApp::registerKeyForwardHandler()
   if (m_keyForwardHandlerRegistered) {
     return;
   }
-  getEvents()->addHandler(EventTypes::CoordinationKeyForward, this, [this](const Event &event) {
-    handleCoordinationKeyForward(event);
-  });
+  // Must match the Coordinator's post target (system target); dispatch is
+  // an exact (target, type) lookup. See ServerApp::registerKeyForwardHandler.
+  getEvents()->addHandler(
+      EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget(),
+      [this](const Event &event) { handleCoordinationKeyForward(event); }
+  );
   m_keyForwardHandlerRegistered = true;
 }
 
@@ -369,13 +372,13 @@ void ClientApp::unregisterKeyForwardHandler()
   if (!m_keyForwardHandlerRegistered) {
     return;
   }
-  getEvents()->removeHandler(EventTypes::CoordinationKeyForward, this);
+  getEvents()->removeHandler(EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget());
   m_keyForwardHandlerRegistered = false;
 }
 
 void ClientApp::handleCoordinationKeyForward(const Event &event)
 {
-  const auto *info = static_cast<const CoordinationKeyForwardInfo *>(event.getData());
+  const auto *info = dynamic_cast<const CoordinationKeyForwardInfo *>(event.getDataObject());
   if (info == nullptr) {
     return;
   }
@@ -427,21 +430,22 @@ void ClientApp::appendPreConnectHosts(const QStringList &hosts)
       continue;
     }
 
+    // Construction and resolution fail differently: a malformed host (ctor
+    // throw) is skipped, while a currently unresolvable one (resolve()
+    // throw, e.g. peer asleep) is still kept as a candidate. This runs from
+    // the CoordinationTopologyReady handler, so nothing may escape -- a
+    // rethrow here would kill the client epoch on one bad fleet host.
     try {
       NetworkAddress netAddr(hostStd, port);
-      netAddr.resolve();
-      m_serverAddresses.append(netAddr);
-      added = true;
-      LOG_DEBUG("added fleet pre-connect address: %s", hostStd.c_str());
-    } catch (SocketAddressException &e) {
-      if (e.getError() == SocketAddressException::SocketError::BadPort) {
-        LOG_WARN("skipping fleet pre-connect address with bad port: %s", hostStd.c_str());
-        continue;
+      try {
+        netAddr.resolve();
+      } catch (SocketAddressException &) {
+        LOG_DEBUG("keeping unresolved fleet pre-connect address: %s", hostStd.c_str());
       }
-      NetworkAddress netAddr(hostStd, port);
       m_serverAddresses.append(netAddr);
       added = true;
-      LOG_DEBUG("added fleet pre-connect address (unresolved): %s", hostStd.c_str());
+    } catch (SocketAddressException &e) {
+      LOG_WARN("skipping malformed fleet pre-connect address \"%s\": %s", hostStd.c_str(), e.what());
     }
   }
 

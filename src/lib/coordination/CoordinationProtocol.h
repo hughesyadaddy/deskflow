@@ -24,6 +24,8 @@ operator tooling (kvmctl) keeps working unchanged.
 */
 struct Message
 {
+  //! Cursor and KeyFwd are legacy mesh v1 message types: still decoded so
+  //! the transport can classify and drop them, never handled or sent.
   enum class Type
   {
     Invalid,
@@ -37,12 +39,7 @@ struct Message
     Fleet
   };
 
-  enum class KeyPhase
-  {
-    Down,
-    Up,
-    Repeat
-  };
+  using KeyPhase = RelayKeyPhase;
 
   Type type = Type::Invalid;
   std::string name;
@@ -52,15 +49,15 @@ struct Message
   std::string token;
   // cursor: host screen under the fleet cursor (server → peers)
   std::string host;
-  // keyfwd: keyboard relay (peer → server)
+  // key: keyboard relay (peer → cursor host)
   KeyPhase keyPhase = KeyPhase::Down;
   uint16_t keyId = 0;
   uint16_t keyMask = 0;
   uint16_t keyButton = 0;
   std::string keyLang;
-  // mesh v2 hello
+  // hello version announcement
   int meshVersion = 0;
-  // mesh v2 fleet fragment (decoded from `fleet` messages)
+  // fleet fragment (decoded from `fleet` messages)
   FleetFragment fleet;
 };
 
@@ -75,31 +72,20 @@ std::string encodeClaim(
 std::string encodePromote(const std::string &token);
 std::string encodeStatus(const std::string &token);
 
-std::string encodeCursor(const std::string &host, int64_t seq, const std::string &token);
-
-std::string encodeKeyFwd(
-    const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button,
-    const std::string &lang, const std::string &token
-);
-
-//! Mesh v2 keyboard relay (peer → cursor host).
+//! Keyboard relay (peer → cursor host).
 std::string encodeKey(
-    const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button,
-    const std::string &lang, const std::string &token
+    const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button, const std::string &lang,
+    const std::string &token
 );
 
 std::string encodeHello(int meshVersion, const std::string &name, const std::string &token);
 std::string encodeFleet(const FleetFragment &fragment, const std::string &token);
 
-//! Build a FleetFragment from a decoded fleet message.
-FleetFragment fleetFragmentFromMessage(const Message &message);
-
 //! Status reply (legacy shape: role/server_ip/seq/last_switch/name).
 //! When \p fleet is set, a read-only \c fleet object is included for mesh v2 UIs.
 std::string encodeStatusReply(
     Role role, const std::string &serverAddress, int64_t seq, double lastSwitchAt, const std::string &name,
-    const FleetState *fleet = nullptr, int meshVersion = 0,
-    const std::vector<std::string> &versionMismatchPeers = {}
+    const FleetState *fleet = nullptr, int meshVersion = 0, const std::vector<std::string> &versionMismatchPeers = {}
 );
 
 //! A decoded status reply.

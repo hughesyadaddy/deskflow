@@ -136,10 +136,9 @@ bool sendAll(int fd, const std::string &payload)
 
 } // namespace
 
-CoordinationMesh::CoordinationMesh(int port, std::string token, int meshVersion, Receiver receiver)
+CoordinationMesh::CoordinationMesh(int port, std::string token, Receiver receiver)
     : m_port(port),
       m_token(std::move(token)),
-      m_meshVersion(meshVersion),
       m_receiver(std::move(receiver))
 {
   // do nothing
@@ -182,6 +181,15 @@ bool CoordinationMesh::start()
     platformCloseSocket(m_listenFd);
     m_listenFd = -1;
     return false;
+  }
+
+  if (m_port == 0) {
+    // Ephemeral port (tests): report what the OS actually assigned.
+    sockaddr_in bound{};
+    SocketLen boundLen = sizeof(bound);
+    if (::getsockname(m_listenFd, reinterpret_cast<sockaddr *>(&bound), &boundLen) == 0) {
+      m_port = ntohs(bound.sin_port);
+    }
   }
 
   m_running = true;
@@ -353,9 +361,11 @@ void CoordinationMesh::handleClient(int clientFd)
         LOG_DEBUG("coordination: dropping message with bad token");
         continue;
       }
-      if (m_meshVersion >= 2 && (message.type == Message::Type::Cursor || message.type == Message::Type::KeyFwd)) {
+      if (message.type == Message::Type::Cursor || message.type == Message::Type::KeyFwd) {
+        // Legacy mesh v1 traffic; drop the message but keep the connection
+        // (it may carry pipelined valid messages), like the bad-token case.
         LOG_DEBUG("coordination: dropping legacy mesh v1 message");
-        return;
+        continue;
       }
       m_receiver(message, [clientFd](const std::string &reply) {
         std::string payload = reply;

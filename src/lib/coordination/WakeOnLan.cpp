@@ -37,6 +37,16 @@ void platformCloseSocket(int fd)
 #endif
 }
 
+//! Last socket error as text: Winsock reports via WSAGetLastError(), not errno.
+std::string lastSocketError()
+{
+#if defined(_WIN32)
+  return "winsock error " + std::to_string(WSAGetLastError());
+#else
+  return std::strerror(errno);
+#endif
+}
+
 std::optional<uint8_t> parseHexOctet(const std::string &text, std::size_t offset)
 {
   const auto hexValue = [](char c) -> int {
@@ -105,7 +115,7 @@ bool sendWakeOnLan(const std::string &mac)
 
   const int fd = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, 0));
   if (fd < 0) {
-    LOG_WARN("coordination: wake-on-lan: socket() failed: %s", std::strerror(errno));
+    LOG_WARN("coordination: wake-on-lan: socket() failed: %s", lastSocketError().c_str());
     return false;
   }
 
@@ -124,7 +134,7 @@ bool sendWakeOnLan(const std::string &mac)
   platformCloseSocket(fd);
 
   if (sent != static_cast<decltype(sent)>(packet.size())) {
-    LOG_WARN("coordination: wake-on-lan: sendto failed for %s: %s", mac.c_str(), std::strerror(errno));
+    LOG_WARN("coordination: wake-on-lan: sendto failed for %s: %s", mac.c_str(), lastSocketError().c_str());
     return false;
   }
   LOG_INFO("coordination: wake-on-lan: magic packet broadcast for %s", mac.c_str());

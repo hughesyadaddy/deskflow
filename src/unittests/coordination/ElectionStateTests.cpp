@@ -7,14 +7,11 @@
 #include "ElectionStateTests.h"
 
 #include "coordination/ElectionState.h"
-#include "coordination/KeyboardRelayDecision.h"
-
 #include <QTest>
 
 using deskflow::coordination::ElectionState;
 using deskflow::coordination::ElectionTuning;
 using deskflow::coordination::Role;
-using deskflow::coordination::passKeyToLocalOs;
 using ClaimAction = ElectionState::ClaimAction;
 
 namespace {
@@ -208,29 +205,6 @@ void ElectionStateTests::cursorHereTracksScreenPresenceForRelay()
   f.state.setCursorHere(false);
   QVERIFY(f.state.cursorScreenKnown());
   QVERIFY(!f.state.cursorHere());
-}
-
-void ElectionStateTests::relayPassesKeyWhenCursorOnSelf()
-{
-  QVERIFY(passKeyToLocalOs(true, true, 1.0));
-}
-
-void ElectionStateTests::relayForwardsKeyWhenCursorElsewhere()
-{
-  QVERIFY(!passKeyToLocalOs(false, true, 1.0));
-}
-
-void ElectionStateTests::relayBootGraceWhileScreenSyncUnknown()
-{
-  using deskflow::coordination::kCursorRelayBootGraceS;
-
-  // Unknown screen: pass locally during grace regardless of cursorOnSelf.
-  QVERIFY(passKeyToLocalOs(true, false, 0.0));
-  QVERIFY(passKeyToLocalOs(false, false, 0.1));
-  QVERIFY(passKeyToLocalOs(false, false, kCursorRelayBootGraceS - 0.001));
-  // After grace, assume cursor is elsewhere and forward.
-  QVERIFY(!passKeyToLocalOs(false, false, kCursorRelayBootGraceS));
-  QVERIFY(!passKeyToLocalOs(false, false, kCursorRelayBootGraceS + 0.2));
 }
 
 void ElectionStateTests::relayStartClearsStaleCursorScreenKnown()

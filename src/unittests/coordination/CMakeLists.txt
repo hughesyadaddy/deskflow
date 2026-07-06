@@ -31,6 +31,13 @@ create_test(
 )
 
 create_test(
+  NAME PreConnectHostsTests
+  DEPENDS coordination
+  SOURCE PreConnectHostsTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+)
+
+create_test(
   NAME WakeOnLanTests
   DEPENDS coordination
   SOURCE WakeOnLanTests.cpp

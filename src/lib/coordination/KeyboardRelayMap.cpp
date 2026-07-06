@@ -91,9 +91,7 @@ KeyID mapVirtualKey(int vkCode)
 
   const BYTE keyboardState[256] = {};
   WCHAR buffer[8] = {};
-  const int rc = ToUnicodeEx(
-      static_cast<UINT>(vkCode), 0, keyboardState, buffer, 8, 0, GetKeyboardLayout(0)
-  );
+  const int rc = ToUnicodeEx(static_cast<UINT>(vkCode), 0, keyboardState, buffer, 8, 0, GetKeyboardLayout(0));
   if (rc == 1 && buffer[0] >= 32) {
     return static_cast<KeyID>(buffer[0]);
   }

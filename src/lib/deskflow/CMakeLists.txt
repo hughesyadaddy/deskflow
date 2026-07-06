@@ -89,7 +89,10 @@ add_library(${lib_name} STATIC ${PLATFORM_CODE}
   ipc/CoreIpcServer.h
 )
 
-target_link_libraries(${lib_name} PUBLIC common Qt6::Core Qt6::Network)
+# coordination is a real dependency (CoordinationEvents/FleetState/RelayKeyEvent
+# headers in ServerApp/ClientApp); declare it instead of compiling by include-path
+# accident. The reverse edge is header-only (KeyTypes.h has no lib dependency).
+target_link_libraries(${lib_name} PUBLIC common coordination Qt6::Core Qt6::Network)
 
 if(WIN32)
   target_link_libraries(${lib_name} PRIVATE platform)

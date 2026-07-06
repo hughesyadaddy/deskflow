@@ -205,7 +205,9 @@ void Client::enter(int32_t xAbs, int32_t yAbs, uint32_t, KeyModifierMask mask, b
   }
   m_screen->mouseMove(xAbs, yAbs);
   m_screen->enter(mask);
-  m_events->addEvent(Event(EventTypes::CoordinationScreenEntered));
+  // System target, not null: the coordination handlers live on the system
+  // target and EventQueue dispatch is an exact (target, type) match.
+  m_events->addEvent(Event(EventTypes::CoordinationScreenEntered, m_events->getSystemTarget()));
 }
 
 bool Client::leave()
@@ -216,7 +218,7 @@ bool Client::leave()
   m_active = false;
 
   m_screen->leave();
-  m_events->addEvent(Event(EventTypes::CoordinationScreenLeft));
+  m_events->addEvent(Event(EventTypes::CoordinationScreenLeft, m_events->getSystemTarget()));
 
   if (m_enableClipboard) {
     // send clipboards that we own and that have changed
