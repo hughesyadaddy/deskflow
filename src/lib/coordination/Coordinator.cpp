@@ -441,6 +441,7 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
       m_loggedKeyForward = false;
       m_loggedKeyForwardReceive = false;
     }
+    LOG_DEBUG("coordination: keyboard follow-cursor disabled; relay not started");
     m_keyboardRelay->stop();
     return;
   }
@@ -852,6 +853,22 @@ void Coordinator::workerLoop()
       }
     } else if (role == Role::Init && now - m_startedAt <= kDiscoveryWindowS) {
       discoverOnce();
+    }
+
+    // Relay-state reconciler: a client epoch must always have a live
+    // keyboard relay monitor (its keys cannot reach other screens without
+    // one), and a server epoch must never keep one (Server::onKeyDown owns
+    // the keyboard). Heals epoch handoffs that missed the explicit
+    // updateKeyboardRelayForRole call and taps/hooks that died silently
+    // (permission loss, tap teardown).
+    if (m_config.keyboardFollowCursor) {
+      if (role == Role::Client && !m_keyboardRelay->running()) {
+        LOG_WARN("coordination: keyboard relay not running in client epoch; restarting");
+        updateKeyboardRelayForRole(Role::Client);
+      } else if (role == Role::Server && m_keyboardRelay->running()) {
+        LOG_WARN("coordination: keyboard relay still running in server epoch; stopping");
+        m_keyboardRelay->stop();
+      }
     }
 
     if (tick % kVersionProbeEveryTicks == 0) {

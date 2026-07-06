@@ -13,11 +13,20 @@ class StubKeyboardRelayMonitor : public IKeyboardRelayMonitor
 public:
   bool start(RelayPassThroughQuery, KeyForwardSend) override
   {
+    m_running = true;
     return true;
   }
   void stop() override
   {
+    m_running = false;
   }
+  bool running() const override
+  {
+    return m_running;
+  }
+
+private:
+  bool m_running = false;
 };
 
 std::unique_ptr<IKeyboardRelayMonitor> createKeyboardRelayMonitor()

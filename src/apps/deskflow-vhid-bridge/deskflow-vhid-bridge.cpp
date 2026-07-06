@@ -61,7 +61,8 @@ namespace hr = pqrs::karabiner::driverkit::virtual_hid_device_driver::hid_report
 using Clock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 
-void log_line(const std::string &message) {
+void log_line(const std::string &message)
+{
   // stderr is captured by the LaunchDaemon log; stdout is reserved for none.
   std::string line = "[bridge] " + message + "\n";
   ::write(STDERR_FILENO, line.data(), line.size());
@@ -78,9 +79,9 @@ void log_line(const std::string &message) {
 // works (just without the accel tweak), never a dead cursor.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-void disable_pointer_acceleration() {
-  io_service_t service =
-      IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOHIDSystem"));
+void disable_pointer_acceleration()
+{
+  io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOHIDSystem"));
   if (!service) {
     log_line("accel: IOHIDSystem not found");
     return;
@@ -95,8 +96,7 @@ void disable_pointer_acceleration() {
   IOReturn rm = IOHIDSetAccelerationWithKey(connect, CFSTR(kIOHIDMouseAccelerationType), -1.0);
   IOReturn rp = IOHIDSetAccelerationWithKey(connect, CFSTR(kIOHIDPointerAccelerationKey), -1.0);
   IOServiceClose(connect);
-  log_line("accel: disabled mouse_r=" + std::to_string(rm) + " pointer_r=" + std::to_string(rp) +
-           " (0=ok)");
+  log_line("accel: disabled mouse_r=" + std::to_string(rm) + " pointer_r=" + std::to_string(rp) + " (0=ok)");
 }
 #pragma clang diagnostic pop
 
@@ -140,14 +140,24 @@ constexpr uint32_t kMaskSuper = 0x0010;
 // ---------------------------------------------------------------------------
 // Byte (de)serialization — bounds-checked, big-endian (network order).
 // ---------------------------------------------------------------------------
-class ByteReader {
+class ByteReader
+{
 public:
-  explicit ByteReader(const std::vector<uint8_t> &data) : data_(data) {}
+  explicit ByteReader(const std::vector<uint8_t> &data) : data_(data)
+  {
+  }
 
-  bool ok() const { return ok_; }
-  size_t remaining() const { return data_.size() - pos_; }
+  bool ok() const
+  {
+    return ok_;
+  }
+  size_t remaining() const
+  {
+    return data_.size() - pos_;
+  }
 
-  bool skip(size_t n) {
+  bool skip(size_t n)
+  {
     if (remaining() < n) {
       ok_ = false;
       return false;
@@ -155,14 +165,16 @@ public:
     pos_ += n;
     return true;
   }
-  std::optional<uint8_t> u8() {
+  std::optional<uint8_t> u8()
+  {
     if (remaining() < 1) {
       ok_ = false;
       return std::nullopt;
     }
     return data_[pos_++];
   }
-  std::optional<int16_t> i16() {
+  std::optional<int16_t> i16()
+  {
     if (remaining() < 2) {
       ok_ = false;
       return std::nullopt;
@@ -178,61 +190,77 @@ private:
   bool ok_ = true;
 };
 
-void append_be16(std::vector<uint8_t> &out, int16_t value) {
+void append_be16(std::vector<uint8_t> &out, int16_t value)
+{
   auto u = static_cast<uint16_t>(value);
   out.push_back(static_cast<uint8_t>(u >> 8));
   out.push_back(static_cast<uint8_t>(u & 0xff));
 }
-void append_be32(std::vector<uint8_t> &out, uint32_t value) {
+void append_be32(std::vector<uint8_t> &out, uint32_t value)
+{
   out.push_back(static_cast<uint8_t>(value >> 24));
   out.push_back(static_cast<uint8_t>(value >> 16));
   out.push_back(static_cast<uint8_t>(value >> 8));
   out.push_back(static_cast<uint8_t>(value & 0xff));
 }
-void append_bytes(std::vector<uint8_t> &out, const char *bytes, size_t n) {
+void append_bytes(std::vector<uint8_t> &out, const char *bytes, size_t n)
+{
   out.insert(out.end(), bytes, bytes + n);
 }
 
-bool body_has_code(const std::vector<uint8_t> &body, const char (&code)[4]) {
+bool body_has_code(const std::vector<uint8_t> &body, const char (&code)[4])
+{
   return body.size() >= 4 && std::memcmp(body.data(), code, 4) == 0;
 }
 
 // ---------------------------------------------------------------------------
 // Framed socket I/O. Every message is a 4-byte big-endian length + payload.
 // ---------------------------------------------------------------------------
-class FramedSocket {
+class FramedSocket
+{
 public:
-  explicit FramedSocket(int fd) : fd_(fd) {}
+  explicit FramedSocket(int fd) : fd_(fd)
+  {
+  }
   FramedSocket(const FramedSocket &) = delete;
   FramedSocket &operator=(const FramedSocket &) = delete;
-  ~FramedSocket() { close(); }
+  ~FramedSocket()
+  {
+    close();
+  }
 
-  void close() {
+  void close()
+  {
     if (fd_ >= 0) {
       ::close(fd_);
       fd_ = -1;
     }
   }
-  int fd() const { return fd_; }
+  int fd() const
+  {
+    return fd_;
+  }
 
   // Reads a complete framed message. Returns std::nullopt on EOF or any error.
-  std::optional<std::vector<uint8_t>> read_message() {
+  std::optional<std::vector<uint8_t>> read_message()
+  {
     std::array<uint8_t, 4> header{};
-    if (!read_exact(header.data(), header.size())) return std::nullopt;
-    uint32_t length = (static_cast<uint32_t>(header[0]) << 24) |
-                      (static_cast<uint32_t>(header[1]) << 16) |
-                      (static_cast<uint32_t>(header[2]) << 8) |
-                      static_cast<uint32_t>(header[3]);
+    if (!read_exact(header.data(), header.size()))
+      return std::nullopt;
+    uint32_t length = (static_cast<uint32_t>(header[0]) << 24) | (static_cast<uint32_t>(header[1]) << 16) |
+                      (static_cast<uint32_t>(header[2]) << 8) | static_cast<uint32_t>(header[3]);
     if (length == 0 || length > proto::kMaxMessageBytes) {
       log_line("rejecting framed length " + std::to_string(length));
       return std::nullopt;
     }
     std::vector<uint8_t> body(length);
-    if (!read_exact(body.data(), body.size())) return std::nullopt;
+    if (!read_exact(body.data(), body.size()))
+      return std::nullopt;
     return body;
   }
 
-  bool write_message(const std::vector<uint8_t> &body) {
+  bool write_message(const std::vector<uint8_t> &body)
+  {
     std::vector<uint8_t> frame;
     frame.reserve(4 + body.size());
     append_be32(frame, static_cast<uint32_t>(body.size()));
@@ -241,25 +269,30 @@ public:
   }
 
 private:
-  bool read_exact(uint8_t *buffer, size_t n) {
+  bool read_exact(uint8_t *buffer, size_t n)
+  {
     size_t got = 0;
     while (got < n) {
       ssize_t r = ::recv(fd_, buffer + got, n - got, 0);
-      if (r == 0) return false;              // peer closed
+      if (r == 0)
+        return false; // peer closed
       if (r < 0) {
-        if (errno == EINTR) continue;
+        if (errno == EINTR)
+          continue;
         return false;
       }
       got += static_cast<size_t>(r);
     }
     return true;
   }
-  bool write_all(const uint8_t *buffer, size_t n) {
+  bool write_all(const uint8_t *buffer, size_t n)
+  {
     size_t sent = 0;
     while (sent < n) {
       ssize_t w = ::send(fd_, buffer + sent, n - sent, 0);
       if (w <= 0) {
-        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && errno == EINTR)
+          continue;
         return false;
       }
       sent += static_cast<size_t>(w);
@@ -275,7 +308,8 @@ private:
 constexpr int kConnectTimeoutMs = 4000;
 constexpr int kIoTimeoutSeconds = 10; // > deskflow's 5s CALV keep-alive interval
 
-void set_io_timeouts(int fd) {
+void set_io_timeouts(int fd)
+{
   timeval tv{};
   tv.tv_sec = kIoTimeoutSeconds;
   tv.tv_usec = 0;
@@ -283,9 +317,11 @@ void set_io_timeouts(int fd) {
   ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-bool connect_with_timeout(int fd, const sockaddr *addr, socklen_t len, int timeout_ms) {
+bool connect_with_timeout(int fd, const sockaddr *addr, socklen_t len, int timeout_ms)
+{
   int flags = ::fcntl(fd, F_GETFL, 0);
-  if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return false;
+  if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    return false;
   bool connected = false;
   if (::connect(fd, addr, len) == 0) {
     connected = true;
@@ -304,7 +340,8 @@ bool connect_with_timeout(int fd, const sockaddr *addr, socklen_t len, int timeo
   return connected;
 }
 
-int connect_tcp(const std::string &host, uint16_t port) {
+int connect_tcp(const std::string &host, uint16_t port)
+{
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -318,7 +355,8 @@ int connect_tcp(const std::string &host, uint16_t port) {
   int fd = -1;
   for (addrinfo *ai = result; ai != nullptr; ai = ai->ai_next) {
     fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (fd < 0) continue;
+    if (fd < 0)
+      continue;
     if (connect_with_timeout(fd, ai->ai_addr, ai->ai_addrlen, kConnectTimeoutMs)) {
       set_io_timeouts(fd);
       break;
@@ -330,7 +368,8 @@ int connect_tcp(const std::string &host, uint16_t port) {
   return fd;
 }
 
-std::optional<std::string> json_quoted_value(const std::string &json, const std::string &key, size_t from = 0) {
+std::optional<std::string> json_quoted_value(const std::string &json, const std::string &key, size_t from = 0)
+{
   const std::string needle = "\"" + key + "\":\"";
   const size_t pos = json.find(needle, from);
   if (pos == std::string::npos) {
@@ -344,7 +383,8 @@ std::optional<std::string> json_quoted_value(const std::string &json, const std:
   return json.substr(start, end - start);
 }
 
-void merge_unique_host(std::vector<std::string> &hosts, const std::string &host) {
+void merge_unique_host(std::vector<std::string> &hosts, const std::string &host)
+{
   if (host.empty()) {
     return;
   }
@@ -353,8 +393,10 @@ void merge_unique_host(std::vector<std::string> &hosts, const std::string &host)
   }
 }
 
-bool refresh_hosts_from_coord_snapshot(uint16_t coord_port, const std::string &self_name,
-                                       std::vector<std::string> &hosts) {
+bool refresh_hosts_from_coord_snapshot(
+    uint16_t coord_port, const std::string &self_name, std::vector<std::string> &hosts
+)
+{
   int fd = connect_tcp("127.0.0.1", coord_port);
   if (fd < 0) {
     return false;
@@ -431,15 +473,16 @@ bool refresh_hosts_from_coord_snapshot(uint16_t coord_port, const std::string &s
 // ---------------------------------------------------------------------------
 // Virtual HID sink — owns the pqrs client and emits HID reports.
 // ---------------------------------------------------------------------------
-constexpr std::array<hr::modifier, 8> kAllModifiers = {
-    hr::modifier::left_control,  hr::modifier::left_shift,
-    hr::modifier::left_option,   hr::modifier::left_command,
-    hr::modifier::right_control, hr::modifier::right_shift,
-    hr::modifier::right_option,  hr::modifier::right_command};
+constexpr std::array<hr::modifier, 8> kAllModifiers = {hr::modifier::left_control,  hr::modifier::left_shift,
+                                                       hr::modifier::left_option,   hr::modifier::left_command,
+                                                       hr::modifier::right_control, hr::modifier::right_shift,
+                                                       hr::modifier::right_option,  hr::modifier::right_command};
 
-class VirtualHidSink {
+class VirtualHidSink
+{
 public:
-  VirtualHidSink() {
+  VirtualHidSink()
+  {
     pqrs::dispatcher::extra::initialize_shared_dispatcher();
     client_ = std::make_unique<pqrs::karabiner::driverkit::virtual_hid_device_service::client>();
     client_->connected.connect([this] {
@@ -448,42 +491,53 @@ public:
       client_->async_virtual_hid_keyboard_initialize(p);
       client_->async_virtual_hid_pointing_initialize();
     });
-    client_->connect_failed.connect(
-        [](auto &&ec) { log_line("vhid connect_failed: " + std::to_string(ec.value())); });
+    client_->connect_failed.connect([](auto &&ec) { log_line("vhid connect_failed: " + std::to_string(ec.value())); });
     client_->virtual_hid_keyboard_ready.connect([this](bool r) { keyboard_ready_ = r; });
     client_->virtual_hid_pointing_ready.connect([this](bool r) { pointing_ready_ = r; });
   }
   VirtualHidSink(const VirtualHidSink &) = delete;
   VirtualHidSink &operator=(const VirtualHidSink &) = delete;
-  ~VirtualHidSink() {
-    if (client_) client_->async_stop();
+  ~VirtualHidSink()
+  {
+    if (client_)
+      client_->async_stop();
     pqrs::dispatcher::extra::terminate_shared_dispatcher();
   }
 
-  void start() { client_->async_start(); }
+  void start()
+  {
+    client_->async_start();
+  }
 
-  bool wait_ready(milliseconds timeout) {
+  bool wait_ready(milliseconds timeout)
+  {
     Clock::time_point deadline = Clock::now() + timeout;
     while (Clock::now() < deadline) {
-      if (keyboard_ready_ && pointing_ready_) return true;
+      if (keyboard_ready_ && pointing_ready_)
+        return true;
       std::this_thread::sleep_for(milliseconds(20));
     }
     return keyboard_ready_ && pointing_ready_;
   }
 
-  void post_keyboard(uint8_t modifier_bits, const std::set<uint16_t> &keys) {
+  void post_keyboard(uint8_t modifier_bits, const std::set<uint16_t> &keys)
+  {
     hr::keyboard_input report;
     for (hr::modifier m : kAllModifiers) {
-      if (modifier_bits & static_cast<uint8_t>(m)) report.modifiers.insert(m);
+      if (modifier_bits & static_cast<uint8_t>(m))
+        report.modifiers.insert(m);
     }
-    for (uint16_t usage : keys) report.keys.insert(usage);
+    for (uint16_t usage : keys)
+      report.keys.insert(usage);
     client_->async_post_report(report);
   }
 
-  void post_pointing(const std::set<uint8_t> &buttons, int8_t dx, int8_t dy,
-                     int8_t vertical_wheel, int8_t horizontal_wheel) {
+  void
+  post_pointing(const std::set<uint8_t> &buttons, int8_t dx, int8_t dy, int8_t vertical_wheel, int8_t horizontal_wheel)
+  {
     hr::pointing_input report;
-    for (uint8_t b : buttons) report.buttons.insert(b);
+    for (uint8_t b : buttons)
+      report.buttons.insert(b);
     report.x = static_cast<uint8_t>(dx);
     report.y = static_cast<uint8_t>(dy);
     report.vertical_wheel = static_cast<uint8_t>(vertical_wheel);
@@ -502,75 +556,191 @@ private:
 // ---------------------------------------------------------------------------
 // Physical US-keyboard HID usage for an ASCII character, ignoring shift (shift
 // is taken from the protocol mask). Both members of a shifted pair map here.
-std::optional<uint16_t> ascii_to_physical_usage(char c) {
-  if (c >= 'a' && c <= 'z') return static_cast<uint16_t>(0x04 + (c - 'a'));
-  if (c >= 'A' && c <= 'Z') return static_cast<uint16_t>(0x04 + (c - 'A'));
+std::optional<uint16_t> ascii_to_physical_usage(char c)
+{
+  if (c >= 'a' && c <= 'z')
+    return static_cast<uint16_t>(0x04 + (c - 'a'));
+  if (c >= 'A' && c <= 'Z')
+    return static_cast<uint16_t>(0x04 + (c - 'A'));
   switch (c) {
-  case '1': case '!': return 0x1e;
-  case '2': case '@': return 0x1f;
-  case '3': case '#': return 0x20;
-  case '4': case '$': return 0x21;
-  case '5': case '%': return 0x22;
-  case '6': case '^': return 0x23;
-  case '7': case '&': return 0x24;
-  case '8': case '*': return 0x25;
-  case '9': case '(': return 0x26;
-  case '0': case ')': return 0x27;
-  case '-': case '_': return 0x2d;
-  case '=': case '+': return 0x2e;
-  case '[': case '{': return 0x2f;
-  case ']': case '}': return 0x30;
-  case '\\': case '|': return 0x31;
-  case ';': case ':': return 0x33;
-  case '\'': case '"': return 0x34;
-  case '`': case '~': return 0x35;
-  case ',': case '<': return 0x36;
-  case '.': case '>': return 0x37;
-  case '/': case '?': return 0x38;
-  case ' ': return 0x2c;
-  default: return std::nullopt;
+  case '1':
+  case '!':
+    return 0x1e;
+  case '2':
+  case '@':
+    return 0x1f;
+  case '3':
+  case '#':
+    return 0x20;
+  case '4':
+  case '$':
+    return 0x21;
+  case '5':
+  case '%':
+    return 0x22;
+  case '6':
+  case '^':
+    return 0x23;
+  case '7':
+  case '&':
+    return 0x24;
+  case '8':
+  case '*':
+    return 0x25;
+  case '9':
+  case '(':
+    return 0x26;
+  case '0':
+  case ')':
+    return 0x27;
+  case '-':
+  case '_':
+    return 0x2d;
+  case '=':
+  case '+':
+    return 0x2e;
+  case '[':
+  case '{':
+    return 0x2f;
+  case ']':
+  case '}':
+    return 0x30;
+  case '\\':
+  case '|':
+    return 0x31;
+  case ';':
+  case ':':
+    return 0x33;
+  case '\'':
+  case '"':
+    return 0x34;
+  case '`':
+  case '~':
+    return 0x35;
+  case ',':
+  case '<':
+    return 0x36;
+  case '.':
+  case '>':
+    return 0x37;
+  case '/':
+  case '?':
+    return 0x38;
+  case ' ':
+    return 0x2c;
+  default:
+    return std::nullopt;
   }
 }
 
-std::optional<uint16_t> special_keyid_to_usage(uint16_t key_id) {
+std::optional<uint16_t> special_keyid_to_usage(uint16_t key_id)
+{
   switch (key_id) {
-  case 0xEF08: return 0x2a; // BackSpace
-  case 0xEF09: return 0x2b; // Tab
-  case 0xEF0D: return 0x28; // Return
-  case 0xEF1B: return 0x29; // Escape
-  case 0xEFFF: return 0x4c; // Delete (forward)
-  case 0xEF50: return 0x4a; // Home
-  case 0xEF51: return 0x50; // Left
-  case 0xEF52: return 0x52; // Up
-  case 0xEF53: return 0x4f; // Right
-  case 0xEF54: return 0x51; // Down
-  case 0xEF55: return 0x4b; // PageUp
-  case 0xEF56: return 0x4e; // PageDown
-  case 0xEF57: return 0x4d; // End
-  default: return std::nullopt;
+  case 0xEF08:
+    return 0x2a; // BackSpace
+  case 0xEF09:
+    return 0x2b; // Tab
+  case 0xEF0D:
+    return 0x28; // Return
+  case 0xEF1B:
+    return 0x29; // Escape
+  case 0xEFE5:
+    return 0x39; // CapsLock (toggle handled by the target OS)
+  case 0xEFFF:
+    return 0x4c; // Delete (forward)
+  case 0xEF50:
+    return 0x4a; // Home
+  case 0xEF51:
+    return 0x50; // Left
+  case 0xEF52:
+    return 0x52; // Up
+  case 0xEF53:
+    return 0x4f; // Right
+  case 0xEF54:
+    return 0x51; // Down
+  case 0xEF55:
+    return 0x4b; // PageUp
+  case 0xEF56:
+    return 0x4e; // PageDown
+  case 0xEF57:
+    return 0x4d; // End
+  default:
+    return std::nullopt;
+  }
+}
+
+// True for KeyIDs that name a character reachable only with shift on the US
+// layout: uppercase letters and the shifted symbol row/pairs. The KeyID is
+// the character the server wants typed, so shift is implied even when the
+// protocol modifier mask lacks it (e.g. uppercase composed via caps lock).
+bool keyid_requires_shift(uint16_t key_id)
+{
+  if (key_id >= 'A' && key_id <= 'Z')
+    return true;
+  switch (key_id) {
+  case '!':
+  case '@':
+  case '#':
+  case '$':
+  case '%':
+  case '^':
+  case '&':
+  case '*':
+  case '(':
+  case ')':
+  case '_':
+  case '+':
+  case '{':
+  case '}':
+  case '|':
+  case ':':
+  case '"':
+  case '~':
+  case '<':
+  case '>':
+  case '?':
+    return true;
+  default:
+    return false;
   }
 }
 
 // Modifier KeyIDs map to a single HID modifier bit; non-modifier keys return 0.
-uint8_t modifier_keyid_to_bit(uint16_t key_id) {
+uint8_t modifier_keyid_to_bit(uint16_t key_id)
+{
   switch (key_id) {
-  case 0xEFE1: return static_cast<uint8_t>(hr::modifier::left_shift);
-  case 0xEFE2: return static_cast<uint8_t>(hr::modifier::right_shift);
-  case 0xEFE3: return static_cast<uint8_t>(hr::modifier::left_control);
-  case 0xEFE4: return static_cast<uint8_t>(hr::modifier::right_control);
-  case 0xEFE9: return static_cast<uint8_t>(hr::modifier::left_option);
-  case 0xEFEA: return static_cast<uint8_t>(hr::modifier::right_option);
-  case 0xEFE7: case 0xEFEB: return static_cast<uint8_t>(hr::modifier::left_command);
-  case 0xEFE8: case 0xEFEC: return static_cast<uint8_t>(hr::modifier::right_command);
-  default: return 0;
+  case 0xEFE1:
+    return static_cast<uint8_t>(hr::modifier::left_shift);
+  case 0xEFE2:
+    return static_cast<uint8_t>(hr::modifier::right_shift);
+  case 0xEFE3:
+    return static_cast<uint8_t>(hr::modifier::left_control);
+  case 0xEFE4:
+    return static_cast<uint8_t>(hr::modifier::right_control);
+  case 0xEFE9:
+    return static_cast<uint8_t>(hr::modifier::left_option);
+  case 0xEFEA:
+    return static_cast<uint8_t>(hr::modifier::right_option);
+  case 0xEFE7:
+  case 0xEFEB:
+    return static_cast<uint8_t>(hr::modifier::left_command);
+  case 0xEFE8:
+  case 0xEFEC:
+    return static_cast<uint8_t>(hr::modifier::right_command);
+  default:
+    return 0;
   }
 }
 
-uint8_t mask_to_modifier_bits(uint32_t mask) {
+uint8_t mask_to_modifier_bits(uint32_t mask)
+{
   uint8_t bits = 0;
-  if (mask & proto::kMaskShift) bits |= static_cast<uint8_t>(hr::modifier::left_shift);
-  if (mask & proto::kMaskControl) bits |= static_cast<uint8_t>(hr::modifier::left_control);
-  if (mask & proto::kMaskAlt) bits |= static_cast<uint8_t>(hr::modifier::left_option);
+  if (mask & proto::kMaskShift)
+    bits |= static_cast<uint8_t>(hr::modifier::left_shift);
+  if (mask & proto::kMaskControl)
+    bits |= static_cast<uint8_t>(hr::modifier::left_control);
+  if (mask & proto::kMaskAlt)
+    bits |= static_cast<uint8_t>(hr::modifier::left_option);
   if (mask & (proto::kMaskMeta | proto::kMaskSuper))
     bits |= static_cast<uint8_t>(hr::modifier::left_command);
   return bits;
@@ -579,12 +749,16 @@ uint8_t mask_to_modifier_bits(uint32_t mask) {
 // ---------------------------------------------------------------------------
 // Bridge — owns input state and translates one host connection.
 // ---------------------------------------------------------------------------
-class Bridge {
+class Bridge
+{
 public:
-  Bridge(VirtualHidSink &sink, std::string client_name, int16_t fallback_w, int16_t fallback_h,
-         double scale_factor)
-      : sink_(sink), client_name_(std::move(client_name)),
-        screen_w_(fallback_w), screen_h_(fallback_h), scale_factor_(scale_factor) {
+  Bridge(VirtualHidSink &sink, std::string client_name, int16_t fallback_w, int16_t fallback_h, double scale_factor)
+      : sink_(sink),
+        client_name_(std::move(client_name)),
+        screen_w_(fallback_w),
+        screen_h_(fallback_h),
+        scale_factor_(scale_factor)
+  {
     // query_main_display overwrites these if the live display is readable; if it
     // isn't (can happen at the login window), the caller-supplied fallback — the
     // machine's real size from config — is kept instead of a wrong hardcoded guess.
@@ -594,18 +768,24 @@ public:
     double backing_scale = 2.0;
     query_main_display(screen_w_, screen_h_, backing_scale);
     motion_scale_ = backing_scale * scale_factor_;
-    log_line("motion scale " + std::to_string(motion_scale_) + " (backing " +
-             std::to_string(backing_scale) + " x factor " + std::to_string(scale_factor_) + ")");
+    log_line(
+        "motion scale " + std::to_string(motion_scale_) + " (backing " + std::to_string(backing_scale) + " x factor " +
+        std::to_string(scale_factor_) + ")"
+    );
   }
 
   // Runs one connection to completion (returns on disconnect/error/close).
-  void run(FramedSocket &socket) {
-    if (!handshake(socket)) return;
+  void run(FramedSocket &socket)
+  {
+    if (!handshake(socket))
+      return;
     release_all();
     while (!g_stop.load()) {
       std::optional<std::vector<uint8_t>> message = socket.read_message();
-      if (!message) break;
-      if (!dispatch(socket, *message)) break;
+      if (!message)
+        break;
+      if (!dispatch(socket, *message))
+        break;
     }
     release_all();
   }
@@ -613,15 +793,16 @@ public:
 private:
   // One held key/modifier, keyed by the Deskflow physical button id so that
   // key-up matches key-down even if the reported KeyID changed meanwhile.
-  struct HeldKey {
+  struct HeldKey
+  {
     std::optional<uint16_t> usage; // none for pure modifier keys
     uint8_t modifier_bits = 0;
   };
 
-  bool handshake(FramedSocket &socket) {
+  bool handshake(FramedSocket &socket)
+  {
     std::optional<std::vector<uint8_t>> hello = socket.read_message();
-    if (!hello || hello->size() < 11 ||
-        std::memcmp(hello->data(), proto::kGreeting, sizeof(proto::kGreeting)) != 0) {
+    if (!hello || hello->size() < 11 || std::memcmp(hello->data(), proto::kGreeting, sizeof(proto::kGreeting)) != 0) {
       log_line("bad or missing server hello");
       return false;
     }
@@ -647,28 +828,48 @@ private:
       log_line("failed to send hello-back");
       return false;
     }
-    log_line("handshake complete as \"" + client_name_ + "\" (server v" +
-             std::to_string(*major) + "." + std::to_string(*minor) + ")");
+    log_line(
+        "handshake complete as \"" + client_name_ + "\" (server v" + std::to_string(*major) + "." +
+        std::to_string(*minor) + ")"
+    );
     return true;
   }
 
   // Returns false to terminate the connection.
-  bool dispatch(FramedSocket &socket, const std::vector<uint8_t> &body) {
-    if (body_has_code(body, proto::kKeepAlive)) return socket.write_message(body); // echo CALV
-    if (body_has_code(body, proto::kNoop)) return true;
-    if (body_has_code(body, proto::kClose)) return false;
-    if (body_has_code(body, proto::kQueryInfo)) return send_screen_info(socket);
-    if (body_has_code(body, proto::kEnter)) return on_enter(body);
-    if (body_has_code(body, proto::kLeave)) { release_all(); return true; }
-    if (body_has_code(body, proto::kMouseMove)) return on_mouse_abs(body);
-    if (body_has_code(body, proto::kMouseRelMove)) return on_mouse_rel(body);
-    if (body_has_code(body, proto::kMouseDown)) return on_mouse_button(body, true);
-    if (body_has_code(body, proto::kMouseUp)) return on_mouse_button(body, false);
-    if (body_has_code(body, proto::kMouseWheel)) return on_mouse_wheel(body);
-    if (body_has_code(body, proto::kKeyDown)) return on_key_down(body);
-    if (body_has_code(body, proto::kKeyDownLang)) return on_key_down(body); // v1.8 sends DKDL
-    if (body_has_code(body, proto::kKeyUp)) return on_key_up(body);
-    if (body_has_code(body, proto::kKeyRepeat)) return on_key_repeat(body);
+  bool dispatch(FramedSocket &socket, const std::vector<uint8_t> &body)
+  {
+    if (body_has_code(body, proto::kKeepAlive))
+      return socket.write_message(body); // echo CALV
+    if (body_has_code(body, proto::kNoop))
+      return true;
+    if (body_has_code(body, proto::kClose))
+      return false;
+    if (body_has_code(body, proto::kQueryInfo))
+      return send_screen_info(socket);
+    if (body_has_code(body, proto::kEnter))
+      return on_enter(body);
+    if (body_has_code(body, proto::kLeave)) {
+      release_all();
+      return true;
+    }
+    if (body_has_code(body, proto::kMouseMove))
+      return on_mouse_abs(body);
+    if (body_has_code(body, proto::kMouseRelMove))
+      return on_mouse_rel(body);
+    if (body_has_code(body, proto::kMouseDown))
+      return on_mouse_button(body, true);
+    if (body_has_code(body, proto::kMouseUp))
+      return on_mouse_button(body, false);
+    if (body_has_code(body, proto::kMouseWheel))
+      return on_mouse_wheel(body);
+    if (body_has_code(body, proto::kKeyDown))
+      return on_key_down(body);
+    if (body_has_code(body, proto::kKeyDownLang))
+      return on_key_down(body); // v1.8 sends DKDL
+    if (body_has_code(body, proto::kKeyUp))
+      return on_key_up(body);
+    if (body_has_code(body, proto::kKeyRepeat))
+      return on_key_repeat(body);
     // CIAK / CROP / DSOP / CSEC / CCLP and anything else: no input action.
     return true;
   }
@@ -679,8 +880,9 @@ private:
   // sub-rectangle of the real screen — the "invisible barrier". Retry briefly so a
   // not-yet-ready display is detected once WindowServer comes up, and log the
   // outcome so a genuine miss is diagnosable rather than silent.
-  static void query_main_display(int16_t &width, int16_t &height, double &backing_scale) {
-    backing_scale = 2.0; // sane default (these Macs are 2x Retina) if the query fails
+  static void query_main_display(int16_t &width, int16_t &height, double &backing_scale)
+  {
+    backing_scale = 2.0;                             // sane default (these Macs are 2x Retina) if the query fails
     for (int attempt = 0; attempt < 15; ++attempt) { // ~3s
       CGDirectDisplayID display = CGMainDisplayID();
       size_t w = CGDisplayPixelsWide(display);
@@ -690,30 +892,35 @@ private:
         height = static_cast<int16_t>(h);
         CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
         size_t pw = mode ? CGDisplayModeGetPixelWidth(mode) : w;
-        if (mode) CGDisplayModeRelease(mode);
-        if (w && pw) backing_scale = static_cast<double>(pw) / static_cast<double>(w);
-        log_line("display detected " + std::to_string(w) + "x" + std::to_string(h) +
-                 " (native px width " + std::to_string(pw) + ", backing scale " +
-                 std::to_string(backing_scale) + ")");
+        if (mode)
+          CGDisplayModeRelease(mode);
+        if (w && pw)
+          backing_scale = static_cast<double>(pw) / static_cast<double>(w);
+        log_line(
+            "display detected " + std::to_string(w) + "x" + std::to_string(h) + " (native px width " +
+            std::to_string(pw) + ", backing scale " + std::to_string(backing_scale) + ")"
+        );
         return;
       }
       std::this_thread::sleep_for(milliseconds(200));
     }
-    log_line("display NOT detected (CG returned 0) -> fallback " +
-             std::to_string(width) + "x" + std::to_string(height) +
-             " (cursor will be confined if this is wrong)");
+    log_line(
+        "display NOT detected (CG returned 0) -> fallback " + std::to_string(width) + "x" + std::to_string(height) +
+        " (cursor will be confined if this is wrong)"
+    );
   }
 
-  bool send_screen_info(FramedSocket &socket) {
+  bool send_screen_info(FramedSocket &socket)
+  {
     std::vector<uint8_t> info;
     append_bytes(info, proto::kInfo, sizeof(proto::kInfo));
-    append_be16(info, 0);                                    // screen origin x
-    append_be16(info, 0);                                    // screen origin y
-    append_be16(info, screen_w_);                            // width
-    append_be16(info, screen_h_);                            // height
-    append_be16(info, 0);                                    // obsolete warp-zone
-    append_be16(info, static_cast<int16_t>(screen_w_ / 2));  // initial cursor x
-    append_be16(info, static_cast<int16_t>(screen_h_ / 2));  // initial cursor y
+    append_be16(info, 0);                                   // screen origin x
+    append_be16(info, 0);                                   // screen origin y
+    append_be16(info, screen_w_);                           // width
+    append_be16(info, screen_h_);                           // height
+    append_be16(info, 0);                                   // obsolete warp-zone
+    append_be16(info, static_cast<int16_t>(screen_w_ / 2)); // initial cursor x
+    append_be16(info, static_cast<int16_t>(screen_h_ / 2)); // initial cursor y
     return socket.write_message(info);
   }
 
@@ -722,38 +929,44 @@ private:
   // the cursor there), then move to the target. Slamming to the nearest corner
   // minimizes visible travel, so the cursor lands cleanly at the host's reported
   // crossing point regardless of which edge the host sits on.
-  void warp_to(int x, int y) {
+  void warp_to(int x, int y)
+  {
     constexpr int kSlamDistance = 1 << 15; // exceeds any display dimension
     int corner_x = (2 * x < screen_w_) ? 0 : screen_w_;
     int corner_y = (2 * y < screen_h_) ? 0 : screen_h_;
-    emit_relative_raw(corner_x == 0 ? -kSlamDistance : kSlamDistance,
-                      corner_y == 0 ? -kSlamDistance : kSlamDistance);
+    emit_relative_raw(corner_x == 0 ? -kSlamDistance : kSlamDistance, corner_y == 0 ? -kSlamDistance : kSlamDistance);
     emit_relative(x - corner_x, y - corner_y);
     last_abs_x_ = x;
     last_abs_y_ = y;
     have_last_abs_ = true;
   }
 
-  bool on_enter(const std::vector<uint8_t> &body) {
+  bool on_enter(const std::vector<uint8_t> &body)
+  {
     ByteReader r(body);
     r.skip(4);
     std::optional<int16_t> x = r.i16();
     std::optional<int16_t> y = r.i16();
-    if (!r.ok() || !x || !y) return true;
+    if (!r.ok() || !x || !y)
+      return true;
     // Logs the host's crossing point against our reported size: if the host ever
     // drives near a boundary the bridge can't reach, the mismatch shows up here.
-    log_line("enter " + std::to_string(*x) + "," + std::to_string(*y) +
-             " of " + std::to_string(screen_w_) + "x" + std::to_string(screen_h_));
+    log_line(
+        "enter " + std::to_string(*x) + "," + std::to_string(*y) + " of " + std::to_string(screen_w_) + "x" +
+        std::to_string(screen_h_)
+    );
     warp_to(*x, *y);
     return true;
   }
 
-  bool on_mouse_abs(const std::vector<uint8_t> &body) {
+  bool on_mouse_abs(const std::vector<uint8_t> &body)
+  {
     ByteReader r(body);
     r.skip(4);
     std::optional<int16_t> x = r.i16();
     std::optional<int16_t> y = r.i16();
-    if (!r.ok() || !x || !y) return true;
+    if (!r.ok() || !x || !y)
+      return true;
     if (have_last_abs_)
       emit_relative(static_cast<int>(*x) - last_abs_x_, static_cast<int>(*y) - last_abs_y_);
     last_abs_x_ = *x;
@@ -762,46 +975,59 @@ private:
     return true;
   }
 
-  bool on_mouse_rel(const std::vector<uint8_t> &body) {
+  bool on_mouse_rel(const std::vector<uint8_t> &body)
+  {
     ByteReader r(body);
     r.skip(4);
     std::optional<int16_t> dx = r.i16();
     std::optional<int16_t> dy = r.i16();
-    if (!r.ok() || !dx || !dy) return true;
+    if (!r.ok() || !dx || !dy)
+      return true;
     emit_relative(*dx, *dy);
     return true;
   }
 
-  bool on_mouse_button(const std::vector<uint8_t> &body, bool down) {
+  bool on_mouse_button(const std::vector<uint8_t> &body, bool down)
+  {
     ByteReader r(body);
     r.skip(4);
     std::optional<uint8_t> synergy_button = r.u8();
-    if (!r.ok() || !synergy_button) return true;
+    if (!r.ok() || !synergy_button)
+      return true;
     uint8_t hid_button = synergy_button_to_hid(*synergy_button);
-    if (hid_button == 0) return true;
-    if (down) mouse_buttons_.insert(hid_button);
-    else mouse_buttons_.erase(hid_button);
+    if (hid_button == 0)
+      return true;
+    if (down)
+      mouse_buttons_.insert(hid_button);
+    else
+      mouse_buttons_.erase(hid_button);
     sink_.post_pointing(mouse_buttons_, 0, 0, 0, 0);
     return true;
   }
 
-  bool on_mouse_wheel(const std::vector<uint8_t> &body) {
+  bool on_mouse_wheel(const std::vector<uint8_t> &body)
+  {
     ByteReader r(body);
     r.skip(4);
     std::optional<int16_t> x = r.i16();
     std::optional<int16_t> y = r.i16();
-    if (!r.ok() || !x || !y) return true;
+    if (!r.ok() || !x || !y)
+      return true;
     int8_t vertical = clamp_to_i8(*y / 120);
     int8_t horizontal = clamp_to_i8(*x / 120);
-    if (vertical == 0 && *y != 0) vertical = (*y > 0) ? 1 : -1;
-    if (horizontal == 0 && *x != 0) horizontal = (*x > 0) ? 1 : -1;
+    if (vertical == 0 && *y != 0)
+      vertical = (*y > 0) ? 1 : -1;
+    if (horizontal == 0 && *x != 0)
+      horizontal = (*x > 0) ? 1 : -1;
     sink_.post_pointing(mouse_buttons_, 0, 0, vertical, horizontal);
     return true;
   }
 
-  bool on_key_down(const std::vector<uint8_t> &body) {
+  bool on_key_down(const std::vector<uint8_t> &body)
+  {
     int16_t key_id = 0, mask = 0, button = 0;
-    if (!parse_key(body, key_id, mask, button)) return true;
+    if (!parse_key(body, key_id, mask, button))
+      return true;
     HeldKey entry;
     uint8_t modifier_bit = modifier_keyid_to_bit(static_cast<uint16_t>(key_id));
     if (modifier_bit != 0) {
@@ -814,29 +1040,47 @@ private:
       }
       entry.usage = usage;
       entry.modifier_bits = mask_to_modifier_bits(static_cast<uint32_t>(static_cast<uint16_t>(mask)));
+      // The KeyID already names the character the server wants typed; a
+      // shifted character must carry shift even when the protocol mask
+      // lacks it (caps-lock-composed uppercase, relay-normalized masks).
+      if (keyid_requires_shift(static_cast<uint16_t>(key_id))) {
+        entry.modifier_bits |= static_cast<uint8_t>(hr::modifier::left_shift);
+      }
     }
     held_keys_[button] = entry;
+    log_line(
+        "key down id=0x" + to_hex(static_cast<uint16_t>(key_id)) + " mask=0x" + to_hex(static_cast<uint16_t>(mask)) +
+        " btn=" + std::to_string(button) + " -> usage=0x" + to_hex(entry.usage.value_or(0)) + " mods=0x" +
+        to_hex(entry.modifier_bits)
+    );
     emit_keyboard();
     return true;
   }
 
-  bool on_key_up(const std::vector<uint8_t> &body) {
+  bool on_key_up(const std::vector<uint8_t> &body)
+  {
     int16_t key_id = 0, mask = 0, button = 0;
-    if (!parse_key(body, key_id, mask, button)) return true;
+    if (!parse_key(body, key_id, mask, button))
+      return true;
     held_keys_.erase(button);
     emit_keyboard();
     return true;
   }
 
   // Auto-repeat: the held key is already down, so no report change is required.
-  bool on_key_repeat(const std::vector<uint8_t> &) { return true; }
+  bool on_key_repeat(const std::vector<uint8_t> &)
+  {
+    return true;
+  }
 
-  bool parse_key(const std::vector<uint8_t> &body, int16_t &key_id, int16_t &mask, int16_t &button) {
+  bool parse_key(const std::vector<uint8_t> &body, int16_t &key_id, int16_t &mask, int16_t &button)
+  {
     ByteReader r(body);
     r.skip(4);
     std::optional<int16_t> id = r.i16();
     std::optional<int16_t> m = r.i16();
-    if (!r.ok() || !id || !m) return false;
+    if (!r.ok() || !id || !m)
+      return false;
     std::optional<int16_t> b = r.i16(); // absent in 1.0 variant; default to KeyID
     key_id = *id;
     mask = *m;
@@ -844,18 +1088,23 @@ private:
     return true;
   }
 
-  std::optional<uint16_t> translate_key(uint16_t key_id) {
-    if (std::optional<uint16_t> special = special_keyid_to_usage(key_id)) return special;
-    if (key_id >= 0x20 && key_id <= 0x7e) return ascii_to_physical_usage(static_cast<char>(key_id));
+  std::optional<uint16_t> translate_key(uint16_t key_id)
+  {
+    if (std::optional<uint16_t> special = special_keyid_to_usage(key_id))
+      return special;
+    if (key_id >= 0x20 && key_id <= 0x7e)
+      return ascii_to_physical_usage(static_cast<char>(key_id));
     return std::nullopt;
   }
 
-  void emit_keyboard() {
+  void emit_keyboard()
+  {
     uint8_t modifiers = 0;
     std::set<uint16_t> keys;
     for (const auto &[button, held] : held_keys_) {
       modifiers |= held.modifier_bits;
-      if (held.usage) keys.insert(*held.usage);
+      if (held.usage)
+        keys.insert(*held.usage);
     }
     sink_.post_keyboard(modifiers, keys);
   }
@@ -869,7 +1118,8 @@ private:
   // the unscaled stepper, used for the corner slam (which only needs to be "big
   // enough" to hit the edge, so it must NOT be scaled again).
 
-  void emit_relative_raw(int dx, int dy) {
+  void emit_relative_raw(int dx, int dy)
+  {
     while (dx != 0 || dy != 0) {
       int8_t step_x = clamp_to_i8(dx);
       int8_t step_y = clamp_to_i8(dy);
@@ -879,11 +1129,13 @@ private:
     }
   }
 
-  void emit_relative(int dx, int dy) {
+  void emit_relative(int dx, int dy)
+  {
     emit_relative_raw(static_cast<int>(dx * motion_scale_), static_cast<int>(dy * motion_scale_));
   }
 
-  void release_all() {
+  void release_all()
+  {
     held_keys_.clear();
     mouse_buttons_.clear();
     have_last_abs_ = false;
@@ -891,21 +1143,31 @@ private:
     sink_.post_pointing({}, 0, 0, 0, 0);
   }
 
-  static int8_t clamp_to_i8(int v) {
+  static int8_t clamp_to_i8(int v)
+  {
     return static_cast<int8_t>(std::clamp(v, -127, 127));
   }
-  static uint8_t synergy_button_to_hid(uint8_t synergy_button) {
+  static uint8_t synergy_button_to_hid(uint8_t synergy_button)
+  {
     switch (synergy_button) {
-    case 1: return 1; // left
-    case 2: return 3; // middle
-    case 3: return 2; // right
-    default: return (synergy_button >= 1 && synergy_button <= 32) ? synergy_button : 0;
+    case 1:
+      return 1; // left
+    case 2:
+      return 3; // middle
+    case 3:
+      return 2; // right
+    default:
+      return (synergy_button >= 1 && synergy_button <= 32) ? synergy_button : 0;
     }
   }
-  static std::string to_hex(uint16_t v) {
+  static std::string to_hex(uint16_t v)
+  {
     static const char *digits = "0123456789abcdef";
     std::string s(4, '0');
-    for (int i = 3; i >= 0; --i) { s[i] = digits[v & 0xf]; v >>= 4; }
+    for (int i = 3; i >= 0; --i) {
+      s[i] = digits[v & 0xf];
+      v >>= 4;
+    }
     return s;
   }
 
@@ -918,8 +1180,8 @@ private:
   bool have_last_abs_ = false;
   int16_t screen_w_ = 1920;
   int16_t screen_h_ = 1080;
-  double scale_factor_ = 4.0;  // sensitivity knob (counts/point = backing x this); from arg
-  double motion_scale_ = 8.0;  // host-point -> HID-count scale; set per-display in ctor
+  double scale_factor_ = 4.0; // sensitivity knob (counts/point = backing x this); from arg
+  double motion_scale_ = 8.0; // host-point -> HID-count scale; set per-display in ctor
 
 public:
   static std::atomic<bool> g_stop;
@@ -929,7 +1191,8 @@ std::atomic<bool> Bridge::g_stop{false};
 
 } // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
   // Split flag arguments (--size=WxH, --scale=S) from positionals so the
   // launchd plist generated by the GUI can pass options without having to
   // fill every preceding positional slot. Legacy positional forms still work.
@@ -969,8 +1232,10 @@ int main(int argc, char **argv) {
   }
 
   if (positional.size() < 2) {
-    log_line("usage: deskflow-vhid-bridge <server_hosts> <client_screen_name> "
-             "[port [width height [scale_factor]]] [--size=WxH] [--scale=S] [--coord-port=N]");
+    log_line(
+        "usage: deskflow-vhid-bridge <server_hosts> <client_screen_name> "
+        "[port [width height [scale_factor]]] [--size=WxH] [--scale=S] [--coord-port=N]"
+    );
     return 2;
   }
 
@@ -1015,8 +1280,10 @@ int main(int argc, char **argv) {
   if (positional.size() >= 5) {
     long pw = std::strtol(positional[3].c_str(), nullptr, 10);
     long ph = std::strtol(positional[4].c_str(), nullptr, 10);
-    if (pw >= 16 && pw <= 32767) fallback_w = static_cast<int16_t>(pw);
-    if (ph >= 16 && ph <= 32767) fallback_h = static_cast<int16_t>(ph);
+    if (pw >= 16 && pw <= 32767)
+      fallback_w = static_cast<int16_t>(pw);
+    if (ph >= 16 && ph <= 32767)
+      fallback_h = static_cast<int16_t>(ph);
   }
   if (flag_w && flag_h) {
     fallback_w = *flag_w;
@@ -1028,7 +1295,8 @@ int main(int argc, char **argv) {
   double scale_factor = 4.0;
   if (positional.size() >= 6) {
     double s = std::strtod(positional[5].c_str(), nullptr);
-    if (s > 0.1 && s < 100.0) scale_factor = s;
+    if (s > 0.1 && s < 100.0)
+      scale_factor = s;
   }
   if (flag_scale)
     scale_factor = *flag_scale;

@@ -30,6 +30,15 @@ public:
 
   virtual bool start(RelayPassThroughQuery passThrough, KeyForwardSend send) = 0;
   virtual void stop() = 0;
+
+  //! True while the monitor's capture machinery is actually live.
+  /*!
+  Distinguishes "thread exists" from "capture works": a tap/hook that
+  failed to install (permissions, transient OS state) leaves a finished
+  thread behind. The coordination worker reconciles against this so a
+  client epoch can never silently run without its keyboard relay.
+  */
+  virtual bool running() const = 0;
 };
 
 std::unique_ptr<IKeyboardRelayMonitor> createKeyboardRelayMonitor();

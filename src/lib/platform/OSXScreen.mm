@@ -1209,7 +1209,7 @@ void OSXScreen::onMediaKey(CGEventRef event)
     return;
   }
 
-  LOG_VERBOSE("Media key event: keyID=0x%02x, %s, repeat=%s", keyID, (down ? "down" : "up"), (isRepeat ? "yes" : "no"));
+  LOG_DEBUG("media key event: keyID=0x%02x, %s, repeat=%s", keyID, (down ? "down" : "up"), (isRepeat ? "yes" : "no"));
 
   KeyButton button = 0;
   KeyModifierMask mask = m_keyState->getActiveModifiers();

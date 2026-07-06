@@ -34,7 +34,11 @@ public:
   bool start(RelayPassThroughQuery passThrough, KeyForwardSend send) override
   {
     if (m_thread.joinable()) {
-      return true;
+      if (m_active) {
+        return true;
+      }
+      // Thread finished without a live hook: reap and retry fresh.
+      stop();
     }
     m_passThrough = std::move(passThrough);
     m_send = std::move(send);
@@ -53,6 +57,11 @@ public:
       m_thread.join();
     }
     m_threadId = 0;
+  }
+
+  bool running() const override
+  {
+    return m_active;
   }
 
 private:
@@ -102,6 +111,7 @@ private:
       g_relayInstance = nullptr;
       return;
     }
+    m_active = true;
     LOG_DEBUG("coordination: keyboard relay monitor started");
 
     MSG message;
@@ -110,6 +120,7 @@ private:
       DispatchMessageW(&message);
     }
 
+    m_active = false;
     UnhookWindowsHookEx(m_hook);
     m_hook = nullptr;
     g_relayInstance = nullptr;
@@ -120,6 +131,7 @@ private:
   KeyForwardSend m_send;
   std::thread m_thread;
   std::atomic<bool> m_running{false};
+  std::atomic<bool> m_active{false}; //!< hook installed and pumping
   DWORD m_threadId = 0;
   HHOOK m_hook = nullptr;
 };

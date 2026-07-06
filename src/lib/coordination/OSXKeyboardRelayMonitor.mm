@@ -31,7 +31,12 @@ public:
   bool start(RelayPassThroughQuery passThrough, KeyForwardSend send) override
   {
     if (m_thread.joinable()) {
-      return true;
+      if (m_active) {
+        return true;
+      }
+      // Thread finished without a live tap (permission/transient failure):
+      // reap it so the retry below can actually start a fresh one.
+      stop();
     }
     m_passThrough = std::move(passThrough);
     m_send = std::move(send);
@@ -52,6 +57,11 @@ public:
     m_runLoop = nullptr;
   }
 
+  bool running() const override
+  {
+    return m_active;
+  }
+
 private:
   static CGEventRef tapCallback(CGEventTapProxy, CGEventType type, CGEventRef event, void *refcon)
   {
@@ -67,9 +77,11 @@ private:
     // system-defined events, not key down/up. Forward a single Down per
     // press; the injector's fakeMediaKey emits the full down+up on the target.
     if (type == static_cast<CGEventType>(NX_SYSDEFINED)) {
-      // Ignore our own injected media events (genuine hardware has pid 0),
-      // matching the standard-key path's guard against feedback loops.
-      if (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0) {
+      // Only ignore OUR OWN injected media events (fakeNativeMediaKey posts
+      // from this process). Genuine hardware media keys are re-posted by
+      // macOS system processes and arrive with a NON-zero source pid, so a
+      // pid != 0 guard silently ate every real brightness/volume press.
+      if (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid()) {
         return event;
       }
       KeyID mediaId = kKeyNone;
@@ -85,6 +97,7 @@ private:
       // full tap on the Down (the Up is a no-op there); a Windows target maps
       // the media KeyID like a normal key and needs the Up to release the VK,
       // otherwise it stays logically held. Both halves are swallowed locally.
+      LOG_DEBUG("coordination: relaying media key 0x%04x %s", mediaId, down ? "down" : "up");
       if (self->m_send) {
         self->m_send(down ? Message::KeyPhase::Down : Message::KeyPhase::Up, mediaId, 0, 0, {});
       }
@@ -95,8 +108,12 @@ private:
       return event;
     }
 
+    // Feedback-loop guard: never re-relay keys this process injected (the
+    // server typing into this screen posts from deskflow-core itself).
+    // Other processes' synthetic keys (dictation tools, Karabiner) are
+    // user input and must relay like hardware.
     const auto sourcePid = CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID);
-    if (sourcePid != 0) {
+    if (sourcePid == getpid()) {
       return event;
     }
 
@@ -123,7 +140,8 @@ private:
     const CGEventMask mask =
         CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(NX_SYSDEFINED);
 
-    m_tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, tapCallback, this);
+    m_tap =
+        CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, tapCallback, this);
     if (m_tap == nullptr) {
       LOG_WARN("coordination: keyboard relay tap unavailable (input monitoring permission?)");
       return;
@@ -133,12 +151,14 @@ private:
     CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_tap, 0);
     CFRunLoopAddSource(m_runLoop, source, kCFRunLoopCommonModes);
     CGEventTapEnable(m_tap, true);
+    m_active = true;
     LOG_DEBUG("coordination: keyboard relay monitor started");
 
     while (m_running) {
       CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, true);
     }
 
+    m_active = false;
     CGEventTapEnable(m_tap, false);
     CFRunLoopRemoveSource(m_runLoop, source, kCFRunLoopCommonModes);
     CFRelease(source);
@@ -151,6 +171,7 @@ private:
   KeyForwardSend m_send;
   std::thread m_thread;
   std::atomic<bool> m_running{false};
+  std::atomic<bool> m_active{false}; //!< tap installed and pumping
   CFMachPortRef m_tap = nullptr;
   CFRunLoopRef m_runLoop = nullptr;
 };

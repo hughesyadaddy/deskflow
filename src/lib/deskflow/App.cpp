@@ -123,10 +123,18 @@ void App::run(QThread &coreThread)
 
 void App::setupFileLogging()
 {
+  // Once per process: in auto (coordinated) mode a new App is constructed
+  // for every role epoch, and stacking a FileLogOutputter per epoch
+  // multiplied every log line by the number of epochs since launch.
+  static bool s_fileLogAttached = false;
+  if (s_fileLogAttached) {
+    return;
+  }
   if (Settings::value(Settings::Log::ToFile).toBool()) {
     const auto file = Settings::value(Settings::Log::File).toString();
     m_fileLog = new FileLogOutputter(file); // NOSONAR - Adopted by `Log`
     CLOG->insert(m_fileLog);
+    s_fileLogAttached = true;
     LOG_VERBOSE("logging to file (%s) enabled", qPrintable(file));
   }
 }
