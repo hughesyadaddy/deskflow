@@ -8,6 +8,8 @@
 
 #include "platform/MSWindowsDesks.h"
 
+#include "platform/InjectionCoalesce.h"
+
 #include "arch/Arch.h"
 #include "base/IEventQueue.h"
 #include "base/IJob.h"
@@ -481,8 +483,8 @@ void MSWindowsDesks::deskMouseMove(int32_t x, int32_t y) const
   // MOVE_NOCOALESCE: deliver every injected position instead of letting the
   // OS merge queued moves, so fast cursor motion is not decimated into jumps.
   send_mouse_input(
-      MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE_NOCOALESCE,
-      (DWORD)((65535.0f * x) / (w - 1) + 0.5f), (DWORD)((65535.0f * y) / (h - 1) + 0.5f), 0
+      MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE_NOCOALESCE, (DWORD)((65535.0f * x) / (w - 1) + 0.5f),
+      (DWORD)((65535.0f * y) / (h - 1) + 0.5f), 0
   );
 }
 
@@ -773,15 +775,44 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       ackNeeded = false;
       break;
 
-    case DESKFLOW_MSG_FAKE_MOVE:
+    case DESKFLOW_MSG_FAKE_MOVE: {
+      // Backlog valve: supersede consecutively queued absolute moves and
+      // inject only the newest position. A slow third-party WH_MOUSE_LL
+      // hook (Mouser, PowerToys, overlays) otherwise turns the NOCOALESCE
+      // firehose into an unbounded input backlog that freezes the cursor.
+      // Head-of-queue peeking (never a filtered drain) preserves ordering
+      // with interleaved button/key/wheel messages exactly.
+      MSG next;
+      for (int drained = 0; drained < deskflow::platform::kMaxCoalescedMoves &&
+                            PeekMessage(&next, nullptr, 0, 0, PM_NOREMOVE) && next.message == DESKFLOW_MSG_FAKE_MOVE;
+           ++drained) {
+        PeekMessage(&next, nullptr, 0, 0, PM_REMOVE);
+        msg.wParam = next.wParam;
+        msg.lParam = next.lParam;
+      }
       deskMouseMove(static_cast<int32_t>(msg.wParam), static_cast<int32_t>(msg.lParam));
       ackNeeded = false;
       break;
+    }
 
-    case DESKFLOW_MSG_FAKE_REL_MOVE:
-      deskMouseRelativeMove(static_cast<int32_t>(msg.wParam), static_cast<int32_t>(msg.lParam));
+    case DESKFLOW_MSG_FAKE_REL_MOVE: {
+      // Same valve for relative motion, but SUM the deltas -- relative
+      // moves are the in-game aim path and must never be dropped.
+      int64_t dx = static_cast<int32_t>(msg.wParam);
+      int64_t dy = static_cast<int32_t>(msg.lParam);
+      MSG next;
+      for (int drained = 0;
+           drained < deskflow::platform::kMaxCoalescedMoves && PeekMessage(&next, nullptr, 0, 0, PM_NOREMOVE) &&
+           next.message == DESKFLOW_MSG_FAKE_REL_MOVE;
+           ++drained) {
+        PeekMessage(&next, nullptr, 0, 0, PM_REMOVE);
+        dx += static_cast<int32_t>(next.wParam);
+        dy += static_cast<int32_t>(next.lParam);
+      }
+      deskMouseRelativeMove(deskflow::platform::clampMoveDelta(dx), deskflow::platform::clampMoveDelta(dy));
       ackNeeded = false;
       break;
+    }
 
     case DESKFLOW_MSG_FAKE_WHEEL:
       // XXX -- add support for x-axis scrolling

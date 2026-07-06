@@ -1,6 +1,15 @@
 # SPDX-FileCopyrightText: (C) 2025 Deskflow Developers
 # SPDX-License-Identifier: MIT
 
+# Platform-neutral: InjectionCoalesce.h is a pure header (no Win32 deps).
+create_test(
+  NAME InjectionCoalesceTests
+  DEPENDS platform
+  LIBS base arch
+  SOURCE InjectionCoalesceTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
+)
+
 if (WIN32)
   create_test(
     NAME MSWindowsClipboardTests
