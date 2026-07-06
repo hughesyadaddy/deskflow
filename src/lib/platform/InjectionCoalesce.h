@@ -26,11 +26,14 @@ path); a pathological backlog of extreme deltas must not wrap.
 */
 inline int32_t clampMoveDelta(int64_t delta)
 {
-  if (delta > std::numeric_limits<int32_t>::max()) {
-    return std::numeric_limits<int32_t>::max();
+  // Parenthesized calls: Windows.h defines min/max as macros.
+  constexpr int64_t kMax = (std::numeric_limits<int32_t>::max)();
+  constexpr int64_t kMin = (std::numeric_limits<int32_t>::min)();
+  if (delta > kMax) {
+    return static_cast<int32_t>(kMax);
   }
-  if (delta < std::numeric_limits<int32_t>::min()) {
-    return std::numeric_limits<int32_t>::min();
+  if (delta < kMin) {
+    return static_cast<int32_t>(kMin);
   }
   return static_cast<int32_t>(delta);
 }
