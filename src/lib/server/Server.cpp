@@ -257,10 +257,29 @@ void Server::adoptClient(BaseClientProxy *client)
 
   // add client to client list
   if (!addClient(client)) {
-    // can only have one screen with a given name at any given time
-    LOG_WARN("a client with name \"%s\" is already connected", getName(client).c_str());
-    closeClient(client, kMsgEBusy);
-    return;
+    // An entry with this name already exists. The usual cause is a client
+    // that was killed and relaunched before the server noticed its old
+    // socket die (deploy/restart): rejecting would block the reconnect for
+    // the full close timeout. Adopt the new connection and drop the ghost —
+    // unless the name collides with the primary screen itself.
+    BaseClientProxy *stale = nullptr;
+    if (auto found = m_clients.find(getName(client)); found != m_clients.end()) {
+      stale = found->second;
+    }
+    if (stale == nullptr || stale == m_primaryClient) {
+      // can only have one screen with a given name at any given time
+      LOG_WARN("a client with name \"%s\" is already connected", getName(client).c_str());
+      closeClient(client, kMsgEBusy);
+      return;
+    }
+
+    LOG_INFO("adopting new connection for \"%s\", dropping stale client", getName(client).c_str());
+    closeClient(stale, kMsgCClose);
+    if (!addClient(client)) {
+      LOG_WARN("a client with name \"%s\" is already connected", getName(client).c_str());
+      closeClient(client, kMsgEBusy);
+      return;
+    }
   }
   LOG_DEBUG("client \"%s\" has connected", getName(client).c_str());
   ipcSendConnectionState(deskflow::core::ConnectionState::Connected);
