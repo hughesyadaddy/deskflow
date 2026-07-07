@@ -2,6 +2,15 @@
 # Runs ON a Mac (local or via SSH). Pull fleet branch, signed build, install.
 set -euo pipefail
 
+# Non-interactive SSH shells skip login profiles; Homebrew tools must be on PATH.
+if [[ -x /opt/homebrew/bin/brew ]]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [[ -x /usr/local/bin/brew ]]; then
+  eval "$(/usr/local/bin/brew shellenv)"
+else
+  export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DESKFLOW_ROOT="${FLEET_DESKFLOW_ROOT:-$ROOT}"
 DESKFLOW_ROOT="${DESKFLOW_ROOT/#\~/$HOME}"
