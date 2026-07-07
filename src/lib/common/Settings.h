@@ -96,6 +96,11 @@ public:
     inline static const auto Elevate = QStringLiteral("daemon/elevate");
     inline static const auto LogFile = QStringLiteral("daemon/logFile");
     inline static const auto LogLevel = QStringLiteral("daemon/logLevel");
+    // Run the core with a UIAccess token on the normal desktop so its injected
+    // input reaches elevated foreground windows (e.g. an elevated PowerToys),
+    // which UIPI otherwise blocks for a medium-integrity injector. Requires the
+    // core binary to be Authenticode-signed and installed under Program Files.
+    inline static const auto UiAccessCore = QStringLiteral("daemon/uiAccessCore");
   };
   struct Gui
   {

@@ -190,6 +190,9 @@ QVariant Settings::defaultValue(const QString &key)
   if (key == Daemon::Elevate)
     return !Settings::isPortableMode();
 
+  if (key == Daemon::UiAccessCore)
+    return !Settings::isPortableMode();
+
   if (key == Gui::UpdateCheckUrl)
     return kUrlUpdateCheck;
 

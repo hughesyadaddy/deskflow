@@ -343,8 +343,17 @@ void MSWindowsWatchdog::startProcess()
   const bool elevate = loginScreenActive();
   m_lastElevated = elevate;
 
+  // Grant UIAccess on the normal desktop (not the login screen, which is
+  // already SYSTEM). UIAccess raises the core enough to bypass UIPI, so its
+  // injected input reaches an elevated foreground window (e.g. elevated
+  // PowerToys) instead of being dropped -- while remaining visible to
+  // PowerToys' own low-level hook so remaps still apply. Windows only honors
+  // the UIAccess bit if the binary is Authenticode-signed and under Program
+  // Files; if it isn't, the bit is silently ignored (medium core).
+  const bool uiAccess = !elevate && m_uiAccessCore;
+
   LOG_INFO("running command: %ls", m_command.c_str());
-  LOG_INFO("core integrity: %s", elevate ? "SYSTEM (login screen active)" : "medium");
+  LOG_INFO("core integrity: %s", elevate ? "SYSTEM (login screen active)" : (uiAccess ? "medium + UIAccess" : "medium"));
 
   BOOL createRet;
   if (m_foreground) {
@@ -357,12 +366,17 @@ void MSWindowsWatchdog::startProcess()
     ZeroMemory(&sa, sizeof(SECURITY_ATTRIBUTES));
     HANDLE userToken = getUserToken(&sa, elevate);
 
-    // UIAccess lets the elevated core drive the secure/login desktop UI. Only
-    // set it on the login-screen path; on the normal desktop the core is medium
-    // with no UIAccess so PowerToys/Mouser hooks see its input.
-    if (elevate) {
-      DWORD uiAccess = 1;
-      SetTokenInformation(userToken, TokenUIAccess, &uiAccess, sizeof(DWORD));
+    // Request UIAccess on the token. On the login screen the SYSTEM token
+    // already drives the secure desktop; on the normal desktop this is what
+    // lets the (medium) core reach elevated windows.
+    if (elevate || uiAccess) {
+      DWORD enable = 1;
+      if (!SetTokenInformation(userToken, TokenUIAccess, &enable, sizeof(DWORD))) {
+        LOG_WARN(
+            "could not set UIAccess on core token (error %s); core may be unable to reach elevated windows",
+            windowsErrorToString(GetLastError()).c_str()
+        );
+      }
     }
 
     createRet = m_process->startAsUser(userToken, &sa);
@@ -394,13 +408,14 @@ void MSWindowsWatchdog::startProcess()
   }
 }
 
-void MSWindowsWatchdog::setProcessConfig(const std::string_view &command)
+void MSWindowsWatchdog::setProcessConfig(const std::string_view &command, bool uiAccessCore)
 {
   LOG_VERBOSE("locking process state mutex for watchdog config change");
   std::scoped_lock lock{m_processStateMutex};
 
-  LOG_DEBUG("setting watchdog process config");
+  LOG_DEBUG("setting watchdog process config (uiAccessCore=%s)", uiAccessCore ? "yes" : "no");
   m_command = std::wstring(command.begin(), command.end());
+  m_uiAccessCore = uiAccessCore;
 
   if (m_command.empty()) {
     LOG_DEBUG("command cleared, queueing process stop");

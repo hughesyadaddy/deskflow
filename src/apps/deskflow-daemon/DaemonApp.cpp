@@ -97,8 +97,11 @@ void DaemonApp::applyWatchdogCommand() const
   const auto corePath = QStringLiteral("%1/%2").arg(QCoreApplication::applicationDirPath(), kCoreBinName);
   const auto command = QStringLiteral("\"%1\" %2 --settings \"%3\"").arg(corePath, modeArg, m_configFile).toStdString();
 
-  LOG_DEBUG("applying watchdog command");
-  m_pWatchdog->setProcessConfig(command);
+  const auto uiAccessCore =
+      config.value(Settings::Daemon::UiAccessCore, !Settings::isPortableMode()).toBool();
+
+  LOG_DEBUG("applying watchdog command (uiAccessCore: %s)", uiAccessCore ? "yes" : "no");
+  m_pWatchdog->setProcessConfig(command, uiAccessCore);
 #else
   LOG_ERR("applying watchdog command not implemented on this platform");
 #endif
@@ -113,7 +116,7 @@ void DaemonApp::clearWatchdogCommand()
   Settings::setValue(Settings::Daemon::ConfigFile);
 
 #if defined(Q_OS_WIN)
-  m_pWatchdog->setProcessConfig("");
+  m_pWatchdog->setProcessConfig("", false);
 #else
   LOG_ERR("clearing watchdog command not implemented on this platform");
 #endif

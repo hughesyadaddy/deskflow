@@ -52,11 +52,13 @@ public:
   /**
    * @brief Set the command to run for the core process.
    *
-   * The core always runs at the user's (medium) integrity; the watchdog never
-   * elevates it (see plan 2026-07-07). Secure-desktop input is the VHID
-   * bridge's responsibility.
+   * @param uiAccessCore when true, grant the core a UIAccess token on the
+   * normal desktop so its injected input reaches elevated foreground windows
+   * (e.g. an elevated PowerToys) that UIPI would otherwise block for a plain
+   * medium-integrity injector. The core is still SYSTEM-elevated only while the
+   * login/lock screen is active (see plan 2026-07-07).
    */
-  void setProcessConfig(const std::string_view &command);
+  void setProcessConfig(const std::string_view &command, bool uiAccessCore);
 
   /**
    * @brief Stop the main loop and output loop threads.
@@ -160,6 +162,7 @@ private:
   HANDLE m_outputReadPipe = nullptr;
   bool m_awaitingUserSession = false; // true while deferring launch for a login/lock screen
   bool m_lastElevated = false;        // integrity the running core was launched at (login-screen elevate)
+  bool m_uiAccessCore = false;        // grant UIAccess on the normal desktop (reach elevated windows)
   MSWindowsSession m_session;
   int m_startFailures = 0;
   FileLogOutputter &m_fileLogOutputter;
