@@ -42,6 +42,12 @@ SettingsDialog::SettingsDialog(QWidget *parent, const ServerConfig &serverConfig
 
   ui->setupUi(this);
 
+  // The daemon no longer elevates the core (see plan 2026-07-07): the core runs
+  // at medium integrity for its whole life so user-level hooks (PowerToys) keep
+  // working, and the secure desktop is reached by the VHID bridge. Hide the now
+  // inert elevate toggle rather than present a no-op control.
+  ui->cbElevateDaemon->setVisible(false);
+
   // these are enabled by the control next to them
   ui->lineCommandEnter->setEnabled(false);
   ui->lineCommandExit->setEnabled(false);

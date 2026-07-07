@@ -77,7 +77,6 @@ void DaemonApp::applyWatchdogCommand() const
 
   QSettings config(m_configFile, QSettings::IniFormat);
   const auto coreMode = config.value(Settings::Core::CoreMode).toInt();
-  const auto elevate = config.value(Settings::Daemon::Elevate, !Settings::isPortableMode()).toBool();
 
   QString modeArg;
   if (coreMode == Settings::CoreMode::Server) {
@@ -86,10 +85,9 @@ void DaemonApp::applyWatchdogCommand() const
     modeArg = QStringLiteral("client");
   } else if (coreMode == Settings::CoreMode::Auto) {
     // Auto (native coordination mesh) runs server and client epochs in one
-    // core process. The watchdog relaunches it across desktops including the
-    // secure/Winlogon desktop, so the elected-server/client role is driven by
-    // the mesh and the machine is reachable at the login window -- the Windows
-    // counterpart to the macOS vhid-bridge LoginWindow agent.
+    // core process. The core stays at medium integrity for its whole life; the
+    // secure/login desktop is reached by the VHID bridge, not by relaunching
+    // the core elevated (see plan 2026-07-07).
     modeArg = QStringLiteral("auto");
   } else {
     LOG_ERR("cannot apply watchdog command: invalid core mode in config: %d", coreMode);
@@ -99,12 +97,8 @@ void DaemonApp::applyWatchdogCommand() const
   const auto corePath = QStringLiteral("%1/%2").arg(QCoreApplication::applicationDirPath(), kCoreBinName);
   const auto command = QStringLiteral("\"%1\" %2 --settings \"%3\"").arg(corePath, modeArg, m_configFile).toStdString();
 
-  LOG_DEBUG("applying watchdog command (elevate: %s)", elevate ? "yes" : "no");
-  m_pWatchdog->setElevationContext(
-      config.value(Settings::Core::ComputerName).toString().toStdString(),
-      static_cast<uint16_t>(config.value(Settings::Coordination::Port).toUInt())
-  );
-  m_pWatchdog->setProcessConfig(command, elevate);
+  LOG_DEBUG("applying watchdog command");
+  m_pWatchdog->setProcessConfig(command);
 #else
   LOG_ERR("applying watchdog command not implemented on this platform");
 #endif
@@ -119,7 +113,7 @@ void DaemonApp::clearWatchdogCommand()
   Settings::setValue(Settings::Daemon::ConfigFile);
 
 #if defined(Q_OS_WIN)
-  m_pWatchdog->setProcessConfig("", false);
+  m_pWatchdog->setProcessConfig("");
 #else
   LOG_ERR("clearing watchdog command not implemented on this platform");
 #endif

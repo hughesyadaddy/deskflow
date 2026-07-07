@@ -13,7 +13,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
-#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,7 +23,11 @@ typedef VOID(WINAPI *SendSas)(BOOL asUser);
 class FileLogOutputter;
 
 /**
- * @brief Monitors and controls a core process on Windows, elevating if necessary.
+ * @brief Monitors and (re)starts the core process on Windows at medium integrity.
+ *
+ * The watchdog relaunches the core only on crash or console-session change. It
+ * never elevates the core: doing so broke user-level input hooks (PowerToys)
+ * and could not reach the UAC secure desktop anyway (see plan 2026-07-07).
  */
 class MSWindowsWatchdog
 {
@@ -47,14 +50,13 @@ public:
   void startAsync();
 
   /**
-   * @brief Set the command to run and whether to elevate the process.
+   * @brief Set the command to run for the core process.
+   *
+   * The core always runs at the user's (medium) integrity; the watchdog never
+   * elevates it (see plan 2026-07-07). Secure-desktop input is the VHID
+   * bridge's responsibility.
    */
-  void setProcessConfig(const std::string_view &command, bool elevate);
-
-  /**
-   * @brief Local identity and coordination port for cursor-host-aware elevation.
-   */
-  void setElevationContext(const std::string &selfName, uint16_t coordPort);
+  void setProcessConfig(const std::string_view &command);
 
   /**
    * @brief Stop the main loop and output loop threads.
@@ -78,64 +80,28 @@ private:
   void outputLoop(const void *);
 
   /**
-   * @brief Duplicates the process token for the given process.
+   * @brief Get a security token for the active user session.
    *
-   * Required for starting a process in the user session; when we start an elevated process
-   * to ensure that it has access to secure processes, such as the login screen, we duplicate
-   * the token of an existing process that has the necessary access such as `winlogon.exe`.
-   *
-   * @param process The process to duplicate the token from (typically `winlogon.exe`).
+   * Throws NoInteractiveSessionError when no user is logged on (login/lock
+   * screen), so the caller can treat it as a benign wait state rather than a
+   * start failure.
    */
-  HANDLE duplicateProcessToken(HANDLE process, LPSECURITY_ATTRIBUTES security);
+  HANDLE getUserToken(LPSECURITY_ATTRIBUTES security);
 
   /**
-   * @brief Get a security token for the user session.
-   *
-   * Checks to see if logonui.exe is running or if the `elevatedToken` arg is true,
-   * which indicates either we're in a secure user session or we need an elevated token.
-   * If either case is true, it duplicates the token from `winlogon.exe`.
-   */
-  HANDLE getUserToken(LPSECURITY_ATTRIBUTES security, bool elevatedToken);
-
-  /**
-   * @brief Start the core process, elevating if necessary.
+   * @brief Start the core process at the user's (medium) integrity.
    */
   void startProcess();
-
-  /**
-   * @brief True while the secure/login desktop is active.
-   *
-   * The daemon runs in session 0 and cannot query session 1's input desktop, so
-   * this detects it by the presence of consent.exe (UAC elevation prompt) or
-   * LogonUI.exe (lock/login screen). Only a SYSTEM-level core can inject on
-   * those desktops; otherwise a medium-integrity core is preferred so user-level
-   * hook tools (PowerToys, Mouser) can see its input. Drives "auto" elevation.
-   */
-  bool secureDesktopActive();
-
-  /**
-   * @brief True when the core should run elevated on the secure/login desktop.
-   *
-   * When coordination is available, elevation is limited to epochs where the
-   * fleet cursor is on this machine so UAC/login injection targets the right host.
-   *
-   * Reads the cached result of refreshWantsElevatedCore(); safe to call under
-   * m_processStateMutex (no blocking I/O).
-   */
-  bool wantsElevatedCore() const;
-
-  /**
-   * @brief Re-poll the fleet cursor host for the elevation decision.
-   *
-   * Blocks up to 500 ms on a localhost TCP poll -- must be called WITHOUT
-   * m_processStateMutex held, or daemon IPC stalls behind the poll.
-   */
-  void refreshWantsElevatedCore();
 
   /**
    * @brief Controls whether the process should restart immediately or delay start.
    */
   ProcessState handleStartError(const std::string_view &message = "");
+
+  /**
+   * @brief Reschedule quietly when no interactive user session is available yet.
+   */
+  ProcessState handleNoInteractiveSession();
 
   /**
    * @brief Init the output read pipe for standard out/error.
@@ -171,14 +137,7 @@ private:
   std::unique_ptr<Thread> m_sasThread;
   HANDLE m_outputWritePipe = nullptr;
   HANDLE m_outputReadPipe = nullptr;
-  bool m_elevateProcess = false;
-  std::string m_selfName;
-  uint16_t m_coordPort = 0;
-  bool m_lastElevated = false; // integrity the running core was launched at (for auto-elevate transitions)
-  std::atomic<bool> m_cachedWantsElevated{false}; // refreshed outside the lock each loop iteration
-  std::optional<bool> m_pendingElevated;          // debounced secure-desktop target integrity
-  std::optional<double> m_pendingElevatedSince;   // Arch::time() when pending transition began
-  static constexpr double kSecureDesktopDebounceSeconds = 1.5;
+  bool m_awaitingUserSession = false; // true while deferring launch for a login/lock screen
   MSWindowsSession m_session;
   int m_startFailures = 0;
   FileLogOutputter &m_fileLogOutputter;

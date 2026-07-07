@@ -12,8 +12,6 @@
 #include "base/LogOutputters.h"
 #include "base/TMethodJob.h"
 #include "common/Constants.h"
-#include "common/CoordinationLocalStatus.h"
-#include "common/FleetCursor.h"
 #include "common/LogLevel.h"
 #include "deskflow/App.h"
 #include "mt/Thread.h"
@@ -24,6 +22,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <Wtsapi32.h>
 #include <shlobj.h>
 #include <tchar.h>
 #include <tlhelp32.h>
@@ -67,42 +66,16 @@ HANDLE openProcessForKill(const PROCESSENTRY32 &entry)
   return handle;
 }
 
-// UAC auto-dismisses the consent prompt after ~2 minutes, so any consent.exe
-// older than this is hung or leaked. Treating it as "secure desktop active"
-// would flap the core between elevated/user tokens on every cursor edge-cross
-// (the elevate decision follows the fleet cursor host) — killing and
-// relaunching deskflow-core for as long as the zombie process lives.
-static constexpr double kMaxConsentAgeSeconds = 180.0;
-
-static bool processYoungerThan(DWORD pid, double maxAgeSeconds)
+// Thrown when the medium-integrity core cannot launch because no interactive
+// user is logged on (login/lock screen). This is an expected wait state, not a
+// crash -- the watchdog reschedules quietly instead of crit-logging and backing
+// off like a real start failure.
+struct NoInteractiveSessionError : std::runtime_error
 {
-  MSWindowsHandle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
-  if (process.get() == nullptr) {
-    return true; // can't inspect it; assume it's a live prompt
+  NoInteractiveSessionError() : std::runtime_error("no interactive user session")
+  {
   }
-
-  FILETIME create;
-  FILETIME exit;
-  FILETIME kernel;
-  FILETIME user;
-  if (!GetProcessTimes(process.get(), &create, &exit, &kernel, &user)) {
-    return true;
-  }
-
-  FILETIME nowFileTime;
-  GetSystemTimeAsFileTime(&nowFileTime);
-
-  ULARGE_INTEGER created;
-  created.LowPart = create.dwLowDateTime;
-  created.HighPart = create.dwHighDateTime;
-  ULARGE_INTEGER now;
-  now.LowPart = nowFileTime.dwLowDateTime;
-  now.HighPart = nowFileTime.dwHighDateTime;
-
-  // FILETIME is in 100ns units.
-  const double ageSeconds = static_cast<double>(now.QuadPart - created.QuadPart) / 1e7;
-  return ageSeconds < maxAgeSeconds;
-}
+};
 
 //
 // MSWindowsWatchdog
@@ -143,69 +116,28 @@ void MSWindowsWatchdog::stop()
 }
 
 HANDLE
-MSWindowsWatchdog::duplicateProcessToken(HANDLE process, LPSECURITY_ATTRIBUTES security)
-{
-  HANDLE sourceToken;
-
-  BOOL tokenRet = OpenProcessToken(process, TOKEN_ASSIGN_PRIMARY | TOKEN_ALL_ACCESS, &sourceToken);
-
-  if (!tokenRet) {
-    LOG_ERR("could not open token, process handle: %d", process);
-    throw std::runtime_error(windowsErrorToString(GetLastError()));
-  }
-
-  LOG_DEBUG("got token %i, duplicating", sourceToken);
-
-  HANDLE newToken;
-  BOOL duplicateRet = DuplicateTokenEx(
-      sourceToken, TOKEN_ASSIGN_PRIMARY | TOKEN_ALL_ACCESS, security, SecurityImpersonation, TokenPrimary, &newToken
-  );
-
-  if (!duplicateRet) {
-    CloseHandle(sourceToken);
-    LOG_ERR("could not duplicate token %i", sourceToken);
-    throw std::runtime_error(windowsErrorToString(GetLastError()));
-  }
-
-  CloseHandle(sourceToken);
-  LOG_DEBUG("duplicated, new token: %i", newToken);
-  return newToken;
-}
-
-HANDLE
-MSWindowsWatchdog::getUserToken(LPSECURITY_ATTRIBUTES security, bool elevatedToken)
+MSWindowsWatchdog::getUserToken(LPSECURITY_ATTRIBUTES security)
 {
   m_session.updateActiveSession();
 
-  if (elevatedToken) {
-
-    LOG_DEBUG("getting elevated token");
-
-    HANDLE process;
-    if (!m_session.isProcessInSession(L"winlogon.exe", &process)) {
-      throw std::runtime_error("cannot get user token without winlogon.exe");
+  // Probe the active console session first so we can distinguish the benign
+  // "no user logged on" case (login/lock screen -> wait and retry) from real
+  // token failures (missing SeTcbPrivilege, duplication errors) that must
+  // escalate to the crit-log/backoff path instead of retrying forever.
+  HANDLE probe = nullptr;
+  if (!WTSQueryUserToken(m_session.getActiveSessionId(), &probe)) {
+    const DWORD err = GetLastError();
+    if (err == ERROR_NO_TOKEN) {
+      LOG_DEBUG("no user token in session %d (login/lock screen)", m_session.getActiveSessionId());
+      throw NoInteractiveSessionError();
     }
-    if (process == nullptr) {
-      throw std::runtime_error("found winlogon.exe but failed to open process handle");
-    }
-
-    try {
-      HANDLE token = duplicateProcessToken(process, security);
-      if (process != nullptr) {
-        CloseHandle(process);
-      }
-      return token;
-    } catch (...) {
-      LOG_ERR("failed to duplicate user token from winlogon.exe");
-      if (process != nullptr) {
-        CloseHandle(process);
-      }
-      throw;
-    }
-  } else {
-    LOG_DEBUG("getting non-elevated token");
-    return m_session.getUserToken(security);
+    LOG_ERR("could not query user token from session %d", m_session.getActiveSessionId());
+    throw std::runtime_error(windowsErrorToString(err));
   }
+  CloseHandle(probe);
+
+  LOG_DEBUG("getting user session token");
+  return m_session.getUserToken(security);
 }
 
 void MSWindowsWatchdog::mainLoop(const void *)
@@ -216,53 +148,18 @@ void MSWindowsWatchdog::mainLoop(const void *)
 
   LOG_DEBUG("starting watchdog main loop");
   while (m_running) {
-    // Refresh the elevation decision BEFORE taking the lock: the fleet
-    // poll blocks up to 500 ms and daemon IPC (setProcessConfig /
-    // setElevationContext) must never stall behind it.
-    bool refreshElevation = false;
-    {
-      std::scoped_lock configLock(m_processStateMutex);
-      refreshElevation = m_elevateProcess && !m_foreground;
-    }
-    if (refreshElevation) {
-      refreshWantsElevatedCore();
-    }
-
     LOG_VERBOSE("locking process state mutex in watchdog main loop");
     std::unique_lock lock(m_processStateMutex);
 
-    // Auto-elevate: relaunch when the session changes, or (when elevation is
-    // enabled) when the secure/login desktop appears or clears, so the core's
-    // integrity matches the desktop it must inject on. Secure-desktop changes
-    // are debounced so a brief consent.exe/LogonUI flicker does not kill the
-    // core and drop every peer in the coordination mesh.
-    if (m_processState == Running && !m_command.empty() && !m_foreground) {
-      if (m_session.hasChanged()) {
-        LOG_DEBUG("session changed, queueing process start");
-        m_processState = StartPending;
-        m_nextStartTime.reset();
-        m_pendingElevated.reset();
-        m_pendingElevatedSince.reset();
-      } else if (m_elevateProcess) {
-        const bool secureNow = wantsElevatedCore();
-        if (secureNow == m_lastElevated) {
-          m_pendingElevated.reset();
-          m_pendingElevatedSince.reset();
-        } else if (!m_pendingElevated.has_value() || m_pendingElevated.value() != secureNow) {
-          m_pendingElevated = secureNow;
-          m_pendingElevatedSince = Arch::time();
-          LOG_DEBUG(
-              "secure-desktop transition pending (target elevated=%s), debouncing %.1fs", secureNow ? "yes" : "no",
-              kSecureDesktopDebounceSeconds
-          );
-        } else if (Arch::time() - m_pendingElevatedSince.value() >= kSecureDesktopDebounceSeconds) {
-          LOG_DEBUG("secure-desktop transition stable, queueing process start");
-          m_processState = StartPending;
-          m_nextStartTime.reset();
-          m_pendingElevated.reset();
-          m_pendingElevatedSince.reset();
-        }
-      }
+    // The core runs at medium integrity for its whole lifetime; the only
+    // relaunch trigger is a console-session change (fast user switch / logon),
+    // which requires re-acquiring the new session's user token. The core is
+    // never killed/relaunched to change integrity -- that flip broke PowerToys
+    // (see plan 2026-07-07) and never reached the secure desktop anyway.
+    if (m_processState == Running && !m_command.empty() && !m_foreground && m_session.hasChanged()) {
+      LOG_DEBUG("session changed, queueing process start");
+      m_processState = StartPending;
+      m_nextStartTime.reset();
     }
 
     switch (m_processState) {
@@ -283,7 +180,10 @@ void MSWindowsWatchdog::mainLoop(const void *)
       try {
         startProcess();
         m_startFailures = 0;
+        m_awaitingUserSession = false;
         m_processState = Running;
+      } catch (const NoInteractiveSessionError &) { // NOSONAR - expected wait state
+        m_processState = handleNoInteractiveSession();
       } catch (std::exception &e) { // NOSONAR - Catching all exceptions
         m_processState = handleStartError(e.what());
       } catch (...) { // NOSONAR - Catching remaining exceptions
@@ -350,22 +250,23 @@ void MSWindowsWatchdog::startProcess()
 
   if (m_process != nullptr) {
     LOG_DEBUG("closing existing process to make way for new one");
-    // Short timeout: on a relaunch (esp. auto-elevate desktop transitions) the
-    // core is being replaced immediately, so don't wait the full graceful
-    // window -- a slow exit there delays reaching the secure desktop for UAC.
+    // Short timeout: on a relaunch (crash or session change) the core is being
+    // replaced immediately, so don't wait the full graceful window.
     m_process->shutdown(2);
     m_process.reset();
   }
 
   m_process = std::make_unique<deskflow::platform::MSWindowsProcess>(m_command, m_outputWritePipe, m_outputWritePipe);
 
-  // Auto-elevate: when elevation is enabled, only run the core SYSTEM while the
-  // secure/login desktop is active; otherwise run at the user's (medium)
-  // integrity so user-level hook tools (PowerToys, Mouser) can see its input.
-  const bool elevate = m_elevateProcess && wantsElevatedCore();
-  m_lastElevated = elevate;
-
-  LOG_INFO("running command (%s): %ls", elevate ? "elevated" : "not elevated", m_command.c_str());
+  // The core always runs at the user's (medium) integrity so user-level hook
+  // tools (PowerToys Keyboard Manager, Mouser) can intercept and remap its
+  // injected input. It is never elevated to SYSTEM/UIAccess: a low-level hook
+  // sees injected input regardless of the injector's integrity, and UIAccess
+  // does not reach the UAC secure desktop anyway -- that is the VHID bridge's
+  // job (see plan 2026-07-07). Reaching the secure desktop by elevating the
+  // core only churned the mesh and broke PowerToys.
+  LOG_INFO("running command: %ls", m_command.c_str());
+  LOG_INFO("core integrity: medium (secure-desktop flip removed)");
 
   BOOL createRet;
   if (m_foreground) {
@@ -376,18 +277,7 @@ void MSWindowsWatchdog::startProcess()
 
     SECURITY_ATTRIBUTES sa;
     ZeroMemory(&sa, sizeof(SECURITY_ATTRIBUTES));
-    HANDLE userToken = getUserToken(&sa, elevate);
-
-    // UIAccess lets the core drive higher-integrity / secure-desktop UI, but a
-    // UIAccess token also raises the core's *injected* input above normal
-    // user-level hooks -- so PowerToys/Keyboard Manager (UIAccess=0) can't see
-    // deskflow's input. Only grant it when elevated (secure/login desktop, where
-    // those hooks are out of the picture anyway); on the normal desktop keep a
-    // plain token so user-level hook tools intercept deskflow input.
-    if (elevate) {
-      DWORD uiAccess = 1;
-      SetTokenInformation(userToken, TokenUIAccess, &uiAccess, sizeof(DWORD));
-    }
+    HANDLE userToken = getUserToken(&sa);
 
     createRet = m_process->startAsUser(userToken, &sa);
   }
@@ -412,84 +302,19 @@ void MSWindowsWatchdog::startProcess()
 
     LOG_DEBUG("started core process from watchdog");
     LOG_VERBOSE(
-        "process info, session=%i, elevated=%s, command: %s", //
-        m_session.getActiveSessionId(), elevate ? "yes" : "no", m_command.c_str()
+        "process info, session=%i, integrity=medium, command: %s", //
+        m_session.getActiveSessionId(), m_command.c_str()
     );
   }
 }
 
-bool MSWindowsWatchdog::secureDesktopActive()
-{
-  // session-0 daemon can't query session 1's input desktop directly, so detect
-  // the secure/login desktop by the processes that own it: consent.exe (UAC
-  // elevation prompt) and LogonUI.exe (lock/login screen).
-  MSWindowsHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-  if (snapshot.get() == INVALID_HANDLE_VALUE) {
-    return false;
-  }
-
-  PROCESSENTRY32 entry;
-  entry.dwSize = sizeof(PROCESSENTRY32);
-  if (!Process32First(snapshot.get(), &entry)) {
-    return false;
-  }
-
-  do {
-    // LogonUI (lock/login screen) legitimately persists, so it always counts.
-    if (_wcsicmp(entry.szExeFile, L"LogonUI.exe") == 0) {
-      return true;
-    }
-    // consent.exe (UAC prompt) auto-dismisses within ~2 minutes; older ones
-    // are hung/leaked and must not hold the fleet in secure-desktop state.
-    if (_wcsicmp(entry.szExeFile, L"consent.exe") == 0) {
-      if (processYoungerThan(entry.th32ProcessID, kMaxConsentAgeSeconds)) {
-        return true;
-      }
-      LOG_DEBUG("ignoring stale consent.exe pid=%u (older than %.0fs)", entry.th32ProcessID, kMaxConsentAgeSeconds);
-    }
-  } while (Process32Next(snapshot.get(), &entry));
-
-  return false;
-}
-
-bool MSWindowsWatchdog::wantsElevatedCore() const
-{
-  return m_cachedWantsElevated.load();
-}
-
-void MSWindowsWatchdog::refreshWantsElevatedCore()
-{
-  if (!secureDesktopActive()) {
-    m_cachedWantsElevated = false;
-    return;
-  }
-  std::string selfName;
-  uint16_t coordPort = 0;
-  {
-    std::scoped_lock lock{m_processStateMutex};
-    selfName = m_selfName;
-    coordPort = m_coordPort;
-  }
-  if (coordPort == 0 || selfName.empty()) {
-    m_cachedWantsElevated = true;
-    return;
-  }
-  const auto fleet = deskflow::common::pollLocalFleetStatus(coordPort, 500);
-  if (!fleet.has_value() || fleet->cursorHost.isEmpty()) {
-    m_cachedWantsElevated = true;
-    return;
-  }
-  m_cachedWantsElevated = deskflow::common::cursorHostIsLocal(selfName, fleet->cursorHost.toStdString());
-}
-
-void MSWindowsWatchdog::setProcessConfig(const std::string_view &command, bool elevate)
+void MSWindowsWatchdog::setProcessConfig(const std::string_view &command)
 {
   LOG_VERBOSE("locking process state mutex for watchdog config change");
   std::scoped_lock lock{m_processStateMutex};
 
   LOG_DEBUG("setting watchdog process config");
   m_command = std::wstring(command.begin(), command.end());
-  m_elevateProcess = elevate;
 
   if (m_command.empty()) {
     LOG_DEBUG("command cleared, queueing process stop");
@@ -499,13 +324,6 @@ void MSWindowsWatchdog::setProcessConfig(const std::string_view &command, bool e
     m_processState = ProcessState::StartPending;
     m_nextStartTime.reset();
   }
-}
-
-void MSWindowsWatchdog::setElevationContext(const std::string &selfName, uint16_t coordPort)
-{
-  std::scoped_lock lock{m_processStateMutex};
-  m_selfName = selfName;
-  m_coordPort = coordPort;
 }
 
 void MSWindowsWatchdog::outputLoop(const void *)
@@ -618,6 +436,23 @@ MSWindowsWatchdog::ProcessState MSWindowsWatchdog::handleStartError(const std::s
   LOG_INFO("retrying process start immediately");
   m_nextStartTime.reset();
   return ProcessState::StartPending;
+}
+
+MSWindowsWatchdog::ProcessState MSWindowsWatchdog::handleNoInteractiveSession()
+{
+  // Expected at the login/lock screen: no user is logged on, so there is no
+  // user token to launch the medium-integrity core. Wait quietly and retry
+  // when a session appears -- do NOT treat this as a crash (no crit log, no
+  // failure backoff escalation).
+  if (!m_awaitingUserSession) {
+    LOG_INFO("no interactive user session yet; deferring core launch until a user logs on");
+    m_awaitingUserSession = true;
+  } else {
+    LOG_DEBUG("still waiting for an interactive user session");
+  }
+  m_startFailures = 0;
+  m_nextStartTime = Arch::time() + 2.0;
+  return ProcessState::StartScheduled;
 }
 
 std::string MSWindowsWatchdog::processStateToString(MSWindowsWatchdog::ProcessState state)
