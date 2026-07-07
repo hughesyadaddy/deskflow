@@ -102,14 +102,22 @@ install_bundle() {
     local stage
     stage="$(mktemp -d "${TMPDIR:-/tmp}/deskflow-install.XXXXXX")"
     echo "Using staged cmake --install (macdeployqt + bundle layout)"
-    cmake --install "$BUILD_DIR" --prefix "$stage"
-    if [[ ! -d "$stage/Deskflow.app" ]]; then
+    if cmake --install "$BUILD_DIR" --prefix "$stage" && [[ -d "$stage/Deskflow.app" ]]; then
+      cp -R "$stage/Deskflow.app" "$INSTALL_APP"
       rm -rf "$stage"
-      echo "error: staged install did not produce Deskflow.app" >&2
+    elif [[ -d "$SOURCE_APP" ]]; then
+      rm -rf "$stage"
+      echo "warning: cmake --install failed — using signed build tree at $SOURCE_APP" >&2
+      cp -R "$SOURCE_APP" "$INSTALL_APP"
+    else
+      rm -rf "$stage"
+      echo "error: staged install failed and no build tree at $SOURCE_APP" >&2
+      if [[ -d "${INSTALL_APP}.bak" ]]; then
+        mv "${INSTALL_APP}.bak" "$INSTALL_APP"
+        echo "restored previous install from ${INSTALL_APP}.bak" >&2
+      fi
       exit 1
     fi
-    cp -R "$stage/Deskflow.app" "$INSTALL_APP"
-    rm -rf "$stage"
   elif [[ -d "$SOURCE_APP" ]]; then
     echo "Using build tree copy from $SOURCE_APP"
     cp -R "$SOURCE_APP" "$INSTALL_APP"
