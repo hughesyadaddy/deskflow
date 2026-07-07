@@ -67,7 +67,7 @@ deploy_macos() {
   local deploy_m="${FLEET_DEPLOY_MOUSER:-1}"
   local reconf="${FLEET_RECONFIGURE:-0}"
 
-  for kv in "${EXTRA_ENV[@]}"; do
+  for kv in ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}; do
     case "$kv" in
       FLEET_DEPLOY_MOUSER=*) deploy_m="${kv#*=}" ;;
       FLEET_DEPLOY_DESKFLOW=*) deploy_df="${kv#*=}" ;;
@@ -124,7 +124,7 @@ deploy_windows() {
   local deploy_df="${FLEET_DEPLOY_DESKFLOW:-1}"
   local deploy_m="${FLEET_DEPLOY_MOUSER:-1}"
 
-  for kv in "${EXTRA_ENV[@]}"; do
+  for kv in ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}; do
     case "$kv" in
       FLEET_DEPLOY_MOUSER=*) deploy_m="${kv#*=}" ;;
       FLEET_DEPLOY_DESKFLOW=*) deploy_df="${kv#*=}" ;;
