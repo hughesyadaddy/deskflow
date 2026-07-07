@@ -53,6 +53,13 @@ create_test(
 )
 
 create_test(
+  NAME KeyboardRelayHookPolicyTests
+  DEPENDS coordination
+  SOURCE KeyboardRelayHookPolicyTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+)
+
+create_test(
   NAME CoordinationLocalStatusTests
   DEPENDS common coordination
   SOURCE CoordinationLocalStatusTests.cpp
@@ -64,6 +71,15 @@ if(APPLE)
     NAME KeyboardRelayMapTests
     DEPENDS coordination
     SOURCE KeyboardRelayMapTests.cpp
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+  )
+endif()
+
+if(WIN32)
+  create_test(
+    NAME KeyboardRelayMapWindowsTests
+    DEPENDS coordination
+    SOURCE KeyboardRelayMapWindowsTests.cpp
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
   )
 endif()

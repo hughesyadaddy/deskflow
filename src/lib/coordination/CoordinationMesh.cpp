@@ -229,16 +229,20 @@ void CoordinationMesh::stop()
   }
 }
 
-void CoordinationMesh::sendTo(const std::string &host, const std::string &line)
+bool CoordinationMesh::sendTo(const std::string &host, const std::string &line)
 {
   const int fd = connectWithTimeout(host, m_port, kSendConnectTimeoutMs);
   if (fd < 0) {
-    return; // unreachable peers are normal (asleep / off)
+    return false; // unreachable peers are normal (asleep / off)
   }
   std::string payload = line;
   payload.push_back('\n');
-  sendAll(fd, payload);
+  if (!sendAll(fd, payload)) {
+    platformCloseSocket(fd);
+    return false;
+  }
   platformCloseSocket(fd);
+  return true;
 }
 
 bool CoordinationMesh::probe(const std::string &host, int timeoutMs)

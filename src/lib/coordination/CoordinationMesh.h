@@ -52,7 +52,8 @@ public:
   }
 
   //! Fire-and-forget send to ``host:port`` (connect timeout bounded).
-  void sendTo(const std::string &host, const std::string &line);
+  //! Returns false when the peer is unreachable (connect timeout).
+  bool sendTo(const std::string &host, const std::string &line);
 
   //! Connect-probe a peer's coordination port (LAN-first reachability).
   bool probe(const std::string &host, int timeoutMs);

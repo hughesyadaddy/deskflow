@@ -15,6 +15,7 @@ add_library(coordination STATIC
   FleetStateMerge.h
   KeyboardRouter.cpp
   KeyboardRouter.h
+  KeyboardRelayHookPolicy.h
   LocalInputMonitor.h
   Peer.cpp
   Peer.h

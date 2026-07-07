@@ -85,6 +85,27 @@ KeyID mapVirtualKey(int vkCode)
     return kKeyAudioPlay;
   // VK_MEDIA_STOP intentionally omitted: the macOS injector has no NX key
   // type for stop, so it cannot actuate on a Mac target.
+  case VK_LSHIFT:
+  case VK_SHIFT:
+    return kKeyShift_L;
+  case VK_RSHIFT:
+    return kKeyShift_R;
+  case VK_LCONTROL:
+  case VK_CONTROL:
+    return kKeyControl_L;
+  case VK_RCONTROL:
+    return kKeyControl_R;
+  case VK_LMENU:
+  case VK_MENU:
+    return kKeyAlt_L;
+  case VK_RMENU:
+    return kKeyAlt_R;
+  case VK_LWIN:
+    return kKeySuper_L;
+  case VK_RWIN:
+    return kKeySuper_R;
+  case VK_CAPITAL:
+    return kKeyCapsLock;
   default:
     break;
   }

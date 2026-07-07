@@ -136,7 +136,7 @@ private:
   void sendLineToPeers(const std::string &line, const PeerList &peers);
   bool mergeAndBroadcastFleetFragment(const FleetFragment &fragment, bool sendEvenIfUnchanged);
   void handleKeyForwardMessage(const Message &message);
-  void
+  bool
   sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
   bool isKnownPeer(const std::string &name) const;
   bool relayPassThroughLocal();

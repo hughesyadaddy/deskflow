@@ -7,6 +7,7 @@
 #include "coordination/KeyboardRelayMonitor.h"
 
 #include "coordination/KeyboardRelayMap.h"
+#include "coordination/KeyboardRelayHookPolicy.h"
 
 #include "base/Log.h"
 
@@ -84,18 +85,28 @@ private:
       return CallNextHookEx(nullptr, code, wParam, lParam);
     }
 
+    const bool isInjected = (info->flags & LLKHF_INJECTED) != 0;
+    if (isInjected) {
+      return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
     Message::KeyPhase phase = Message::KeyPhase::Down;
     KeyID id = 0;
     KeyModifierMask mask = 0;
     KeyButton button = 0;
-    if (!mapRelayKeyFromHook(
-            static_cast<int>(info->vkCode), static_cast<int>(info->scanCode), (info->flags & LLKHF_EXTENDED) != 0,
-            keyUp, isRepeat, id, mask, button, phase
-        )) {
-      return CallNextHookEx(nullptr, code, wParam, lParam);
+    const bool mapped = mapRelayKeyFromHook(
+        static_cast<int>(info->vkCode), static_cast<int>(info->scanCode), (info->flags & LLKHF_EXTENDED) != 0, keyUp,
+        isRepeat, id, mask, button, phase
+    );
+
+    bool forwarded = false;
+    if (mapped && self->m_send) {
+      forwarded = self->m_send(phase, id, mask, button, {});
     }
-    if (self->m_send) {
-      self->m_send(phase, id, mask, button, {});
+
+    const KeyboardRelayHookContext ctx{passLocal, isInjected, mapped, forwarded};
+    if (keyboardRelayHookShouldPassThrough(ctx)) {
+      return CallNextHookEx(nullptr, code, wParam, lParam);
     }
     return 1;
   }

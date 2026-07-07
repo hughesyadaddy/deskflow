@@ -13,6 +13,7 @@
 #include "coordination/Coordinator.h"
 #include "coordination/FleetState.h"
 #include "coordination/Peer.h"
+#include "deskflow/KeyTypes.h"
 
 #include <QTest>
 
@@ -470,6 +471,75 @@ void CoordinatorFleetPublishTests::keyForward_gatingMatrix()
   QCOMPARE(forwarded, 2);
 
   events.removeHandler(EventTypes::CoordinationKeyForward, events.getSystemTarget());
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::sendKeyForward_returnsFalseWithoutDestination()
+{
+  auto config = testConfig();
+  config.selfName = "tiny11";
+  config.peers = {};
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsClient(coordinator);
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_election.becameClient("");
+    coordinator.m_fleetState.cursorHost = "hackintosh";
+  }
+
+  // Remote cursor but no mesh destination: must not claim the key was forwarded.
+  QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::sendKeyForward_returnsFalseWhenMeshUnreachable()
+{
+  auto config = testConfig();
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  // TEST-NET-1 address: connect should time out; hook must not swallow on false forward.
+  config.peers = deskflow::coordination::parsePeerList("hackintosh=240.0.0.1");
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsClient(coordinator);
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_fleetState.cursorHost = "hackintosh";
+  }
+
+  QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::sendKeyForward_returnsTrueWhenDestinationReachable()
+{
+  auto config = testConfig();
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.peers = deskflow::coordination::parsePeerList("hackintosh=127.0.0.1");
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsClient(coordinator);
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_fleetState.cursorHost = "hackintosh";
+  }
+
+  // Mesh send targets host:localMeshPort; loopback reaches our own listener.
+  QVERIFY(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+
   coordinator.stop();
 }
 

@@ -16,6 +16,11 @@ bool mapRelayKeyFromCgEvent(
     void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button
 );
 
+//! macOS modifier keys arrive as kCGEventFlagsChanged, not key down/up.
+bool mapRelayModifierFromCgEvent(
+    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button
+);
+
 //! Neutral media KeyID for an IOKit NX key type (kKeyNone if unmapped). Pure.
 KeyID mediaKeyIdFromNxType(uint32_t nxKeyType);
 

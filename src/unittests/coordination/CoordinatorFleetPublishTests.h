@@ -33,6 +33,9 @@ private Q_SLOTS:
   void wakePeer_ignoredForClientsAndPeersWithoutHints();
   void rescueChord_forcesRelayLocalUntilCursorMoves();
   void keyForward_gatingMatrix();
+  void sendKeyForward_returnsFalseWithoutDestination();
+  void sendKeyForward_returnsFalseWhenMeshUnreachable();
+  void sendKeyForward_returnsTrueWhenDestinationReachable();
   void hello_acceptClearsVersionMismatch();
 
 private:

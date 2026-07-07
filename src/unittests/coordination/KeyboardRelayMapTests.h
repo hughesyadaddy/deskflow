@@ -15,4 +15,7 @@ private Q_SLOTS:
   void mapRelayKeyFromCgEventOffMainThreadDoesNotCrash();
   void mediaKeyIdFromNxType_mapsConsumerKeys();
   void mapRelayMediaKeyFromCgEvent_ignoresPlainKey();
+  void modifierKeys_mapToFleetKeyIds();
+  void mapModifiers_useNeutralMaskBits();
+  void mapRelayModifierFromCgEvent_handlesFlagsChanged();
 };

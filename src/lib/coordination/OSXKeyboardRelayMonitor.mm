@@ -6,6 +6,7 @@
 
 #include "coordination/KeyboardRelayMonitor.h"
 
+#include "coordination/KeyboardRelayHookPolicy.h"
 #include "coordination/KeyboardRelayMap.h"
 
 #include "base/Log.h"
@@ -19,6 +20,17 @@
 namespace deskflow::coordination {
 
 namespace {
+
+bool relayEventIsInjected(CGEventRef event)
+{
+  return CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid();
+}
+
+CGEventRef relaySwallowDecision(CGEventRef event, bool passLocal, bool isInjected, bool mapped, bool forwarded)
+{
+  const KeyboardRelayHookContext ctx{passLocal, isInjected, mapped, forwarded};
+  return keyboardRelayHookShouldPassThrough(ctx) ? event : nullptr;
+}
 
 class OSXKeyboardRelayMonitor : public IKeyboardRelayMonitor
 {
@@ -73,6 +85,8 @@ private:
       return event;
     }
 
+    const bool isInjected = relayEventIsInjected(event);
+
     // Consumer/media keys (volume, brightness, play/pause, ...) arrive as
     // system-defined events, not key down/up. Forward a single Down per
     // press; the injector's fakeMediaKey emits the full down+up on the target.
@@ -81,7 +95,7 @@ private:
       // from this process). Genuine hardware media keys are re-posted by
       // macOS system processes and arrive with a NON-zero source pid, so a
       // pid != 0 guard silently ate every real brightness/volume press.
-      if (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid()) {
+      if (isInjected) {
         return event;
       }
       KeyID mediaId = kKeyNone;
@@ -98,10 +112,35 @@ private:
       // the media KeyID like a normal key and needs the Up to release the VK,
       // otherwise it stays logically held. Both halves are swallowed locally.
       LOG_DEBUG("coordination: relaying media key 0x%04x %s", mediaId, down ? "down" : "up");
+      bool forwarded = false;
       if (self->m_send) {
-        self->m_send(down ? Message::KeyPhase::Down : Message::KeyPhase::Up, mediaId, 0, 0, {});
+        forwarded = self->m_send(down ? Message::KeyPhase::Down : Message::KeyPhase::Up, mediaId, 0, 0, {});
       }
-      return nullptr; // swallow so the key does not also act locally
+      return relaySwallowDecision(event, false, false, true, forwarded);
+    }
+
+    if (type == kCGEventFlagsChanged) {
+      if (isInjected) {
+        return event;
+      }
+
+      const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
+      if (passLocal) {
+        return event;
+      }
+
+      Message::KeyPhase phase = Message::KeyPhase::Down;
+      KeyID id = 0;
+      KeyModifierMask mask = 0;
+      KeyButton button = 0;
+      if (!mapRelayModifierFromCgEvent(event, phase, id, mask, button)) {
+        return event;
+      }
+      bool forwarded = false;
+      if (self->m_send) {
+        forwarded = self->m_send(phase, id, mask, button, {});
+      }
+      return relaySwallowDecision(event, false, false, true, forwarded);
     }
 
     if (type != kCGEventKeyDown && type != kCGEventKeyUp) {
@@ -112,8 +151,7 @@ private:
     // server typing into this screen posts from deskflow-core itself).
     // Other processes' synthetic keys (dictation tools, Karabiner) are
     // user input and must relay like hardware.
-    const auto sourcePid = CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID);
-    if (sourcePid == getpid()) {
+    if (isInjected) {
       return event;
     }
 
@@ -129,16 +167,17 @@ private:
     if (!mapRelayKeyFromCgEvent(event, phase, id, mask, button)) {
       return event;
     }
+    bool forwarded = false;
     if (self->m_send) {
-      self->m_send(phase, id, mask, button, {});
+      forwarded = self->m_send(phase, id, mask, button, {});
     }
-    return nullptr;
+    return relaySwallowDecision(event, false, false, true, forwarded);
   }
 
   void runLoop()
   {
-    const CGEventMask mask =
-        CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(NX_SYSDEFINED);
+    const CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) |
+                             CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(NX_SYSDEFINED);
 
     m_tap =
         CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, tapCallback, this);

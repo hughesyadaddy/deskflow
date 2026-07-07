@@ -83,4 +83,75 @@ void KeyboardRelayMapTests::mapRelayMediaKeyFromCgEvent_ignoresPlainKey()
   CFRelease(keyEvent);
 }
 
+void KeyboardRelayMapTests::modifierKeys_mapToFleetKeyIds()
+{
+  const auto expectDown = [](CGKeyCode vk, CGEventFlags flags, KeyID expected) {
+    CGEventRef event = CGEventCreate(nullptr);
+    QVERIFY(event != nullptr);
+    CGEventSetType(event, kCGEventFlagsChanged);
+    CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, vk);
+    CGEventSetFlags(event, flags);
+
+    Message::KeyPhase phase = Message::KeyPhase::Up;
+    KeyID id = kKeyNone;
+    KeyModifierMask mask = 0;
+    KeyButton button = 0;
+    QVERIFY(deskflow::coordination::mapRelayModifierFromCgEvent(event, phase, id, mask, button));
+    QCOMPARE(phase, Message::KeyPhase::Down);
+    QCOMPARE(id, expected);
+    CFRelease(event);
+  };
+
+  expectDown(kVK_Command, kCGEventFlagMaskCommand, kKeySuper_L);
+  expectDown(kVK_Control, kCGEventFlagMaskControl, kKeyControl_L);
+  expectDown(kVK_Option, kCGEventFlagMaskAlternate, kKeyAlt_L);
+  expectDown(kVK_Shift, kCGEventFlagMaskShift, kKeyShift_L);
+  expectDown(kVK_RightCommand, kCGEventFlagMaskCommand, kKeySuper_R);
+  expectDown(kVK_RightControl, kCGEventFlagMaskControl, kKeyControl_R);
+  expectDown(kVK_RightOption, kCGEventFlagMaskAlternate, kKeyAlt_R);
+  expectDown(kVK_RightShift, kCGEventFlagMaskShift, kKeyShift_R);
+}
+
+void KeyboardRelayMapTests::mapRelayModifierFromCgEvent_handlesFlagsChanged()
+{
+  const auto expectUp = [](CGKeyCode vk) {
+    CGEventRef event = CGEventCreate(nullptr);
+    QVERIFY(event != nullptr);
+    CGEventSetType(event, kCGEventFlagsChanged);
+    CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, vk);
+    CGEventSetFlags(event, 0);
+
+    Message::KeyPhase phase = Message::KeyPhase::Down;
+    KeyID id = kKeySuper_L;
+    KeyModifierMask mask = KeyModifierSuper;
+    KeyButton button = 0;
+    QVERIFY(deskflow::coordination::mapRelayModifierFromCgEvent(event, phase, id, mask, button));
+    QCOMPARE(phase, Message::KeyPhase::Up);
+    QCOMPARE(id, kKeyNone);
+    QCOMPARE(mask, 0u);
+    QCOMPARE(button, static_cast<KeyButton>(vk));
+    CFRelease(event);
+  };
+
+  expectUp(kVK_Command);
+  expectUp(kVK_Control);
+  expectUp(kVK_Shift);
+  expectUp(kVK_Option);
+}
+
+void KeyboardRelayMapTests::mapModifiers_useNeutralMaskBits()
+{
+  CGEventRef event = CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_C, true);
+  QVERIFY(event != nullptr);
+  CGEventSetFlags(event, kCGEventFlagMaskCommand | kCGEventFlagMaskControl);
+
+  Message::KeyPhase phase = Message::KeyPhase::Down;
+  KeyID id = kKeyNone;
+  KeyModifierMask mask = 0;
+  KeyButton button = 0;
+  QVERIFY(deskflow::coordination::mapRelayKeyFromCgEvent(event, phase, id, mask, button));
+  QCOMPARE(mask, KeyModifierSuper | KeyModifierControl);
+  CFRelease(event);
+}
+
 QTEST_MAIN(KeyboardRelayMapTests)

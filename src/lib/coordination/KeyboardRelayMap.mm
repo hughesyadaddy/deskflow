@@ -23,25 +23,77 @@ KeyModifierMask mapModifiers(CGEventFlags flags)
 {
   KeyModifierMask mask = 0;
   if ((flags & kCGEventFlagMaskShift) != 0) {
-    mask |= shiftKey;
+    mask |= KeyModifierShift;
   }
   if ((flags & kCGEventFlagMaskControl) != 0) {
-    mask |= controlKey;
-  }
-  if ((flags & kCGEventFlagMaskCommand) != 0) {
-    mask |= cmdKey;
+    mask |= KeyModifierControl;
   }
   if ((flags & kCGEventFlagMaskAlternate) != 0) {
-    mask |= optionKey;
+    mask |= KeyModifierAlt;
+  }
+  if ((flags & kCGEventFlagMaskCommand) != 0) {
+    mask |= KeyModifierSuper;
   }
   if ((flags & kCGEventFlagMaskAlphaShift) != 0) {
-    mask |= alphaLock;
+    mask |= KeyModifierCapsLock;
   }
   return mask;
 }
 
+KeyID modifierKeyIdFromVirtualKey(CGKeyCode vk)
+{
+  switch (vk) {
+  case kVK_Shift:
+    return kKeyShift_L;
+  case kVK_RightShift:
+    return kKeyShift_R;
+  case kVK_Control:
+    return kKeyControl_L;
+  case kVK_RightControl:
+    return kKeyControl_R;
+  case kVK_Option:
+    return kKeyAlt_L;
+  case kVK_RightOption:
+    return kKeyAlt_R;
+  case kVK_Command:
+    return kKeySuper_L;
+  case kVK_RightCommand:
+    return kKeySuper_R;
+  case kVK_CapsLock:
+    return kKeyCapsLock;
+  default:
+    return kKeyNone;
+  }
+}
+
+bool modifierIsDown(CGKeyCode vk, CGEventFlags flags)
+{
+  switch (vk) {
+  case kVK_Shift:
+  case kVK_RightShift:
+    return (flags & kCGEventFlagMaskShift) != 0;
+  case kVK_Control:
+  case kVK_RightControl:
+    return (flags & kCGEventFlagMaskControl) != 0;
+  case kVK_Option:
+  case kVK_RightOption:
+    return (flags & kCGEventFlagMaskAlternate) != 0;
+  case kVK_Command:
+  case kVK_RightCommand:
+    return (flags & kCGEventFlagMaskCommand) != 0;
+  case kVK_CapsLock:
+    return (flags & kCGEventFlagMaskAlphaShift) != 0;
+  default:
+    return false;
+  }
+}
+
 KeyID translateVirtualKey(CGKeyCode vk, const UCKeyboardLayout *layout, UInt32 keyboardType)
 {
+  if (const KeyID modifier = modifierKeyIdFromVirtualKey(vk); modifier != kKeyNone) {
+    return modifier;
+  }
+
   switch (vk) {
   case kVK_Return:
     return kKeyReturn;
@@ -142,6 +194,33 @@ bool mapRelayKeyFromCgEvent(
   id = translateVirtualKey(vk, layout, keyboardType);
 
   return id != kKeyNone || phase == Message::KeyPhase::Repeat;
+}
+
+bool mapRelayModifierFromCgEvent(
+    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button
+)
+{
+  auto *event = static_cast<CGEventRef>(cgEvent);
+  if (CGEventGetType(event) != kCGEventFlagsChanged) {
+    return false;
+  }
+
+  const CGKeyCode vk = static_cast<CGKeyCode>(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode));
+  const CGEventFlags flags = CGEventGetFlags(event);
+  button = static_cast<KeyButton>(vk);
+  mask = mapModifiers(flags);
+  id = modifierKeyIdFromVirtualKey(vk);
+  if (id == kKeyNone) {
+    return false;
+  }
+
+  if (modifierIsDown(vk, flags)) {
+    phase = Message::KeyPhase::Down;
+  } else {
+    phase = Message::KeyPhase::Up;
+    id = kKeyNone;
+  }
+  return true;
 }
 
 // NX key type -> neutral media KeyID. Kept in sync with the inverse table in

@@ -460,7 +460,7 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
     m_keyboardRelay->start(
         [this] { return relayPassThroughLocal(); },
         [this](Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang) {
-          sendKeyForward(phase, id, mask, button, lang);
+          return sendKeyForward(phase, id, mask, button, lang);
         }
     );
     LOG_INFO("coordination: keyboard relay started (client epoch)");
@@ -573,7 +573,7 @@ void Coordinator::handleKeyForwardMessage(const Message &message)
   events->addEvent(Event(EventTypes::CoordinationKeyForward, events->getSystemTarget(), info));
 }
 
-void Coordinator::sendKeyForward(
+bool Coordinator::sendKeyForward(
     Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang
 )
 {
@@ -583,7 +583,7 @@ void Coordinator::sendKeyForward(
   {
     std::scoped_lock lock{m_mutex};
     if (m_election.role() != Role::Client) {
-      return;
+      return false;
     }
 
     // Keyboard rescue: force this keyboard local until the fleet cursor
@@ -593,10 +593,10 @@ void Coordinator::sendKeyForward(
       m_relayLocalOverride = true;
       m_overrideCursorHost = m_fleetState.cursorHost;
       LOG_INFO("coordination: keyboard rescue chord: keyboard forced local");
-      return;
+      return false;
     }
     if (m_relayLocalOverride) {
-      return; // override active: never forward
+      return false; // override active: never forward
     }
 
     KeyboardRouteInput input;
@@ -606,7 +606,7 @@ void Coordinator::sendKeyForward(
 
     const auto decision = routeKeyboard(input);
     if (decision.route == KeyboardRoute::Local) {
-      return;
+      return false;
     }
 
     destination = peerMeshAddress(decision.forwardHost, m_fleetState, m_config.peers);
@@ -623,14 +623,14 @@ void Coordinator::sendKeyForward(
     }
   }
   if (destination.empty()) {
-    return;
+    return false;
   }
   if (logFirst) {
     LOG_INFO("coordination: forwarding keyboard to %s", destination.c_str());
   } else {
     LOG_DEBUG("coordination: forwarding keyboard to %s", destination.c_str());
   }
-  m_mesh->sendTo(destination, line);
+  return m_mesh->sendTo(destination, line);
 }
 
 bool Coordinator::isKnownPeer(const std::string &name) const
@@ -650,7 +650,7 @@ bool Coordinator::relayPassThroughLocal()
   // Rescue override: keyboard stays local until the fleet cursor host
   // changes value (fresh authoritative state supersedes the override).
   if (m_relayLocalOverride) {
-    if (m_fleetState.cursorHost != m_overrideCursorHost) {
+    if (!namesEqual(m_fleetState.cursorHost, m_overrideCursorHost)) {
       m_relayLocalOverride = false;
       LOG_INFO("coordination: keyboard rescue override cleared (fleet cursor moved)");
     } else {
