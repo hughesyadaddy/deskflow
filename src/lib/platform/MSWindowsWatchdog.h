@@ -153,6 +153,17 @@ private:
    */
   static void shutdownExistingProcesses();
 
+  /**
+   * @brief Make PowerToys Keyboard Manager reclaim low-level hook priority.
+   *
+   * When the core (re)starts on the normal desktop it registers its
+   * WH_KEYBOARD_LL hook LAST, which places it ahead of an already-running
+   * PowerToys in the hook chain and can suppress remaps until PowerToys
+   * re-registers. Terminating the KBM engine makes the PowerToys runner respawn
+   * it so its hook re-registers after ours. No-op if KBM isn't running.
+   */
+  static void nudgePowerToysKbm();
+
 private:
   bool m_running = true;
   std::unique_ptr<Thread> m_mainThread;

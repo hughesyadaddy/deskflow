@@ -180,6 +180,33 @@ MSWindowsWatchdog::getUserToken(LPSECURITY_ATTRIBUTES security, bool elevatedTok
   return m_session.getUserToken(security);
 }
 
+void MSWindowsWatchdog::nudgePowerToysKbm()
+{
+  // Terminate PowerToys.KeyboardManagerEngine.exe if present; the PowerToys
+  // runner respawns it, re-registering its WH_KEYBOARD_LL hook AFTER ours so
+  // its remaps take effect again. No-op when PowerToys/KBM isn't running.
+  MSWindowsHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+  if (snapshot.get() == INVALID_HANDLE_VALUE) {
+    return;
+  }
+
+  PROCESSENTRY32 entry;
+  entry.dwSize = sizeof(PROCESSENTRY32);
+  if (!Process32First(snapshot.get(), &entry)) {
+    return;
+  }
+
+  do {
+    if (_wcsicmp(entry.szExeFile, L"PowerToys.KeyboardManagerEngine.exe") != 0) {
+      continue;
+    }
+    MSWindowsHandle proc(OpenProcess(PROCESS_TERMINATE, FALSE, entry.th32ProcessID));
+    if (proc.get() != nullptr && TerminateProcess(proc.get(), 0)) {
+      LOG_INFO("nudged PowerToys Keyboard Manager (pid %u) to reclaim hook priority", entry.th32ProcessID);
+    }
+  } while (Process32Next(snapshot.get(), &entry));
+}
+
 bool MSWindowsWatchdog::loginScreenActive()
 {
   // session-0 daemon can't query session 1's input desktop directly; the
@@ -405,6 +432,15 @@ void MSWindowsWatchdog::startProcess()
         "process info, session=%i, elevated=%s, command: %s", //
         m_session.getActiveSessionId(), elevate ? "yes" : "no", m_command.c_str()
     );
+
+    // On the normal desktop our core just registered its low-level keyboard
+    // hook LAST, which puts it ahead of an already-running PowerToys and can
+    // suppress remaps until PowerToys re-registers. Poke PowerToys' Keyboard
+    // Manager so it reclaims hook priority (the runner respawns it). Skip on
+    // the login screen (no PowerToys there).
+    if (!elevate && m_uiAccessCore) {
+      nudgePowerToysKbm();
+    }
   }
 }
 
