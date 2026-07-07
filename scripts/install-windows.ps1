@@ -77,34 +77,69 @@ function Get-DeskflowProcesses {
   Get-CimInstance Win32_Process -Filter "Name LIKE 'deskflow%'" -ErrorAction SilentlyContinue
 }
 
+function Stop-ProcessTree {
+  param([int]$ProcessId)
+  # /T tree-kills watchdog-spawned children; elevated /F reaches SYSTEM (session 0).
+  cmd.exe /c "taskkill /F /T /PID $ProcessId >nul 2>&1"
+  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+function Remove-DeskflowService {
+  # The daemon is a watchdog: it respawns deskflow-core. It MUST be stopped and
+  # removed before killing cores, or the killed core is immediately relaunched.
+  $svc = Get-CimInstance Win32_Service -Filter "Name='Deskflow'" -ErrorAction SilentlyContinue
+  if (-not $svc) { return }
+
+  if ($svc.State -eq 'Running') {
+    Stop-Service -Name Deskflow -Force -ErrorAction SilentlyContinue
+  }
+
+  # Wait for the SCM to report Stopped; force-kill the daemon PID if it hangs so
+  # the watchdog thread cannot spawn another core.
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline) {
+    $s = Get-Service -Name Deskflow -ErrorAction SilentlyContinue
+    if (-not $s -or $s.Status -eq 'Stopped') { break }
+    Start-Sleep -Milliseconds 500
+  }
+  $running = Get-CimInstance Win32_Service -Filter "Name='Deskflow'" -ErrorAction SilentlyContinue
+  if ($running -and $running.ProcessId -gt 0) {
+    Write-Host "  force-killing daemon service PID $($running.ProcessId)"
+    Stop-ProcessTree -ProcessId $running.ProcessId
+  }
+
+  sc.exe stop Deskflow 2>$null | Out-Null
+  sc.exe delete Deskflow 2>$null | Out-Null
+
+  # Wait until the service is fully removed before continuing so a re-create
+  # later cannot collide with a delete that is still pending.
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Service -Name Deskflow -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 500
+  }
+}
+
 function Stop-DeskflowAll {
   Write-Host '== Stopping Deskflow service and all processes =='
 
-  $svc = Get-Service -Name Deskflow -ErrorAction SilentlyContinue
-  if ($svc -and $svc.Status -eq 'Running') {
-    Stop-Service -Name Deskflow -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-  }
-  if (Get-Service -Name Deskflow -ErrorAction SilentlyContinue) {
-    sc.exe stop Deskflow 2>$null | Out-Null
-    Start-Sleep -Seconds 1
-    sc.exe delete Deskflow 2>$null | Out-Null
-    Start-Sleep -Seconds 1
-  }
+  Remove-DeskflowService
 
+  # Kill every Deskflow process in EVERY session. A stale core can run as SYSTEM
+  # in session 0 (watchdog/secure-desktop) alongside a user-session core, because
+  # the single-instance guard uses per-session namespaces. Tree-kill by PID so
+  # both die regardless of session.
   $deadline = (Get-Date).AddSeconds(25)
   while ((Get-Date) -lt $deadline) {
     $procs = @(Get-DeskflowProcesses)
     if ($procs.Count -eq 0) { break }
 
     foreach ($proc in $procs) {
-      Write-Host "  stopping PID $($proc.ProcessId) $($proc.Name) ($($proc.ExecutablePath))"
-      Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+      Write-Host "  killing PID $($proc.ProcessId) $($proc.Name) session=$($proc.SessionId) ($($proc.ExecutablePath))"
+      Stop-ProcessTree -ProcessId $proc.ProcessId
     }
 
     foreach ($name in $script:DeskflowProcessNames) {
-      Get-Process -Name $name -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
       Invoke-TaskKill "$name.exe"
     }
 
@@ -113,7 +148,7 @@ function Stop-DeskflowAll {
 
   $remaining = @(Get-DeskflowProcesses)
   if ($remaining.Count -gt 0) {
-    $detail = ($remaining | ForEach-Object { "$($_.Name) pid=$($_.ProcessId) path=$($_.ExecutablePath)" }) -join '; '
+    $detail = ($remaining | ForEach-Object { "$($_.Name) pid=$($_.ProcessId) session=$($_.SessionId) path=$($_.ExecutablePath)" }) -join '; '
     throw "Could not stop all Deskflow processes: $detail"
   }
 
@@ -198,6 +233,37 @@ function Set-DeskflowRunRegistry {
   }
 }
 
+function Get-InteractiveSession {
+  # The session that owns explorer.exe is the interactive console session.
+  # Returns @{ SessionId; User } or $null when nobody is logged in.
+  $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
+    Sort-Object SessionId | Select-Object -First 1
+  if (-not $explorer) { return $null }
+  $owner = Invoke-CimMethod -InputObject $explorer -MethodName GetOwner -ErrorAction SilentlyContinue
+  if (-not $owner -or -not $owner.User) { return $null }
+  $user = if ($owner.Domain) { "$($owner.Domain)\$($owner.User)" } else { $owner.User }
+  [pscustomobject]@{ SessionId = [int]$explorer.SessionId; User = $user }
+}
+
+function Start-GuiInSession {
+  # Start-Process from a session-0 (service/SSH) context lands the GUI in session 0,
+  # invisible to the user and prone to spawning a duplicate core. An interactive
+  # scheduled task launches into the user's active console session instead.
+  param([string]$Gui, [string]$WorkDir, [string]$User)
+
+  $taskName = 'DeskflowInstallLaunch'
+  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+  $action = New-ScheduledTaskAction -Execute $Gui -Argument '--show' -WorkingDirectory $WorkDir
+  $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive
+  Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
+  try {
+    Start-ScheduledTask -TaskName $taskName
+    Start-Sleep -Seconds 3
+  } finally {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+  }
+}
+
 function Start-DeskflowGui {
   param([string]$InstallRoot)
 
@@ -214,7 +280,7 @@ function Start-DeskflowGui {
     }
     if ($proc.Name -ieq 'deskflow.exe') {
       Write-Host "  stopping extra GUI PID $($proc.ProcessId) ($($proc.ExecutablePath))"
-      Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+      Stop-ProcessTree -ProcessId $proc.ProcessId
     }
   }
 
@@ -223,8 +289,18 @@ function Start-DeskflowGui {
     throw 'deskflow.exe still running after cleanup; refusing to launch another instance.'
   }
 
-  Write-Host "== Launching single GUI: $gui --show =="
-  Start-Process -FilePath $gui -WorkingDirectory $InstallRoot -ArgumentList '--show'
+  $mySession = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+  $interactive = Get-InteractiveSession
+
+  if ($interactive -and $interactive.SessionId -ne $mySession) {
+    Write-Host "== Launching GUI in active session $($interactive.SessionId) as $($interactive.User) =="
+    Start-GuiInSession -Gui $gui -WorkDir $InstallRoot -User $interactive.User
+  } elseif ($mySession -ne 0) {
+    Write-Host "== Launching single GUI: $gui --show =="
+    Start-Process -FilePath $gui -WorkingDirectory $InstallRoot -ArgumentList '--show'
+  } else {
+    Write-Host '== No interactive session; GUI will start at next login (Run key) =='
+  }
 }
 
 function Assert-CanonicalRuntime {
