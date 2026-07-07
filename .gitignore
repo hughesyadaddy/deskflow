@@ -50,6 +50,7 @@ CMakeFiles/*
 /scripts/*
 !/scripts/*.ps1
 !/scripts/*.sh
+!/scripts/fleet.env.example
 
 # Ai helperfilers
 **/[cC]laude.[mM][dD]
