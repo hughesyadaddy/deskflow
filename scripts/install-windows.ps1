@@ -253,7 +253,8 @@ function Start-GuiInSession {
 
   $taskName = 'DeskflowInstallLaunch'
   Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-  $action = New-ScheduledTaskAction -Execute $Gui -Argument '--show' -WorkingDirectory $WorkDir
+  # No --show: deploys should restart the GUI silently to tray, not pop the window.
+  $action = New-ScheduledTaskAction -Execute $Gui -WorkingDirectory $WorkDir
   $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive
   Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
   try {
@@ -296,8 +297,8 @@ function Start-DeskflowGui {
     Write-Host "== Launching GUI in active session $($interactive.SessionId) as $($interactive.User) =="
     Start-GuiInSession -Gui $gui -WorkDir $InstallRoot -User $interactive.User
   } elseif ($mySession -ne 0) {
-    Write-Host "== Launching single GUI: $gui --show =="
-    Start-Process -FilePath $gui -WorkingDirectory $InstallRoot -ArgumentList '--show'
+    Write-Host "== Launching single GUI (tray): $gui =="
+    Start-Process -FilePath $gui -WorkingDirectory $InstallRoot
   } else {
     Write-Host '== No interactive session; GUI will start at next login (Run key) =='
   }

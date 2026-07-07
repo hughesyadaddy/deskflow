@@ -84,10 +84,11 @@ restart_deskflow() {
   # Brief pause: macOS may relaunch login-item apps after the bundle is replaced.
   sleep 2
   echo "== Launching $INSTALL_APP =="
-  # --show brings the window to the front and sets a regular menu-bar presence.
+  # No --show: deploys restart the app silently to the tray instead of popping
+  # the settings window over whatever the user is doing.
   # If an instance is already running, a second launch pings it via the GUI socket
   # and exits immediately (single-instance), so this is safe after reinstall.
-  open "$INSTALL_APP" --args --show
+  open -g "$INSTALL_APP"
 }
 
 install_bundle() {
