@@ -80,16 +80,37 @@ private:
   void outputLoop(const void *);
 
   /**
-   * @brief Get a security token for the active user session.
+   * @brief Duplicate the primary token of another process (e.g. winlogon.exe).
    *
-   * Throws NoInteractiveSessionError when no user is logged on (login/lock
-   * screen), so the caller can treat it as a benign wait state rather than a
-   * start failure.
+   * Used only for the login/lock screen: to inject on the secure Winlogon
+   * desktop the core must run with a SYSTEM token, which we obtain by
+   * duplicating winlogon.exe's token.
    */
-  HANDLE getUserToken(LPSECURITY_ATTRIBUTES security);
+  HANDLE duplicateProcessToken(HANDLE process, LPSECURITY_ATTRIBUTES security);
 
   /**
-   * @brief Start the core process at the user's (medium) integrity.
+   * @brief Get a security token for launching the core.
+   *
+   * When @p elevatedToken is true (login/lock screen active) duplicates
+   * winlogon.exe's SYSTEM token so the core can inject on the secure desktop.
+   * Otherwise returns the interactive user's medium token, throwing
+   * NoInteractiveSessionError when no user is logged on yet.
+   */
+  HANDLE getUserToken(LPSECURITY_ATTRIBUTES security, bool elevatedToken);
+
+  /**
+   * @brief True while the login/lock screen (LogonUI.exe) is active.
+   *
+   * Detected in session 0 by the presence of LogonUI.exe. This is the ONLY
+   * case the core is elevated for -- it is stable (unlike the transient
+   * consent.exe UAC prompt) so it does not cause the mesh churn / PowerToys
+   * breakage that the old consent-driven elevate flip did. In-session UAC is
+   * intentionally NOT covered here (that is the VHID bridge's job).
+   */
+  bool loginScreenActive();
+
+  /**
+   * @brief Start the core process (elevated only while the login screen is up).
    */
   void startProcess();
 
@@ -138,6 +159,7 @@ private:
   HANDLE m_outputWritePipe = nullptr;
   HANDLE m_outputReadPipe = nullptr;
   bool m_awaitingUserSession = false; // true while deferring launch for a login/lock screen
+  bool m_lastElevated = false;        // integrity the running core was launched at (login-screen elevate)
   MSWindowsSession m_session;
   int m_startFailures = 0;
   FileLogOutputter &m_fileLogOutputter;

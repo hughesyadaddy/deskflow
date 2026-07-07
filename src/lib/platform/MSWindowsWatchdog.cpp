@@ -116,9 +116,49 @@ void MSWindowsWatchdog::stop()
 }
 
 HANDLE
-MSWindowsWatchdog::getUserToken(LPSECURITY_ATTRIBUTES security)
+MSWindowsWatchdog::duplicateProcessToken(HANDLE process, LPSECURITY_ATTRIBUTES security)
+{
+  HANDLE sourceToken;
+  if (!OpenProcessToken(process, TOKEN_ASSIGN_PRIMARY | TOKEN_ALL_ACCESS, &sourceToken)) {
+    LOG_ERR("could not open token, process handle: %p", process);
+    throw std::runtime_error(windowsErrorToString(GetLastError()));
+  }
+
+  HANDLE newToken;
+  if (!DuplicateTokenEx(
+          sourceToken, TOKEN_ASSIGN_PRIMARY | TOKEN_ALL_ACCESS, security, SecurityImpersonation, TokenPrimary, &newToken
+      )) {
+    CloseHandle(sourceToken);
+    LOG_ERR("could not duplicate token");
+    throw std::runtime_error(windowsErrorToString(GetLastError()));
+  }
+
+  CloseHandle(sourceToken);
+  return newToken;
+}
+
+HANDLE
+MSWindowsWatchdog::getUserToken(LPSECURITY_ATTRIBUTES security, bool elevatedToken)
 {
   m_session.updateActiveSession();
+
+  if (elevatedToken) {
+    // Login/lock screen: inject on the secure Winlogon desktop by running the
+    // core with winlogon.exe's SYSTEM token.
+    LOG_DEBUG("getting elevated (winlogon) token for login screen");
+    HANDLE process = nullptr;
+    if (!m_session.isProcessInSession(L"winlogon.exe", &process) || process == nullptr) {
+      throw std::runtime_error("cannot get elevated token without winlogon.exe");
+    }
+    try {
+      HANDLE token = duplicateProcessToken(process, security);
+      CloseHandle(process);
+      return token;
+    } catch (...) {
+      CloseHandle(process);
+      throw;
+    }
+  }
 
   // Probe the active console session first so we can distinguish the benign
   // "no user logged on" case (login/lock screen -> wait and retry) from real
@@ -140,6 +180,32 @@ MSWindowsWatchdog::getUserToken(LPSECURITY_ATTRIBUTES security)
   return m_session.getUserToken(security);
 }
 
+bool MSWindowsWatchdog::loginScreenActive()
+{
+  // session-0 daemon can't query session 1's input desktop directly; the
+  // lock/login screen is owned by LogonUI.exe. Unlike consent.exe (transient
+  // UAC prompt) LogonUI is stable while shown, so keying elevation off it does
+  // not cause relaunch churn.
+  MSWindowsHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+  if (snapshot.get() == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+
+  PROCESSENTRY32 entry;
+  entry.dwSize = sizeof(PROCESSENTRY32);
+  if (!Process32First(snapshot.get(), &entry)) {
+    return false;
+  }
+
+  do {
+    if (_wcsicmp(entry.szExeFile, L"LogonUI.exe") == 0) {
+      return true;
+    }
+  } while (Process32Next(snapshot.get(), &entry));
+
+  return false;
+}
+
 void MSWindowsWatchdog::mainLoop(const void *)
 {
   using enum ProcessState;
@@ -151,15 +217,24 @@ void MSWindowsWatchdog::mainLoop(const void *)
     LOG_VERBOSE("locking process state mutex in watchdog main loop");
     std::unique_lock lock(m_processStateMutex);
 
-    // The core runs at medium integrity for its whole lifetime; the only
-    // relaunch trigger is a console-session change (fast user switch / logon),
-    // which requires re-acquiring the new session's user token. The core is
-    // never killed/relaunched to change integrity -- that flip broke PowerToys
-    // (see plan 2026-07-07) and never reached the secure desktop anyway.
-    if (m_processState == Running && !m_command.empty() && !m_foreground && m_session.hasChanged()) {
-      LOG_DEBUG("session changed, queueing process start");
-      m_processState = StartPending;
-      m_nextStartTime.reset();
+    // The core normally runs at medium integrity so user-level input hooks
+    // (PowerToys) keep working (see plan 2026-07-07). It is relaunched only for:
+    //   1. a console-session change (fast user switch / logon), and
+    //   2. the login/lock screen appearing or clearing -- there the core must
+    //      run SYSTEM to inject on the secure Winlogon desktop.
+    // In-session UAC (consent.exe) is intentionally NOT a trigger: it flickers
+    // and would churn the mesh / break PowerToys. LogonUI is stable, so its
+    // transitions cost at most one relaunch each (lock and unlock).
+    if (m_processState == Running && !m_command.empty() && !m_foreground) {
+      if (m_session.hasChanged()) {
+        LOG_DEBUG("session changed, queueing process start");
+        m_processState = StartPending;
+        m_nextStartTime.reset();
+      } else if (loginScreenActive() != m_lastElevated) {
+        LOG_DEBUG("login-screen transition (active=%s), queueing process start", loginScreenActive() ? "yes" : "no");
+        m_processState = StartPending;
+        m_nextStartTime.reset();
+      }
     }
 
     switch (m_processState) {
@@ -258,15 +333,18 @@ void MSWindowsWatchdog::startProcess()
 
   m_process = std::make_unique<deskflow::platform::MSWindowsProcess>(m_command, m_outputWritePipe, m_outputWritePipe);
 
-  // The core always runs at the user's (medium) integrity so user-level hook
-  // tools (PowerToys Keyboard Manager, Mouser) can intercept and remap its
-  // injected input. It is never elevated to SYSTEM/UIAccess: a low-level hook
-  // sees injected input regardless of the injector's integrity, and UIAccess
-  // does not reach the UAC secure desktop anyway -- that is the VHID bridge's
-  // job (see plan 2026-07-07). Reaching the secure desktop by elevating the
-  // core only churned the mesh and broke PowerToys.
+  // The core runs at medium integrity during a normal desktop session so
+  // user-level hook tools (PowerToys Keyboard Manager, Mouser) can intercept
+  // and remap its injected input. It is elevated ONLY while the login/lock
+  // screen (LogonUI) is active, where it must run SYSTEM to inject on the
+  // secure Winlogon desktop and where no user-level hooks are running anyway.
+  // In-session UAC (consent.exe) is deliberately not elevated for -- that flip
+  // churned the mesh and broke PowerToys; the VHID bridge handles it instead.
+  const bool elevate = loginScreenActive();
+  m_lastElevated = elevate;
+
   LOG_INFO("running command: %ls", m_command.c_str());
-  LOG_INFO("core integrity: medium (secure-desktop flip removed)");
+  LOG_INFO("core integrity: %s", elevate ? "SYSTEM (login screen active)" : "medium");
 
   BOOL createRet;
   if (m_foreground) {
@@ -277,7 +355,15 @@ void MSWindowsWatchdog::startProcess()
 
     SECURITY_ATTRIBUTES sa;
     ZeroMemory(&sa, sizeof(SECURITY_ATTRIBUTES));
-    HANDLE userToken = getUserToken(&sa);
+    HANDLE userToken = getUserToken(&sa, elevate);
+
+    // UIAccess lets the elevated core drive the secure/login desktop UI. Only
+    // set it on the login-screen path; on the normal desktop the core is medium
+    // with no UIAccess so PowerToys/Mouser hooks see its input.
+    if (elevate) {
+      DWORD uiAccess = 1;
+      SetTokenInformation(userToken, TokenUIAccess, &uiAccess, sizeof(DWORD));
+    }
 
     createRet = m_process->startAsUser(userToken, &sa);
   }
@@ -302,8 +388,8 @@ void MSWindowsWatchdog::startProcess()
 
     LOG_DEBUG("started core process from watchdog");
     LOG_VERBOSE(
-        "process info, session=%i, integrity=medium, command: %s", //
-        m_session.getActiveSessionId(), m_command.c_str()
+        "process info, session=%i, elevated=%s, command: %s", //
+        m_session.getActiveSessionId(), elevate ? "yes" : "no", m_command.c_str()
     );
   }
 }
