@@ -67,6 +67,43 @@ HANDLE openProcessForKill(const PROCESSENTRY32 &entry)
   return handle;
 }
 
+// UAC auto-dismisses the consent prompt after ~2 minutes, so any consent.exe
+// older than this is hung or leaked. Treating it as "secure desktop active"
+// would flap the core between elevated/user tokens on every cursor edge-cross
+// (the elevate decision follows the fleet cursor host) — killing and
+// relaunching deskflow-core for as long as the zombie process lives.
+static constexpr double kMaxConsentAgeSeconds = 180.0;
+
+static bool processYoungerThan(DWORD pid, double maxAgeSeconds)
+{
+  MSWindowsHandle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+  if (process.get() == nullptr) {
+    return true; // can't inspect it; assume it's a live prompt
+  }
+
+  FILETIME create;
+  FILETIME exit;
+  FILETIME kernel;
+  FILETIME user;
+  if (!GetProcessTimes(process.get(), &create, &exit, &kernel, &user)) {
+    return true;
+  }
+
+  FILETIME nowFileTime;
+  GetSystemTimeAsFileTime(&nowFileTime);
+
+  ULARGE_INTEGER created;
+  created.LowPart = create.dwLowDateTime;
+  created.HighPart = create.dwHighDateTime;
+  ULARGE_INTEGER now;
+  now.LowPart = nowFileTime.dwLowDateTime;
+  now.HighPart = nowFileTime.dwHighDateTime;
+
+  // FILETIME is in 100ns units.
+  const double ageSeconds = static_cast<double>(now.QuadPart - created.QuadPart) / 1e7;
+  return ageSeconds < maxAgeSeconds;
+}
+
 //
 // MSWindowsWatchdog
 //
@@ -398,8 +435,17 @@ bool MSWindowsWatchdog::secureDesktopActive()
   }
 
   do {
-    if (_wcsicmp(entry.szExeFile, L"consent.exe") == 0 || _wcsicmp(entry.szExeFile, L"LogonUI.exe") == 0) {
+    // LogonUI (lock/login screen) legitimately persists, so it always counts.
+    if (_wcsicmp(entry.szExeFile, L"LogonUI.exe") == 0) {
       return true;
+    }
+    // consent.exe (UAC prompt) auto-dismisses within ~2 minutes; older ones
+    // are hung/leaked and must not hold the fleet in secure-desktop state.
+    if (_wcsicmp(entry.szExeFile, L"consent.exe") == 0) {
+      if (processYoungerThan(entry.th32ProcessID, kMaxConsentAgeSeconds)) {
+        return true;
+      }
+      LOG_DEBUG("ignoring stale consent.exe pid=%u (older than %.0fs)", entry.th32ProcessID, kMaxConsentAgeSeconds);
     }
   } while (Process32Next(snapshot.get(), &entry));
 
