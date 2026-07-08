@@ -30,6 +30,7 @@
 #include <QStringDecoder>
 
 #include <algorithm>
+#include <vector>
 
 //
 // Free functions
@@ -182,29 +183,101 @@ MSWindowsWatchdog::getUserToken(LPSECURITY_ATTRIBUTES security, bool elevatedTok
 
 void MSWindowsWatchdog::nudgePowerToysKbm()
 {
-  // Terminate PowerToys.KeyboardManagerEngine.exe if present; the PowerToys
-  // runner respawns it, re-registering its WH_KEYBOARD_LL hook AFTER ours so
-  // its remaps take effect again. No-op when PowerToys/KBM isn't running.
-  MSWindowsHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-  if (snapshot.get() == INVALID_HANDLE_VALUE) {
+  // Our core just registered its low-level keyboard hook; on a relaunch that
+  // puts it AHEAD of an already-running PowerToys, suppressing remaps. The
+  // PowerToys runner does NOT respawn a killed engine, so we terminate the KBM
+  // engine and relaunch it ourselves in the user session -- it then registers
+  // its hook AFTER ours and remaps work again. Give the core a moment first so
+  // its hook is installed before KBM re-registers (order = last-in-first-out).
+  Arch::sleep(1.5);
+
+  std::wstring kbmPath;
+  DWORD kbmPid = 0;
+  DWORD runnerPid = 0;
+  {
+    MSWindowsHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (snapshot.get() == INVALID_HANDLE_VALUE) {
+      return;
+    }
+    PROCESSENTRY32 entry;
+    entry.dwSize = sizeof(PROCESSENTRY32);
+    if (!Process32First(snapshot.get(), &entry)) {
+      return;
+    }
+    do {
+      if (_wcsicmp(entry.szExeFile, L"PowerToys.KeyboardManagerEngine.exe") == 0) {
+        kbmPid = entry.th32ProcessID;
+        MSWindowsHandle p(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, kbmPid));
+        if (p.get() != nullptr) {
+          wchar_t buf[MAX_PATH];
+          DWORD sz = MAX_PATH;
+          if (QueryFullProcessImageNameW(p.get(), 0, buf, &sz)) {
+            kbmPath.assign(buf, sz);
+          }
+        }
+      } else if (_wcsicmp(entry.szExeFile, L"PowerToys.exe") == 0) {
+        runnerPid = entry.th32ProcessID;
+      }
+    } while (Process32Next(snapshot.get(), &entry));
+  }
+
+  if (kbmPath.empty()) {
+    LOG_DEBUG("PowerToys Keyboard Manager engine not running; nothing to nudge");
     return;
   }
 
-  PROCESSENTRY32 entry;
-  entry.dwSize = sizeof(PROCESSENTRY32);
-  if (!Process32First(snapshot.get(), &entry)) {
-    return;
+  {
+    MSWindowsHandle proc(OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, kbmPid));
+    if (proc.get() != nullptr) {
+      TerminateProcess(proc.get(), 0);
+      WaitForSingleObject(proc.get(), 2000);
+    }
   }
 
-  do {
-    if (_wcsicmp(entry.szExeFile, L"PowerToys.KeyboardManagerEngine.exe") != 0) {
-      continue;
+  // Relaunch the engine in the interactive user session. It takes the runner
+  // pid as an argument so it still exits with PowerToys.
+  try {
+    SECURITY_ATTRIBUTES sa;
+    ZeroMemory(&sa, sizeof(SECURITY_ATTRIBUTES));
+    HANDLE userToken = getUserToken(&sa, false);
+
+    LPVOID env = nullptr;
+    CreateEnvironmentBlock(&env, userToken, FALSE);
+
+    const std::wstring dir = kbmPath.substr(0, kbmPath.find_last_of(L"\\/"));
+    std::wstring cmd = L"\"" + kbmPath + L"\"";
+    if (runnerPid != 0) {
+      cmd += L" " + std::to_wstring(runnerPid);
     }
-    MSWindowsHandle proc(OpenProcess(PROCESS_TERMINATE, FALSE, entry.th32ProcessID));
-    if (proc.get() != nullptr && TerminateProcess(proc.get(), 0)) {
-      LOG_INFO("nudged PowerToys Keyboard Manager (pid %u) to reclaim hook priority", entry.th32ProcessID);
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    static wchar_t desktop[] = L"winsta0\\Default"; // NOSONAR - idiomatic Win32
+    si.lpDesktop = desktop;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    const DWORD flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    if (CreateProcessAsUserW(
+            userToken, nullptr, cmdBuf.data(), &sa, &sa, FALSE, flags, env, dir.c_str(), &si, &pi
+        )) {
+      LOG_INFO("relaunched PowerToys Keyboard Manager to reclaim hook priority");
+      CloseHandle(pi.hProcess);
+      CloseHandle(pi.hThread);
+    } else {
+      LOG_WARN("failed to relaunch PowerToys Keyboard Manager: %s", windowsErrorToString(GetLastError()).c_str());
     }
-  } while (Process32Next(snapshot.get(), &entry));
+
+    if (env != nullptr) {
+      DestroyEnvironmentBlock(env);
+    }
+    CloseHandle(userToken);
+  } catch (const std::exception &e) {
+    LOG_WARN("could not relaunch PowerToys Keyboard Manager: %s", e.what());
+  }
 }
 
 bool MSWindowsWatchdog::loginScreenActive()

@@ -158,11 +158,12 @@ private:
    *
    * When the core (re)starts on the normal desktop it registers its
    * WH_KEYBOARD_LL hook LAST, which places it ahead of an already-running
-   * PowerToys in the hook chain and can suppress remaps until PowerToys
-   * re-registers. Terminating the KBM engine makes the PowerToys runner respawn
-   * it so its hook re-registers after ours. No-op if KBM isn't running.
+   * PowerToys in the hook chain and suppresses remaps. The PowerToys runner
+   * does not respawn a killed engine, so this terminates the KBM engine and
+   * relaunches it in the user session; its hook then re-registers after ours.
+   * No-op if KBM isn't running. Not static: needs the user session token.
    */
-  static void nudgePowerToysKbm();
+  void nudgePowerToysKbm();
 
 private:
   bool m_running = true;
