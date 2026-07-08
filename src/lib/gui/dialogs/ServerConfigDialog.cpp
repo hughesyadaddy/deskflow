@@ -14,6 +14,7 @@
 #include "common/PlatformInfo.h"
 #include "common/Settings.h"
 #include "dialogs/ActionDialog.h"
+#include "dialogs/ChordRemapDialog.h"
 #include "dialogs/HotkeyDialog.h"
 #include "dialogs/ScreenSettingsDialog.h"
 
@@ -21,6 +22,15 @@
 
 #include <QFileDialog>
 #include <QMessageBox>
+
+namespace {
+
+QString normalizeChordSpec(QString spec)
+{
+  return spec.replace(QStringLiteral("Meta"), QStringLiteral("Super"));
+}
+
+} // namespace
 
 using enum ScreenConfig::SwitchCorner;
 
@@ -161,6 +171,194 @@ void ServerConfigDialog::removeHotkey()
   serverConfig().hotkeys().removeAt(row);
   ui->listActions->clear();
   delete ui->listHotkeys->item(row);
+  onChange();
+}
+
+void ServerConfigDialog::refreshChordRemapScreens()
+{
+  const QString current = ui->comboChordRemapScreen->currentText();
+  ui->comboChordRemapScreen->blockSignals(true);
+  ui->comboChordRemapScreen->clear();
+  for (const Screen &screen : serverConfig().screens()) {
+    if (!screen.isNull()) {
+      ui->comboChordRemapScreen->addItem(screen.name());
+    }
+  }
+  const int idx = ui->comboChordRemapScreen->findText(current);
+  ui->comboChordRemapScreen->setCurrentIndex(idx >= 0 ? idx : 0);
+  ui->comboChordRemapScreen->blockSignals(false);
+}
+
+void ServerConfigDialog::refreshChordRemapList()
+{
+  ui->listChordRemaps->clear();
+  if (ui->comboChordRemapScreen->count() == 0) {
+    return;
+  }
+
+  const QString screen = ui->comboChordRemapScreen->currentText();
+  for (int i = 0; i < serverConfig().chordRemaps().size(); ++i) {
+    const ChordRemap &remap = serverConfig().chordRemaps()[i];
+    if (remap.screen() != screen) {
+      continue;
+    }
+    auto *item = new QListWidgetItem(remap.text());
+    item->setData(Qt::UserRole, i);
+    ui->listChordRemaps->addItem(item);
+  }
+}
+
+bool ServerConfigDialog::validateChordRemap(const ChordRemap &remap, int excludeIndex) const
+{
+  if (!remap.inSequence().valid() || !remap.outSequence().valid()) {
+    QMessageBox::warning(
+        const_cast<ServerConfigDialog *>(this), tr("Chord remap"), tr("Enter both input and output chords.")
+    );
+    return false;
+  }
+
+  const QString inSpec = normalizeChordSpec(remap.inSequence().toString());
+  const QString outSpec = normalizeChordSpec(remap.outSequence().toString());
+  if (inSpec.isEmpty() || outSpec.isEmpty()) {
+    QMessageBox::warning(
+        const_cast<ServerConfigDialog *>(this), tr("Chord remap"), tr("Enter both input and output chords.")
+    );
+    return false;
+  }
+  if (inSpec == outSpec) {
+    QMessageBox::warning(
+        const_cast<ServerConfigDialog *>(this), tr("Chord remap"), tr("Input and output chords must differ.")
+    );
+    return false;
+  }
+
+  for (int i = 0; i < serverConfig().chordRemaps().size(); ++i) {
+    if (i == excludeIndex) {
+      continue;
+    }
+    const ChordRemap &other = serverConfig().chordRemaps()[i];
+    if (other.screen() == remap.screen() &&
+        normalizeChordSpec(other.inSequence().toString()) == inSpec) {
+      QMessageBox::warning(
+          const_cast<ServerConfigDialog *>(this), tr("Chord remap"),
+          tr("This screen already has a remap for that input chord.")
+      );
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void ServerConfigDialog::addChordRemap()
+{
+  if (ui->comboChordRemapScreen->count() == 0) {
+    QMessageBox::warning(this, tr("Chord remap"), tr("Add a screen before creating chord remaps."));
+    return;
+  }
+
+  ChordRemap remap;
+  remap.setScreen(ui->comboChordRemapScreen->currentText());
+  ChordRemapDialog dlg(this, remap);
+  if (dlg.exec() != QDialog::Accepted) {
+    return;
+  }
+  if (!validateChordRemap(remap, -1)) {
+    return;
+  }
+
+  serverConfig().chordRemaps().append(remap);
+  refreshChordRemapList();
+  onChange();
+}
+
+void ServerConfigDialog::editChordRemap()
+{
+  auto *item = ui->listChordRemaps->currentItem();
+  if (item == nullptr) {
+    return;
+  }
+
+  const int index = item->data(Qt::UserRole).toInt();
+  if (index < 0 || index >= serverConfig().chordRemaps().size()) {
+    return;
+  }
+
+  ChordRemap &remap = serverConfig().chordRemaps()[index];
+  const ChordRemap backup = remap;
+  ChordRemapDialog dlg(this, remap);
+  if (dlg.exec() != QDialog::Accepted) {
+    return;
+  }
+  if (!validateChordRemap(remap, index)) {
+    remap = backup;
+    return;
+  }
+
+  item->setText(remap.text());
+  onChange();
+}
+
+void ServerConfigDialog::removeChordRemap()
+{
+  auto *item = ui->listChordRemaps->currentItem();
+  if (item == nullptr) {
+    return;
+  }
+
+  const int index = item->data(Qt::UserRole).toInt();
+  if (index < 0 || index >= serverConfig().chordRemaps().size()) {
+    return;
+  }
+
+  serverConfig().chordRemaps().removeAt(index);
+  refreshChordRemapList();
+  onChange();
+}
+
+void ServerConfigDialog::listChordRemapsSelectionChanged(const QItemSelection &selected, const QItemSelection &)
+{
+  const bool itemsSelected = !selected.isEmpty();
+  ui->btnEditChordRemap->setEnabled(itemsSelected);
+  ui->btnRemoveChordRemap->setEnabled(itemsSelected);
+}
+
+void ServerConfigDialog::chordRemapScreenChanged()
+{
+  refreshChordRemapList();
+}
+
+QSet<QString> ServerConfigDialog::currentScreenNames() const
+{
+  QSet<QString> names;
+  for (const Screen &screen : serverConfig().screens()) {
+    if (!screen.isNull()) {
+      names.insert(screen.name());
+    }
+  }
+  return names;
+}
+
+void ServerConfigDialog::syncChordRemapsWithScreens()
+{
+  const QSet<QString> currentNames = currentScreenNames();
+  const QSet<QString> removed = m_knownScreenNames - currentNames;
+  const QSet<QString> added = currentNames - m_knownScreenNames;
+
+  if (removed.size() == 1 && added.size() == 1) {
+    serverConfig().renameChordRemapScreen(*removed.begin(), *added.begin());
+  } else {
+    serverConfig().pruneChordRemapsForMissingScreens();
+  }
+
+  m_knownScreenNames = currentNames;
+  refreshChordRemapScreens();
+  refreshChordRemapList();
+}
+
+void ServerConfigDialog::onScreensChanged()
+{
+  syncChordRemapsWithScreens();
   onChange();
 }
 
@@ -362,6 +560,7 @@ void ServerConfigDialog::addClient()
 void ServerConfigDialog::onScreenRemoved()
 {
   ui->lblNewScreen->setEnabled(true);
+  syncChordRemapsWithScreens();
   onChange();
 }
 
@@ -370,6 +569,10 @@ void ServerConfigDialog::toggleExternalConfig(bool checked)
   ui->widgetExternalConfigControls->setEnabled(checked);
   ui->tabWidget->setTabEnabled(0, !checked);
   ui->tabWidget->setTabEnabled(1, !checked);
+  const int chordTab = ui->tabWidget->indexOf(ui->tabChordRemaps);
+  if (chordTab >= 0) {
+    ui->tabWidget->setTabEnabled(chordTab, !checked);
+  }
   serverConfig().setUseExternalConfig(checked);
   onChange();
 }
@@ -450,6 +653,10 @@ void ServerConfigDialog::loadFromConfig()
   for (const Hotkey &hotkey : std::as_const(serverConfig().hotkeys()))
     ui->listHotkeys->addItem(hotkey.text());
 
+  refreshChordRemapScreens();
+  refreshChordRemapList();
+  m_knownScreenNames = currentScreenNames();
+
   ui->screenSetupView->setModel(&m_screenSetupModel);
 
   for (auto &screen : serverConfig().screens()) {
@@ -512,6 +719,16 @@ void ServerConfigDialog::initConnections() const
       &ServerConfigDialog::listHotkeysSelectionChanged
   );
 
+  connect(ui->btnNewChordRemap, &QPushButton::clicked, this, &ServerConfigDialog::addChordRemap);
+  connect(ui->btnEditChordRemap, &QPushButton::clicked, this, &ServerConfigDialog::editChordRemap);
+  connect(ui->btnRemoveChordRemap, &QPushButton::clicked, this, &ServerConfigDialog::removeChordRemap);
+  connect(ui->listChordRemaps, &QListView::doubleClicked, this, &ServerConfigDialog::editChordRemap);
+  connect(
+      ui->listChordRemaps->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+      &ServerConfigDialog::listChordRemapsSelectionChanged
+  );
+  connect(ui->comboChordRemapScreen, &QComboBox::currentTextChanged, this, &ServerConfigDialog::chordRemapScreenChanged);
+
   connect(ui->btnNewAction, &QPushButton::clicked, this, &ServerConfigDialog::addAction);
   connect(ui->btnEditAction, &QPushButton::clicked, this, &ServerConfigDialog::editAction);
   connect(ui->btnRemoveAction, &QPushButton::clicked, this, &ServerConfigDialog::removeAction);
@@ -545,7 +762,7 @@ void ServerConfigDialog::initConnections() const
       ui->cbDefaultLockToComputerState, &QCheckBox::toggled, this, &ServerConfigDialog::toggleDefaultLockToComputerState
   );
   connect(ui->cbDisableLockToComputer, &QCheckBox::toggled, this, &ServerConfigDialog::toggleLockToComputer);
-  connect(&m_screenSetupModel, &ScreenSetupModel::screensChanged, this, &ServerConfigDialog::onChange);
+  connect(&m_screenSetupModel, &ScreenSetupModel::screensChanged, this, &ServerConfigDialog::onScreensChanged);
   connect(ui->groupGestureSharing, &QGroupBox::toggled, this, &ServerConfigDialog::onGestureSharingToggled);
   connect(ui->lineGestureSecret, &QLineEdit::textChanged, this, &ServerConfigDialog::onChange);
 }

@@ -17,6 +17,7 @@
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
 #include "server/Config.h"
+#include "server/ChordRemapTypes.h"
 #include "server/TopologyLink.h"
 #include "server/VirtualHostTracker.h"
 
@@ -373,6 +374,7 @@ private:
   void onKeyDown(KeyID, KeyModifierMask, KeyButton, const std::string &, const char *screens);
   void onKeyUp(KeyID, KeyModifierMask, KeyButton, const char *screens);
   void onKeyRepeat(KeyID, KeyModifierMask, int32_t, KeyButton, const std::string &);
+  bool applyChordRemapForActiveScreen(KeyID &id, KeyModifierMask &mask);
   void onMouseDown(ButtonID);
   void onMouseUp(ButtonID);
   bool onMouseMovePrimary(int32_t x, int32_t y);
