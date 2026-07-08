@@ -15,4 +15,5 @@ class KeyboardRelayMapWindowsTests : public QObject
 private Q_SLOTS:
   void modifierKeys_mapToFleetKeyIds();
   void modifierKeyUp_clearsId();
+  void shiftedKey_translatesToShiftedKeyId();
 };

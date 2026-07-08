@@ -88,7 +88,7 @@ bool modifierIsDown(CGKeyCode vk, CGEventFlags flags)
   }
 }
 
-KeyID translateVirtualKey(CGKeyCode vk, const UCKeyboardLayout *layout, UInt32 keyboardType)
+KeyID translateVirtualKey(CGKeyCode vk, CGEventFlags flags, const UCKeyboardLayout *layout, UInt32 keyboardType)
 {
   if (const KeyID modifier = modifierKeyIdFromVirtualKey(vk); modifier != kKeyNone) {
     return modifier;
@@ -131,12 +131,26 @@ KeyID translateVirtualKey(CGKeyCode vk, const UCKeyboardLayout *layout, UInt32 k
     return kKeyNone;
   }
 
+  // Translate with the live Shift/CapsLock state so Shift+A relays as 'A',
+  // matching the normal server capture path (OSXKeyState::mapKeyFromEvent).
+  // With a modifier-less KeyID ('a'), the target's KeyMap would actively
+  // RELEASE Shift to reproduce the lowercase glyph, dropping the modifier.
+  // Command/Control/Option are excluded, mirroring the normal path, which
+  // strips them so the base glyph is sent and the mask applies them remotely.
+  UInt32 modifierKeyState = 0;
+  if ((flags & kCGEventFlagMaskShift) != 0) {
+    modifierKeyState |= (shiftKey >> 8);
+  }
+  if ((flags & kCGEventFlagMaskAlphaShift) != 0) {
+    modifierKeyState |= (alphaLock >> 8);
+  }
+
   UInt32 deadKeyState = 0;
   UniChar chars[4];
   UniCharCount count = 0;
   if (UCKeyTranslate(
-          layout, vk, kUCKeyActionDisplay, 0, keyboardType, kUCKeyTranslateNoDeadKeysMask, &deadKeyState, 4, &count,
-          chars
+          layout, vk, kUCKeyActionDisplay, modifierKeyState, keyboardType, kUCKeyTranslateNoDeadKeysMask, &deadKeyState,
+          4, &count, chars
       ) == noErr &&
       count > 0) {
     const UniChar c = chars[0];
@@ -157,7 +171,7 @@ bool mapRelayKeyFromCgEvent(
   const CGEventType type = CGEventGetType(event);
   if (type == kCGEventKeyDown) {
     phase = CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) != 0 ? Message::KeyPhase::Repeat
-                                                                               : Message::KeyPhase::Down;
+                                                                                : Message::KeyPhase::Down;
   } else if (type == kCGEventKeyUp) {
     phase = Message::KeyPhase::Up;
   } else {
@@ -191,7 +205,7 @@ bool mapRelayKeyFromCgEvent(
   AutoCFData layoutData(layoutRef, CFRelease);
   const auto *layout =
       layoutData ? reinterpret_cast<const UCKeyboardLayout *>(CFDataGetBytePtr(layoutData.get())) : nullptr;
-  id = translateVirtualKey(vk, layout, keyboardType);
+  id = translateVirtualKey(vk, CGEventGetFlags(event), layout, keyboardType);
 
   return id != kKeyNone || phase == Message::KeyPhase::Repeat;
 }

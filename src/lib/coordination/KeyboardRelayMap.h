@@ -32,6 +32,10 @@ bool mapRelayKeyFromHook(
     int vkCode, int scanCode, bool isExtended, bool keyUp, bool isRepeat, KeyID &id, KeyModifierMask &mask,
     KeyButton &button, Message::KeyPhase &phase
 );
+
+//! Translate a virtual key to a KeyID using the given Shift/CapsLock state so
+//! shifted glyphs relay as the character the user actually typed.
+KeyID mapRelayVirtualKey(int vkCode, bool shift, bool capsLock);
 #endif
 
 } // namespace deskflow::coordination

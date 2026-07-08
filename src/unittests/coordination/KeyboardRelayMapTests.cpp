@@ -154,4 +154,101 @@ void KeyboardRelayMapTests::mapModifiers_useNeutralMaskBits()
   CFRelease(event);
 }
 
+void KeyboardRelayMapTests::shiftedKey_translatesToShiftedKeyId()
+{
+  // Regression: the relay used to translate with zero modifier state, so
+  // Shift+A relayed as 'a' and the target's KeyMap released Shift to
+  // reproduce the lowercase glyph -- modifiers appeared dead on relayed
+  // keyboards. The KeyID must reflect the live Shift state.
+  const auto mapKey = [](CGKeyCode vk, CGEventFlags flags, KeyID &id, KeyModifierMask &mask) {
+    CGEventRef event = CGEventCreateKeyboardEvent(nullptr, vk, true);
+    QVERIFY(event != nullptr);
+    CGEventSetFlags(event, flags);
+
+    // mapRelayKeyFromCgEvent fetches layout data via the main queue, so run
+    // it off-main and pump the run loop (same pattern as the crash test).
+    std::atomic<bool> finished{false};
+    std::atomic<bool> mapped{false};
+    std::thread worker([&]() {
+      Message::KeyPhase phase = Message::KeyPhase::Down;
+      KeyButton button = 0;
+      mapped.store(
+          deskflow::coordination::mapRelayKeyFromCgEvent(event, phase, id, mask, button), std::memory_order_relaxed
+      );
+      finished.store(true, std::memory_order_relaxed);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!finished.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < deadline) {
+      CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+    }
+    if (!finished.load(std::memory_order_relaxed)) {
+      worker.detach();
+      QFAIL("mapRelayKeyFromCgEvent did not complete within 5 seconds");
+    }
+    worker.join();
+    CFRelease(event);
+    QVERIFY(mapped.load(std::memory_order_relaxed));
+  };
+
+  KeyID unshiftedId = kKeyNone;
+  KeyModifierMask unshiftedMask = 0;
+  mapKey(kVK_ANSI_A, 0, unshiftedId, unshiftedMask);
+
+  KeyID shiftedId = kKeyNone;
+  KeyModifierMask shiftedMask = 0;
+  mapKey(kVK_ANSI_A, kCGEventFlagMaskShift, shiftedId, shiftedMask);
+
+  KeyID capsLockedId = kKeyNone;
+  KeyModifierMask capsLockedMask = 0;
+  mapKey(kVK_ANSI_A, kCGEventFlagMaskAlphaShift, capsLockedId, capsLockedMask);
+
+  KeyID shiftCapsId = kKeyNone;
+  KeyModifierMask shiftCapsMask = 0;
+  mapKey(kVK_ANSI_A, kCGEventFlagMaskShift | kCGEventFlagMaskAlphaShift, shiftCapsId, shiftCapsMask);
+
+  if (QTest::currentTestFailed()) {
+    return;
+  }
+
+  QVERIFY((shiftedMask & KeyModifierShift) != 0);
+  QVERIFY(shiftedId != kKeyNone);
+  // On any Latin layout the A key produces a lowercase letter unshifted and
+  // its uppercase counterpart shifted or caps-locked. Unlike Windows, macOS
+  // does NOT cancel CapsLock with Shift: Shift+CapsLock+A stays uppercase.
+  if (unshiftedId >= 'a' && unshiftedId <= 'z') {
+    QCOMPARE(shiftedId, static_cast<KeyID>(unshiftedId - 'a' + 'A'));
+    QCOMPARE(capsLockedId, shiftedId);
+    QCOMPARE(shiftCapsId, shiftedId);
+  } else {
+    QVERIFY(shiftedId != unshiftedId);
+  }
+
+  // Digit row: Shift changes the glyph but CapsLock must not. Only assert on
+  // US-like layouts where the key produces '1' unshifted (e.g. French AZERTY
+  // differs on both counts).
+  KeyID digitId = kKeyNone;
+  KeyModifierMask digitMask = 0;
+  mapKey(kVK_ANSI_1, 0, digitId, digitMask);
+
+  if (QTest::currentTestFailed()) {
+    return;
+  }
+
+  if (digitId == static_cast<KeyID>('1')) {
+    KeyID shiftedDigitId = kKeyNone;
+    KeyModifierMask shiftedDigitMask = 0;
+    mapKey(kVK_ANSI_1, kCGEventFlagMaskShift, shiftedDigitId, shiftedDigitMask);
+
+    KeyID capsDigitId = kKeyNone;
+    KeyModifierMask capsDigitMask = 0;
+    mapKey(kVK_ANSI_1, kCGEventFlagMaskAlphaShift, capsDigitId, capsDigitMask);
+
+    if (QTest::currentTestFailed()) {
+      return;
+    }
+    QVERIFY(shiftedDigitId != digitId);
+    QCOMPARE(capsDigitId, digitId);
+  }
+}
+
 QTEST_MAIN(KeyboardRelayMapTests)

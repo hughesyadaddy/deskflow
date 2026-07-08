@@ -15,6 +15,7 @@
 #include <windows.h>
 
 using deskflow::coordination::mapRelayKeyFromHook;
+using deskflow::coordination::mapRelayVirtualKey;
 using deskflow::coordination::Message;
 
 void KeyboardRelayMapWindowsTests::modifierKeys_mapToFleetKeyIds()
@@ -47,6 +48,38 @@ void KeyboardRelayMapWindowsTests::modifierKeyUp_clearsId()
   QCOMPARE(phase, Message::KeyPhase::Up);
   QCOMPARE(id, kKeyNone);
   QCOMPARE(button, static_cast<KeyButton>(VK_CONTROL));
+}
+
+void KeyboardRelayMapWindowsTests::shiftedKey_translatesToShiftedKeyId()
+{
+  // Regression: the relay used to call ToUnicodeEx with a zeroed keyboard
+  // state, so Shift+A relayed as 'a' and the target's KeyMap released Shift
+  // to reproduce the lowercase glyph -- modifiers appeared dead on relayed
+  // keyboards. The KeyID must reflect the given Shift/CapsLock state.
+  const KeyID unshifted = mapRelayVirtualKey('A', false, false);
+  const KeyID shifted = mapRelayVirtualKey('A', true, false);
+  const KeyID capsLocked = mapRelayVirtualKey('A', false, true);
+  const KeyID shiftCaps = mapRelayVirtualKey('A', true, true);
+
+  QVERIFY(unshifted != kKeyNone);
+  QVERIFY(shifted != kKeyNone);
+  // On any Latin layout the A key produces a lowercase letter unshifted and
+  // its uppercase counterpart shifted or caps-locked; Shift cancels CapsLock.
+  if (unshifted >= 'a' && unshifted <= 'z') {
+    QCOMPARE(shifted, static_cast<KeyID>(unshifted - 'a' + 'A'));
+    QCOMPARE(capsLocked, shifted);
+    QCOMPARE(shiftCaps, unshifted);
+  } else {
+    QVERIFY(shifted != unshifted);
+  }
+
+  // Digit row: Shift changes the glyph but CapsLock must not. Only assert on
+  // US-like layouts where the key produces '1' unshifted.
+  const KeyID digit = mapRelayVirtualKey('1', false, false);
+  if (digit == static_cast<KeyID>('1')) {
+    QVERIFY(mapRelayVirtualKey('1', true, false) != digit);
+    QCOMPARE(mapRelayVirtualKey('1', false, true), digit);
+  }
 }
 
 QTEST_MAIN(KeyboardRelayMapWindowsTests)

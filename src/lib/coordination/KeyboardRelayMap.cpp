@@ -35,7 +35,9 @@ KeyModifierMask activeModifiers()
   return mask;
 }
 
-KeyID mapVirtualKey(int vkCode)
+} // namespace
+
+KeyID mapRelayVirtualKey(int vkCode, bool shift, bool capsLock)
 {
   switch (vkCode) {
   case VK_RETURN:
@@ -110,7 +112,19 @@ KeyID mapVirtualKey(int vkCode)
     break;
   }
 
-  const BYTE keyboardState[256] = {};
+  // Translate with the live Shift/CapsLock state so Shift+A relays as 'A',
+  // matching the normal server capture path. With a modifier-less KeyID
+  // ('a'), the target's KeyMap would actively RELEASE Shift to reproduce the
+  // lowercase glyph, dropping the modifier. Ctrl/Alt are excluded so the base
+  // glyph is sent and the mask applies them remotely (and to avoid ToUnicodeEx
+  // emitting control characters).
+  BYTE keyboardState[256] = {};
+  if (shift) {
+    keyboardState[VK_SHIFT] = 0x80;
+  }
+  if (capsLock) {
+    keyboardState[VK_CAPITAL] = 0x01;
+  }
   WCHAR buffer[8] = {};
   const int rc = ToUnicodeEx(static_cast<UINT>(vkCode), 0, keyboardState, buffer, 8, 0, GetKeyboardLayout(0));
   if (rc == 1 && buffer[0] >= 32) {
@@ -118,8 +132,6 @@ KeyID mapVirtualKey(int vkCode)
   }
   return kKeyNone;
 }
-
-} // namespace
 
 bool mapRelayKeyFromHook(
     int vkCode, int scanCode, bool isExtended, bool keyUp, bool isRepeat, KeyID &id, KeyModifierMask &mask,
@@ -132,7 +144,7 @@ bool mapRelayKeyFromHook(
   phase = keyUp ? Message::KeyPhase::Up : (isRepeat ? Message::KeyPhase::Repeat : Message::KeyPhase::Down);
   button = static_cast<KeyButton>(vkCode);
   mask = activeModifiers();
-  id = mapVirtualKey(vkCode);
+  id = mapRelayVirtualKey(vkCode, (mask & KeyModifierShift) != 0, (mask & KeyModifierCapsLock) != 0);
   if (keyUp) {
     id = kKeyNone;
     return true;
