@@ -73,20 +73,52 @@ Decision needed (open question 1): pay for EV + attestation to keep Secure Boot 
 Today (`src/lib/platform/MSWindowsDesks.cpp`):
 - `send_keyboard_input()` / `send_mouse_input()` call `SendInput`.
 - `fakeKeyEvent`, `fakeMouseButton`, `fakeMouseMove`, `fakeMouseRelativeMove`, `fakeMouseWheel` post `DESKFLOW_MSG_FAKE_*` to the desk thread, which calls those `SendInput` wrappers.
+- The `SendInput` path is **retained**, not replaced: it's the fallback when the driver is absent, and the shipped SYSTEM-on-LogonUI PIN path still uses it. The new work is one dispatch branch inside the existing desk-thread handler — do **not** build a parallel abstraction layer.
 
-Target: when a virtual-HID mode is enabled and the device is present, translate those same fake-input events into **HID reports** submitted to the driver (the `VhidClient` IOCTL path already exists in the bridge; lift it into the core or keep the bridge as the submitter). Key sub-tasks:
-- Map Deskflow `KeyButton`/VK + modifier state → **HID usage codes** + modifier byte (8-byte keyboard report, up to 6 keys — need roll-over handling).
-- Map mouse move/button/wheel → the 4-byte mouse report (relative). Absolute positioning needs an absolute-mouse collection (FakerInput has one; our descriptor is relative-only today — may need an absolute collection for cursor placement).
-- Decide the boundary: does `deskflow-core` open the vhid device directly (it's medium/UIAccess in session 1) or keep routing through a helper? The IOCTL needs `FILE_WRITE_ACCESS`; confirm a medium/UIAccess core can open the device interface, else keep a small submitter.
-- Keep `SendInput` as a fallback when the driver isn't installed/loaded (gated by a setting), so non-driver machines still work.
+Target: when virtual-HID mode is enabled and the device is openable, translate the same fake-input events into **HID reports**. The hard parts (from technical review [engineering](62790777-dff8-47ac-9dbf-e86f5e48b089)):
 
-## Phases
+### Stateful HID keyboard component (the biggest missing piece)
+`SendInput` is stateless per event; a HID boot-keyboard report is **stateful** — every report must carry the full set of currently-pressed usages (`keys[6]`) plus the live modifier bitmask. Build a named `HidKeyboardState` that:
+- owns the pressed-key set + modifier byte; adds/removes on each fake key event; emits the full 8-byte report each time;
+- maps **from scan code, not VK** — the message already carries the scancode (`LOWORD(msg.lParam)`); use the PS/2 set-1 scancode → HID Usage Page 0x07 table, handling the `0xE0` extended prefix (arrows/nav/right-modifiers) explicitly;
+- defines overflow behavior at a 7th simultaneous key (drop, or emit rollover-error `0x01`×6);
+- releases cleanly on disconnect/leave (no stuck keys/modifiers — the FakerInput cautionary bug class).
 
-1. **Driver finish + load.** Complete `deskflow-vhid.sys` (keyboard + mouse VHF children; change the Logitech placeholder VID/PID `0x046D/0xFFFF` to our own). Build with WDK; test-sign; load on tiny11 (Secure Boot off for now). Prove with `deskflow-vhid-bridge-win.exe` that the virtual devices enumerate and inject.
-2. **Prove the three payoffs** on tiny11 before deep integration: (a) KBM remaps virtual-HID keystrokes cleanly (no double-fire); (b) input reaches an elevated PowerToys window; (c) UAC consent Yes/No click lands. This is the go/no-go gate.
-3. **Core integration.** Route `MSWindowsDesks` fake-input through HID reports behind a setting (`daemon/useVhidInput`, default off); `SendInput` fallback when the device is absent. Add absolute-mouse collection if needed for cursor placement.
-4. **Signing for production.** If Secure Boot must stay on: EV cert + Partner Center attestation; wire signtool/CAB submission into the Windows build. Else document the test-signing setup.
-5. **Retire the UIAccess workaround.** Once HID input is the path, the core no longer needs UIAccess for the mouse (HID isn't UIPI-gated) — set `daemon/uiAccessCore=false` and confirm the keyboard double-fire is gone and the mouse still reaches elevated windows.
+### Mouse: absolute is REQUIRED (was open question 3 — now decided)
+`deskMouseMove` is the primary path and uses `MOUSEEVENTF_ABSOLUTE` (streams absolute positions on screen-enter). A relative-only virtual mouse would drift on every crossing and break entry positioning/UAC targeting — a functional regression, not a self-correcting nuisance. Therefore:
+- add an **absolute-mouse collection** to the HID descriptor + a matching report/IOCTL (keep the relative collection for the `fakeMouseRelativeMove` game path);
+- the report deltas are `char` (−127..127); `fakeMouseMove`/`RelativeMove` produce larger values, so the submit layer must **clamp-and-split** large deltas across multiple reports (absolute avoids this for positioning; relative still needs it).
+
+### Device access boundary (was open question 2 — now decided)
+Write an explicit **SDDL on the device interface** granting write to the core's user/session account (INF security or `WdfDeviceCreateDeviceInterface` + `SDDL`). That decision *determines* whether the medium/UIAccess session-1 core can `CreateFileW` the interface directly (preferred — drop the named-pipe hop) vs needing a helper. Do not leave the pipe's default `PIPE_ACCESS_INBOUND` security in place (it just relocates the "who can write" question).
+
+### Injected-input sentinel under HID
+HID input has `LLKHF_INJECTED` **clear** by design, so `fakeInputBegin/End` (which today mark Deskflow's own injection via `DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY`) can't distinguish our HID input. State explicitly what they become under HID (no-op on the HID path; still used by the retained `SendInput` fallback). On a pure client this is expected to be harmless — confirm.
+
+### VID/PID
+Change the placeholder `VendorID = 0x046D` (Logitech's registered USB VID — must not ship on a signed device) to a clearly-synthetic, non-impersonating VID/PID.
+
+### Runtime fallback decision tree
+Define precisely: setting off → `SendInput`; setting on + device opens (`findDevicePath` **and** `CreateFileW` succeed) → HID; setting on + present-but-open-fails (ACL) → log + `SendInput`. A half-provisioned box must never silently do nothing.
+
+## Testing strategy
+
+The riskiest pieces are deterministic, host-testable logic — do not leave them to manual observation:
+- Unit tests for scancode→HID-usage mapping and `HidKeyboardState` (chords, held modifiers, key-repeat, modifier-only reports, 7-key overflow, extended-key `0xE0`, release-all-on-disconnect).
+- Delta clamp/split test (e.g. 200 → 127 + 73).
+- Soak/fuzz test replaying a captured input stream; assert the report stream ends with all keys/modifiers released (no stuck keys — the FakerInput failure mode).
+- Non-functional criterion: no added input latency vs `SendInput`, zero stuck-key events over an N-minute soak (input lag is a prior hard-won concern).
+
+## Phases / PR breakdown
+
+Split into 5 PRs along phase seams ([splitting review](b797eb4c-32c1-4c51-aef0-f8b7e4a8a45a)). Everything defaults off until Phase 5, so all PRs merge safely under test-signing.
+
+- **PR 1 — Driver finish + load + descriptor.** Complete `deskflow-vhid.sys`: keyboard + relative mouse + **absolute mouse** VHF collections; non-impersonating VID/PID; explicit device-interface **SDDL**. Build with WDK; test-sign; load on tiny11 (Secure Boot off). Prove enumeration/injection with `deskflow-vhid-bridge-win.exe`. **Also in PR 1 (de-risk early): submit a trivial signed root-enumerated VHF sample through Partner Center attestation** to confirm the signing path is viable for a root-enumerated software device *before* betting the fleet on Secure-Boot-on (open question 1).
+- **PR 2 — HID mapping + submitter (pure logic, unit-tested).** `HidKeyboardState` (scancode→usage, modifier byte, rollover, release-all), mouse clamp/split, absolute mapping. No `MSWindowsDesks` wiring yet. Full unit tests (see Testing).
+- **Phase 2 gate (manual, not a PR) — prove the three payoffs** on tiny11: (c) **UAC consent Yes/No click first** (most likely to surprise), then (a) KBM remaps virtual-HID keystrokes cleanly (no double-fire), (b) input reaches an elevated PowerToys window. Go/no-go before PR 3.
+- **PR 3 — Core wiring.** One dispatch branch in the desk-thread handler routing fake-input → HID behind `daemon/useVhidInput` (default off); the full fallback decision tree; retained `SendInput`. Resolve `fakeInputBegin/End` semantics under HID.
+- **PR 4 — Signing + deploy pipeline (parallelizable with PR 3; blocked on open question 1).** EV cert + Partner Center attestation and signtool/CAB submission, **or** documented test-signing. Driver install/upgrade/uninstall routed through `scripts/install-windows.ps1` (`pnputil`), including a **"disable/uninstall → fall back to SendInput" recovery path** (a kernel fault on a headless fleet box must be recoverable).
+- **PR 5 — Retire the UIAccess workaround.** Once HID is proven the path, set `daemon/uiAccessCore=false`; confirm the keyboard double-fire is gone and the mouse still reaches elevated windows. Net deletion.
 
 ## Success criteria
 
@@ -95,6 +127,9 @@ Target: when a virtual-HID mode is enabled and the device is present, translate 
 3. UAC consent Yes/No is clickable remotely via the virtual device.
 4. Login/lock PIN path unchanged and still working.
 5. Driver loads on tiny11 with the chosen signing method; `SendInput` fallback still works where the driver is absent.
+6. Cursor lands at the correct absolute position on screen-enter (no drift across crossings) — absolute-mouse collection working.
+7. Unit tests pass for scancode→usage mapping, `HidKeyboardState` (chords/modifiers/rollover/release-all), and delta clamp/split.
+8. No added input latency vs `SendInput`; zero stuck-key/modifier events over an N-minute soak replay.
 
 ## Risks
 
@@ -105,10 +140,16 @@ Target: when a virtual-HID mode is enabled and the device is present, translate 
 
 ## Open questions
 
-1. **Secure Boot on (pay for EV + attestation) vs off (free test-signing)** on the fleet?
-2. Does a medium/UIAccess `deskflow-core` in session 1 have rights to open the vhid device interface directly, or keep a session-1 submitter helper?
-3. Absolute-mouse collection needed for cursor positioning, or is relative motion enough (operator self-corrects, as on the macOS bridge)?
-4. Finish our VHF driver (recommended) vs adopt FakerInput — final call before Phase 1.
+1. **Secure Boot on (pay ~$250–560/yr EV + Partner Center attestation) vs off (free test-signing + watermark)** on the fleet? PR 1 validates attestation feasibility for a root-enumerated device early so this can be answered before PR 4.
+2. Finish our VHF driver (recommended) vs adopt FakerInput — final call before PR 1.
+
+**Resolved by technical review (were open questions):**
+- *Absolute mouse* — **required** (the primary move path is absolute; relative-only regresses cursor sync). Added to the descriptor in PR 1.
+- *Device access boundary* — decided by writing an explicit **SDDL** on the device interface; the core opens it directly if the SDDL allows (preferred), dropping the pipe hop.
+
+## Escape hatch (if signing answer is "Secure Boot must stay on and attestation is rejected")
+
+A **hardware HID gadget** (e.g. Raspberry Pi Zero in USB-gadget mode, driven over the network/serial) delivers identical hardware-class keyboard+mouse input with **zero driver signing** and Secure Boot untouched — the price is a ~$15 dongle per box and a small firmware/transport bridge. For a fixed 3-box fleet this is a viable fallback and is why we don't over-invest before PR 1's attestation check.
 
 ## References
 
