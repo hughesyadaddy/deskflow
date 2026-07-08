@@ -14,9 +14,12 @@ class ChordRemapTests : public QObject
 private Q_SLOTS:
   void applyChordRemap_exactMatch();
   void applyChordRemap_wrongScreen();
+  void applyChordRemap_noMatch_wrongKey();
+  void applyChordRemap_noMatch_extraModifier();
   void applyChordRemap_preservesCapsLock();
   void applyChordRemap_firstMatchPrecedence();
   void needsHoldThrough_defaultRows();
   void seedDefaultChordRemaps_whenTiny11Present();
   void seedDefaultChordRemaps_skipsWithoutTiny11();
+  void seedDefaultChordRemaps_skipsWhenSectionPresent();
 };

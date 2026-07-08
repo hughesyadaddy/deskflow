@@ -14,14 +14,9 @@
 
 namespace {
 
-QString normalizeChordSpec(QString spec)
-{
-  return spec.replace(QStringLiteral("Meta"), QStringLiteral("Super"));
-}
-
 QString chordSpecFromSequence(const KeySequence &sequence)
 {
-  return normalizeChordSpec(sequence.toString());
+  return ChordRemap::normalizeChordSpec(sequence.toString());
 }
 
 int keyIdToQtKey(KeyID id)
@@ -45,7 +40,7 @@ int keyIdToQtKey(KeyID id)
 
 KeySequence keySequenceFromChordSpec(const QString &specQt)
 {
-  std::string spec = normalizeChordSpec(specQt).toStdString();
+  std::string spec = ChordRemap::normalizeChordSpec(specQt).toStdString();
   KeyModifierMask mask = 0;
   if (!deskflow::KeyMap::parseModifiers(spec, mask)) {
     return {};
@@ -112,6 +107,11 @@ void ChordRemap::saveSettings(QSettings &settings) const
 bool ChordRemap::operator==(const ChordRemap &other) const
 {
   return m_screen == other.m_screen && m_inSequence == other.m_inSequence && m_outSequence == other.m_outSequence;
+}
+
+QString ChordRemap::normalizeChordSpec(QString spec)
+{
+  return spec.replace(QStringLiteral("Meta"), QStringLiteral("Super"));
 }
 
 ChordRemap ChordRemap::fromServerEntry(const deskflow::server::ChordRemapEntry &entry)

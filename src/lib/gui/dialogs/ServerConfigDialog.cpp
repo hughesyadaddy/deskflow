@@ -18,19 +18,11 @@
 #include "dialogs/HotkeyDialog.h"
 #include "dialogs/ScreenSettingsDialog.h"
 
+#include "gui/ChordRemap.h"
 #include "gui/StyleUtils.h"
 
 #include <QFileDialog>
 #include <QMessageBox>
-
-namespace {
-
-QString normalizeChordSpec(QString spec)
-{
-  return spec.replace(QStringLiteral("Meta"), QStringLiteral("Super"));
-}
-
-} // namespace
 
 using enum ScreenConfig::SwitchCorner;
 
@@ -217,8 +209,8 @@ bool ServerConfigDialog::validateChordRemap(const ChordRemap &remap, int exclude
     return false;
   }
 
-  const QString inSpec = normalizeChordSpec(remap.inSequence().toString());
-  const QString outSpec = normalizeChordSpec(remap.outSequence().toString());
+  const QString inSpec = ChordRemap::normalizeChordSpec(remap.inSequence().toString());
+  const QString outSpec = ChordRemap::normalizeChordSpec(remap.outSequence().toString());
   if (inSpec.isEmpty() || outSpec.isEmpty()) {
     QMessageBox::warning(
         const_cast<ServerConfigDialog *>(this), tr("Chord remap"), tr("Enter both input and output chords.")
@@ -238,7 +230,7 @@ bool ServerConfigDialog::validateChordRemap(const ChordRemap &remap, int exclude
     }
     const ChordRemap &other = serverConfig().chordRemaps()[i];
     if (other.screen() == remap.screen() &&
-        normalizeChordSpec(other.inSequence().toString()) == inSpec) {
+        ChordRemap::normalizeChordSpec(other.inSequence().toString()) == inSpec) {
       QMessageBox::warning(
           const_cast<ServerConfigDialog *>(this), tr("Chord remap"),
           tr("This screen already has a remap for that input chord.")

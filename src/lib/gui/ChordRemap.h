@@ -53,6 +53,7 @@ public:
   bool operator==(const ChordRemap &other) const;
 
   static ChordRemap fromServerEntry(const deskflow::server::ChordRemapEntry &entry);
+  static QString normalizeChordSpec(QString spec);
 
 protected:
   KeySequence &inSequence()
