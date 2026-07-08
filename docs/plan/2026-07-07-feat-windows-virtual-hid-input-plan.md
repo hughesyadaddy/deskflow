@@ -1,7 +1,7 @@
 ---
 date: 2026-07-07
 type: feat
-status: draft
+status: superseded
 topic: windows-virtual-hid-input
 branch: refactor/fleet-state-hub
 supersedes_partial:
@@ -14,6 +14,18 @@ research_agents:
 ---
 
 # Windows virtual-HID input: one hardware-class path for remap + elevated + UAC
+
+> **Superseded for the keyboard-remap goal (2026-07-08).** The remap requirement
+> was solved without a driver: a **server-side chord remap** (commit `899de7910`,
+> `Server.cpp` `kChordRemaps`) applies the user's exact PowerToys table before
+> forwarding to tiny11, so Deskflow sends the already-remapped chord (Ctrl+X
+> instead of Win+X, Alt+Tab instead of Win+Tab, …). Confirmed working on the
+> fleet — first-press correct, no PowerToys, no signing, Secure Boot untouched.
+> Diagnostic that led here: disabling the coordination relay + plain client mode
+> did NOT fix PowerToys remapping, proving it's the generic KVM-injection limit,
+> not the fork. This virtual-HID plan remains valid only if a future goal needs
+> hardware-class input for UAC-consent clicks or elevated-window mouse without
+> UIAccess — not needed for the remap use case.
 
 ## Problem statement
 
