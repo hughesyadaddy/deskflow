@@ -36,8 +36,6 @@
 #include <array>
 #if defined(__APPLE__)
 #include <Carbon/Carbon.h>
-#elif defined(_WIN32)
-#include <winuser.h>
 #endif
 #ifdef _WIN32
 #include <algorithm>
@@ -91,18 +89,19 @@ bool isChordRemapSourceModifierButton(KeyButton button, KeyModifierMask sourceMo
     return false;
   }
 #elif defined(_WIN32)
+  // Virtual-key codes — avoid Windows.h here (include-order breaks MSVC unity builds).
   switch (button) {
-  case VK_LWIN:
-  case VK_RWIN:
+  case 0x5B: // VK_LWIN
+  case 0x5C: // VK_RWIN
     return (sourceMods & KeyModifierSuper) != 0;
-  case VK_LMENU:
-  case VK_RMENU:
+  case 0xA4: // VK_LMENU
+  case 0xA5: // VK_RMENU
     return (sourceMods & KeyModifierAlt) != 0;
-  case VK_LCONTROL:
-  case VK_RCONTROL:
+  case 0xA2: // VK_LCONTROL
+  case 0xA3: // VK_RCONTROL
     return (sourceMods & KeyModifierControl) != 0;
-  case VK_LSHIFT:
-  case VK_RSHIFT:
+  case 0xA0: // VK_LSHIFT
+  case 0xA1: // VK_RSHIFT
     return (sourceMods & KeyModifierShift) != 0;
   default:
     return false;
