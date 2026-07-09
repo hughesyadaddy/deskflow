@@ -14,8 +14,8 @@ ChordRemapDialog::ChordRemapDialog(QWidget *parent, ChordRemap &remap)
 {
   ui->setupUi(this);
 
-  ui->m_pKeySequenceWidgetIn->setText(remap.inSequence().toString());
-  ui->m_pKeySequenceWidgetOut->setText(remap.outSequence().toString());
+  ui->m_pKeySequenceWidgetIn->setKeySequence(remap.inSequence());
+  ui->m_pKeySequenceWidgetOut->setKeySequence(remap.outSequence());
 }
 
 ChordRemapDialog::~ChordRemapDialog() = default;

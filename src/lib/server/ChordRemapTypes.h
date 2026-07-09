@@ -7,6 +7,7 @@
 #pragma once
 
 #include "deskflow/KeyTypes.h"
+#include "base/String.h"
 
 #include <array>
 #include <string>
@@ -61,7 +62,7 @@ inline bool applyChordRemap(
 )
 {
   for (const auto &entry : table) {
-    if (entry.screen != screen) {
+    if (!deskflow::string::CaselessCmp::equal(entry.screen, screen)) {
       continue;
     }
     if (entry.inKey == id && (mask & kChordRemapMods) == entry.inMods) {

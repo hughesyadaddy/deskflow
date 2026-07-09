@@ -392,6 +392,9 @@ void Config::read(ConfigReadContext &context)
 
 void Config::seedDefaultChordRemaps()
 {
+  if (m_chordRemapsSectionRead) {
+    return;
+  }
   if (!m_chordRemaps.empty()) {
     return;
   }
@@ -798,6 +801,7 @@ void parseChordRemapAssignment(ConfigReadContext &s, const std::string &line, Ch
 
 void Config::readSectionChordRemaps(ConfigReadContext &s)
 {
+  m_chordRemapsSectionRead = true;
   std::string line;
   std::string screen;
   while (s.readLine(line)) {
@@ -813,6 +817,7 @@ void Config::readSectionChordRemaps(ConfigReadContext &s)
       if (!isScreen(screen)) {
         throw ServerConfigReadException(s, "unknown screen name \"%{1}\"", screen);
       }
+      screen = getCanonicalName(screen);
       continue;
     }
 
@@ -1538,7 +1543,7 @@ std::ostream &operator<<(std::ostream &s, const Config &config)
   s << config.m_inputFilter.format("\t");
   s << "end" << std::endl;
 
-  if (!config.m_chordRemaps.empty()) {
+  if (config.m_chordRemapsSectionRead || !config.m_chordRemaps.empty()) {
     s << "section: chordRemaps" << std::endl;
     std::string currentScreen;
     for (const auto &entry : config.m_chordRemaps) {

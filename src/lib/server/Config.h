@@ -427,6 +427,7 @@ private:
   ScreenOptions m_globalOptions;
   InputFilter m_inputFilter;
   std::vector<ChordRemapEntry> m_chordRemaps;
+  bool m_chordRemapsSectionRead = false;
   bool m_hasLockToScreenAction = false;
   IEventQueue *m_events;
   inline static const QStringList m_oldNames = {

@@ -22,4 +22,6 @@ private Q_SLOTS:
   void seedDefaultChordRemaps_whenTiny11Present();
   void seedDefaultChordRemaps_skipsWithoutTiny11();
   void seedDefaultChordRemaps_skipsWhenSectionPresent();
+  void seedDefaultChordRemaps_skipsWhenSectionEmpty();
+  void applyChordRemap_caseInsensitiveScreen();
 };

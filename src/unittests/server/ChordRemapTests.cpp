@@ -179,4 +179,36 @@ void ChordRemapTests::seedDefaultChordRemaps_skipsWhenSectionPresent()
   QCOMPARE(config.getChordRemaps()[0].inKey, kKeyTab);
 }
 
+void ChordRemapTests::seedDefaultChordRemaps_skipsWhenSectionEmpty()
+{
+  const std::string conf =
+      "section: screens\n"
+      "\thackintosh:\n"
+      "\ttiny11:\n"
+      "end\n\n"
+      "section: links\n"
+      "end\n\n"
+      "section: options\n"
+      "end\n\n"
+      "section: chordRemaps\n"
+      "end\n\n";
+  std::istringstream in(conf);
+  ConfigReadContext context(in);
+  Config config(nullptr);
+  config.read(context);
+  QVERIFY(config.getChordRemaps().empty());
+}
+
+void ChordRemapTests::applyChordRemap_caseInsensitiveScreen()
+{
+  KeyID id = kKeyTab;
+  KeyModifierMask mask = KeyModifierSuper;
+  std::vector<ChordRemapEntry> table = {
+      {"Tiny11", KeyModifierSuper, kKeyTab, KeyModifierAlt, kKeyTab},
+  };
+
+  QVERIFY(applyChordRemap(id, mask, table, "tiny11"));
+  QCOMPARE(mask, KeyModifierAlt);
+}
+
 QTEST_MAIN(ChordRemapTests)

@@ -111,6 +111,7 @@ void ServerConfig::commit()
     chordRemaps()[i].saveSettings(settings().get());
   }
   settings().endArray();
+  settings().setValue(QStringLiteral("chordRemapsInitialized"), true);
 
   settings().endGroup();
 }
@@ -157,7 +158,9 @@ void ServerConfig::recall()
   }
   settings().endArray();
 
-  if (chordRemaps().isEmpty() && screenExists(QString::fromUtf8(deskflow::server::kDefaultChordRemapScreen))) {
+  const bool chordRemapsInitialized = settings().value(QStringLiteral("chordRemapsInitialized"), false).toBool();
+  if (!chordRemapsInitialized && chordRemaps().isEmpty() &&
+      screenExists(QString::fromUtf8(deskflow::server::kDefaultChordRemapScreen))) {
     for (const auto &entry : deskflow::server::kDefaultTiny11ChordRemaps) {
       chordRemaps().append(ChordRemap::fromServerEntry(entry));
     }
@@ -218,18 +221,16 @@ QTextStream &operator<<(QTextStream &outStream, const ServerConfig &config)
 
   outStream << "end" << Qt::endl << Qt::endl;
 
-  if (!config.chordRemaps().isEmpty()) {
-    outStream << "section: chordRemaps" << Qt::endl;
-    QString currentScreen;
-    for (const ChordRemap &remap : config.chordRemaps()) {
-      if (remap.screen() != currentScreen) {
-        currentScreen = remap.screen();
-        outStream << "\t" << currentScreen << ":" << Qt::endl;
-      }
-      outStream << remap;
+  outStream << "section: chordRemaps" << Qt::endl;
+  QString currentScreen;
+  for (const ChordRemap &remap : config.chordRemaps()) {
+    if (remap.screen() != currentScreen) {
+      currentScreen = remap.screen();
+      outStream << "\t" << currentScreen << ":" << Qt::endl;
     }
-    outStream << "end" << Qt::endl << Qt::endl;
+    outStream << remap;
   }
+  outStream << "end" << Qt::endl << Qt::endl;
 
   return outStream;
 }
