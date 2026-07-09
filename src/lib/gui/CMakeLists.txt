@@ -143,6 +143,7 @@ if(WIN32)
     base
     arch
     net
+    app
   )
 endif()
 
