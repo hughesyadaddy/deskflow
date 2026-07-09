@@ -17,6 +17,7 @@
 #include "deskflow/ipc/CoreIpcServer.h"
 #include "io/IStream.h"
 #include "server/Config.h"
+#include "server/ChordRemapTypes.h"
 #include "server/PrimaryClient.h"
 #include "server/Server.h"
 #include "server/TopologyLink.h"
@@ -25,7 +26,12 @@
 #include <QTemporaryDir>
 #include <QTest>
 
+#if defined(__APPLE__)
+#include <Carbon/Carbon.h>
+#endif
+
 #include <memory>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -382,6 +388,78 @@ private:
   std::vector<std::pair<int32_t, int32_t>> m_enterCalls;
 };
 
+struct RecordedKeyEvent
+{
+  enum class Kind
+  {
+    Down,
+    Up,
+    Repeat,
+  };
+
+  Kind kind = Kind::Down;
+  KeyID id = kKeyNone;
+  KeyModifierMask mask = 0;
+};
+
+class RecordingRemoteClient : public TestClientProxy
+{
+public:
+  explicit RecordingRemoteClient(std::string name) : TestClientProxy(std::move(name))
+  {
+  }
+
+  void keyDown(KeyID id, KeyModifierMask mask, KeyButton, const std::string &) override
+  {
+    m_keys.push_back({RecordedKeyEvent::Kind::Down, id, mask});
+  }
+
+  void keyRepeat(KeyID id, KeyModifierMask mask, int32_t, KeyButton, const std::string &) override
+  {
+    m_keys.push_back({RecordedKeyEvent::Kind::Repeat, id, mask});
+  }
+
+  void keyUp(KeyID id, KeyModifierMask mask, KeyButton) override
+  {
+    m_keys.push_back({RecordedKeyEvent::Kind::Up, id, mask});
+  }
+
+  const std::vector<RecordedKeyEvent> &keys() const
+  {
+    return m_keys;
+  }
+
+  void clearKeys()
+  {
+    m_keys.clear();
+  }
+
+private:
+  std::vector<RecordedKeyEvent> m_keys;
+};
+
+void loadConfigWithSuperTabRemap(deskflow::server::Config &config)
+{
+  const std::string conf =
+      "section: screens\n"
+      "\tserver:\n"
+      "\ttiny11:\n"
+      "end\n\n"
+      "section: links\n"
+      "\tserver:\n"
+      "\t\tright = tiny11\n"
+      "end\n\n"
+      "section: options\n"
+      "end\n\n"
+      "section: chordRemaps\n"
+      "\ttiny11:\n"
+      "\t\tchordRemap(Super+Tab) = Alt+Tab\n"
+      "end\n\n";
+  std::istringstream in(conf);
+  deskflow::server::ConfigReadContext context(in);
+  config.read(context);
+}
+
 struct LeakedServerFixture
 {
   EventQueue events;
@@ -619,6 +697,164 @@ void ServerTests::rescueChord_jumpsBackToPrimaryScreen()
 
     QCOMPARE(server.m_active, fixture.primary);
     server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::chordRemapHoldThrough_superTabKeepsAltUntilSuperUp()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    QCOMPARE(server.m_active, &remote);
+
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QCOMPARE(remote.keys().size(), 2u);
+    QCOMPARE(remote.keys()[0].kind, RecordedKeyEvent::Kind::Down);
+    QCOMPARE(remote.keys()[0].id, kKeySetModifiers);
+    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+    QCOMPARE(remote.keys()[1].id, kKeyTab);
+    QCOMPARE(remote.keys()[1].mask, KeyModifierAlt);
+    QVERIFY(server.m_chordRemapSession.active);
+
+    remote.clearKeys();
+    server.onKeyUp(kKeyTab, KeyModifierSuper, 0, nullptr);
+    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys()[0].kind, RecordedKeyEvent::Kind::Up);
+    QCOMPARE(remote.keys()[0].id, kKeyTab);
+    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+    QVERIFY(server.m_chordRemapSession.active);
+
+    remote.clearKeys();
+    server.onKeyUp(kKeySuper_L, 0, 0, nullptr);
+    QCOMPARE(remote.keys().size(), 2u);
+    QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
+    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+    QCOMPARE(remote.keys()[1].kind, RecordedKeyEvent::Kind::Up);
+    QCOMPARE(remote.keys()[1].id, kKeySuper_L);
+    QVERIFY(!server.m_chordRemapSession.active);
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::chordRemapHoldThrough_relaySuperUpClearsSession()
+{
+#if defined(__APPLE__)
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QVERIFY(server.m_chordRemapSession.active);
+    remote.clearKeys();
+
+    // Fleet keyboard relay clears KeyID on key-up; modifier release is in button.
+    server.onKeyUp(kKeyNone, 0, static_cast<KeyButton>(kVK_Command), nullptr);
+    QCOMPARE(remote.keys().size(), 2u);
+    QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
+    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+    QCOMPARE(remote.keys()[1].kind, RecordedKeyEvent::Kind::Up);
+    QCOMPARE(remote.keys()[1].id, kKeyNone);
+    QVERIFY(!server.m_chordRemapSession.active);
+
+    server.m_clients.erase("tiny11");
+  }
+#else
+  QSKIP("Relay modifier key-up uses platform virtual-key codes");
+#endif
+}
+
+void ServerTests::chordRemapHoldThrough_tabRepeatKeepsAltMask()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    remote.clearKeys();
+
+    server.onKeyRepeat(kKeyTab, KeyModifierSuper, 1, 0, "en");
+    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys()[0].kind, RecordedKeyEvent::Kind::Repeat);
+    QCOMPARE(remote.keys()[0].id, kKeyTab);
+    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+    QVERIFY(server.m_chordRemapSession.active);
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::chordRemapHoldThrough_cancelsOnRescueChord()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QVERIFY(server.m_chordRemapSession.active);
+    remote.clearKeys();
+
+    constexpr KeyModifierMask rescue = KeyModifierShift | KeyModifierControl | KeyModifierAlt;
+    server.onKeyDown(kKeyEscape, rescue, 0, "en", nullptr);
+
+    QCOMPARE(server.m_active, fixture.primary);
+    QVERIFY(!server.m_chordRemapSession.active);
+    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
+    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::chordRemapHoldThrough_cancelsOnScreenSwitch()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QVERIFY(server.m_chordRemapSession.active);
+    remote.clearKeys();
+
+    server.switchScreen(fixture.primary, 100, 200, false);
+    QCOMPARE(server.m_active, fixture.primary);
+    QVERIFY(!server.m_chordRemapSession.active);
+    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
+    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+
+    server.m_clients.erase("tiny11");
   }
 }
 

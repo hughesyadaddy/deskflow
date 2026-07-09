@@ -375,6 +375,11 @@ private:
   void onKeyUp(KeyID, KeyModifierMask, KeyButton, const char *screens);
   void onKeyRepeat(KeyID, KeyModifierMask, int32_t, KeyButton, const std::string &);
   bool applyChordRemapForActiveScreen(KeyID &id, KeyModifierMask &mask);
+  void cancelChordRemapSession();
+  void endChordRemapSession(const std::string &lang);
+  KeyModifierMask effectiveChordRemapMask(KeyModifierMask mask) const;
+  bool isActiveChordRemapSession() const;
+  bool isChordRemapSourceModifierKey(KeyID id, KeyButton button) const;
   void onMouseDown(ButtonID);
   void onMouseUp(ButtonID);
   bool onMouseMovePrimary(int32_t x, int32_t y);
@@ -532,4 +537,12 @@ private:
   bool m_defaultLockToScreenState = false;
   bool m_disableLockToScreen = false;
   bool m_enableClipboard = true;
+
+  struct ChordRemapSession
+  {
+    bool active = false;
+    deskflow::server::ChordRemapEntry entry;
+    KeyModifierMask heldOutMods = 0;
+  };
+  ChordRemapSession m_chordRemapSession;
 };

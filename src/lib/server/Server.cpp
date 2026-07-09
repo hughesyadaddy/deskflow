@@ -34,6 +34,11 @@
 #include <QJsonObject>
 
 #include <array>
+#if defined(__APPLE__)
+#include <Carbon/Carbon.h>
+#elif defined(_WIN32)
+#include <winuser.h>
+#endif
 #ifdef _WIN32
 #include <algorithm>
 #endif
@@ -44,12 +49,128 @@
 
 using namespace deskflow::server;
 
+namespace {
+
+bool isChordRemapSourceModifierKey(KeyID id, KeyModifierMask sourceMods)
+{
+  switch (id) {
+  case kKeySuper_L:
+  case kKeySuper_R:
+    return (sourceMods & KeyModifierSuper) != 0;
+  case kKeyAlt_L:
+  case kKeyAlt_R:
+    return (sourceMods & KeyModifierAlt) != 0;
+  case kKeyControl_L:
+  case kKeyControl_R:
+    return (sourceMods & KeyModifierControl) != 0;
+  case kKeyShift_L:
+  case kKeyShift_R:
+    return (sourceMods & KeyModifierShift) != 0;
+  default:
+    return false;
+  }
+}
+
+bool isChordRemapSourceModifierButton(KeyButton button, KeyModifierMask sourceMods)
+{
+#if defined(__APPLE__)
+  switch (static_cast<CGKeyCode>(button)) {
+  case kVK_Command:
+  case kVK_RightCommand:
+    return (sourceMods & KeyModifierSuper) != 0;
+  case kVK_Option:
+  case kVK_RightOption:
+    return (sourceMods & KeyModifierAlt) != 0;
+  case kVK_Control:
+  case kVK_RightControl:
+    return (sourceMods & KeyModifierControl) != 0;
+  case kVK_Shift:
+  case kVK_RightShift:
+    return (sourceMods & KeyModifierShift) != 0;
+  default:
+    return false;
+  }
+#elif defined(_WIN32)
+  switch (button) {
+  case VK_LWIN:
+  case VK_RWIN:
+    return (sourceMods & KeyModifierSuper) != 0;
+  case VK_LMENU:
+  case VK_RMENU:
+    return (sourceMods & KeyModifierAlt) != 0;
+  case VK_LCONTROL:
+  case VK_RCONTROL:
+    return (sourceMods & KeyModifierControl) != 0;
+  case VK_LSHIFT:
+  case VK_RSHIFT:
+    return (sourceMods & KeyModifierShift) != 0;
+  default:
+    return false;
+  }
+#else
+  (void)button;
+  (void)sourceMods;
+  return false;
+#endif
+}
+
+bool isChordRemapSourceModifierRelease(KeyID id, KeyButton button, KeyModifierMask sourceMods)
+{
+  if (isChordRemapSourceModifierKey(id, sourceMods)) {
+    return true;
+  }
+  if (id != kKeyNone) {
+    return false;
+  }
+  return isChordRemapSourceModifierButton(button, sourceMods);
+}
+
+} // namespace
+
 bool Server::applyChordRemapForActiveScreen(KeyID &id, KeyModifierMask &mask)
 {
   if (m_active == nullptr || m_config == nullptr) {
     return false;
   }
   return applyChordRemap(id, mask, m_config->getChordRemaps(), getName(m_active));
+}
+
+bool Server::isActiveChordRemapSession() const
+{
+  if (!m_chordRemapSession.active || m_active == nullptr) {
+    return false;
+  }
+  return deskflow::string::CaselessCmp::equal(m_chordRemapSession.entry.screen, getName(m_active));
+}
+
+KeyModifierMask Server::effectiveChordRemapMask(KeyModifierMask mask) const
+{
+  return deskflow::server::effectiveChordRemapMask(mask, m_chordRemapSession.heldOutMods);
+}
+
+bool Server::isChordRemapSourceModifierKey(KeyID id, KeyButton button) const
+{
+  return ::isChordRemapSourceModifierRelease(id, button, m_chordRemapSession.entry.inMods);
+}
+
+void Server::cancelChordRemapSession()
+{
+  if (!m_chordRemapSession.active || m_active == nullptr) {
+    m_chordRemapSession = {};
+    return;
+  }
+  m_active->keyDown(kKeyClearModifiers, m_chordRemapSession.heldOutMods, 0, std::string{});
+  m_chordRemapSession = {};
+}
+
+void Server::endChordRemapSession(const std::string &lang)
+{
+  if (!m_chordRemapSession.active || m_active == nullptr) {
+    m_chordRemapSession = {};
+    return;
+  }
+  m_active->keyDown(kKeyClearModifiers, m_chordRemapSession.heldOutMods, 0, lang);
+  m_chordRemapSession = {};
 }
 
 //
@@ -481,6 +602,9 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
   // since that's a waste of time we skip that and just warp the
   // mouse.
   if (m_active != dst) {
+    if (m_chordRemapSession.active) {
+      cancelChordRemapSession();
+    }
     // leave active screen
     if (!m_active->leave()) {
       // cannot leave screen
@@ -1832,12 +1956,30 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
   // active-screen relay is in. Escape hatch for a wedged or stale switch.
   if (deskflow::coordination::isKeyboardRescueChord(id, mask) && m_active != m_primaryClient) {
     LOG_INFO("keyboard rescue chord: switching back to primary screen \"%s\"", getName(m_primaryClient).c_str());
+    cancelChordRemapSession();
     jumpToScreen(m_primaryClient);
     return;
   }
 
-  if (applyChordRemapForActiveScreen(id, mask)) {
-    LOG_DEBUG("chord remap -> id=%d mask=0x%04x for \"%s\"", id, mask, getName(m_active).c_str());
+  if (isActiveChordRemapSession()) {
+    mask = effectiveChordRemapMask(mask);
+  } else {
+    ChordRemapEntry entry;
+    if (findChordRemap(id, mask, m_config->getChordRemaps(), getName(m_active), &entry)) {
+      if (needsHoldThrough(entry)) {
+        m_chordRemapSession.active = true;
+        m_chordRemapSession.entry = entry;
+        m_chordRemapSession.heldOutMods = entry.outMods;
+        m_active->keyDown(kKeySetModifiers, entry.outMods, 0, lang);
+        id = entry.outKey;
+        mask = effectiveChordRemapMask(mask);
+        LOG_DEBUG(
+            "chord remap hold-through start -> id=%d mask=0x%04x for \"%s\"", id, mask, getName(m_active).c_str()
+        );
+      } else if (applyChordRemap(id, mask, m_config->getChordRemaps(), getName(m_active))) {
+        LOG_DEBUG("chord remap -> id=%d mask=0x%04x for \"%s\"", id, mask, getName(m_active).c_str());
+      }
+    }
   }
 
   // relay
@@ -1863,7 +2005,15 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
   LOG_VERBOSE("onKeyUp id=%d mask=0x%04x button=0x%04x", id, mask, button);
   assert(m_active != nullptr);
 
-  applyChordRemapForActiveScreen(id, mask);
+  if (isActiveChordRemapSession()) {
+    if (isChordRemapSourceModifierKey(id, button)) {
+      endChordRemapSession(std::string{});
+    } else {
+      mask = effectiveChordRemapMask(mask);
+    }
+  } else {
+    applyChordRemapForActiveScreen(id, mask);
+  }
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
@@ -1891,7 +2041,11 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
   );
   assert(m_active != nullptr);
 
-  applyChordRemapForActiveScreen(id, mask);
+  if (isActiveChordRemapSession()) {
+    mask = effectiveChordRemapMask(mask);
+  } else {
+    applyChordRemapForActiveScreen(id, mask);
+  }
 
   // relay
   m_active->keyRepeat(id, mask, count, button, lang);
@@ -2361,6 +2515,9 @@ void Server::removeOldClient(BaseClientProxy *client)
 void Server::forceLeaveClient(const BaseClientProxy *client)
 {
   if (const auto *active = (m_activeSaver != nullptr) ? m_activeSaver : m_active; active == client) {
+    if (m_chordRemapSession.active) {
+      cancelChordRemapSession();
+    }
     // record new position (center of primary screen)
     m_primaryClient->getCursorCenter(m_x, m_y);
 

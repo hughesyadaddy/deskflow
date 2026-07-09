@@ -57,8 +57,9 @@ inline bool needsHoldThrough(const ChordRemapEntry &entry)
   return entry.inKey == entry.outKey && out != in && out != 0;
 }
 
-inline bool applyChordRemap(
-    KeyID &id, KeyModifierMask &mask, const std::vector<ChordRemapEntry> &table, const std::string &screen
+inline bool findChordRemap(
+    KeyID id, KeyModifierMask mask, const std::vector<ChordRemapEntry> &table, const std::string &screen,
+    ChordRemapEntry *out = nullptr
 )
 {
   for (const auto &entry : table) {
@@ -66,12 +67,31 @@ inline bool applyChordRemap(
       continue;
     }
     if (entry.inKey == id && (mask & kChordRemapMods) == entry.inMods) {
-      id = entry.outKey;
-      mask = (mask & ~kChordRemapMods) | entry.outMods;
+      if (out != nullptr) {
+        *out = entry;
+      }
       return true;
     }
   }
   return false;
+}
+
+inline KeyModifierMask effectiveChordRemapMask(KeyModifierMask mask, KeyModifierMask heldOutMods)
+{
+  return (mask & ~kChordRemapMods) | heldOutMods;
+}
+
+inline bool applyChordRemap(
+    KeyID &id, KeyModifierMask &mask, const std::vector<ChordRemapEntry> &table, const std::string &screen
+)
+{
+  ChordRemapEntry entry;
+  if (!findChordRemap(id, mask, table, screen, &entry)) {
+    return false;
+  }
+  id = entry.outKey;
+  mask = effectiveChordRemapMask(mask, entry.outMods);
+  return true;
 }
 
 } // namespace deskflow::server
