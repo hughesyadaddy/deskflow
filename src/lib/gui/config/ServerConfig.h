@@ -10,6 +10,7 @@
 
 #include "common/Constants.h"
 #include "gui/Hotkey.h"
+#include "gui/ChordRemap.h"
 #include "gui/config/ScreenConfig.h"
 #include "gui/config/ScreenList.h"
 
@@ -20,10 +21,12 @@ class QSettings;
 class QString;
 class QFile;
 class ServerConfigDialog;
+class ChordRemapConfTests;
 
 class ServerConfig : public ScreenConfig
 {
   friend class ServerConfigDialog;
+  friend class ChordRemapConfTests;
   friend QTextStream &operator<<(QTextStream &outStream, const ServerConfig &config);
 
 public:
@@ -45,6 +48,11 @@ public:
     return m_Hotkeys;
   }
 
+  const ChordRemapList &chordRemaps() const
+  {
+    return m_ChordRemaps;
+  }
+
   bool save(const QString &fileName) const;
   bool screenExists(const QString &screenName) const;
   void save(QFile &file) const;
@@ -56,6 +64,8 @@ public:
   QString configFile() const;
   bool useExternalConfig() const;
   void addClient(const QString &clientName);
+  void pruneChordRemapsForMissingScreens();
+  void renameChordRemapScreen(const QString &oldName, const QString &newName);
 
 private:
   void recall();
@@ -79,12 +89,17 @@ private:
   {
     return m_Hotkeys;
   }
+  ChordRemapList &chordRemaps()
+  {
+    return m_ChordRemaps;
+  }
   int adjacentScreenIndex(int idx, int deltaColumn, int deltaRow) const;
   bool findScreenName(const QString &name, int &index);
   bool fixNoServer(const QString &name, int &index);
 
 private:
   HotkeyList m_Hotkeys;
+  ChordRemapList m_ChordRemaps;
 
   ScreenList m_Screens;
   int m_columns;

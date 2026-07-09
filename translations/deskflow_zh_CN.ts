@@ -136,6 +136,21 @@ p, li { white-space: pre-wrap; }
     </message>
 </context>
 <context>
+    <name>ChordRemapDialog</name>
+    <message>
+        <source>Chord remap</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>When this chord is pressed:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Send this chord to the target screen:</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>ClientConfigDialog</name>
     <message>
         <source>Client Configuration</source>
@@ -1231,6 +1246,26 @@ Enabling this setting will disable the server config GUI.</source>
         <translation>配置文件路径</translation>
     </message>
     <message>
+        <source>Chord remap</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Enter both input and output chords.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Input and output chords must differ.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This screen already has a remap for that input chord.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add a screen before creating chord remaps.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>%1 Configurations (*.conf);;All files (*.*)</source>
         <extracomment>%1 is replaced with the application names (*.conf) and (*.*) should not be translated</extracomment>
         <translation>%1 配置 (*.conf);;所有文件 (*.*)</translation>
@@ -1261,6 +1296,18 @@ Enabling this setting will disable the server config GUI.</source>
     </message>
     <message>
         <source>Mouser on this computer reads gestures locally and relays them through Deskflow. Requires the Mouser app on each computer.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Chord Remaps</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Applied only when the cursor is on the selected screen. Restart core after saving.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Screen:</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

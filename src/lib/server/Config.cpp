@@ -373,6 +373,10 @@ bool Config::operator==(const Config &x) const
     return false;
   }
 
+  if (m_chordRemaps != x.m_chordRemaps) {
+    return false;
+  }
+
   return true;
 }
 
@@ -382,7 +386,19 @@ void Config::read(ConfigReadContext &context)
   while (context.getStream()) {
     tmp.readSection(context);
   }
+  tmp.seedDefaultChordRemaps();
   *this = tmp;
+}
+
+void Config::seedDefaultChordRemaps()
+{
+  if (!m_chordRemaps.empty()) {
+    return;
+  }
+  if (!isScreen(kDefaultChordRemapScreen)) {
+    return;
+  }
+  m_chordRemaps.assign(kDefaultTiny11ChordRemaps.begin(), kDefaultTiny11ChordRemaps.end());
 }
 
 const char *Config::dirName(Direction dir)
@@ -414,6 +430,7 @@ void Config::readSection(ConfigReadContext &s)
   static const char s_screens[] = "screens";
   static const char s_links[] = "links";
   static const char s_aliases[] = "aliases";
+  static const char s_chordRemaps[] = "chordRemaps";
 
   std::string line;
   if (!s.readLine(line)) {
@@ -446,6 +463,8 @@ void Config::readSection(ConfigReadContext &s)
     readSectionAliases(s);
   } else if (name == s_links) {
     readSectionLinks(s);
+  } else if (name == s_chordRemaps) {
+    readSectionChordRemaps(s);
   } else {
     throw ServerConfigReadException(s, "unknown section name \"%{1}\"", name);
   }
@@ -722,6 +741,91 @@ void Config::readSectionAliases(ConfigReadContext &s)
     }
   }
   throw ServerConfigReadException(s, "unexpected end of aliases section");
+}
+
+namespace {
+
+void parseChordRemapAssignment(ConfigReadContext &s, const std::string &line, ChordRemapEntry &entry)
+{
+  static const char kPrefix[] = "chordRemap(";
+  if (line.compare(0, sizeof(kPrefix) - 1, kPrefix) != 0) {
+    throw ServerConfigReadException(s, "syntax for chord remap: chordRemap(in) = out");
+  }
+
+  const auto close = line.find(')', sizeof(kPrefix) - 1);
+  if (close == std::string::npos) {
+    throw ServerConfigReadException(s, "syntax for chord remap: chordRemap(in) = out");
+  }
+
+  std::string inSpec = line.substr(sizeof(kPrefix) - 1, close - (sizeof(kPrefix) - 1));
+  const auto eq = line.find('=', close);
+  if (eq == std::string::npos) {
+    throw ServerConfigReadException(s, "syntax for chord remap: chordRemap(in) = out");
+  }
+  std::string outSpec = line.substr(eq + 1);
+  const auto trim = [](std::string &value) {
+    const auto start = value.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+      value.clear();
+      return;
+    }
+    const auto end = value.find_last_not_of(" \t");
+    value = value.substr(start, end - start + 1);
+  };
+  trim(inSpec);
+  trim(outSpec);
+
+  KeyModifierMask inMask = 0;
+  if (!deskflow::KeyMap::parseModifiers(inSpec, inMask)) {
+    throw ServerConfigReadException(s, "unable to parse chord remap input modifiers");
+  }
+  if (!deskflow::KeyMap::parseKey(inSpec, entry.inKey)) {
+    throw ServerConfigReadException(s, "unable to parse chord remap input key");
+  }
+  entry.inMods = inMask;
+
+  KeyModifierMask outMask = 0;
+  if (!deskflow::KeyMap::parseModifiers(outSpec, outMask)) {
+    throw ServerConfigReadException(s, "unable to parse chord remap output modifiers");
+  }
+  if (!deskflow::KeyMap::parseKey(outSpec, entry.outKey)) {
+    throw ServerConfigReadException(s, "unable to parse chord remap output key");
+  }
+  entry.outMods = outMask;
+}
+
+} // namespace
+
+void Config::readSectionChordRemaps(ConfigReadContext &s)
+{
+  std::string line;
+  std::string screen;
+  while (s.readLine(line)) {
+    if (line == "end") {
+      return;
+    }
+
+    if (!line.empty() && line.back() == ':') {
+      screen = line.substr(0, line.size() - 1);
+      if (!isValidScreenName(screen)) {
+        throw ServerConfigReadException(s, "invalid screen name \"%{1}\"", screen);
+      }
+      if (!isScreen(screen)) {
+        throw ServerConfigReadException(s, "unknown screen name \"%{1}\"", screen);
+      }
+      continue;
+    }
+
+    if (screen.empty()) {
+      throw ServerConfigReadException(s, "chord remap before first screen");
+    }
+
+    ChordRemapEntry entry;
+    entry.screen = screen;
+    parseChordRemapAssignment(s, line, entry);
+    m_chordRemaps.push_back(entry);
+  }
+  throw ServerConfigReadException(s, "unexpected end of chordRemaps section");
 }
 
 InputFilter::Condition *
@@ -1433,6 +1537,20 @@ std::ostream &operator<<(std::ostream &s, const Config &config)
   }
   s << config.m_inputFilter.format("\t");
   s << "end" << std::endl;
+
+  if (!config.m_chordRemaps.empty()) {
+    s << "section: chordRemaps" << std::endl;
+    std::string currentScreen;
+    for (const auto &entry : config.m_chordRemaps) {
+      if (entry.screen != currentScreen) {
+        currentScreen = entry.screen;
+        s << "\t" << currentScreen.c_str() << ":" << std::endl;
+      }
+      s << "\t\tchordRemap(" << deskflow::KeyMap::formatKey(entry.inKey, entry.inMods) << ") = "
+        << deskflow::KeyMap::formatKey(entry.outKey, entry.outMods) << std::endl;
+    }
+    s << "end" << std::endl;
+  }
 
   return s;
 }

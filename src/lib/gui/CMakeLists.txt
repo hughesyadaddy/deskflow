@@ -27,6 +27,8 @@ add_library(${target} STATIC
   FileTail.h
   Hotkey.cpp
   Hotkey.h
+  ChordRemap.cpp
+  ChordRemap.h
   KeySequence.cpp
   KeySequence.h
   Logger.cpp
@@ -66,6 +68,9 @@ add_library(${target} STATIC
   dialogs/ClientConfigDialog.ui
   dialogs/FingerprintDialog.cpp
   dialogs/FingerprintDialog.h
+  dialogs/ChordRemapDialog.cpp
+  dialogs/ChordRemapDialog.h
+  dialogs/ChordRemapDialog.ui
   dialogs/HotkeyDialog.cpp
   dialogs/HotkeyDialog.h
   dialogs/HotkeyDialog.ui

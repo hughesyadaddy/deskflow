@@ -13,6 +13,7 @@
 #include "config/ServerConfig.h"
 
 #include <QDialog>
+#include <QSet>
 
 class QItemSelection;
 
@@ -49,6 +50,17 @@ protected:
   void removeHotkey();
   void listHotkeysSelectionChanged(const QItemSelection &selected, [[maybe_unused]] const QItemSelection &deselected);
 
+  void addChordRemap();
+  void editChordRemap();
+  void removeChordRemap();
+  void listChordRemapsSelectionChanged(const QItemSelection &selected, [[maybe_unused]] const QItemSelection &deselected);
+  void chordRemapScreenChanged();
+  void refreshChordRemapScreens();
+  void refreshChordRemapList();
+  void syncChordRemapsWithScreens();
+  bool validateChordRemap(const ChordRemap &remap, int excludeIndex) const;
+  QSet<QString> currentScreenNames() const;
+
   void addAction();
   void editAction();
   void removeAction();
@@ -77,6 +89,10 @@ protected:
   bool browseConfigFile();
 
   ServerConfig &serverConfig()
+  {
+    return m_serverConfig;
+  }
+  const ServerConfig &serverConfig() const
   {
     return m_serverConfig;
   }
@@ -119,7 +135,9 @@ private:
   QString m_originalServerConfigUsesExternalFile;
   ServerConfig m_serverConfig;
   ScreenSetupModel m_screenSetupModel;
+  QSet<QString> m_knownScreenNames;
 
 private Q_SLOTS:
+  void onScreensChanged();
   void onChange();
 };

@@ -28,6 +28,7 @@
 #include "server/MouserBridge.h"
 #include "server/PrimaryClient.h"
 #include "server/VirtualHostTracker.h"
+#include "server/ChordRemapTypes.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -43,61 +44,13 @@
 
 using namespace deskflow::server;
 
-namespace {
-
-// Server-side keyboard chord remap for the Windows fleet target (tiny11).
-//
-// PowerToys Keyboard Manager cannot reliably remap KVM-injected input (a
-// documented limitation of hook-based remappers over remote/RDP/VM/KVM), so we
-// apply the user's exact Keyboard Manager table here, on the server, before the
-// chord is forwarded -- Deskflow sends the already-remapped combo (e.g. Ctrl+X
-// instead of Super+X). This is precise per-chord (not a coarse modifier swap)
-// and needs no PowerToys, driver, or signing.
-//
-// Ported 1:1 from the user's Keyboard Manager default.json (Mac Command arrives
-// as KeyModifierSuper on this fleet). To change the mappings, edit this table.
-constexpr const char *kChordRemapTargetScreen = "tiny11";
-
-constexpr KeyModifierMask kChordRemapMods =
-    KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
-
-struct ChordRemap
+bool Server::applyChordRemapForActiveScreen(KeyID &id, KeyModifierMask &mask)
 {
-  KeyModifierMask inMods;
-  KeyID inKey;
-  KeyModifierMask outMods;
-  KeyID outKey;
-};
-
-const std::array<ChordRemap, 11> kChordRemaps = {{
-    {KeyModifierControl | KeyModifierAlt, kKeyF12, KeyModifierSuper, kKeyTab}, // Ctrl+Alt+F12 -> Win+Tab
-    {KeyModifierSuper, kKeyTab, KeyModifierAlt, kKeyTab},                      // Win+Tab -> Alt+Tab
-    {KeyModifierSuper, 'h', KeyModifierSuper, kKeyDown},                       // Win+H -> Win+Down
-    {KeyModifierSuper, 'n', KeyModifierControl, 'n'},                          // Win+N -> Ctrl+N
-    {KeyModifierSuper, 'q', KeyModifierAlt, kKeyF4},                           // Win+Q -> Alt+F4
-    {KeyModifierSuper, 'r', KeyModifierControl, 'r'},                          // Win+R -> Ctrl+R
-    {KeyModifierSuper, 't', KeyModifierControl, 't'},                          // Win+T -> Ctrl+T
-    {KeyModifierSuper, 'v', KeyModifierControl, 'v'},                          // Win+V -> Ctrl+V
-    {KeyModifierSuper, 'w', KeyModifierControl, 'w'},                          // Win+W -> Ctrl+W
-    {KeyModifierSuper, 'x', KeyModifierControl, 'x'},                          // Win+X -> Ctrl+X
-    {KeyModifierSuper, '`', KeyModifierControl, kKeyTab},                      // Win+` -> Ctrl+Tab
-}};
-
-// Rewrites (id, mask) in place if the chord matches a remap entry. Returns true
-// when a remap was applied. Non-chord modifier bits (CapsLock, etc.) are kept.
-bool applyChordRemap(KeyID &id, KeyModifierMask &mask)
-{
-  for (const auto &entry : kChordRemaps) {
-    if (entry.inKey == id && (mask & kChordRemapMods) == entry.inMods) {
-      id = entry.outKey;
-      mask = (mask & ~kChordRemapMods) | entry.outMods;
-      return true;
-    }
+  if (m_active == nullptr || m_config == nullptr) {
+    return false;
   }
-  return false;
+  return applyChordRemap(id, mask, m_config->getChordRemaps(), getName(m_active));
 }
-
-} // namespace
 
 //
 // Server
@@ -1883,9 +1836,8 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
     return;
   }
 
-  // Windows-target chord remap (user's PowerToys table, applied server-side).
-  if (getName(m_active) == kChordRemapTargetScreen && applyChordRemap(id, mask)) {
-    LOG_DEBUG("chord remap -> id=%d mask=0x%04x for \"%s\"", id, mask, kChordRemapTargetScreen);
+  if (applyChordRemapForActiveScreen(id, mask)) {
+    LOG_DEBUG("chord remap -> id=%d mask=0x%04x for \"%s\"", id, mask, getName(m_active).c_str());
   }
 
   // relay
@@ -1911,10 +1863,7 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
   LOG_VERBOSE("onKeyUp id=%d mask=0x%04x button=0x%04x", id, mask, button);
   assert(m_active != nullptr);
 
-  // Windows-target chord remap (mirror onKeyDown so the release matches).
-  if (getName(m_active) == kChordRemapTargetScreen) {
-    applyChordRemap(id, mask);
-  }
+  applyChordRemapForActiveScreen(id, mask);
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
@@ -1942,10 +1891,7 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
   );
   assert(m_active != nullptr);
 
-  // Windows-target chord remap (mirror onKeyDown so repeats stay remapped).
-  if (getName(m_active) == kChordRemapTargetScreen) {
-    applyChordRemap(id, mask);
-  }
+  applyChordRemapForActiveScreen(id, mask);
 
   // relay
   m_active->keyRepeat(id, mask, count, button, lang);

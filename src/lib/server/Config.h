@@ -14,6 +14,7 @@
 #include "deskflow/OptionTypes.h"
 #include "net/NetworkAddress.h"
 #include "server/InputFilter.h"
+#include "server/ChordRemapTypes.h"
 
 #include <iosfwd>
 #include <map>
@@ -351,6 +352,12 @@ public:
   */
   const ScreenOptions *getOptions(const std::string &name) const;
 
+  //! Chord remaps for per-screen keyboard translation (server-side).
+  const std::vector<ChordRemapEntry> &getChordRemaps() const
+  {
+    return m_chordRemaps;
+  }
+
   //! Check for lock to screen action
   /*!
   Returns \c true if this configuration has a lock to screen action.
@@ -399,6 +406,8 @@ private:
   void readSectionScreens(ConfigReadContext &);
   void readSectionLinks(ConfigReadContext &);
   void readSectionAliases(ConfigReadContext &);
+  void readSectionChordRemaps(ConfigReadContext &);
+  void seedDefaultChordRemaps();
 
   InputFilter::Condition *
   parseCondition(const ConfigReadContext &, const std::string &condition, const std::vector<std::string> &args);
@@ -417,6 +426,7 @@ private:
   NetworkAddress m_deskflowAddress;
   ScreenOptions m_globalOptions;
   InputFilter m_inputFilter;
+  std::vector<ChordRemapEntry> m_chordRemaps;
   bool m_hasLockToScreenAction = false;
   IEventQueue *m_events;
   inline static const QStringList m_oldNames = {

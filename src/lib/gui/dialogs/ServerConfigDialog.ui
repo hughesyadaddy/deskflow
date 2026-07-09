@@ -303,6 +303,97 @@
        </item>
       </layout>
      </widget>
+     <widget class="QWidget" name="tabChordRemaps">
+      <attribute name="title">
+       <string>Chord Remaps</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="chordRemapsLayout">
+       <item>
+        <widget class="QLabel" name="lblChordRemapHelp">
+         <property name="text">
+          <string>Applied only when the cursor is on the selected screen. Restart core after saving.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="chordRemapScreenLayout">
+         <item>
+          <widget class="QLabel" name="lblChordRemapScreen">
+           <property name="text">
+            <string>Screen:</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="comboChordRemapScreen"/>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="chordRemapListLayout">
+         <item>
+          <widget class="QListWidget" name="listChordRemaps"/>
+         </item>
+         <item>
+          <layout class="QVBoxLayout" name="chordRemapButtonsLayout">
+           <item>
+            <widget class="QPushButton" name="btnNewChordRemap">
+             <property name="text">
+              <string>&amp;New</string>
+             </property>
+             <property name="icon">
+              <iconset theme="QIcon::ThemeIcon::ListAdd"/>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btnEditChordRemap">
+             <property name="enabled">
+              <bool>false</bool>
+             </property>
+             <property name="text">
+              <string>&amp;Edit</string>
+             </property>
+             <property name="icon">
+              <iconset theme="document-edit"/>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btnRemoveChordRemap">
+             <property name="enabled">
+              <bool>false</bool>
+             </property>
+             <property name="text">
+              <string>&amp;Remove</string>
+             </property>
+             <property name="icon">
+              <iconset theme="QIcon::ThemeIcon::ListRemove"/>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="chordRemapButtonSpacer">
+             <property name="orientation">
+              <enum>Qt::Orientation::Vertical</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>20</width>
+               <height>40</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+          </layout>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
      <widget class="QWidget" name="tabAdvanced">
       <attribute name="title">
        <string>Advanced</string>

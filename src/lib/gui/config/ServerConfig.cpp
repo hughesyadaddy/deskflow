@@ -9,10 +9,14 @@
 #include "ServerConfig.h"
 
 #include "Hotkey.h"
+#include "ChordRemap.h"
 #include "common/Settings.h"
+#include "server/ChordRemapTypes.h"
 
 #include <QAbstractButton>
 #include <QPushButton>
+
+#include <algorithm>
 
 using enum ScreenConfig::Modifier;
 using enum ScreenConfig::SwitchCorner;
@@ -53,7 +57,8 @@ bool ServerConfig::save(const QString &fileName) const
 bool ServerConfig::operator==(const ServerConfig &sc) const
 {
   return m_Screens == sc.m_Screens && //
-         m_Hotkeys == sc.m_Hotkeys;   //
+         m_Hotkeys == sc.m_Hotkeys && //
+         m_ChordRemaps == sc.m_ChordRemaps;
 }
 
 void ServerConfig::save(QFile &file) const
@@ -66,6 +71,7 @@ void ServerConfig::setupScreens()
 {
   screens().clear();
   hotkeys().clear();
+  chordRemaps().clear();
 
   // There must always be screen objects for each cell in the screens QList.
   // Unused screens are identified by having an empty name.
@@ -96,6 +102,13 @@ void ServerConfig::commit()
   for (int i = 0; i < hotkeys().size(); i++) {
     settings().setArrayIndex(i);
     hotkeys()[i].saveSettings(settings().get());
+  }
+  settings().endArray();
+
+  settings().beginWriteArray("chordRemaps");
+  for (int i = 0; i < chordRemaps().size(); i++) {
+    settings().setArrayIndex(i);
+    chordRemaps()[i].saveSettings(settings().get());
   }
   settings().endArray();
 
@@ -134,6 +147,21 @@ void ServerConfig::recall()
     hotkeys().append(h);
   }
   settings().endArray();
+
+  int numChordRemaps = settings().beginReadArray("chordRemaps");
+  for (int i = 0; i < numChordRemaps; i++) {
+    settings().setArrayIndex(i);
+    ChordRemap remap;
+    remap.loadSettings(settings().get());
+    chordRemaps().append(remap);
+  }
+  settings().endArray();
+
+  if (chordRemaps().isEmpty() && screenExists(QString::fromUtf8(deskflow::server::kDefaultChordRemapScreen))) {
+    for (const auto &entry : deskflow::server::kDefaultTiny11ChordRemaps) {
+      chordRemaps().append(ChordRemap::fromServerEntry(entry));
+    }
+  }
 
   settings().endGroup();
 }
@@ -189,6 +217,19 @@ QTextStream &operator<<(QTextStream &outStream, const ServerConfig &config)
     outStream << hotkey;
 
   outStream << "end" << Qt::endl << Qt::endl;
+
+  if (!config.chordRemaps().isEmpty()) {
+    outStream << "section: chordRemaps" << Qt::endl;
+    QString currentScreen;
+    for (const ChordRemap &remap : config.chordRemaps()) {
+      if (remap.screen() != currentScreen) {
+        currentScreen = remap.screen();
+        outStream << "\t" << currentScreen << ":" << Qt::endl;
+      }
+      outStream << remap;
+    }
+    outStream << "end" << Qt::endl << Qt::endl;
+  }
 
   return outStream;
 }
@@ -256,6 +297,30 @@ bool ServerConfig::screenExists(const QString &screenName) const
   }
 
   return isExists;
+}
+
+void ServerConfig::pruneChordRemapsForMissingScreens()
+{
+  ChordRemapList &remaps = chordRemaps();
+  remaps.erase(
+      std::remove_if(remaps.begin(), remaps.end(), [this](const ChordRemap &remap) {
+        return !screenExists(remap.screen());
+      }),
+      remaps.end()
+  );
+}
+
+void ServerConfig::renameChordRemapScreen(const QString &oldName, const QString &newName)
+{
+  if (oldName.isEmpty() || newName.isEmpty() || oldName == newName) {
+    return;
+  }
+
+  for (ChordRemap &remap : chordRemaps()) {
+    if (remap.screen() == oldName) {
+      remap.setScreen(newName);
+    }
+  }
 }
 
 void ServerConfig::addClient(const QString &clientName)
