@@ -1,0 +1,53 @@
+---
+description: Mandatory kill-everything-and-restart procedure for any Deskflow rebuild, reinstall, or relaunch on any fleet machine
+alwaysApply: true
+---
+
+# Deskflow: ALWAYS kill everything before any restart
+
+Any rebuild, reinstall, relaunch, restart, or debug-restart of Deskflow on ANY
+fleet machine (hackintosh, macbookpro, tiny11) MUST go through the full
+kill-everything path. NO exceptions, including "quick" debug restarts such as
+config/log-level changes.
+
+## Why (learned the hard way)
+
+- The Windows daemon service is a **watchdog**: it respawns `deskflow-core`.
+  Killing the core without removing the service first creates duplicates.
+- The single-instance guard (QSharedMemory) is **per-session**: a session-0
+  core and a session-1 core can coexist and fight each other (input lag).
+- Ad-hoc `taskkill /IM` or `pkill` by name misses elevated/session-0
+  processes; launching the GUI over SSH lands it in session 0.
+
+## Windows (tiny11)
+
+NEVER kill/restart ad hoc. Use the hardened logic from
+`scripts/install-windows.ps1` — either run the script itself, or replicate its
+exact sequence:
+
+1. `Remove-DeskflowService` FIRST (stop service, force-kill hung daemon PID,
+   `sc delete`, wait for removal) — before touching any core process.
+2. Tree-kill every `deskflow*` process by PID in every session, loop until
+   zero remain (`Stop-DeskflowAll`); error out if any survive.
+3. Recreate + start the service (`Ensure-DeskflowService`,
+   `Start-DeskflowService`).
+4. Launch exactly one GUI into the interactive session via scheduled task
+   (`Start-DeskflowGui` / `Start-GuiInSession`) — never `Start-Process` from
+   an SSH (session-0) context.
+5. Verify: expect exactly `deskflow-daemon` (session 0), `deskflow` (session
+   1), `deskflow-core` (session 1). Report the final process list.
+
+## macOS (hackintosh, macbookpro)
+
+1. Quit the app AND `pkill -9 -f 'Deskflow.app/Contents/MacOS'` (both the GUI
+   and `deskflow-core`); verify with `pgrep` that zero remain.
+2. Relaunch silently to tray with `open -g /Applications/Deskflow.app` (never
+   pass `--show`; it pops the settings window over the user's work).
+3. `scripts/install-macos.sh` already implements quit/install/relaunch — use
+   it for installs.
+
+## Also applies to
+
+- Log-level or config changes that require a core restart.
+- Fleet deploys (`scripts/fleet-deploy.sh` already routes through the install
+  scripts — do not bypass them with manual SSH kills/launches).
