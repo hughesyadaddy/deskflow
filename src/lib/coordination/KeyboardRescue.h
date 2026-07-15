@@ -13,7 +13,7 @@
 namespace deskflow::coordination {
 
 //! Five plain Escape downs within 2s on the keyboard host → soft-restart
-//! local Deskflow core (see request path in CoreIpc / CoreProcess).
+//! local Deskflow core via the deskflow-core-registered restart handler.
 /*!
 Call only for KeyDown / KeyPhase::Down (not Repeat). Chord modifiers
 (Shift/Ctrl/Alt/Super) must be clear; Caps/NumLock are ignored. Rolling
@@ -28,9 +28,10 @@ struct EscTapRescue
 
   bool noteEscDown(KeyID id, KeyModifierMask mask, Clock::time_point now = Clock::now())
   {
-    constexpr KeyModifierMask chordMods =
-        KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
+    constexpr KeyModifierMask chordMods = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
     if (id != kKeyEscape || (mask & chordMods) != 0) {
+      // Non-Esc (or Esc with chord mods) breaks the streak; Caps/Num on plain Esc still count.
+      reset();
       return false;
     }
 

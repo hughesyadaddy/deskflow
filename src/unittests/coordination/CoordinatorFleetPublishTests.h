@@ -32,6 +32,8 @@ private Q_SLOTS:
   void wakePeer_refiresAfterRateLimitWindow();
   void wakePeer_ignoredForClientsAndPeersWithoutHints();
   void fiveEsc_requestsLocalCoreRestart();
+  void fiveEsc_localPass_requestsLocalCoreRestart();
+  void fiveEsc_repeatPhase_doesNotRestart();
   void keyForward_gatingMatrix();
   void sendKeyForward_returnsFalseWithoutDestination();
   void sendKeyForward_returnsFalseWhenMeshUnreachable();

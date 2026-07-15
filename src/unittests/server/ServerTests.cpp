@@ -693,9 +693,14 @@ void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
       server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
       QCOMPARE(restartCalls, 0);
+    }
+    QCOMPARE(remote.keys().size(), static_cast<size_t>(deskflow::coordination::EscTapRescue::kTaps - 1));
+    for (const auto &key : remote.keys()) {
+      QCOMPARE(key.kind, RecordedKeyEvent::Kind::Down);
+      QCOMPARE(key.id, kKeyEscape);
     }
     remote.clearKeys();
     server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);

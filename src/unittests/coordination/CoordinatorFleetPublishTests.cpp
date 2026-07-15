@@ -398,7 +398,7 @@ void CoordinatorFleetPublishTests::fiveEsc_requestsLocalCoreRestart()
   coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
   QVERIFY(!coordinator.relayPassThroughLocal());
 
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
     // Taps 1–4 still attempt forward (return depends on mesh reachability).
     coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en");
     QCOMPARE(restartCalls, 0);
@@ -406,6 +406,71 @@ void CoordinatorFleetPublishTests::fiveEsc_requestsLocalCoreRestart()
   // Fifth Esc: swallow (return true) and request soft restart.
   QVERIFY(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"));
   QCOMPARE(restartCalls, 1);
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::fiveEsc_localPass_requestsLocalCoreRestart()
+{
+  auto config = testConfig();
+  config.selfName = "macbookpro";
+  config.keyboardFollowCursor = false;
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsClient(coordinator);
+
+  int restartCalls = 0;
+  coordinator.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+
+  FleetFragment inbound;
+  inbound.server = "hackintosh";
+  inbound.seq = 1;
+  inbound.cursorHost = "macbookpro";
+  inbound.links = {FleetLink{"hackintosh", "macbookpro", "left"}};
+  inbound.screens = {FleetScreen{"hackintosh"}, FleetScreen{"macbookpro"}};
+  coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
+  QVERIFY(coordinator.relayPassThroughLocal());
+
+  for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
+    QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"));
+    QCOMPARE(restartCalls, 0);
+  }
+  QVERIFY(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"));
+  QCOMPARE(restartCalls, 1);
+
+  coordinator.stop();
+}
+
+void CoordinatorFleetPublishTests::fiveEsc_repeatPhase_doesNotRestart()
+{
+  auto config = testConfig();
+  config.selfName = "macbookpro";
+  config.keyboardFollowCursor = false;
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+  armAsClient(coordinator);
+
+  int restartCalls = 0;
+  coordinator.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+
+  FleetFragment inbound;
+  inbound.server = "hackintosh";
+  inbound.seq = 1;
+  inbound.cursorHost = "hackintosh";
+  inbound.links = {FleetLink{"hackintosh", "macbookpro", "left"}};
+  inbound.screens = {FleetScreen{"hackintosh"}, FleetScreen{"macbookpro"}};
+  coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
+
+  for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps; ++i) {
+    coordinator.sendKeyForward(Message::KeyPhase::Repeat, kKeyEscape, 0, 1, "en");
+  }
+  QCOMPARE(restartCalls, 0);
 
   coordinator.stop();
 }

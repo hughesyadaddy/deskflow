@@ -31,15 +31,9 @@ void ipcSendConnectionState(deskflow::core::ConnectionState state)
 void ipcRequestLocalCoreRestart()
 {
   auto &server = deskflow::core::ipc::CoreIpcServer::instance();
-  // Mutually exclusive: never queue restartCore when empty (stale fire later),
-  // and never both broadcast and stop.
-  if (server.hasClients()) {
-    LOG_INFO("keyboard rescue: 5x Esc — requesting core restart via GUI");
-    ipcSendToClient(QStringLiteral("restartCore"));
-    return;
-  }
-  LOG_WARN("keyboard rescue: 5x Esc — no GUI IPC client; stopping core for respawn");
+  // Decide restart vs stop on the IPC owning thread so hasClients() cannot
+  // race a disconnect into broadcastCommand's pending-queue path.
   QMetaObject::invokeMethod(
-      &server, [] { deskflow::core::ipc::CoreIpcServer::instance().requestStopProcess(); }, Qt::QueuedConnection
+      &server, [] { deskflow::core::ipc::CoreIpcServer::instance().requestLocalCoreRestart(); }, Qt::QueuedConnection
   );
 }

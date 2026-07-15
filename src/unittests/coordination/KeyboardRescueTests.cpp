@@ -55,4 +55,17 @@ void KeyboardRescueTests::capsLockIgnored_stillCounts()
   QCOMPARE(rescue.count(), 1);
 }
 
+void KeyboardRescueTests::nonEsc_breaksStreak()
+{
+  EscTapRescue rescue;
+  const auto t0 = Clock::now();
+  QVERIFY(!rescue.noteEscDown(kKeyEscape, 0, t0));
+  QVERIFY(!rescue.noteEscDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(50)));
+  QCOMPARE(rescue.count(), 2);
+  QVERIFY(!rescue.noteEscDown('a', 0, t0 + std::chrono::milliseconds(100)));
+  QCOMPARE(rescue.count(), 0);
+  QVERIFY(!rescue.noteEscDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(150)));
+  QCOMPARE(rescue.count(), 1);
+}
+
 QTEST_MAIN(KeyboardRescueTests)

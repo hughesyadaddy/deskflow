@@ -11,6 +11,7 @@
 
 class QLocalServer;
 class QLocalSocket;
+class IpcServerLocalRestartTests;
 
 namespace deskflow::core::ipc {
 
@@ -24,8 +25,12 @@ public:
 
   void listen();
   void broadcastCommand(const QString &command, const QString &args = "");
+  //! Broadcast only if clients are connected; never enqueue for later replay.
+  void broadcastCommandIfClients(const QString &command, const QString &args = "");
   bool hasClients() const;
   void requestStopProcess();
+  //! Soft-restart via GUI or stop when none — always on this object's thread.
+  void requestLocalCoreRestart();
 
 Q_SIGNALS:
   void logLevelChanged(const QString &logLevel);
@@ -44,6 +49,8 @@ protected:
   void writeToClientSocket(QLocalSocket *&clientSocket, const QString &message) const;
 
 private:
+  friend class ::IpcServerLocalRestartTests;
+
   void processMessage(QLocalSocket *clientSocket, const QString &message);
   virtual void processCommand(QLocalSocket *clientSocket, const QString &command, const QStringList &parts) = 0;
   void handleNewConnection();

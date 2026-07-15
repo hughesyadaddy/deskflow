@@ -186,6 +186,30 @@ void IpcServer::broadcastCommand(const QString &command, const QString &args)
   }
 }
 
+void IpcServer::broadcastCommandIfClients(const QString &command, const QString &args)
+{
+  if (m_clients.isEmpty()) {
+    LOG_VERBOSE(
+        "%s ipc server has no clients, dropping (no queue): %s", m_typeName.constData(), command.toUtf8().constData()
+    );
+    return;
+  }
+  broadcastCommand(command, args);
+}
+
+void IpcServer::requestLocalCoreRestart()
+{
+  // Mutually exclusive on the owning thread: never queue restartCore when
+  // empty (stale fire later), and never both broadcast and stop.
+  if (hasClients()) {
+    LOG_INFO("keyboard rescue: 5x Esc — requesting core restart via GUI");
+    broadcastCommandIfClients(QStringLiteral("restartCore"));
+    return;
+  }
+  LOG_WARN("keyboard rescue: 5x Esc — no GUI IPC client; stopping core for respawn");
+  requestStopProcess();
+}
+
 void IpcServer::writeToClientSocket(QLocalSocket *&clientSocket, const QString &message) const
 {
   QByteArray messageData = message.toUtf8() + '\n';

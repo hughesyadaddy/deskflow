@@ -16,4 +16,5 @@ private Q_SLOTS:
   void gapBeyondWindow_resetsCount();
   void modifiers_doNotCount();
   void capsLockIgnored_stillCounts();
+  void nonEsc_breaksStreak();
 };
