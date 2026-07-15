@@ -597,6 +597,11 @@ void CoreProcess::setProcessState(ProcessState state)
 
 void CoreProcess::onCoreIpcMessageReceived(const QString &command, const QString &args)
 {
+  if (command == "restartCore") {
+    qInfo("core requested restart (keyboard rescue 5x Esc)");
+    restart();
+    return;
+  }
   if (command == "connectionState") {
     const auto metaEnum = QMetaEnum::fromType<ConnectionState>();
     bool ok = false;

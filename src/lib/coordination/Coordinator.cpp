@@ -450,8 +450,8 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
       std::scoped_lock lock{m_mutex};
       m_loggedKeyForward = false;
       m_loggedKeyForwardReceive = false;
-      m_relayLocalOverride = false;
-      m_overrideCursorHost.clear();
+      // Do not reset EscTapRescue here: the tick reconciler restarts a dead
+      // relay and must not wipe an in-progress 5× Esc sequence.
       // Epoch restart does not call becameClient(); clear stale screen sync.
       m_election.resetCursorScreen();
     }
@@ -470,6 +470,7 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
     std::scoped_lock lock{m_mutex};
     m_loggedKeyForward = false;
     m_loggedKeyForwardReceive = false;
+    m_escTapRescue.reset();
   }
   // Server epoch: keyboard uses Server::onKeyDown → m_active (not key relay).
   m_keyboardRelay->stop();
@@ -577,6 +578,20 @@ bool Coordinator::sendKeyForward(
     Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang
 )
 {
+  // Always observe Downs (including when routing is Local) so 5× Esc still
+  // works while the cursor is on this machine. True return = swallow Esc.
+  if (phase == Message::KeyPhase::Down) {
+    bool triggered = false;
+    {
+      std::scoped_lock lock{m_mutex};
+      triggered = m_escTapRescue.noteEscDown(id, mask);
+    }
+    if (triggered) {
+      requestLocalCoreRestart();
+      return true;
+    }
+  }
+
   std::string destination;
   std::string line;
   bool logFirst = false;
@@ -584,19 +599,6 @@ bool Coordinator::sendKeyForward(
     std::scoped_lock lock{m_mutex};
     if (m_election.role() != Role::Client) {
       return false;
-    }
-
-    // Keyboard rescue: force this keyboard local until the fleet cursor
-    // host next changes. Works even when routing state is stale, because
-    // every swallowed key passes through here.
-    if (phase == Message::KeyPhase::Down && isKeyboardRescueChord(id, mask)) {
-      m_relayLocalOverride = true;
-      m_overrideCursorHost = m_fleetState.cursorHost;
-      LOG_INFO("coordination: keyboard rescue chord: keyboard forced local");
-      return false;
-    }
-    if (m_relayLocalOverride) {
-      return false; // override active: never forward
     }
 
     KeyboardRouteInput input;
@@ -633,6 +635,15 @@ bool Coordinator::sendKeyForward(
   return m_mesh->sendTo(destination, line);
 }
 
+void Coordinator::requestLocalCoreRestart()
+{
+  if (m_localCoreRestartHook) {
+    m_localCoreRestartHook();
+    return;
+  }
+  deskflow::coordination::requestLocalCoreRestart();
+}
+
 bool Coordinator::isKnownPeer(const std::string &name) const
 {
   for (const auto &peer : m_config.peers) {
@@ -646,17 +657,6 @@ bool Coordinator::isKnownPeer(const std::string &name) const
 bool Coordinator::relayPassThroughLocal()
 {
   std::scoped_lock lock{m_mutex};
-
-  // Rescue override: keyboard stays local until the fleet cursor host
-  // changes value (fresh authoritative state supersedes the override).
-  if (m_relayLocalOverride) {
-    if (!namesEqual(m_fleetState.cursorHost, m_overrideCursorHost)) {
-      m_relayLocalOverride = false;
-      LOG_INFO("coordination: keyboard rescue override cleared (fleet cursor moved)");
-    } else {
-      return true;
-    }
-  }
 
   KeyboardRouteInput input;
   input.selfName = m_config.selfName;

@@ -11,6 +11,7 @@
 #include "coordination/FleetState.h"
 #include "coordination/FleetStateMerge.h"
 #include "coordination/KeyboardRelayMonitor.h"
+#include "coordination/KeyboardRescue.h"
 #include "coordination/LocalInputMonitor.h"
 #include "coordination/Peer.h"
 #include "deskflow/KeyTypes.h"
@@ -138,6 +139,7 @@ private:
   void handleKeyForwardMessage(const Message &message);
   bool
   sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
+  void requestLocalCoreRestart();
   bool isKnownPeer(const std::string &name) const;
   bool relayPassThroughLocal();
   void promoteSelf(const char *reason);
@@ -181,9 +183,9 @@ private:
   int m_wedgeStrikes = 0;
   bool m_loggedKeyForward = false;
   bool m_loggedKeyForwardReceive = false;
-  //! Rescue chord engaged: pass keys locally until the cursor host changes.
-  bool m_relayLocalOverride = false;
-  std::string m_overrideCursorHost;
+  EscTapRescue m_escTapRescue;
+  //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
+  std::function<void()> m_localCoreRestartHook;
   std::set<std::string> m_versionMismatchPeers;
   //! Last wake action per peer (rate limit; guarded by m_mutex).
   std::map<std::string, std::chrono::steady_clock::time_point> m_lastWakeAt;

@@ -675,14 +675,14 @@ void ServerTests::requestWakePeer_refiresAfterThrottleWindow()
   }
 }
 
-void ServerTests::rescueChord_jumpsBackToPrimaryScreen()
+void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
 {
   LeakedServerFixture fixture;
   QVERIFY(fixture.config.addScreen("server"));
   QVERIFY(fixture.config.addScreen("remote"));
   QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
   fixture.init("server");
-  TestClientProxy remote("remote");
+  RecordingRemoteClient remote("remote");
 
   {
     Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
@@ -690,12 +690,19 @@ void ServerTests::rescueChord_jumpsBackToPrimaryScreen()
     server.switchScreen(&remote, 50, 60, false);
     QCOMPARE(server.m_active, &remote);
 
-    // The escape hatch for a wedged relay: the chord must yank the cursor
-    // (and keyboard) back to the primary screen and swallow the key.
-    constexpr KeyModifierMask chord = KeyModifierShift | KeyModifierControl | KeyModifierAlt;
-    server.onKeyDown(kKeyEscape, chord, 1, "en", nullptr);
+    int restartCalls = 0;
+    server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
 
-    QCOMPARE(server.m_active, fixture.primary);
+    for (int i = 0; i < 4; ++i) {
+      server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+      QCOMPARE(restartCalls, 0);
+    }
+    remote.clearKeys();
+    server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+    QCOMPARE(restartCalls, 1);
+    QVERIFY(remote.keys().empty());
+    QCOMPARE(server.m_active, &remote);
+
     server.m_clients.erase("remote");
   }
 }
@@ -802,7 +809,7 @@ void ServerTests::chordRemapHoldThrough_tabRepeatKeepsAltMask()
   }
 }
 
-void ServerTests::chordRemapHoldThrough_cancelsOnRescueChord()
+void ServerTests::chordRemapHoldThrough_fiveEscCancelsSession()
 {
   LeakedServerFixture fixture;
   loadConfigWithSuperTabRemap(fixture.config);
@@ -816,16 +823,22 @@ void ServerTests::chordRemapHoldThrough_cancelsOnRescueChord()
 
     server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
     QVERIFY(server.m_chordRemapSession.active);
+
+    int restartCalls = 0;
+    server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+
+    for (int i = 0; i < 4; ++i) {
+      server.onKeyDown(kKeyEscape, 0, 0, "en", nullptr);
+    }
     remote.clearKeys();
+    server.onKeyDown(kKeyEscape, 0, 0, "en", nullptr);
 
-    constexpr KeyModifierMask rescue = KeyModifierShift | KeyModifierControl | KeyModifierAlt;
-    server.onKeyDown(kKeyEscape, rescue, 0, "en", nullptr);
-
-    QCOMPARE(server.m_active, fixture.primary);
+    QCOMPARE(restartCalls, 1);
     QVERIFY(!server.m_chordRemapSession.active);
     QCOMPARE(remote.keys().size(), 1u);
     QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
     QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+    QCOMPARE(server.m_active, &remote);
 
     server.m_clients.erase("tiny11");
   }

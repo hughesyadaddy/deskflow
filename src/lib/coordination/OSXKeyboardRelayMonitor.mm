@@ -155,11 +155,6 @@ private:
       return event;
     }
 
-    const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
-    if (passLocal) {
-      return event;
-    }
-
     Message::KeyPhase phase = Message::KeyPhase::Down;
     KeyID id = 0;
     KeyModifierMask mask = 0;
@@ -167,6 +162,18 @@ private:
     if (!mapRelayKeyFromCgEvent(event, phase, id, mask, button)) {
       return event;
     }
+
+    const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
+    // When keys stay local, still deliver Downs to sendKeyForward so 5× Esc
+    // restart can observe taps (return true = swallow this key).
+    if (passLocal) {
+      if (type == kCGEventKeyDown && phase == Message::KeyPhase::Down && self->m_send &&
+          self->m_send(phase, id, mask, button, {})) {
+        return nullptr;
+      }
+      return event;
+    }
+
     bool forwarded = false;
     if (self->m_send) {
       forwarded = self->m_send(phase, id, mask, button, {});

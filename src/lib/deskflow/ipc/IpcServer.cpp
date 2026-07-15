@@ -154,6 +154,16 @@ void IpcServer::processMessage(QLocalSocket *clientSocket, const QString &messag
   clientSocket->flush();
 }
 
+bool IpcServer::hasClients() const
+{
+  return !m_clients.isEmpty();
+}
+
+void IpcServer::requestStopProcess()
+{
+  Q_EMIT stopProcessRequested();
+}
+
 void IpcServer::broadcastCommand(const QString &command, const QString &args)
 {
   const auto message = args.isEmpty() ? command : QStringLiteral("%1=%2").arg(command, args);

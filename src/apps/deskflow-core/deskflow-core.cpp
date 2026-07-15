@@ -14,9 +14,11 @@
 #include "base/Log.h"
 #include "common/Constants.h"
 #include "common/ExitCodes.h"
+#include "coordination/KeyboardRescue.h"
 #include "deskflow/App.h"
 #include "deskflow/ClientApp.h"
 #include "deskflow/ServerApp.h"
+#include "deskflow/ipc/CoreIpc.h"
 #include "deskflow/ipc/CoreIpcServer.h"
 
 #if defined(Q_OS_WIN)
@@ -164,6 +166,7 @@ int main(int argc, char **argv)
     AutoModeRunner runner(events, processName);
 
     const auto ipcServer = new deskflow::core::ipc::CoreIpcServer(&app); // NOSONAR - Qt managed
+    deskflow::coordination::setLocalCoreRestartHandler(&ipcRequestLocalCoreRestart);
     QObject::connect(ipcServer, &deskflow::core::ipc::IpcServer::stopProcessRequested, &app, [&runner] {
       runner.requestQuit();
     });
@@ -190,6 +193,7 @@ int main(int argc, char **argv)
   }
 
   const auto ipcServer = new deskflow::core::ipc::CoreIpcServer(&app); // NOSONAR - Qt managed
+  deskflow::coordination::setLocalCoreRestartHandler(&ipcRequestLocalCoreRestart);
   QObject::connect(
       ipcServer, &deskflow::core::ipc::IpcServer::stopProcessRequested, coreApp.get(), &App::quit, Qt::DirectConnection
   );

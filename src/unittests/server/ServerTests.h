@@ -20,11 +20,11 @@ private Q_SLOTS:
   void queuedSwitch_executesWhenNeighborConnects();
   void requestWakePeer_postsEventOncePerThrottleWindow();
   void requestWakePeer_refiresAfterThrottleWindow();
-  void rescueChord_jumpsBackToPrimaryScreen();
+  void fiveEsc_requestsLocalCoreRestartAndSwallows();
   void chordRemapHoldThrough_superTabKeepsAltUntilSuperUp();
   void chordRemapHoldThrough_relaySuperUpClearsSession();
   void chordRemapHoldThrough_tabRepeatKeepsAltMask();
-  void chordRemapHoldThrough_cancelsOnRescueChord();
+  void chordRemapHoldThrough_fiveEscCancelsSession();
   void chordRemapHoldThrough_cancelsOnScreenSwitch();
   void fleetWalk_skipsDisconnectedScreens();
   void fleetWalk_cyclicLinksTerminate();

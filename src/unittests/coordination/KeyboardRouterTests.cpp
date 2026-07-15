@@ -142,18 +142,4 @@ void KeyboardRouterTests::matrix_planAcceptance()
   QCOMPARE(QString::fromStdString(decision.forwardHost), expectedHost);
 }
 
-void KeyboardRouterTests::rescueChord_detection()
-{
-  using deskflow::coordination::isKeyboardRescueChord;
-  constexpr KeyModifierMask chordMask = KeyModifierShift | KeyModifierControl | KeyModifierAlt;
-
-  QVERIFY(isKeyboardRescueChord(kKeyEscape, chordMask));
-  // Extra modifiers (e.g. CapsLock bit) must not defeat the chord.
-  QVERIFY(isKeyboardRescueChord(kKeyEscape, chordMask | KeyModifierCapsLock));
-
-  QVERIFY(!isKeyboardRescueChord(kKeyEscape, KeyModifierControl | KeyModifierShift));
-  QVERIFY(!isKeyboardRescueChord(kKeyEscape, 0));
-  QVERIFY(!isKeyboardRescueChord('a', chordMask));
-}
-
 QTEST_MAIN(KeyboardRouterTests)

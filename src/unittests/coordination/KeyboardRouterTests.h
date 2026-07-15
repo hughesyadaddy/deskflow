@@ -20,5 +20,4 @@ private Q_SLOTS:
   void matrix_remoteCursor_serverForwards();
   void matrix_planAcceptance_data();
   void matrix_planAcceptance();
-  void rescueChord_detection();
 };

@@ -24,6 +24,8 @@ public:
 
   void listen();
   void broadcastCommand(const QString &command, const QString &args = "");
+  bool hasClients() const;
+  void requestStopProcess();
 
 Q_SIGNALS:
   void logLevelChanged(const QString &logLevel);

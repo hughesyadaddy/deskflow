@@ -80,11 +80,6 @@ private:
     const bool keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
     const bool isRepeat = !keyUp && (info->flags & LLKHF_UP) == 0 && (GetAsyncKeyState(info->vkCode) & 0x8000);
 
-    const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
-    if (passLocal) {
-      return CallNextHookEx(nullptr, code, wParam, lParam);
-    }
-
     const bool isInjected = (info->flags & LLKHF_INJECTED) != 0;
     if (isInjected) {
       return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -98,6 +93,17 @@ private:
         static_cast<int>(info->vkCode), static_cast<int>(info->scanCode), (info->flags & LLKHF_EXTENDED) != 0, keyUp,
         isRepeat, id, mask, button, phase
     );
+
+    const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
+    // When keys stay local, still deliver Downs to sendKeyForward so 5× Esc
+    // restart can observe taps (return true = swallow this key).
+    if (passLocal) {
+      if (mapped && !keyUp && phase == Message::KeyPhase::Down && self->m_send &&
+          self->m_send(phase, id, mask, button, {})) {
+        return 1;
+      }
+      return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
 
     bool forwarded = false;
     if (mapped && self->m_send) {

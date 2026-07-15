@@ -11,6 +11,7 @@
 #include "base/Event.h"
 #include "base/Stopwatch.h"
 #include "common/NetworkProtocol.h"
+#include "coordination/KeyboardRescue.h"
 #include "coordination/RelayKeyEvent.h"
 #include "deskflow/Clipboard.h"
 #include "deskflow/ClipboardTypes.h"
@@ -23,6 +24,7 @@
 
 #include <chrono>
 #include <climits>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -380,6 +382,7 @@ private:
   KeyModifierMask effectiveChordRemapMask(KeyModifierMask mask) const;
   bool isActiveChordRemapSession() const;
   bool isChordRemapSourceModifierKey(KeyID id, KeyButton button) const;
+  void requestLocalCoreRestart();
   void onMouseDown(ButtonID);
   void onMouseUp(ButtonID);
   bool onMouseMovePrimary(int32_t x, int32_t y);
@@ -545,4 +548,8 @@ private:
     KeyModifierMask heldOutMods = 0;
   };
   ChordRemapSession m_chordRemapSession;
+
+  deskflow::coordination::EscTapRescue m_escTapRescue;
+  //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
+  std::function<void()> m_localCoreRestartHook;
 };

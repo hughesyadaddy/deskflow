@@ -373,10 +373,12 @@ void CoordinatorFleetPublishTests::wakePeer_refiresAfterRateLimitWindow()
   coordinator.stop();
 }
 
-void CoordinatorFleetPublishTests::rescueChord_forcesRelayLocalUntilCursorMoves()
+void CoordinatorFleetPublishTests::fiveEsc_requestsLocalCoreRestart()
 {
   auto config = testConfig();
   config.selfName = "macbookpro";
+  // Avoid OS keyboard relay / reconciler noise while probing Esc taps.
+  config.keyboardFollowCursor = false;
 
   EventQueue events;
   Coordinator coordinator(config);
@@ -384,7 +386,9 @@ void CoordinatorFleetPublishTests::rescueChord_forcesRelayLocalUntilCursorMoves(
   QVERIFY(coordinator.start());
   armAsClient(coordinator);
 
-  // Fleet cursor sits on a remote host: keys would normally forward.
+  int restartCalls = 0;
+  coordinator.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+
   FleetFragment inbound;
   inbound.server = "hackintosh";
   inbound.seq = 1;
@@ -394,25 +398,14 @@ void CoordinatorFleetPublishTests::rescueChord_forcesRelayLocalUntilCursorMoves(
   coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
   QVERIFY(!coordinator.relayPassThroughLocal());
 
-  // Chord (Down) engages the override: every key stays local, nothing
-  // forwards, whatever the fleet state says.
-  constexpr KeyModifierMask chord = KeyModifierShift | KeyModifierControl | KeyModifierAlt;
-  coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, chord, 1, "en");
-  QVERIFY(coordinator.relayPassThroughLocal());
-  {
-    std::scoped_lock lock{coordinator.m_mutex};
-    QVERIFY(coordinator.m_relayLocalOverride);
+  for (int i = 0; i < 4; ++i) {
+    // Taps 1–4 still attempt forward (return depends on mesh reachability).
+    coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en");
+    QCOMPARE(restartCalls, 0);
   }
-
-  // Fresh authoritative cursor state (host changed) clears the override.
-  inbound.seq = 2;
-  inbound.cursorHost = "tiny11";
-  coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
-  QVERIFY(!coordinator.relayPassThroughLocal());
-  {
-    std::scoped_lock lock{coordinator.m_mutex};
-    QVERIFY(!coordinator.m_relayLocalOverride);
-  }
+  // Fifth Esc: swallow (return true) and request soft restart.
+  QVERIFY(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"));
+  QCOMPARE(restartCalls, 1);
 
   coordinator.stop();
 }

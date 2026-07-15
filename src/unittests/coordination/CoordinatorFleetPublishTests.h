@@ -31,7 +31,7 @@ private Q_SLOTS:
   void wakePeer_rateLimitsPerPeer();
   void wakePeer_refiresAfterRateLimitWindow();
   void wakePeer_ignoredForClientsAndPeersWithoutHints();
-  void rescueChord_forcesRelayLocalUntilCursorMoves();
+  void fiveEsc_requestsLocalCoreRestart();
   void keyForward_gatingMatrix();
   void sendKeyForward_returnsFalseWithoutDestination();
   void sendKeyForward_returnsFalseWhenMeshUnreachable();

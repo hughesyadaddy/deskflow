@@ -12,3 +12,6 @@
 
 void ipcSendToClient(const QString &command, const QString &args = "");
 void ipcSendConnectionState(deskflow::core::ConnectionState state);
+
+//! Soft-restart local core via GUI (`restartCore`) or stop when no GUI client.
+void ipcRequestLocalCoreRestart();

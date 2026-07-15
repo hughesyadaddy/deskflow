@@ -16,6 +16,8 @@ add_library(coordination STATIC
   KeyboardRouter.cpp
   KeyboardRouter.h
   KeyboardRelayHookPolicy.h
+  KeyboardRescue.cpp
+  KeyboardRescue.h
   LocalInputMonitor.h
   Peer.cpp
   Peer.h
