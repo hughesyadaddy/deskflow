@@ -104,6 +104,9 @@ public:
   bool fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang) override;
   bool fakeKeyUp(KeyButton button) override;
   void fakeAllKeysUp() override;
+  //! Release modifiers the OS reports down that the server cannot be
+  //! holding (stale injected keys from a lost release). Secondary only.
+  void sanitizeStaleModifiers() const;
 
   // IPlatformScreen overrides
   void enable() override;

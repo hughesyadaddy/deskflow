@@ -195,6 +195,11 @@ void MSWindowsScreen::enable()
 
     // watch jump zones
     m_hook.setMode(kHOOK_WATCH_JUMP_ZONE);
+  } else {
+    // Core (re)start on this desktop -- including the per-desktop watchdog
+    // relaunch (LogonUI / secure desktop return): clean up any modifier a
+    // previous core instance injected but never released.
+    sanitizeStaleModifiers();
   }
 }
 
@@ -232,6 +237,45 @@ void MSWindowsScreen::disable()
   m_isOnScreen = m_isPrimary;
 }
 
+void MSWindowsScreen::sanitizeStaleModifiers() const
+{
+  // A KVM target can be left with a synthetic modifier physically held when
+  // the release was lost -- TCP drop mid chord-remap, relay restart, or a
+  // core relaunch on another desktop (LogonUI). At the boundaries where this
+  // runs (enable, enter) the protocol guarantees the server holds no keys on
+  // this screen, so any modifier the OS still reports down is stale: inject
+  // its key-up so ordinary typing stops turning into shortcuts. The one
+  // false-positive -- a human physically holding a modifier at this machine
+  // in the same instant -- self-corrects on their next press, which is far
+  // cheaper than a stuck Win/Alt. Every release is logged for the soak.
+  if (m_isPrimary) {
+    return;
+  }
+  struct StaleCheck
+  {
+    UINT vk;
+    bool extended;
+  };
+  static const StaleCheck kModifiers[] = {
+      {VK_LWIN, true},     {VK_RWIN, true},     {VK_LMENU, false},  {VK_RMENU, true},
+      {VK_LCONTROL, false}, {VK_RCONTROL, true}, {VK_LSHIFT, false}, {VK_RSHIFT, false},
+  };
+  for (const auto &[vk, extended] : kModifiers) {
+    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
+      continue;
+    }
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(vk);
+    input.ki.dwFlags = KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
+    if (SendInput(1, &input, sizeof(input)) == 1) {
+      LOG_WARN("released stuck modifier vk=0x%02x", vk);
+    } else {
+      LOG_WARN("failed to release stuck modifier vk=0x%02x: %d", vk, GetLastError());
+    }
+  }
+}
+
 void MSWindowsScreen::enter()
 {
   m_desks->enter();
@@ -255,6 +299,11 @@ void MSWindowsScreen::enter()
       m_screensaver->deactivate();
       m_screensaverActive = 0;
     }
+
+    // The server is about to drive this screen from a clean slate; drop any
+    // stale injected modifier a lost release left behind (also covers
+    // reconnect-adoption, which resyncs enter without a mouse move).
+    sanitizeStaleModifiers();
   }
 
   // now on screen
