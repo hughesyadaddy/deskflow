@@ -17,8 +17,17 @@ bool mapRelayKeyFromCgEvent(
 );
 
 //! macOS modifier keys arrive as kCGEventFlagsChanged, not key down/up.
+/*!
+\p capsLockOn is the caller-owned last-known Caps Lock toggle state. Caps
+generates flagsChanged on BOTH the toggling press and the (state-preserving)
+release, and the flags carry the toggle state rather than the key's travel --
+so deciding press/release from the flags alone double-relays one toggle
+direction and drops the other. A caps event relays exactly one Down per
+observed state CHANGE (half-duplex targets toggle once per Down); the
+release edge and repeats relay nothing. The function updates \p capsLockOn.
+*/
 bool mapRelayModifierFromCgEvent(
-    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button
+    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button, bool &capsLockOn
 );
 
 //! Neutral media KeyID for an IOKit NX key type (kKeyNone if unmapped). Pure.

@@ -211,7 +211,7 @@ bool mapRelayKeyFromCgEvent(
 }
 
 bool mapRelayModifierFromCgEvent(
-    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button
+    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button, bool &capsLockOn
 )
 {
   auto *event = static_cast<CGEventRef>(cgEvent);
@@ -226,6 +226,22 @@ bool mapRelayModifierFromCgEvent(
   id = modifierKeyIdFromVirtualKey(vk);
   if (id == kKeyNone) {
     return false;
+  }
+
+  if (vk == kVK_CapsLock) {
+    // Caps is a toggle: flagsChanged fires on the toggling press AND the
+    // state-preserving release, and AlphaShift reports toggle STATE, not key
+    // travel. Deciding press/release from the flags alone relays the ON
+    // toggle twice (double-toggle = net nothing) and the OFF toggle never.
+    // Relay exactly one Down per observed state change; half-duplex targets
+    // toggle once per Down. The release edge relays nothing.
+    const bool nowOn = (flags & kCGEventFlagMaskAlphaShift) != 0;
+    if (nowOn == capsLockOn) {
+      return false;
+    }
+    capsLockOn = nowOn;
+    phase = Message::KeyPhase::Down;
+    return true;
   }
 
   if (modifierIsDown(vk, flags)) {

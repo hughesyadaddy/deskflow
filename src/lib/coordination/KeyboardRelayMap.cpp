@@ -144,6 +144,12 @@ bool mapRelayKeyFromHook(
   phase = keyUp ? Message::KeyPhase::Up : (isRepeat ? Message::KeyPhase::Repeat : Message::KeyPhase::Down);
   button = static_cast<KeyButton>(vkCode);
   mask = activeModifiers();
+  if (vkCode == VK_CAPITAL && !keyUp && !isRepeat) {
+    // The LL hook fires before the OS commits the toggle, so the sampled caps
+    // state is the PRE-toggle value; flip it so the relayed mask carries the
+    // post-toggle intent deterministically instead of racing the OS.
+    mask ^= KeyModifierCapsLock;
+  }
   id = mapRelayVirtualKey(vkCode, (mask & KeyModifierShift) != 0, (mask & KeyModifierCapsLock) != 0);
   if (keyUp) {
     id = kKeyNone;

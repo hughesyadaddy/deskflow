@@ -96,7 +96,8 @@ void KeyboardRelayMapTests::modifierKeys_mapToFleetKeyIds()
     KeyID id = kKeyNone;
     KeyModifierMask mask = 0;
     KeyButton button = 0;
-    QVERIFY(deskflow::coordination::mapRelayModifierFromCgEvent(event, phase, id, mask, button));
+    bool capsLockOn = false;
+    QVERIFY(deskflow::coordination::mapRelayModifierFromCgEvent(event, phase, id, mask, button, capsLockOn));
     QCOMPARE(phase, Message::KeyPhase::Down);
     QCOMPARE(id, expected);
     CFRelease(event);
@@ -125,7 +126,8 @@ void KeyboardRelayMapTests::mapRelayModifierFromCgEvent_handlesFlagsChanged()
     KeyID id = kKeySuper_L;
     KeyModifierMask mask = KeyModifierSuper;
     KeyButton button = 0;
-    QVERIFY(deskflow::coordination::mapRelayModifierFromCgEvent(event, phase, id, mask, button));
+    bool capsLockOn = false;
+    QVERIFY(deskflow::coordination::mapRelayModifierFromCgEvent(event, phase, id, mask, button, capsLockOn));
     QCOMPARE(phase, Message::KeyPhase::Up);
     QCOMPARE(id, kKeyNone);
     QCOMPARE(mask, 0u);
@@ -137,6 +139,46 @@ void KeyboardRelayMapTests::mapRelayModifierFromCgEvent_handlesFlagsChanged()
   expectUp(kVK_Control);
   expectUp(kVK_Shift);
   expectUp(kVK_Option);
+}
+
+void KeyboardRelayMapTests::capsLock_relaysOncePerToggle()
+{
+  const auto capsEvent = [](bool alphaShiftOn) {
+    CGEventRef event = CGEventCreate(nullptr);
+    CGEventSetType(event, kCGEventFlagsChanged);
+    CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, kVK_CapsLock);
+    CGEventSetFlags(event, alphaShiftOn ? kCGEventFlagMaskAlphaShift : static_cast<CGEventFlags>(0));
+    return event;
+  };
+  const auto relay = [](CGEventRef event, bool &capsLockOn, Message::KeyPhase &phase, KeyID &id) {
+    KeyModifierMask mask = 0;
+    KeyButton button = 0;
+    const bool mapped = deskflow::coordination::mapRelayModifierFromCgEvent(event, phase, id, mask, button, capsLockOn);
+    CFRelease(event);
+    return mapped;
+  };
+
+  bool capsLockOn = false;
+  Message::KeyPhase phase = Message::KeyPhase::Up;
+  KeyID id = kKeyNone;
+
+  // Toggling ON: press edge (state change) relays one caps Down...
+  QVERIFY(relay(capsEvent(true), capsLockOn, phase, id));
+  QCOMPARE(phase, Message::KeyPhase::Down);
+  QCOMPARE(id, kKeyCapsLock);
+  QVERIFY(capsLockOn);
+  // ...and the state-preserving release edge relays nothing (this event used
+  // to relay a SECOND Down: double-toggle = caps never engaged remotely).
+  QVERIFY(!relay(capsEvent(true), capsLockOn, phase, id));
+
+  // Toggling OFF: press edge relays one caps Down (this used to relay a
+  // kKeyNone Up: the remote caps never disengaged)...
+  QVERIFY(relay(capsEvent(false), capsLockOn, phase, id));
+  QCOMPARE(phase, Message::KeyPhase::Down);
+  QCOMPARE(id, kKeyCapsLock);
+  QVERIFY(!capsLockOn);
+  // ...and its release edge is silent too.
+  QVERIFY(!relay(capsEvent(false), capsLockOn, phase, id));
 }
 
 void KeyboardRelayMapTests::mapModifiers_useNeutralMaskBits()

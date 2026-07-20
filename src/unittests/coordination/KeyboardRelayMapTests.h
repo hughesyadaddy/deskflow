@@ -18,5 +18,6 @@ private Q_SLOTS:
   void modifierKeys_mapToFleetKeyIds();
   void mapModifiers_useNeutralMaskBits();
   void mapRelayModifierFromCgEvent_handlesFlagsChanged();
+  void capsLock_relaysOncePerToggle();
   void shiftedKey_translatesToShiftedKeyId();
 };

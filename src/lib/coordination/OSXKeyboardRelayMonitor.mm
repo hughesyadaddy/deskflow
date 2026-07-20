@@ -52,6 +52,9 @@ public:
     }
     m_passThrough = std::move(passThrough);
     m_send = std::move(send);
+    // Seed the caps toggle tracker from the live system state so the first
+    // caps press relays as a change instead of being swallowed as a no-op.
+    m_capsLockOn = (CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) & kCGEventFlagMaskAlphaShift) != 0;
     m_running = true;
     m_thread = std::thread([this] { runLoop(); });
     return true;
@@ -133,7 +136,7 @@ private:
       KeyID id = 0;
       KeyModifierMask mask = 0;
       KeyButton button = 0;
-      if (!mapRelayModifierFromCgEvent(event, phase, id, mask, button)) {
+      if (!mapRelayModifierFromCgEvent(event, phase, id, mask, button, self->m_capsLockOn)) {
         return event;
       }
       bool forwarded = false;
@@ -219,6 +222,7 @@ private:
   std::atomic<bool> m_running{false};
   std::atomic<bool> m_active{false}; //!< tap installed and pumping
   CFMachPortRef m_tap = nullptr;
+  bool m_capsLockOn = false;
   CFRunLoopRef m_runLoop = nullptr;
 };
 
