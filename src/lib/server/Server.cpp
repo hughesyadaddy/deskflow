@@ -155,6 +155,7 @@ bool Server::isChordRemapSourceModifierKey(KeyID id, KeyButton button) const
 void Server::cancelChordRemapSession()
 {
   if (!m_chordRemapSession.active || m_active == nullptr) {
+    rememberUndeliveredChordModClear();
     m_chordRemapSession = {};
     return;
   }
@@ -165,11 +166,42 @@ void Server::cancelChordRemapSession()
 void Server::endChordRemapSession(const std::string &lang)
 {
   if (!m_chordRemapSession.active || m_active == nullptr) {
+    rememberUndeliveredChordModClear();
     m_chordRemapSession = {};
     return;
   }
   m_active->keyDown(kKeyClearModifiers, m_chordRemapSession.heldOutMods, 0, lang);
   m_chordRemapSession = {};
+}
+
+void Server::rememberUndeliveredChordModClear()
+{
+  if (!m_chordRemapSession.active || m_chordRemapSession.heldOutMods == 0) {
+    return;
+  }
+  // The session's client cannot receive the clear right now (its connection
+  // is dead or dying). Remember what it owes so reconnect-adoption can
+  // deliver it -- otherwise the target keeps the synthetic modifier held and
+  // ordinary typing turns into shortcuts.
+  m_pendingChordModClears[m_chordRemapSession.entry.screen] = m_chordRemapSession.heldOutMods;
+  LOG_WARN(
+      "chord remap: clear of mods 0x%04x for \"%s\" undeliverable; queued for reconnect",
+      m_chordRemapSession.heldOutMods, m_chordRemapSession.entry.screen.c_str()
+  );
+}
+
+void Server::flushPendingChordModClear(BaseClientProxy *client)
+{
+  const auto it = m_pendingChordModClears.find(getName(client));
+  if (it == m_pendingChordModClears.end()) {
+    return;
+  }
+  // Redundant clears are harmless (the client computes the keystrokes needed
+  // to reach the cleared state; already-clear means no-op), so deliver
+  // unconditionally on the fresh connection.
+  LOG_INFO("chord remap: delivering queued mod clear 0x%04x to reconnected \"%s\"", it->second, it->first.c_str());
+  client->keyDown(kKeyClearModifiers, it->second, 0, std::string{});
+  m_pendingChordModClears.erase(it);
 }
 
 void Server::requestLocalCoreRestart()
@@ -313,6 +345,13 @@ Server::~Server()
   m_events->removeHandler(Timer, this);
   stopSwitch();
 
+  // Best-effort: release any chord-held mods while the client link is still
+  // alive, so a role flip / epoch teardown doesn't strand a synthetic
+  // modifier on the target (five-Esc rescue of a server core lands here too).
+  if (m_chordRemapSession.active) {
+    cancelChordRemapSession();
+  }
+
   try {
     // force immediate disconnection of secondary clients
     disconnect();
@@ -434,6 +473,9 @@ void Server::adoptClient(BaseClientProxy *client)
   // send notification
   auto *info = new Server::ScreenConnectedInfo(getName(client));
   m_events->addEvent(Event(EventTypes::ServerConnected, m_primaryClient->getEventTarget(), info));
+
+  // deliver any mod clear the previous connection died holding
+  flushPendingChordModClear(client);
 
   // cursor already on this screen (e.g. reconnect): resync enter without a mouse move
   resyncEnterIfActiveClient(client);
@@ -2521,6 +2563,9 @@ void Server::forceLeaveClient(const BaseClientProxy *client)
 {
   if (const auto *active = (m_activeSaver != nullptr) ? m_activeSaver : m_active; active == client) {
     if (m_chordRemapSession.active) {
+      // The active client is disconnecting: the clear below goes into a dead
+      // socket, so queue it for the reconnect before cancelling.
+      rememberUndeliveredChordModClear();
       cancelChordRemapSession();
     }
     // record new position (center of primary screen)

@@ -382,6 +382,11 @@ private:
   KeyModifierMask effectiveChordRemapMask(KeyModifierMask mask) const;
   bool isActiveChordRemapSession() const;
   bool isChordRemapSourceModifierKey(KeyID id, KeyButton button) const;
+  //! Deliver a chord-mod clear that could not reach \p client's screen while
+  //! its previous connection was dying (reconnect-adoption path).
+  void flushPendingChordModClear(BaseClientProxy *client);
+  //! Queue the active session's held out-mods for delivery on reconnect.
+  void rememberUndeliveredChordModClear();
   void requestLocalCoreRestart();
   void onMouseDown(ButtonID);
   void onMouseUp(ButtonID);
@@ -548,6 +553,11 @@ private:
     KeyModifierMask heldOutMods = 0;
   };
   ChordRemapSession m_chordRemapSession;
+  //! Clears we could not deliver because the session's client was already
+  //! disconnecting (screen name -> held out-mods). Flushed to the fresh
+  //! connection on reconnect-adoption so the target never keeps a synthetic
+  //! modifier held across a TCP drop.
+  std::map<std::string, KeyModifierMask> m_pendingChordModClears;
 
   deskflow::coordination::EscTapRescue m_escTapRescue;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().

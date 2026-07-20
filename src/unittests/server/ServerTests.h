@@ -26,6 +26,9 @@ private Q_SLOTS:
   void chordRemapHoldThrough_tabRepeatKeepsAltMask();
   void chordRemapHoldThrough_fiveEscCancelsSession();
   void chordRemapHoldThrough_cancelsOnScreenSwitch();
+  void chordRemapPendingClear_flushesOnReconnect();
+  void chordRemapSession_clearsOnServerTeardown();
+  void chordRemapSecondChord_keepsSingleSlotSession();
   void fleetWalk_skipsDisconnectedScreens();
   void fleetWalk_cyclicLinksTerminate();
 };

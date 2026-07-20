@@ -876,6 +876,101 @@ void ServerTests::chordRemapHoldThrough_cancelsOnScreenSwitch()
   }
 }
 
+void ServerTests::chordRemapPendingClear_flushesOnReconnect()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QVERIFY(server.m_chordRemapSession.active);
+
+    // TCP drop mid-chord: the clear can't reach the dying connection, so it
+    // must be queued for the reconnect instead of silently lost.
+    server.forceLeaveClient(&remote);
+    QVERIFY(!server.m_chordRemapSession.active);
+    QCOMPARE(server.m_pendingChordModClears.size(), static_cast<size_t>(1));
+    QCOMPARE(server.m_pendingChordModClears.at("tiny11"), KeyModifierAlt);
+
+    // Fresh connection for the same screen (adoptClient calls this): the
+    // queued clear is delivered exactly once.
+    RecordingRemoteClient reconnected("tiny11");
+    server.flushPendingChordModClear(&reconnected);
+    QCOMPARE(reconnected.keys().size(), 1u);
+    QCOMPARE(reconnected.keys()[0].kind, RecordedKeyEvent::Kind::Down);
+    QCOMPARE(reconnected.keys()[0].id, kKeyClearModifiers);
+    QCOMPARE(reconnected.keys()[0].mask, KeyModifierAlt);
+    QVERIFY(server.m_pendingChordModClears.empty());
+
+    // Second flush is a no-op.
+    reconnected.clearKeys();
+    server.flushPendingChordModClear(&reconnected);
+    QVERIFY(reconnected.keys().empty());
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::chordRemapSession_clearsOnServerTeardown()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QVERIFY(server.m_chordRemapSession.active);
+    remote.clearKeys();
+
+    server.m_clients.erase("tiny11");
+    // Server destroyed mid-chord (role flip / five-Esc restart of a server
+    // core): the held out-mods must be released while the link is alive.
+  }
+
+  QVERIFY(!remote.keys().empty());
+  QCOMPARE(remote.keys()[0].kind, RecordedKeyEvent::Kind::Down);
+  QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
+  QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+}
+
+void ServerTests::chordRemapSecondChord_keepsSingleSlotSession()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QVERIFY(server.m_chordRemapSession.active);
+    remote.clearKeys();
+
+    // A second matching chord while a session is active must not restart the
+    // session or emit another kKeySetModifiers (single-slot semantics).
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys()[0].kind, RecordedKeyEvent::Kind::Down);
+    QCOMPARE(remote.keys()[0].id, kKeyTab);
+    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
+    QVERIFY(server.m_chordRemapSession.active);
+    QCOMPARE(server.m_chordRemapSession.heldOutMods, KeyModifierAlt);
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
 void ServerTests::fleetWalk_skipsDisconnectedScreens()
 {
   LeakedServerFixture fixture;
