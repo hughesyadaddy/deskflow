@@ -912,6 +912,22 @@ void ServerTests::chordRemapPendingClear_flushesOnReconnect()
     server.flushPendingChordModClear(&reconnected);
     QVERIFY(reconnected.keys().empty());
 
+    // Casing mismatch: the pending key comes from the chord CONFIG's casing,
+    // the flush looks up by canonical screen name -- the map must be
+    // caseless like every other chord comparison.
+    server.m_clients.emplace("tiny11", &remote);
+    server.switchScreen(&remote, 50, 60, false);
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QVERIFY(server.m_chordRemapSession.active);
+    server.m_chordRemapSession.entry.screen = "TINY11";
+    server.forceLeaveClient(&remote);
+    QCOMPARE(server.m_pendingChordModClears.size(), static_cast<size_t>(1));
+    reconnected.clearKeys();
+    server.flushPendingChordModClear(&reconnected);
+    QCOMPARE(reconnected.keys().size(), 1u);
+    QCOMPARE(reconnected.keys()[0].id, kKeyClearModifiers);
+    QVERIFY(server.m_pendingChordModClears.empty());
+
     server.m_clients.erase("tiny11");
   }
 }

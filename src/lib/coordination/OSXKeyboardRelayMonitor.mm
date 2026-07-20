@@ -12,6 +12,7 @@
 #include "base/Log.h"
 
 #include <ApplicationServices/ApplicationServices.h>
+#include <Carbon/Carbon.h>
 #import <IOKit/hidsystem/ev_keymap.h>
 
 #include <atomic>
@@ -123,12 +124,26 @@ private:
     }
 
     if (type == kCGEventFlagsChanged) {
+      // Keep the caps toggle tracker true to the OS even when this event
+      // will not relay (local mode or injected): a stale tracker would make
+      // the next genuine remote caps press look like a no-op state and be
+      // swallowed (KeyboardRelayMap.mm relays caps per state CHANGE).
+      const bool isCapsEvent =
+          static_cast<CGKeyCode>(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)) == kVK_CapsLock;
+      const bool capsNowOn = (CGEventGetFlags(event) & kCGEventFlagMaskAlphaShift) != 0;
+
       if (isInjected) {
+        if (isCapsEvent) {
+          self->m_capsLockOn = capsNowOn;
+        }
         return event;
       }
 
       const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
       if (passLocal) {
+        if (isCapsEvent) {
+          self->m_capsLockOn = capsNowOn;
+        }
         return event;
       }
 

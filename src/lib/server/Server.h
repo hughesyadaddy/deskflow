@@ -9,6 +9,7 @@
 #pragma once
 
 #include "base/Event.h"
+#include "base/String.h"
 #include "base/Stopwatch.h"
 #include "common/NetworkProtocol.h"
 #include "coordination/KeyboardRescue.h"
@@ -556,8 +557,10 @@ private:
   //! Clears we could not deliver because the session's client was already
   //! disconnecting (screen name -> held out-mods). Flushed to the fresh
   //! connection on reconnect-adoption so the target never keeps a synthetic
-  //! modifier held across a TCP drop.
-  std::map<std::string, KeyModifierMask> m_pendingChordModClears;
+  //! modifier held across a TCP drop. Caseless: the key is recorded from the
+  //! chord-remap config's casing but looked up by canonical screen name
+  //! (every other chord comparison is CaselessCmp too).
+  std::map<std::string, KeyModifierMask, deskflow::string::CaselessCmp> m_pendingChordModClears;
 
   deskflow::coordination::EscTapRescue m_escTapRescue;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
