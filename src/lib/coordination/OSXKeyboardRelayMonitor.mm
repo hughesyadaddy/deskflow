@@ -187,7 +187,14 @@ private:
     // key held on one side with its release delivered to the other.
     if (phase == Message::KeyPhase::Up) {
       if (!self->m_ledger.follow(button)) {
-        return event; // Down stayed local
+        // Unmatched Up (Down stayed local -- or the ledger was lost to a
+        // monitor restart mid-hold). If the cursor is remote, forward-and-
+        // swallow as a fallback so a remote target never keeps the key held.
+        const bool passLocalNow = self->m_passThrough ? self->m_passThrough() : true;
+        if (!passLocalNow && self->m_send && self->m_send(phase, id, mask, button, {})) {
+          return nullptr;
+        }
+        return event;
       }
       self->m_ledger.release(button);
       const bool forwarded = self->m_send && self->m_send(phase, id, mask, button, {});
