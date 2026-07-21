@@ -182,9 +182,15 @@ HKL AppUtilWindows::getCurrentKeyboardLayout() const
   if (GetGUIThreadInfo(0, &gti) && gti.hwndActive) {
     layout = GetKeyboardLayout(GetWindowThreadProcessId(gti.hwndActive, nullptr));
   } else {
-    LOG_WARN("failed to determine current keyboard layout");
+    // No foreground window: routine on the secure desktop (UAC/LogonUI) and
+    // during focus transitions. Fall back to the last known good layout so a
+    // null HKL never propagates into ActivateKeyboardLayout/getKeyID and
+    // degrades key translation exactly when the desktop state is fragile.
+    layout = m_lastKeyboardLayout != nullptr ? m_lastKeyboardLayout : GetKeyboardLayout(0);
+    LOG_DEBUG("no foreground window; using fallback keyboard layout");
   }
 
+  m_lastKeyboardLayout = layout;
   return layout;
 }
 

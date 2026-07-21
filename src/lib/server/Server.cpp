@@ -2404,8 +2404,16 @@ void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
       LOG_VERBOSE("clamp to bottom of \"%s\"", getName(m_active).c_str());
     }
 
-    // warp cursor if it moved.
-    if (m_x != xOld || m_y != yOld) {
+    // Keep emitting while the user pushes INTO a clamped edge even though the
+    // clamped position no longer changes: macOS reveals the auto-hide Dock
+    // (and other OSes drive edge gestures) off a continued stream of pointer
+    // events dwelling at the extreme row -- going silent after the first edge
+    // event made bottom-edge Dock reveal fire only intermittently.
+    const bool pushingIntoEdge = (dx < 0 && m_x == ax) || (dx > 0 && m_x == ax + aw - 1) ||
+                                 (dy < 0 && m_y == ay) || (dy > 0 && m_y == ay + ah - 1);
+
+    // warp cursor if it moved or is being held against an edge.
+    if (m_x != xOld || m_y != yOld || pushingIntoEdge) {
       LOG_VERBOSE("move on %s to %d,%d", getName(m_active).c_str(), m_x, m_y);
       m_active->mouseMove(m_x, m_y);
     }

@@ -424,9 +424,19 @@ public:
     m_keys.push_back({RecordedKeyEvent::Kind::Up, id, mask});
   }
 
+  void mouseMove(int32_t x, int32_t y) override
+  {
+    m_mouseMoves.emplace_back(x, y);
+  }
+
   const std::vector<RecordedKeyEvent> &keys() const
   {
     return m_keys;
+  }
+
+  const std::vector<std::pair<int32_t, int32_t>> &mouseMoves() const
+  {
+    return m_mouseMoves;
   }
 
   void clearKeys()
@@ -434,8 +444,14 @@ public:
     m_keys.clear();
   }
 
+  void clearMouseMoves()
+  {
+    m_mouseMoves.clear();
+  }
+
 private:
   std::vector<RecordedKeyEvent> m_keys;
+  std::vector<std::pair<int32_t, int32_t>> m_mouseMoves;
 };
 
 void loadConfigWithSuperTabRemap(deskflow::server::Config &config)
@@ -1031,6 +1047,50 @@ void ServerTests::fleetWalk_cyclicLinksTerminate()
     int32_t x = 1023;
     int32_t y = 384;
     QCOMPARE(server.getNeighbor(fixture.primary, Direction::Right, x, y), nullptr);
+  }
+}
+
+void ServerTests::mouseEdgeClamp_keepsEmittingAtEdge()
+{
+  // macOS reveals the auto-hide Dock off a continued stream of pointer events
+  // dwelling at the bottom row. Going silent once the clamped position stops
+  // changing made the reveal fire only intermittently.
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote"); // shape 0,0 1024x768
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    QCOMPARE(server.m_active, &remote);
+    remote.clearMouseMoves();
+
+    // Push down past the bottom edge (no bottom neighbor): clamps to 767.
+    server.onMouseMoveSecondary(0, 800);
+    QCOMPARE(remote.mouseMoves().size(), 1u);
+    QCOMPARE(remote.mouseMoves().back(), std::make_pair(50, 767));
+
+    // Keep pushing into the edge: position is unchanged but events must keep
+    // flowing (this was the bug -- the stream went silent here).
+    server.onMouseMoveSecondary(0, 50);
+    server.onMouseMoveSecondary(0, 50);
+    QCOMPARE(remote.mouseMoves().size(), 3u);
+    QCOMPARE(remote.mouseMoves().back(), std::make_pair(50, 767));
+
+    // Zero motion at the edge emits nothing (no busy-streaming at rest).
+    server.onMouseMoveSecondary(0, 0);
+    QCOMPARE(remote.mouseMoves().size(), 3u);
+
+    // Motion away from the edge resumes normal emission and leaves the edge.
+    server.onMouseMoveSecondary(0, -10);
+    QCOMPARE(remote.mouseMoves().size(), 4u);
+    QCOMPARE(remote.mouseMoves().back(), std::make_pair(50, 757));
+
+    server.m_clients.erase("remote");
   }
 }
 

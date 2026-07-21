@@ -48,4 +48,35 @@ void KeyboardRelayHookPolicyTests::injectedWinsEvenWhenForwarded()
   QVERIFY(keyboardRelayHookShouldPassThrough(ctx));
 }
 
+
+void KeyboardRelayHookPolicyTests::ledger_upFollowsForwardedDownAcrossSwitch()
+{
+  using deskflow::coordination::KeyboardRelayForwardLedger;
+  KeyboardRelayForwardLedger ledger;
+
+  // Down forwarded to the mesh while remote; cursor switches back local
+  // mid-hold. The Up must still follow the Down's destination (forward),
+  // otherwise the remote target keeps the key held forever.
+  ledger.downForwarded(0x5B); // Win
+  QVERIFY(ledger.follow(0x5B));
+  ledger.release(0x5B);
+  QVERIFY(!ledger.follow(0x5B));
+
+  // A later fresh local Down of the same button clears any stale claim.
+  ledger.downForwarded(0x12);
+  ledger.downLocal(0x12);
+  QVERIFY(!ledger.follow(0x12));
+}
+
+void KeyboardRelayHookPolicyTests::ledger_localDownKeepsUpLocal()
+{
+  using deskflow::coordination::KeyboardRelayForwardLedger;
+  KeyboardRelayForwardLedger ledger;
+
+  // Down delivered locally (passthrough / unmapped): its Up must not be
+  // forwarded even if the cursor is remote by release time.
+  ledger.downLocal(0x70); // F1
+  QVERIFY(!ledger.follow(0x70));
+}
+
 QTEST_MAIN(KeyboardRelayHookPolicyTests)

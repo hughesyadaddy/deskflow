@@ -181,6 +181,37 @@ void KeyboardRelayMapTests::capsLock_relaysOncePerToggle()
   QVERIFY(!relay(capsEvent(false), capsLockOn, phase, id));
 }
 
+void KeyboardRelayMapTests::functionAndKeypadKeys_mapToFleetKeyIds()
+{
+  // F-keys and keypad keys used to fall through glyph translation to
+  // kKeyNone: the Down leaked to the LOCAL machine (firing there while the
+  // cursor was remote) and the Up was swallowed -- key stuck down locally,
+  // target never saw it.
+  const auto expectDown = [](CGKeyCode vk, KeyID expected) {
+    CGEventRef event = CGEventCreateKeyboardEvent(nullptr, vk, true);
+    QVERIFY(event != nullptr);
+    Message::KeyPhase phase = Message::KeyPhase::Up;
+    KeyID id = kKeyNone;
+    KeyModifierMask mask = 0;
+    KeyButton button = 0;
+    QVERIFY(deskflow::coordination::mapRelayKeyFromCgEvent(event, phase, id, mask, button));
+    QCOMPARE(phase, Message::KeyPhase::Down);
+    QCOMPARE(id, expected);
+    CFRelease(event);
+  };
+
+  expectDown(kVK_F1, kKeyF1);
+  expectDown(kVK_F5, kKeyF5);
+  expectDown(kVK_F12, kKeyF12);
+  expectDown(kVK_F20, kKeyF20);
+  expectDown(kVK_Help, kKeyInsert);
+  expectDown(kVK_ANSI_KeypadEnter, kKeyKP_Enter);
+  expectDown(kVK_ANSI_Keypad0, kKeyKP_0);
+  expectDown(kVK_ANSI_Keypad9, kKeyKP_9);
+  expectDown(kVK_ANSI_KeypadDecimal, kKeyKP_Decimal);
+  expectDown(kVK_ANSI_KeypadDivide, kKeyKP_Divide);
+}
+
 void KeyboardRelayMapTests::mapModifiers_useNeutralMaskBits()
 {
   CGEventRef event = CGEventCreateKeyboardEvent(nullptr, kVK_ANSI_C, true);

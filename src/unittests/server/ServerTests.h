@@ -31,4 +31,5 @@ private Q_SLOTS:
   void chordRemapSecondChord_keepsSingleSlotSession();
   void fleetWalk_skipsDisconnectedScreens();
   void fleetWalk_cyclicLinksTerminate();
+  void mouseEdgeClamp_keepsEmittingAtEdge();
 };

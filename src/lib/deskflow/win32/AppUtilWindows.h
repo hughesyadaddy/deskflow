@@ -47,6 +47,9 @@ public:
 private:
   AppExitMode m_exitMode;
   IEventQueue *m_events;
+  //! Last known good layout, fallback when there is no foreground window
+  //! (secure desktop / focus transitions). Mutable: probe is const.
+  mutable HKL m_lastKeyboardLayout = nullptr;
   std::thread m_eventThread; // NOSONAR - No jthread on Windows
   std::atomic<bool> m_eventThreadRunning = false;
   std::condition_variable m_eventThreadStartedCond;

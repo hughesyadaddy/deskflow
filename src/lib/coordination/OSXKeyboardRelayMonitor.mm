@@ -177,26 +177,52 @@ private:
     KeyID id = 0;
     KeyModifierMask mask = 0;
     KeyButton button = 0;
-    if (!mapRelayKeyFromCgEvent(event, phase, id, mask, button)) {
+    const bool mapped = mapRelayKeyFromCgEvent(event, phase, id, mask, button);
+    if (!mapped && phase == Message::KeyPhase::Up) {
       return event;
     }
 
+    // Repeat/Up of a held key follow the DOWN's destination (ledger), not the
+    // cursor's current screen: a mid-hold screen switch must not strand the
+    // key held on one side with its release delivered to the other.
+    if (phase == Message::KeyPhase::Up) {
+      if (!self->m_ledger.follow(button)) {
+        return event; // Down stayed local
+      }
+      self->m_ledger.release(button);
+      const bool forwarded = self->m_send && self->m_send(phase, id, mask, button, {});
+      return forwarded ? nullptr : event;
+    }
+    if (phase == Message::KeyPhase::Repeat) {
+      if (!self->m_ledger.follow(button)) {
+        return event; // Down stayed local
+      }
+      const bool forwarded = self->m_send && self->m_send(phase, id, mask, button, {});
+      return forwarded ? nullptr : event;
+    }
+
+    // Fresh Down: destination is decided by where the cursor is NOW.
     const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
     // When keys stay local, still deliver Downs to sendKeyForward so 5× Esc
     // restart can observe taps (return true = swallow this key).
     if (passLocal) {
-      if (type == kCGEventKeyDown && phase == Message::KeyPhase::Down && self->m_send &&
-          self->m_send(phase, id, mask, button, {})) {
+      self->m_ledger.downLocal(button);
+      if (mapped && self->m_send && self->m_send(phase, id, mask, button, {})) {
         return nullptr;
       }
       return event;
     }
 
     bool forwarded = false;
-    if (self->m_send) {
+    if (mapped && self->m_send) {
       forwarded = self->m_send(phase, id, mask, button, {});
     }
-    return relaySwallowDecision(event, false, false, true, forwarded);
+    if (forwarded) {
+      self->m_ledger.downForwarded(button);
+    } else {
+      self->m_ledger.downLocal(button);
+    }
+    return relaySwallowDecision(event, false, false, mapped, forwarded);
   }
 
   void runLoop()
@@ -237,6 +263,7 @@ private:
   std::atomic<bool> m_running{false};
   std::atomic<bool> m_active{false}; //!< tap installed and pumping
   CFMachPortRef m_tap = nullptr;
+  KeyboardRelayForwardLedger m_ledger; //!< tap-thread only
   bool m_capsLockOn = false;
   CFRunLoopRef m_runLoop = nullptr;
 };

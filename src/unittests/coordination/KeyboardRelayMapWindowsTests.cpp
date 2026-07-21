@@ -83,3 +83,48 @@ void KeyboardRelayMapWindowsTests::shiftedKey_translatesToShiftedKeyId()
 }
 
 QTEST_MAIN(KeyboardRelayMapWindowsTests)
+
+void KeyboardRelayMapWindowsTests::functionAndKeypadKeys_mapToFleetKeyIds()
+{
+  // These used to fall through ToUnicodeEx to kKeyNone: Down leaked to the
+  // LOCAL machine while the cursor was remote and the Up was swallowed --
+  // key stuck down locally, target never saw it.
+  QCOMPARE(mapRelayVirtualKey(VK_F1, false, false), kKeyF1);
+  QCOMPARE(mapRelayVirtualKey(VK_F12, false, false), kKeyF12);
+  QCOMPARE(mapRelayVirtualKey(VK_F24, false, false), kKeyF24);
+  QCOMPARE(mapRelayVirtualKey(VK_SNAPSHOT, false, false), kKeyPrint);
+  QCOMPARE(mapRelayVirtualKey(VK_INSERT, false, false), kKeyInsert);
+  QCOMPARE(mapRelayVirtualKey(VK_APPS, false, false), kKeyMenu);
+  QCOMPARE(mapRelayVirtualKey(VK_NUMLOCK, false, false), kKeyNumLock);
+  QCOMPARE(mapRelayVirtualKey(VK_SCROLL, false, false), kKeyScrollLock);
+  QCOMPARE(mapRelayVirtualKey(VK_PAUSE, false, false), kKeyPause);
+  QCOMPARE(mapRelayVirtualKey(VK_NUMPAD0, false, false), kKeyKP_0);
+  QCOMPARE(mapRelayVirtualKey(VK_NUMPAD9, false, false), kKeyKP_9);
+  QCOMPARE(mapRelayVirtualKey(VK_ADD, false, false), kKeyKP_Add);
+  QCOMPARE(mapRelayVirtualKey(VK_DECIMAL, false, false), kKeyKP_Decimal);
+
+  // Full hook path: an F-key Down must relay (return true, phase Down).
+  KeyID id = kKeyNone;
+  KeyModifierMask mask = 0;
+  KeyButton button = 0;
+  Message::KeyPhase phase = Message::KeyPhase::Up;
+  QVERIFY(mapRelayKeyFromHook(VK_F5, 0, false, false, false, id, mask, button, phase));
+  QCOMPARE(id, kKeyF5);
+  QCOMPARE(phase, Message::KeyPhase::Down);
+}
+
+void KeyboardRelayMapWindowsTests::unmappedKeyUp_notConsumed()
+{
+  // Down/Up symmetry: a key whose Down is not relayable (kKeyNone) leaks to
+  // the local OS -- its Up must leak too, or the key sticks down locally.
+  // VK_PACKET (0xE7) never maps.
+  KeyID id = kKeyNone;
+  KeyModifierMask mask = 0;
+  KeyButton button = 0;
+  Message::KeyPhase phase = Message::KeyPhase::Down;
+  const bool downMapped = mapRelayKeyFromHook(0xE7, 0, false, false, false, id, mask, button, phase);
+  QVERIFY(!downMapped);
+  const bool upMapped = mapRelayKeyFromHook(0xE7, 0, false, true, false, id, mask, button, phase);
+  QCOMPARE(upMapped, downMapped);
+  QCOMPARE(phase, Message::KeyPhase::Up);
+}

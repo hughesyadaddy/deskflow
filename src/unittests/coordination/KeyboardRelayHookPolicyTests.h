@@ -15,4 +15,6 @@ private Q_SLOTS:
   void passLocalAlwaysPassesThrough();
   void unmappedKeysPassThrough();
   void injectedWinsEvenWhenForwarded();
+  void ledger_upFollowsForwardedDownAcrossSwitch();
+  void ledger_localDownKeepsUpLocal();
 };

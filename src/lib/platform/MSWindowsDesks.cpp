@@ -82,6 +82,8 @@
 #define DESKFLOW_MSG_FAKE_REL_MOVE DESKFLOW_HOOK_LAST_MSG + 11
 // enable; <unused>
 #define DESKFLOW_MSG_FAKE_INPUT DESKFLOW_HOOK_LAST_MSG + 12
+// sanitize stale physically-held modifiers on the input-desktop-bound thread
+#define DESKFLOW_MSG_SANITIZE_MODS DESKFLOW_HOOK_LAST_MSG + 13
 
 static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
 {
@@ -245,6 +247,14 @@ void MSWindowsDesks::getCursorPos(int32_t &x, int32_t &y) const
   y = pos.y;
 }
 
+void MSWindowsDesks::sanitizeStaleModifiers() const
+{
+  // Synchronous: the desk queue is FIFO, and waiting for the ack guarantees
+  // the stale releases have landed before the caller (enable/enter) returns
+  // and the server starts sending real input.
+  sendMessage(DESKFLOW_MSG_SANITIZE_MODS, 0, 0);
+}
+
 void MSWindowsDesks::fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool /*isAutoRepeat*/) const
 {
   sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey));
@@ -349,6 +359,43 @@ bool MSWindowsDesks::restoreRelativeCursorPosition(Desk *desk) const
   deskMouseMove(desk->m_relativeRestoreX, desk->m_relativeRestoreY);
   return true;
 }
+
+namespace {
+
+// Probe-and-release of stale modifiers. MUST run on the desk thread: it is
+// the only thread bound to the current input desktop (SetThreadDesktop), so
+// both the GetAsyncKeyState probe and the SendInput release act on the
+// desktop actually receiving input. Running this on the main screen thread
+// silently no-ops on LogonUI / secure-desktop / post-desk-switch -- the log
+// would claim a release that never landed.
+void deskSanitizeStaleModifiers()
+{
+  struct StaleCheck
+  {
+    UINT vk;
+    bool extended;
+  };
+  static const StaleCheck kModifiers[] = {
+      {VK_LWIN, true},      {VK_RWIN, true},     {VK_LMENU, false},  {VK_RMENU, true},
+      {VK_LCONTROL, false}, {VK_RCONTROL, true}, {VK_LSHIFT, false}, {VK_RSHIFT, false},
+  };
+  for (const auto &[vk, extended] : kModifiers) {
+    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
+      continue;
+    }
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(vk);
+    input.ki.dwFlags = KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
+    if (SendInput(1, &input, sizeof(input)) == 1) {
+      LOG_WARN("released stuck modifier vk=0x%02x", vk);
+    } else {
+      LOG_WARN("failed to release stuck modifier vk=0x%02x: %d", vk, GetLastError());
+    }
+  }
+}
+
+} // namespace
 
 void MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
 {
@@ -618,8 +665,11 @@ void MSWindowsDesks::deskLeave(Desk *desk, HKL keyLayout)
     }
     SetWindowPos(desk->m_window, HWND_TOP, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
-    // switch to requested keyboard layout
-    ActivateKeyboardLayout(keyLayout, 0);
+    // switch to requested keyboard layout (a null HKL from a failed probe
+    // must not reach ActivateKeyboardLayout -- ill-defined call)
+    if (keyLayout != nullptr) {
+      ActivateKeyboardLayout(keyLayout, 0);
+    }
 
     // if not using low-level hooks we have to also activate the
     // window to ensure we don't lose keyboard focus.
@@ -760,6 +810,10 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       m_isOnScreen = false;
       m_keyLayout = (HKL)msg.wParam;
       deskLeave(desk, m_keyLayout);
+      break;
+
+    case DESKFLOW_MSG_SANITIZE_MODS:
+      deskSanitizeStaleModifiers();
       break;
 
     case DESKFLOW_MSG_FAKE_KEY:

@@ -149,6 +149,10 @@ public:
   */
   void fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool isAutoRepeat) const;
 
+  //! Release stale physically-held modifiers on the input-desktop-bound desk
+  //! thread (synchronous). See deskSanitizeStaleModifiers in the .cpp.
+  void sanitizeStaleModifiers() const;
+
   //! Fake mouse press/release
   /*!
   Synthesize a press or release of mouse button \c id.

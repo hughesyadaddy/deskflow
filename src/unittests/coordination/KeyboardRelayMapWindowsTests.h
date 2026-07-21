@@ -16,4 +16,6 @@ private Q_SLOTS:
   void modifierKeys_mapToFleetKeyIds();
   void modifierKeyUp_clearsId();
   void shiftedKey_translatesToShiftedKeyId();
+  void functionAndKeypadKeys_mapToFleetKeyIds();
+  void unmappedKeyUp_notConsumed();
 };

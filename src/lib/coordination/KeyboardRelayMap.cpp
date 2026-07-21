@@ -39,7 +39,41 @@ KeyModifierMask activeModifiers()
 
 KeyID mapRelayVirtualKey(int vkCode, bool shift, bool capsLock)
 {
+  // Contiguous ranges (MSVC has no case ranges). Both sides are contiguous:
+  // VK_F1..VK_F24 = 0x70..0x87, kKeyF1..kKeyF24 = 0xEFBE..0xEFD5;
+  // VK_NUMPAD0..9 = 0x60..0x69, kKeyKP_0..kKeyKP_9 = 0xEFB0..0xEFB9.
+  if (vkCode >= VK_F1 && vkCode <= VK_F24) {
+    return kKeyF1 + static_cast<KeyID>(vkCode - VK_F1);
+  }
+  if (vkCode >= VK_NUMPAD0 && vkCode <= VK_NUMPAD9) {
+    return kKeyKP_0 + static_cast<KeyID>(vkCode - VK_NUMPAD0);
+  }
+
   switch (vkCode) {
+  case VK_SNAPSHOT:
+    return kKeyPrint;
+  case VK_INSERT:
+    return kKeyInsert;
+  case VK_APPS:
+    return kKeyMenu;
+  case VK_NUMLOCK:
+    return kKeyNumLock;
+  case VK_SCROLL:
+    return kKeyScrollLock;
+  case VK_PAUSE:
+    return kKeyPause;
+  case VK_CLEAR:
+    return kKeyClear;
+  case VK_MULTIPLY:
+    return kKeyKP_Multiply;
+  case VK_ADD:
+    return kKeyKP_Add;
+  case VK_SUBTRACT:
+    return kKeyKP_Subtract;
+  case VK_DECIMAL:
+    return kKeyKP_Decimal;
+  case VK_DIVIDE:
+    return kKeyKP_Divide;
   case VK_RETURN:
     return kKeyReturn;
   case VK_TAB:
@@ -125,8 +159,14 @@ KeyID mapRelayVirtualKey(int vkCode, bool shift, bool capsLock)
   if (capsLock) {
     keyboardState[VK_CAPITAL] = 0x01;
   }
+  // Use the FOREGROUND window's layout, not the hook thread's:
+  // GetKeyboardLayout(0) returns this thread's layout, seeded at thread
+  // creation and never tracking the user's per-application input locale --
+  // wrong glyphs on layout-switching systems.
+  const HWND foreground = GetForegroundWindow();
+  const HKL layout = GetKeyboardLayout(foreground != nullptr ? GetWindowThreadProcessId(foreground, nullptr) : 0);
   WCHAR buffer[8] = {};
-  const int rc = ToUnicodeEx(static_cast<UINT>(vkCode), 0, keyboardState, buffer, 8, 0, GetKeyboardLayout(0));
+  const int rc = ToUnicodeEx(static_cast<UINT>(vkCode), 0, keyboardState, buffer, 8, 0, layout);
   if (rc == 1 && buffer[0] >= 32) {
     return static_cast<KeyID>(buffer[0]);
   }
@@ -152,10 +192,17 @@ bool mapRelayKeyFromHook(
   }
   id = mapRelayVirtualKey(vkCode, (mask & KeyModifierShift) != 0, (mask & KeyModifierCapsLock) != 0);
   if (keyUp) {
+    // Release is matched on the target by BUTTON, so the id is cleared. But
+    // the consumed/mapped decision must MIRROR the Down's: a key whose Down
+    // is not relayable leaks to the local OS, and its Up must leak too or
+    // the key sticks down locally.
+    const bool relayable = id != kKeyNone;
     id = kKeyNone;
-    return true;
+    return relayable;
   }
-  return id != kKeyNone || isRepeat;
+  // No isRepeat escape hatch: an unmapped key's repeats follow its leaked
+  // local Down, same as the Up (the monitor's ledger enforces destination).
+  return id != kKeyNone;
 }
 
 } // namespace deskflow::coordination

@@ -243,37 +243,17 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
   // the release was lost -- TCP drop mid chord-remap, relay restart, or a
   // core relaunch on another desktop (LogonUI). At the boundaries where this
   // runs (enable, enter) the protocol guarantees the server holds no keys on
-  // this screen, so any modifier the OS still reports down is stale: inject
-  // its key-up so ordinary typing stops turning into shortcuts. The one
+  // this screen, so any modifier the OS still reports down is stale. The
+  // probe AND the release run on the desk thread -- the only thread bound to
+  // the current input desktop -- otherwise both silently act on the wrong
+  // desktop in exactly the LogonUI/secure-desktop cases this targets. The one
   // false-positive -- a human physically holding a modifier at this machine
   // in the same instant -- self-corrects on their next press, which is far
   // cheaper than a stuck Win/Alt. Every release is logged for the soak.
   if (m_isPrimary) {
     return;
   }
-  struct StaleCheck
-  {
-    UINT vk;
-    bool extended;
-  };
-  static const StaleCheck kModifiers[] = {
-      {VK_LWIN, true},     {VK_RWIN, true},     {VK_LMENU, false},  {VK_RMENU, true},
-      {VK_LCONTROL, false}, {VK_RCONTROL, true}, {VK_LSHIFT, false}, {VK_RSHIFT, false},
-  };
-  for (const auto &[vk, extended] : kModifiers) {
-    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
-      continue;
-    }
-    INPUT input{};
-    input.type = INPUT_KEYBOARD;
-    input.ki.wVk = static_cast<WORD>(vk);
-    input.ki.dwFlags = KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
-    if (SendInput(1, &input, sizeof(input)) == 1) {
-      LOG_WARN("released stuck modifier vk=0x%02x", vk);
-    } else {
-      LOG_WARN("failed to release stuck modifier vk=0x%02x: %d", vk, GetLastError());
-    }
-  }
+  m_desks->sanitizeStaleModifiers();
 }
 
 void MSWindowsScreen::enter()

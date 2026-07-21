@@ -94,12 +94,32 @@ private:
         isRepeat, id, mask, button, phase
     );
 
+    // Repeat/Up of a held key follow the DOWN's destination (ledger), not the
+    // cursor's current screen: a mid-hold screen switch must not strand the
+    // key held on one side with its release delivered to the other.
+    if (keyUp) {
+      if (!self->m_ledger.follow(button)) {
+        return CallNextHookEx(nullptr, code, wParam, lParam); // Down stayed local
+      }
+      self->m_ledger.release(button);
+      const bool forwarded = self->m_send && self->m_send(Message::KeyPhase::Up, id, mask, button, {});
+      return forwarded ? 1 : CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+    if (isRepeat) {
+      if (!self->m_ledger.follow(button)) {
+        return CallNextHookEx(nullptr, code, wParam, lParam); // Down stayed local
+      }
+      const bool forwarded = self->m_send && self->m_send(Message::KeyPhase::Repeat, id, mask, button, {});
+      return forwarded ? 1 : CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    // Fresh Down: destination is decided by where the cursor is NOW.
     const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
     // When keys stay local, still deliver Downs to sendKeyForward so 5× Esc
     // restart can observe taps (return true = swallow this key).
     if (passLocal) {
-      if (mapped && !keyUp && phase == Message::KeyPhase::Down && self->m_send &&
-          self->m_send(phase, id, mask, button, {})) {
+      self->m_ledger.downLocal(button);
+      if (mapped && self->m_send && self->m_send(phase, id, mask, button, {})) {
         return 1;
       }
       return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -108,6 +128,11 @@ private:
     bool forwarded = false;
     if (mapped && self->m_send) {
       forwarded = self->m_send(phase, id, mask, button, {});
+    }
+    if (forwarded) {
+      self->m_ledger.downForwarded(button);
+    } else {
+      self->m_ledger.downLocal(button);
     }
 
     const KeyboardRelayHookContext ctx{passLocal, isInjected, mapped, forwarded};
@@ -146,6 +171,7 @@ private:
 
   RelayPassThroughQuery m_passThrough;
   KeyForwardSend m_send;
+  KeyboardRelayForwardLedger m_ledger; //!< hook-thread only
   std::thread m_thread;
   std::atomic<bool> m_running{false};
   std::atomic<bool> m_active{false}; //!< hook installed and pumping
