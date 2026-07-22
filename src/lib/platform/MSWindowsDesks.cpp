@@ -379,6 +379,31 @@ void deskSanitizeStaleModifiers()
       {VK_LWIN, true},      {VK_RWIN, true},     {VK_LMENU, false},  {VK_RMENU, true},
       {VK_LCONTROL, false}, {VK_RCONTROL, true}, {VK_LSHIFT, false}, {VK_RSHIFT, false},
   };
+  // Menu masking: Windows opens the Start menu on a bare Win up (and focuses
+  // app menu bars on a bare Alt up). A stuck-key cleanup must never read as
+  // a deliberate tap, so if any Win/Alt is about to be released, first inject
+  // a no-op key (unassigned VK 0xE8) to break the tap sequence -- the same
+  // trick remappers use.
+  bool maskMenu = false;
+  for (const auto &[vk, extended] : kModifiers) {
+    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
+      continue;
+    }
+    if (vk == VK_LWIN || vk == VK_RWIN || vk == VK_LMENU || vk == VK_RMENU) {
+      maskMenu = true;
+      break;
+    }
+  }
+  if (maskMenu) {
+    INPUT dummy[2] = {};
+    dummy[0].type = INPUT_KEYBOARD;
+    dummy[0].ki.wVk = 0xE8; // unassigned VK, no observable effect
+    dummy[1].type = INPUT_KEYBOARD;
+    dummy[1].ki.wVk = 0xE8;
+    dummy[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, dummy, sizeof(INPUT));
+  }
+
   for (const auto &[vk, extended] : kModifiers) {
     if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
       continue;

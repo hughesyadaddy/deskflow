@@ -1094,4 +1094,143 @@ void ServerTests::mouseEdgeClamp_keepsEmittingAtEdge()
   }
 }
 
+
+void ServerTests::deferredSuper_loneTapSendsWinTapOnRelease()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    // Super down is withheld -- nothing reaches the client yet.
+    server.onKeyDown(kKeySuper_L, KeyModifierSuper, 0x38, "en", nullptr);
+    QVERIFY(remote.keys().empty());
+    QVERIFY(server.m_deferredSuper.active);
+
+    // Autorepeat stays withheld too.
+    server.onKeyRepeat(kKeySuper_L, KeyModifierSuper, 1, 0x38, "en");
+    QVERIFY(remote.keys().empty());
+
+    // Release with no intervening key: deliberate tap -> down+up delivered
+    // (Start menu on the target is intended here).
+    server.onKeyUp(kKeySuper_L, 0, 0x38, nullptr);
+    QCOMPARE(remote.keys().size(), 2u);
+    QCOMPARE(remote.keys()[0].kind, RecordedKeyEvent::Kind::Down);
+    QCOMPARE(remote.keys()[0].id, kKeySuper_L);
+    QCOMPARE(remote.keys()[1].kind, RecordedKeyEvent::Kind::Up);
+    QCOMPARE(remote.keys()[1].id, kKeySuper_L);
+    QVERIFY(!server.m_deferredSuper.active);
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::deferredSuper_chordFiresWithoutWinLeak()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeySuper_L, KeyModifierSuper, 0x38, "en", nullptr);
+    QVERIFY(remote.keys().empty());
+
+    // Chord key: only the translated output may reach the client -- the
+    // withheld Super must never leak around it (that is what used to open
+    // Win-chord popups on every Cmd shortcut).
+    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
+    QCOMPARE(remote.keys().size(), 2u);
+    QCOMPARE(remote.keys()[0].id, kKeySetModifiers);
+    QCOMPARE(remote.keys()[1].id, kKeyTab);
+    QVERIFY(server.m_chordRemapSession.active);
+
+    remote.clearKeys();
+    server.onKeyUp(kKeyTab, KeyModifierSuper, 0, nullptr);
+    remote.clearKeys();
+
+    // Super release ends the session; no Super down/up ever reaches the
+    // client, only the session clear.
+    server.onKeyUp(kKeySuper_L, 0, 0x38, nullptr);
+    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
+    QVERIFY(!server.m_deferredSuper.active);
+    QVERIFY(!server.m_chordRemapSession.active);
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::deferredSuper_nonChordKeyEmitsRealWinCombo()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeySuper_L, KeyModifierSuper, 0x38, "en", nullptr);
+    QVERIFY(remote.keys().empty());
+
+    // Non-chord key: the withheld Super down is delivered first, then the
+    // key -- a genuine Win+E on the target.
+    server.onKeyDown(static_cast<KeyID>('e'), KeyModifierSuper, 0x0E, "en", nullptr);
+    QCOMPARE(remote.keys().size(), 2u);
+    QCOMPARE(remote.keys()[0].kind, RecordedKeyEvent::Kind::Down);
+    QCOMPARE(remote.keys()[0].id, kKeySuper_L);
+    QCOMPARE(remote.keys()[1].id, static_cast<KeyID>('e'));
+
+    remote.clearKeys();
+    server.onKeyUp(static_cast<KeyID>('e'), KeyModifierSuper, 0x0E, nullptr);
+    server.onKeyUp(kKeySuper_L, 0, 0x38, nullptr);
+    QCOMPARE(remote.keys().size(), 2u);
+    QCOMPARE(remote.keys()[1].kind, RecordedKeyEvent::Kind::Up);
+    QCOMPARE(remote.keys()[1].id, kKeySuper_L);
+    QVERIFY(!server.m_deferredSuper.active);
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::deferredSuper_droppedOnScreenSwitch()
+{
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeySuper_L, KeyModifierSuper, 0x38, "en", nullptr);
+    QVERIFY(server.m_deferredSuper.active);
+
+    // Cursor leaves tiny11 mid-hold: the pending Super must be dropped, not
+    // strand a Win down (or a surprise Start-menu tap) on a screen we left.
+    server.switchScreen(fixture.primary, 512, 384, false);
+    QVERIFY(!server.m_deferredSuper.active);
+
+    remote.clearKeys();
+    server.onKeyUp(kKeySuper_L, 0, 0x38, nullptr);
+    QVERIFY(remote.keys().empty());
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
 QTEST_MAIN(ServerTests)

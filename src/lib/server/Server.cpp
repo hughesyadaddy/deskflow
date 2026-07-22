@@ -154,6 +154,10 @@ bool Server::isChordRemapSourceModifierKey(KeyID id, KeyButton button) const
 
 void Server::cancelChordRemapSession()
 {
+  // Structural boundary (switch/teardown/rescue/disconnect): a Super held
+  // back by the deferral must be dropped with the session -- forwarding it
+  // later would strand a Win down on a screen we already left.
+  m_deferredSuper = {};
   if (!m_chordRemapSession.active || m_active == nullptr) {
     rememberUndeliveredChordModClear();
     m_chordRemapSession = {};
@@ -655,6 +659,9 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     if (m_chordRemapSession.active) {
       cancelChordRemapSession();
     }
+    // a Super still deferred (no chord/session yet) must not follow the
+    // cursor to the next screen
+    m_deferredSuper = {};
     // leave active screen
     if (!m_active->leave()) {
       // cannot leave screen
@@ -1996,6 +2003,16 @@ void Server::onScreensaver(bool activated)
   }
 }
 
+bool Server::screenHasChordRemaps(const std::string &screen) const
+{
+  for (const auto &entry : m_config->getChordRemaps()) {
+    if (deskflow::string::CaselessCmp::equal(entry.screen, screen)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang, const char *screens)
 {
   LOG_VERBOSE("onKeyDown id=%d mask=0x%04x button=0x%04x lang=%s", id, mask, button, lang.c_str());
@@ -2006,6 +2023,31 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
     cancelChordRemapSession();
     requestLocalCoreRestart();
     return;
+  }
+
+  // Deferred Super (chord screens only): hold back the Super down until we
+  // know whether a chord, a real Win combo, or a lone tap follows. A bare
+  // Win down leaking to Windows turns every chord into a Win-chord and every
+  // lone tap into the Start menu.
+  if ((id == kKeySuper_L || id == kKeySuper_R) && IKeyState::KeyInfo::isDefault(screens) &&
+      !isActiveChordRemapSession() && screenHasChordRemaps(getName(m_active))) {
+    if (!m_deferredSuper.active) {
+      m_deferredSuper = {true, false, false, id, button};
+      LOG_DEBUG("deferring super down for chord screen \"%s\"", getName(m_active).c_str());
+    }
+    return; // swallow repeats too
+  }
+  if (m_deferredSuper.active && !m_deferredSuper.emitted && !m_deferredSuper.consumedByChord &&
+      !isActiveChordRemapSession() && IKeyState::KeyInfo::isDefault(screens)) {
+    if (findChordRemap(id, mask, m_config->getChordRemaps(), getName(m_active))) {
+      // A chord is about to fire below: Super stays unsent for this hold.
+      m_deferredSuper.consumedByChord = true;
+    } else {
+      // Real Win combo: deliver the withheld Super down, then the key.
+      m_active->keyDown(m_deferredSuper.id, mask, m_deferredSuper.button, lang);
+      m_deferredSuper.emitted = true;
+      LOG_DEBUG("emitting deferred super down (non-chord key) for \"%s\"", getName(m_active).c_str());
+    }
   }
 
   if (isActiveChordRemapSession()) {
@@ -2052,6 +2094,29 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
   LOG_VERBOSE("onKeyUp id=%d mask=0x%04x button=0x%04x", id, mask, button);
   assert(m_active != nullptr);
 
+  // Resolve a deferred Super on its release: chord hold (nothing to send),
+  // consumed momentary chord (nothing), emitted combo (send the up), or a
+  // deliberate lone tap (send down+up now; Start menu is intended).
+  if (m_deferredSuper.active && (id == kKeySuper_L || id == kKeySuper_R) && IKeyState::KeyInfo::isDefault(screens)) {
+    const DeferredSuper deferred = m_deferredSuper;
+    m_deferredSuper = {};
+    if (isActiveChordRemapSession() && isChordRemapSourceModifierKey(id, button)) {
+      endChordRemapSession(std::string{});
+      return;
+    }
+    if (deferred.consumedByChord) {
+      return;
+    }
+    if (deferred.emitted) {
+      m_active->keyUp(id, mask, button);
+      return;
+    }
+    m_active->keyDown(deferred.id, mask, deferred.button, std::string{});
+    m_active->keyUp(deferred.id, mask, deferred.button);
+    LOG_DEBUG("deferred super resolved as lone tap for \"%s\"", getName(m_active).c_str());
+    return;
+  }
+
   if (isActiveChordRemapSession()) {
     if (isChordRemapSourceModifierKey(id, button)) {
       endChordRemapSession(std::string{});
@@ -2087,6 +2152,11 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
        lang.c_str())
   );
   assert(m_active != nullptr);
+
+  // A deferred Super's autorepeat must stay withheld with its down.
+  if (m_deferredSuper.active && (id == kKeySuper_L || id == kKeySuper_R)) {
+    return;
+  }
 
   if (isActiveChordRemapSession()) {
     mask = effectiveChordRemapMask(mask);

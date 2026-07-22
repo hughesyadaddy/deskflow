@@ -554,6 +554,25 @@ private:
     KeyModifierMask heldOutMods = 0;
   };
   ChordRemapSession m_chordRemapSession;
+
+  //! Deferred Super for chord-remap screens: a bare Win down/up reaching
+  //! Windows opens the Start menu, so on screens with chord remaps the
+  //! physical Super press is HELD BACK until we know what it is -- a chord
+  //! (never forward Super), a real Win+key combo (forward Super late, then
+  //! the key), or a deliberate lone tap (forward down+up on release; Start
+  //! menu is then intended).
+  struct DeferredSuper
+  {
+    bool active = false;          //!< physical Super is held, down not yet decided
+    bool emitted = false;         //!< we forwarded Super down (real Win combo)
+    bool consumedByChord = false; //!< a chord fired during the hold
+    KeyID id = 0;
+    KeyButton button = 0;
+  };
+  DeferredSuper m_deferredSuper;
+
+  //! True when \p screen has at least one chord-remap entry (caseless).
+  bool screenHasChordRemaps(const std::string &screen) const;
   //! Clears we could not deliver because the session's client was already
   //! disconnecting (screen name -> held out-mods). Flushed to the fresh
   //! connection on reconnect-adoption so the target never keeps a synthetic

@@ -32,4 +32,8 @@ private Q_SLOTS:
   void fleetWalk_skipsDisconnectedScreens();
   void fleetWalk_cyclicLinksTerminate();
   void mouseEdgeClamp_keepsEmittingAtEdge();
+  void deferredSuper_loneTapSendsWinTapOnRelease();
+  void deferredSuper_chordFiresWithoutWinLeak();
+  void deferredSuper_nonChordKeyEmitsRealWinCombo();
+  void deferredSuper_droppedOnScreenSwitch();
 };
