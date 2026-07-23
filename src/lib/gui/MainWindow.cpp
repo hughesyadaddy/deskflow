@@ -168,11 +168,15 @@ MainWindow::MainWindow()
   restoreWindow();
 
 #if defined(Q_OS_MACOS)
-  // Self-managed launch: register the app as a login item once so Deskflow
-  // starts itself at login with no external LaunchAgent or keepalive script --
-  // the app owns its own lifecycle. Gated on a one-time flag so a later
-  // opt-out in System Settings > Login Items is respected.
-  if (!Settings::value(Settings::Gui::LoginItemConfigured).toBool()) {
+  // Self-managed launch: verify the SMAppService login registration on EVERY
+  // launch and repair it when missing. Replacing the app bundle (fleet
+  // deploys re-sign and overwrite /Applications/Deskflow.app) invalidates
+  // the registration, and the old one-time flag then left the app
+  // permanently unregistered -- machines silently stopped auto-starting
+  // after login. Deliberate tradeoff: disabling the login item in System
+  // Settings gets re-enabled on the next app launch; this fleet requires
+  // hands-off recovery after login above opt-out ergonomics.
+  if (!macStartAtLoginEnabled()) {
     macSetStartAtLogin(true);
     Settings::setValue(Settings::Gui::LoginItemConfigured, true);
     Settings::save();
