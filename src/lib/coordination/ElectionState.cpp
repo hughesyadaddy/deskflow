@@ -40,8 +40,8 @@ bool ElectionState::onLocalInput()
   if (m_role == Role::Server) {
     return false; // already primary
   }
-  if (now - m_lastSwitchAt < m_tuning.selfCooldownS) {
-    return false; // anti-flap right after a role change
+  if (now - m_lastSwitchAt < effectiveSelfCooldownS()) {
+    return false; // anti-flap right after a role change; escalates with churn
   }
 
   const double window = m_cursorHere ? m_tuning.burstWindowCursorHereS : m_tuning.burstWindowS;
@@ -112,11 +112,33 @@ ElectionState::onClaim(const std::string &senderName, const std::string &ip, con
   return ClaimAction::FollowSender;
 }
 
+double ElectionState::effectiveSelfCooldownS() const
+{
+  // Escalate with churn: 1st flip in the window keeps the base cooldown,
+  // each further flip doubles it (capped). A phantom-input war then decays
+  // instead of ping-ponging every few seconds.
+  double cooldown = m_tuning.selfCooldownS;
+  for (int i = 1; i < m_recentFlips && cooldown < m_tuning.maxSelfCooldownS; ++i) {
+    cooldown *= 2.0;
+  }
+  return std::min(cooldown, m_tuning.maxSelfCooldownS);
+}
+
+void ElectionState::noteRoleFlip(double now)
+{
+  if (now - m_flapWindowStart > m_tuning.flapWindowS) {
+    m_flapWindowStart = now;
+    m_recentFlips = 0;
+  }
+  ++m_recentFlips;
+}
+
 void ElectionState::becameServer()
 {
   m_role = Role::Server;
   m_serverAddress.clear();
   m_lastSwitchAt = m_clock();
+  noteRoleFlip(m_lastSwitchAt);
   resetCursorScreen();
 }
 
@@ -125,6 +147,7 @@ void ElectionState::becameClient(const std::string &serverAddress)
   m_role = Role::Client;
   m_serverAddress = serverAddress;
   m_lastSwitchAt = m_clock();
+  noteRoleFlip(m_lastSwitchAt);
   // Screen sync is reset when the client-epoch keyboard relay starts
   // (Coordinator::updateKeyboardRelayForRole).
 }

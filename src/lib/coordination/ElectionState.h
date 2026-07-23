@@ -32,9 +32,17 @@ struct ElectionTuning
   double claimCooldownS = 1.5;
   //! Claim heartbeat cadence while server.
   double heartbeatIntervalS = 3.0;
-  //! Genuine-input burst to promote: count within window.
-  int burstCount = 4;
-  double burstWindowS = 0.40;
+  //! Genuine-input burst to promote: count within window. Stiff enough that
+  //! sparse phantom motion (idle optical-sensor drift on an attached mouse)
+  //! cannot promote; sustained human motion trivially clears it.
+  int burstCount = 6;
+  double burstWindowS = 0.60;
+  //! Anti-war escalation: each role flip within \c flapWindowS doubles the
+  //! LOCAL promotion cooldown (base selfCooldownS) up to \c maxSelfCooldownS.
+  //! Following a claim stays at base cooldown -- yielding is always safe;
+  //! re-claiming is what wars.
+  double flapWindowS = 30.0;
+  double maxSelfCooldownS = 20.0;
   //! Stricter burst while the shared cursor is on this screen, so
   //! forwarded motion echoes can never promote a passive client.
   int burstCountCursorHere = 12;
@@ -131,6 +139,10 @@ private:
   Role m_role = Role::Init;
   std::string m_serverAddress;
   double m_lastSwitchAt = -1.0e9; // long ago: no cooldown at boot
+  int m_recentFlips = 0;               //!< role flips inside the flap window
+  double m_flapWindowStart = -1.0e9;   //!< start of the current flap window
+  double effectiveSelfCooldownS() const;
+  void noteRoleFlip(double now);
   int64_t m_seq = 0;
   bool m_cursorHere = false;
   bool m_cursorScreenKnown = false;

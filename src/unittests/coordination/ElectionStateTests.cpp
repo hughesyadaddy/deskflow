@@ -52,13 +52,43 @@ void ElectionStateTests::initialRoleIsInit()
 void ElectionStateTests::inputBurstPromotes()
 {
   Fixture f;
-  QVERIFY(f.feedInput(4, 0.05));
+  QVERIFY(f.feedInput(6, 0.05));
+}
+
+void ElectionStateTests::sparsePhantomDriftNeverPromotes()
+{
+  Fixture f;
+  // Idle optical-sensor drift: single events ~0.3s apart never fill the
+  // 6-in-0.60s burst, no matter how long it goes on.
+  QVERIFY(!f.feedInput(100, 0.3));
+}
+
+void ElectionStateTests::escalatingCooldownDampsFlapWar()
+{
+  Fixture f;
+  // First flip: base cooldown applies.
+  f.state.becameClient("10.0.0.2");
+  f.now += 3.0; // past base 2.5s
+  QVERIFY(f.feedInput(6, 0.05));
+
+  // War: two more flips inside the 30s flap window.
+  f.state.becameServer();
+  f.state.becameClient("10.0.0.2");
+
+  // Escalated cooldown (3 flips -> 2.5 * 2^2 = 10s): input shortly after
+  // the flip must NOT promote, however vigorous.
+  f.now += 3.0;
+  QVERIFY(!f.feedInput(6, 0.05));
+
+  // After the escalated window passes, promotion works again.
+  f.now += 9.0;
+  QVERIFY(f.feedInput(6, 0.05));
 }
 
 void ElectionStateTests::slowInputNeverPromotes()
 {
   Fixture f;
-  // Each tick 0.5s apart: outside the 0.40s window, the burst never fills.
+  // Each tick 0.5s apart: the 6-in-0.60s burst never fills.
   QVERIFY(!f.feedInput(50, 0.5));
 }
 
@@ -72,7 +102,7 @@ void ElectionStateTests::selfCooldownBlocksPromotion()
 
   // After the cooldown, a burst promotes again.
   f.now += 3.0;
-  QVERIFY(f.feedInput(4, 0.05));
+  QVERIFY(f.feedInput(6, 0.05));
 }
 
 void ElectionStateTests::serverNeverPromotesAgain()
@@ -236,7 +266,7 @@ void ElectionStateTests::resetCursorScreenClearsInputBurst()
   f.state.resetCursorScreen();
   f.now += 3.0;
   QVERIFY(!f.feedInput(3, 0.01));
-  QVERIFY(f.feedInput(4, 0.05));
+  QVERIFY(f.feedInput(6, 0.05));
 }
 
 void ElectionStateTests::resetCursorScreenClearsKnownState()

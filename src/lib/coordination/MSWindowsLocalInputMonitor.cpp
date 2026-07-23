@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <set>
 #include <thread>
 
 namespace deskflow::coordination {
@@ -79,7 +80,26 @@ private:
     }
     // Null device == synthesized (SendInput); only real hardware counts.
     if (header.hDevice != nullptr && m_callback) {
+      logDeviceOnce(header.hDevice);
       m_callback();
+    }
+  }
+
+  //! Name each genuine input device the first time it is seen (bounded).
+  //! When phantom input claims serverhood, this line convicts the exact
+  //! device (drifting mouse, controller, ghost receiver).
+  void logDeviceOnce(HANDLE device)
+  {
+    if (m_seenDevices.count(device) != 0 || m_seenDevices.size() >= 8) {
+      return;
+    }
+    m_seenDevices.insert(device);
+    wchar_t name[256]{};
+    UINT size = 255;
+    if (GetRawInputDeviceInfoW(device, RIDI_DEVICENAME, name, &size) > 0) {
+      LOG_INFO("coordination: genuine local input from device: %ls", name);
+    } else {
+      LOG_INFO("coordination: genuine local input from unnamed device handle=%p", device);
     }
   }
 
@@ -126,6 +146,7 @@ private:
   }
 
   Callback m_callback;
+  std::set<HANDLE> m_seenDevices; //!< raw-input thread only
   std::thread m_thread;
   std::atomic<bool> m_running{false};
   DWORD m_threadId = 0;

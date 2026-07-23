@@ -14,6 +14,8 @@ class ElectionStateTests : public QObject
 private Q_SLOTS:
   void initialRoleIsInit();
   void inputBurstPromotes();
+  void sparsePhantomDriftNeverPromotes();
+  void escalatingCooldownDampsFlapWar();
   void slowInputNeverPromotes();
   void selfCooldownBlocksPromotion();
   void serverNeverPromotesAgain();
