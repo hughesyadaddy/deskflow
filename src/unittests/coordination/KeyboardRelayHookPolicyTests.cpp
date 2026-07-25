@@ -79,4 +79,32 @@ void KeyboardRelayHookPolicyTests::ledger_localDownKeepsUpLocal()
   QVERIFY(!ledger.follow(0x70));
 }
 
+
+void KeyboardRelayHookPolicyTests::ledger_localDownStaysLocalAfterCursorGoesRemote()
+{
+  using deskflow::coordination::KeyboardRelayForwardLedger;
+  using Destination = KeyboardRelayForwardLedger::Destination;
+  KeyboardRelayForwardLedger ledger;
+
+  // THE LOGIN-SCREEN BUG: Shift pressed while the cursor was local (so the
+  // Down went to this machine's OS), then the cursor becomes remote before
+  // the release. The Up must still be recognised as LOCAL -- forwarding and
+  // swallowing it left Shift physically held here, so every following
+  // keystroke came out uppercase (in a password box, invisibly).
+  ledger.downLocal(0xA0); // VK_LSHIFT
+  QCOMPARE(ledger.destination(0xA0), Destination::Local);
+  QVERIFY(!ledger.follow(0xA0)); // must not follow the mesh
+  ledger.release(0xA0);
+  QCOMPARE(ledger.destination(0xA0), Destination::Unknown);
+
+  // A forwarded Down is still distinguishable from both.
+  ledger.downForwarded(0xA0);
+  QCOMPARE(ledger.destination(0xA0), Destination::Forwarded);
+  QVERIFY(ledger.follow(0xA0));
+
+  // Unseen buttons report Unknown (the only case that may fall back to
+  // forward-and-swallow).
+  QCOMPARE(ledger.destination(0x41), Destination::Unknown);
+}
+
 QTEST_MAIN(KeyboardRelayHookPolicyTests)

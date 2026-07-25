@@ -375,9 +375,17 @@ void deskSanitizeStaleModifiers()
     UINT vk;
     bool extended;
   };
+  // SHIFT IS DELIBERATELY ABSENT. GetAsyncKeyState cannot tell an injected
+  // modifier from one the user is physically holding, and this runs on core
+  // (re)start -- including the per-desktop relaunch when LogonUI appears,
+  // i.e. exactly while someone may be holding Shift to type a capital into
+  // the password box. Releasing it there silently lowercases the character
+  // with no visual feedback. A stuck Shift is also self-evident and
+  // self-correcting for the user, unlike a stuck Win/Alt/Ctrl, which turns
+  // ordinary typing into shortcuts -- that is what this guard is for.
   static const StaleCheck kModifiers[] = {
-      {VK_LWIN, true},      {VK_RWIN, true},     {VK_LMENU, false},  {VK_RMENU, true},
-      {VK_LCONTROL, false}, {VK_RCONTROL, true}, {VK_LSHIFT, false}, {VK_RSHIFT, false},
+      {VK_LWIN, true},      {VK_RWIN, true},      {VK_LMENU, false},
+      {VK_RMENU, true},     {VK_LCONTROL, false}, {VK_RCONTROL, true},
   };
   // Menu masking: Windows opens the Start menu on a bare Win up (and focuses
   // app menu bars on a bare Alt up). A stuck-key cleanup must never read as

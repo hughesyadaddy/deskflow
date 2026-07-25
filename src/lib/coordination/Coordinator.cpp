@@ -472,6 +472,12 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
       // relay and must not wipe an in-progress 5× Esc sequence.
       // Epoch restart does not call becameClient(); clear stale screen sync.
       m_election.resetCursorScreen();
+      // Also drop the PREVIOUS epoch's cursor host. A fresh relay reads this
+      // immediately; if it still named a remote screen, every local keystroke
+      // (including at a login prompt) was swallowed and forwarded until the
+      // next fleet fragment arrived seconds later. Unknown host = keys stay
+      // local, which is the safe default (see routeKeyboard).
+      m_fleetState.cursorHost.clear();
     }
     // Routing follows the fleet cursor host; an unknown host always passes
     // keys locally (see routeKeyboard).

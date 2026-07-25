@@ -143,6 +143,16 @@ private:
       if (passLocal) {
         if (isCapsEvent) {
           self->m_capsLockOn = capsNowOn;
+        } else {
+          // Record the local destination so a later Up (possibly after the
+          // cursor moved remote) is not swallowed away from this machine.
+          const auto vk = static_cast<KeyButton>(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode));
+          if ((CGEventGetFlags(event) & (kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate |
+                                         kCGEventFlagMaskCommand)) != 0) {
+            self->m_ledger.downLocal(vk);
+          } else {
+            self->m_ledger.release(vk);
+          }
         }
         return event;
       }
@@ -154,9 +164,34 @@ private:
       if (!mapRelayModifierFromCgEvent(event, phase, id, mask, button, self->m_capsLockOn)) {
         return event;
       }
+
+      // Modifiers arrive here as flagsChanged, so they need the SAME
+      // destination ledger as ordinary keys: a modifier pressed while local
+      // and released while the cursor is remote must still release locally,
+      // or it stays physically held on this machine (stuck Shift = uppercase
+      // everything, stuck Cmd = shortcuts instead of typing).
+      if (phase == Message::KeyPhase::Up) {
+        const auto destination = self->m_ledger.destination(button);
+        self->m_ledger.release(button);
+        if (destination != KeyboardRelayForwardLedger::Destination::Forwarded) {
+          return event; // its Down went local (or was never seen)
+        }
+        const bool forwardedUp = self->m_send && self->m_send(phase, id, mask, button, {});
+        return forwardedUp ? nullptr : event;
+      }
+
       bool forwarded = false;
       if (self->m_send) {
         forwarded = self->m_send(phase, id, mask, button, {});
+      }
+      // Caps relays as a lone Down per toggle and has no Up to pair with, so
+      // it must not claim a ledger slot.
+      if (!isCapsEvent) {
+        if (forwarded) {
+          self->m_ledger.downForwarded(button);
+        } else {
+          self->m_ledger.downLocal(button);
+        }
       }
       return relaySwallowDecision(event, false, false, true, forwarded);
     }
@@ -186,10 +221,16 @@ private:
     // cursor's current screen: a mid-hold screen switch must not strand the
     // key held on one side with its release delivered to the other.
     if (phase == Message::KeyPhase::Up) {
-      if (!self->m_ledger.follow(button)) {
-        // Unmatched Up (Down stayed local -- or the ledger was lost to a
-        // monitor restart mid-hold). If the cursor is remote, forward-and-
-        // swallow as a fallback so a remote target never keeps the key held.
+      const auto destination = self->m_ledger.destination(button);
+      if (destination == KeyboardRelayForwardLedger::Destination::Local) {
+        // Its Down was delivered locally: the Up must be too, or the key
+        // never releases on this machine.
+        self->m_ledger.release(button);
+        return event;
+      }
+      if (destination == KeyboardRelayForwardLedger::Destination::Unknown) {
+        // Genuinely unseen Down (ledger lost mid-hold): if the cursor is
+        // remote, forward-and-swallow so the target never keeps it held.
         const bool passLocalNow = self->m_passThrough ? self->m_passThrough() : true;
         if (!passLocalNow && self->m_send && self->m_send(phase, id, mask, button, {})) {
           return nullptr;

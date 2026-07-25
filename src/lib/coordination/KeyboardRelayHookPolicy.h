@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <set>
+#include <map>
 
 namespace deskflow::coordination {
 
@@ -37,32 +37,49 @@ inline bool keyboardRelayHookShouldPassThrough(const KeyboardRelayHookContext &c
   return !ctx.forwarded;
 }
 
-//! Tracks which buttons had their Down forwarded to the mesh so a held key
-//! resolves to exactly ONE destination: the Repeat/Up of a key always follows
-//! where its Down went, even if the cursor switched screens mid-hold.
-//! Without this, Down-forwarded-remote + Up-delivered-local leaves the key
-//! logically held on the remote target forever (and vice versa strands it
-//! locally). Single-threaded: only ever touched from the hook/tap thread.
+//! Tracks where each held button's Down actually went so its Repeat/Up
+//! follows the SAME destination, even if the cursor switched screens
+//! mid-hold. Tri-state on purpose: "Down went local" must be remembered
+//! DISTINCTLY from "never seen". Collapsing them let a locally-delivered
+//! Down have its Up forwarded-and-swallowed when the cursor happened to be
+//! remote by release time -- the physical key then never released on the
+//! local machine (a stuck Shift = everything typed after it is uppercase,
+//! including in a login password box).
+//! Single-threaded: only ever touched from the hook/tap thread.
 class KeyboardRelayForwardLedger
 {
 public:
+  enum class Destination
+  {
+    Unknown,   //!< never seen (or already released): no claim
+    Local,     //!< Down was delivered to the local OS; its Up must be too
+    Forwarded, //!< Down went to the mesh; its Up must follow
+  };
+
   //! The Down for \p button was forwarded to the mesh (and swallowed locally).
   void downForwarded(int button)
   {
-    m_buttons.insert(button);
+    m_buttons[button] = Destination::Forwarded;
   }
 
   //! The Down for \p button stayed local (passthrough, unmapped, or send failed).
   void downLocal(int button)
   {
-    m_buttons.erase(button);
+    m_buttons[button] = Destination::Local;
+  }
+
+  //! Where \p button's Down went. Unknown only when genuinely unseen.
+  Destination destination(int button) const
+  {
+    const auto it = m_buttons.find(button);
+    return it == m_buttons.end() ? Destination::Unknown : it->second;
   }
 
   //! True when \p button is held with its Down forwarded: its Repeat/Up must
   //! also forward (and be swallowed locally), regardless of the cursor now.
   bool follow(int button) const
   {
-    return m_buttons.count(button) != 0;
+    return destination(button) == Destination::Forwarded;
   }
 
   //! The Up for \p button was handled; forget the hold.
@@ -72,7 +89,7 @@ public:
   }
 
 private:
-  std::set<int> m_buttons;
+  std::map<int, Destination> m_buttons;
 };
 
 } // namespace deskflow::coordination

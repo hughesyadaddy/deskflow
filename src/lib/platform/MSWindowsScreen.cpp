@@ -254,6 +254,13 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
     return;
   }
   m_desks->sanitizeStaleModifiers();
+  // The releases just changed the OS modifier state behind KeyState's back.
+  // Without a resync the shadow still says (e.g.) Ctrl is held, and
+  // KeyMap::keysForModifierState then emits NO modifier press for a key that
+  // needs it -- relayed capitals arrive lowercase for the rest of the epoch.
+  if (m_keyState != nullptr) {
+    m_keyState->updateKeyState();
+  }
 }
 
 void MSWindowsScreen::enter()

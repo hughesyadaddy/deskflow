@@ -98,10 +98,17 @@ private:
     // cursor's current screen: a mid-hold screen switch must not strand the
     // key held on one side with its release delivered to the other.
     if (keyUp) {
-      if (!self->m_ledger.follow(button)) {
-        // Unmatched Up (Down stayed local -- or the ledger was lost to a
-        // monitor restart mid-hold). If the cursor is remote and the key is
-        // relayable, forward-and-swallow as a fallback so a remote target
+      const auto destination = self->m_ledger.destination(button);
+      if (destination == KeyboardRelayForwardLedger::Destination::Local) {
+        // Its Down was delivered to the local OS: the Up MUST be too, or the
+        // physical key never releases here (stuck Shift = everything typed
+        // afterwards is uppercase, password boxes included).
+        self->m_ledger.release(button);
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+      }
+      if (destination == KeyboardRelayForwardLedger::Destination::Unknown) {
+        // Genuinely unseen Down (ledger lost to a monitor restart mid-hold).
+        // If the cursor is remote, forward-and-swallow so a remote target
         // never keeps the key held; otherwise let it pass locally.
         const bool passLocalNow = self->m_passThrough ? self->m_passThrough() : true;
         if (!passLocalNow && mapped && self->m_send && self->m_send(Message::KeyPhase::Up, id, mask, button, {})) {
@@ -115,7 +122,7 @@ private:
     }
     if (isRepeat) {
       if (!self->m_ledger.follow(button)) {
-        return CallNextHookEx(nullptr, code, wParam, lParam); // Down stayed local
+        return CallNextHookEx(nullptr, code, wParam, lParam); // Down was local/unseen
       }
       const bool forwarded = self->m_send && self->m_send(Message::KeyPhase::Repeat, id, mask, button, {});
       return forwarded ? 1 : CallNextHookEx(nullptr, code, wParam, lParam);

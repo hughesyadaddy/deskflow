@@ -17,4 +17,5 @@ private Q_SLOTS:
   void injectedWinsEvenWhenForwarded();
   void ledger_upFollowsForwardedDownAcrossSwitch();
   void ledger_localDownKeepsUpLocal();
+  void ledger_localDownStaysLocalAfterCursorGoesRemote();
 };
