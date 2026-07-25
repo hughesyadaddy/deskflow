@@ -705,6 +705,40 @@ bool keyid_requires_shift(uint16_t key_id)
   }
 }
 
+// True for KeyIDs naming an alphabetic character. Caps Lock affects ONLY
+// these on the US layout, so only these need caps-aware shift handling.
+bool keyid_is_letter(uint16_t key_id)
+{
+  return (key_id >= 'A' && key_id <= 'Z') || (key_id >= 'a' && key_id <= 'z');
+}
+
+// Live Caps Lock state of THIS machine, read from IOHIDSystem.
+/*!
+The bridge injects raw HID reports, and macOS composes caps+shift as
+LOWERCASE. Blindly adding shift for an uppercase KeyID therefore inverts
+every letter whenever caps happens to be on at the login window -- the
+bridge cannot see the keyboard LED, so it must ask the HID system. Returns
+false when the state cannot be read (the historical assumption).
+*/
+bool target_caps_lock_on()
+{
+  io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass));
+  if (service == IO_OBJECT_NULL) {
+    return false;
+  }
+  io_connect_t connect = MACH_PORT_NULL;
+  bool state = false;
+  if (IOServiceOpen(service, mach_task_self(), kIOHIDParamConnectType, &connect) == KERN_SUCCESS) {
+    bool value = false;
+    if (IOHIDGetModifierLockState(connect, kIOHIDCapsLockState, &value) == KERN_SUCCESS) {
+      state = value;
+    }
+    IOServiceClose(connect);
+  }
+  IOObjectRelease(service);
+  return state;
+}
+
 // Modifier KeyIDs map to a single HID modifier bit; non-modifier keys return 0.
 uint8_t modifier_keyid_to_bit(uint16_t key_id)
 {
@@ -1023,11 +1057,39 @@ private:
     return true;
   }
 
+  // 5x Esc keyboard rescue, bridge edition.
+  /*!
+  At a login window the bridge is the ONLY Deskflow process on this machine,
+  so the fleet rescue (which restarts cores) cannot fix a wedged bridge. Count
+  relayed Esc presses and exit -- launchd's KeepAlive restarts us with a fresh
+  virtual HID device and empty held-key state. The threshold is 4, not 5,
+  because the server swallows the final tap of its own rescue gesture: the
+  same five presses therefore rescue the cores AND the bridge.
+  */
+  void note_escape_down()
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_escape_ > std::chrono::seconds(2)) {
+      escape_taps_ = 0;
+    }
+    last_escape_ = now;
+    if (++escape_taps_ < 4) {
+      return;
+    }
+    log_line("keyboard rescue: escape burst -- releasing input and restarting bridge");
+    release_all();
+    g_stop.store(true);
+    std::exit(0); // launchd KeepAlive restarts us clean
+  }
+
   bool on_key_down(const std::vector<uint8_t> &body)
   {
     int16_t key_id = 0, mask = 0, button = 0;
     if (!parse_key(body, key_id, mask, button))
       return true;
+    if (static_cast<uint16_t>(key_id) == 0xEF1B) { // Escape
+      note_escape_down();
+    }
     HeldKey entry;
     uint8_t modifier_bit = modifier_keyid_to_bit(static_cast<uint16_t>(key_id));
     if (modifier_bit != 0) {
@@ -1043,7 +1105,18 @@ private:
       // The KeyID already names the character the server wants typed; a
       // shifted character must carry shift even when the protocol mask
       // lacks it (caps-lock-composed uppercase, relay-normalized masks).
-      if (keyid_requires_shift(static_cast<uint16_t>(key_id))) {
+      //
+      // Letters are caps-sensitive: macOS composes caps+shift as LOWERCASE,
+      // so with caps ON the shift decision INVERTS -- an uppercase letter
+      // needs NO shift and a lowercase letter needs one. Ignoring this made
+      // every relayed letter come out inverted whenever caps was on at the
+      // login window (where the user cannot see or fix it).
+      const auto id16 = static_cast<uint16_t>(key_id);
+      bool wantShift = keyid_requires_shift(id16);
+      if (keyid_is_letter(id16) && target_caps_lock_on()) {
+        wantShift = !wantShift;
+      }
+      if (wantShift) {
         entry.modifier_bits |= static_cast<uint8_t>(hr::modifier::left_shift);
       }
     }
@@ -1133,6 +1206,9 @@ private:
   {
     emit_relative_raw(static_cast<int>(dx * motion_scale_), static_cast<int>(dy * motion_scale_));
   }
+
+  int escape_taps_ = 0;
+  std::chrono::steady_clock::time_point last_escape_{};
 
   void release_all()
   {

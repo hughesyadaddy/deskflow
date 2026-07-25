@@ -618,7 +618,10 @@ bool Coordinator::sendKeyForward(
       triggered = m_escTapRescue.noteEscDown(id, mask);
     }
     if (triggered) {
-      requestLocalCoreRestart();
+      // Fleet-wide: this path is what sees the taps at a login screen (the
+      // elevated/secure-desktop core runs as a client epoch), and the wedged
+      // machine is usually a different one.
+      requestFleetRescue();
       return true;
     }
   }
