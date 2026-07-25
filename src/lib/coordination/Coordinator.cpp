@@ -111,11 +111,25 @@ Coordinator::~Coordinator()
   stop();
 }
 
+namespace {
+//! Live coordinator for the process-wide fleet-rescue hook (KeyboardRescue
+//! takes a plain function pointer). Single coordinator per process.
+Coordinator *g_rescueCoordinator = nullptr;
+void fleetRescueThunk()
+{
+  if (g_rescueCoordinator != nullptr) {
+    g_rescueCoordinator->requestFleetRescue();
+  }
+}
+} // namespace
+
 bool Coordinator::start()
 {
   if (!m_mesh->start()) {
     return false;
   }
+  g_rescueCoordinator = this;
+  setFleetRescueHandler(&fleetRescueThunk);
   m_inputMonitor->start([this] { onGenuineInput(); });
   m_startedAt = monotonicSeconds();
   m_workerStop = false;
@@ -129,6 +143,10 @@ bool Coordinator::start()
 
 void Coordinator::stop()
 {
+  if (g_rescueCoordinator == this) {
+    setFleetRescueHandler(nullptr);
+    g_rescueCoordinator = nullptr;
+  }
   {
     std::scoped_lock lock{m_mutex};
     m_workerStop = true;
@@ -496,6 +514,13 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
     promoteSelf("manual promote");
     break;
 
+  case Message::Type::Rescue:
+    // Never re-broadcast: the originator already fanned out to every peer,
+    // so echoing would restart-storm the fleet.
+    LOG_INFO("coordination: fleet keyboard rescue received -- restarting local core");
+    requestLocalCoreRestart();
+    break;
+
   case Message::Type::Status: {
     std::string snapshot;
     {
@@ -642,6 +667,25 @@ void Coordinator::requestLocalCoreRestart()
     return;
   }
   deskflow::coordination::requestLocalCoreRestart();
+}
+
+void Coordinator::requestFleetRescue()
+{
+  LOG_INFO("coordination: fleet keyboard rescue -- restarting every peer");
+  std::string line;
+  PeerList peers;
+  {
+    std::scoped_lock lock{m_mutex};
+    if (m_quit) {
+      return;
+    }
+    line = protocol::encodeRescue(m_config.token);
+    peers = m_config.peers;
+  }
+  // Peers first: this process is about to tear its own core down, and the
+  // sends are blocking connects.
+  sendLineToPeers(line, peers);
+  requestLocalCoreRestart();
 }
 
 bool Coordinator::isKnownPeer(const std::string &name) const

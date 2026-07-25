@@ -14,6 +14,7 @@ class CoordinationProtocolTests : public QObject
 private Q_SLOTS:
   void claimRoundTrip();
   void promoteRoundTrip();
+  void rescueRoundTrip();
   void statusRoundTrip();
   void decodesLegacyCoordinatorClaim();
   void toleratesStringSequenceNumbers();

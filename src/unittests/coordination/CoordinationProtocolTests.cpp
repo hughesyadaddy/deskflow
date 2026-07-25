@@ -47,6 +47,13 @@ void CoordinationProtocolTests::promoteRoundTrip()
   QVERIFY(message.token.empty());
 }
 
+void CoordinationProtocolTests::rescueRoundTrip()
+{
+  const auto message = protocol::decode(protocol::encodeRescue("tok"));
+  QCOMPARE(message.type, Message::Type::Rescue);
+  QCOMPARE(message.token, std::string("tok"));
+}
+
 void CoordinationProtocolTests::statusRoundTrip()
 {
   const auto message = protocol::decode(protocol::encodeStatus("tok"));

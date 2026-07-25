@@ -72,4 +72,13 @@ using LocalCoreRestartFn = void (*)();
 void setLocalCoreRestartHandler(LocalCoreRestartFn fn);
 void requestLocalCoreRestart();
 
+//! Process-wide FLEET rescue hook (set by the Coordinator, which owns the
+//! mesh). The 5-Esc gesture means "input is wedged somewhere in the fleet",
+//! and the machine that sees the taps is usually NOT the broken one -- so
+//! the rescue restarts every connected peer, not just this process.
+//! Falls back to a local-only restart when no mesh is running.
+using FleetRescueFn = void (*)();
+void setFleetRescueHandler(FleetRescueFn fn);
+void requestFleetRescue();
+
 } // namespace deskflow::coordination

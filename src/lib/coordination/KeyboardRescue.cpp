@@ -13,6 +13,7 @@ namespace deskflow::coordination {
 namespace {
 
 LocalCoreRestartFn g_localCoreRestartHandler = nullptr;
+FleetRescueFn g_fleetRescueHandler = nullptr;
 
 } // namespace
 
@@ -28,6 +29,22 @@ void requestLocalCoreRestart()
     return;
   }
   LOG_WARN("keyboard rescue: 5x Esc — no local core restart handler registered");
+}
+
+void setFleetRescueHandler(FleetRescueFn fn)
+{
+  g_fleetRescueHandler = fn;
+}
+
+void requestFleetRescue()
+{
+  if (g_fleetRescueHandler != nullptr) {
+    g_fleetRescueHandler();
+    return;
+  }
+  // No mesh (server/client mode, or coordinator not started): the local
+  // restart is still the best available rescue.
+  requestLocalCoreRestart();
 }
 
 } // namespace deskflow::coordination

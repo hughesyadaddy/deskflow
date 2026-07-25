@@ -127,6 +127,12 @@ public:
   //! Mutex-guarded copy of the merged fleet snapshot (mesh v2).
   FleetState fleetSnapshot() const;
 
+  //! Fleet-wide keyboard rescue: restart the local core AND tell every peer
+  //! to restart theirs. The 5-Esc gesture means "the fleet's input is
+  //! wedged" -- restarting only the machine that happened to see the taps
+  //! left the actually-broken peer stuck.
+  void requestFleetRescue();
+
 private:
   void onMessage(const Message &message, const std::function<void(const std::string &)> &reply);
   void onGenuineInput();
@@ -140,6 +146,7 @@ private:
   bool
   sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
   void requestLocalCoreRestart();
+
   bool isKnownPeer(const std::string &name) const;
   bool relayPassThroughLocal();
   void promoteSelf(const char *reason);

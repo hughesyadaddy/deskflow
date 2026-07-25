@@ -214,7 +214,10 @@ void Server::requestLocalCoreRestart()
     m_localCoreRestartHook();
     return;
   }
-  deskflow::coordination::requestLocalCoreRestart();
+  // Fleet-wide: 5x Esc means input is wedged SOMEWHERE, and the machine
+  // that saw the taps is usually not the broken one. Falls back to a local
+  // restart when no mesh is running.
+  deskflow::coordination::requestFleetRescue();
 }
 
 //

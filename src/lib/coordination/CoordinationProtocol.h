@@ -36,7 +36,8 @@ struct Message
     KeyFwd,
     Key,
     Hello,
-    Fleet
+    Fleet,
+    Rescue
   };
 
   using KeyPhase = RelayKeyPhase;
@@ -70,6 +71,9 @@ std::string encodeClaim(
     const std::string &name, const std::string &ip, const std::string &lan, int64_t seq, const std::string &token
 );
 std::string encodePromote(const std::string &token);
+
+//! Fleet-wide keyboard rescue: every peer restarts its local core.
+std::string encodeRescue(const std::string &token);
 std::string encodeStatus(const std::string &token);
 
 //! Keyboard relay (peer → cursor host).
