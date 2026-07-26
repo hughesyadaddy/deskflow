@@ -2103,25 +2103,34 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
   if (m_deferredSuper.active && (id == kKeySuper_L || id == kKeySuper_R) && IKeyState::KeyInfo::isDefault(screens)) {
     const DeferredSuper deferred = m_deferredSuper;
     m_deferredSuper = {};
-    if (isActiveChordRemapSession() && isChordRemapSourceModifierKey(id, button)) {
-      endChordRemapSession(std::string{});
+    // A live chord session ALWAYS falls through to the normal path below,
+    // which is the only code that ends the session and clears its held-out
+    // modifiers. Returning early here (as this block first did) stranded
+    // sessions whose output mods include Super -- Win stayed held on the
+    // target, so ordinary letters fired Win shortcuts and shift-caps died.
+    if (!isActiveChordRemapSession()) {
+      if (deferred.consumedByChord) {
+        return; // its chord already completed; nothing left to send
+      }
+      if (deferred.emitted) {
+        m_active->keyUp(id, mask, button);
+        return;
+      }
+      m_active->keyDown(deferred.id, mask, deferred.button, std::string{});
+      m_active->keyUp(deferred.id, mask, deferred.button);
+      LOG_DEBUG("deferred super resolved as lone tap for \"%s\"", getName(m_active).c_str());
       return;
     }
-    if (deferred.consumedByChord) {
-      return;
-    }
-    if (deferred.emitted) {
-      m_active->keyUp(id, mask, button);
-      return;
-    }
-    m_active->keyDown(deferred.id, mask, deferred.button, std::string{});
-    m_active->keyUp(deferred.id, mask, deferred.button);
-    LOG_DEBUG("deferred super resolved as lone tap for \"%s\"", getName(m_active).c_str());
-    return;
   }
 
   if (isActiveChordRemapSession()) {
-    if (isChordRemapSourceModifierKey(id, button)) {
+    // Safety net: releasing Super must also end a session that is HOLDING
+    // Super on the target, even if Super is not one of the session's source
+    // modifiers. Otherwise the held Win outlives the keypress and every
+    // subsequent letter becomes a Win shortcut.
+    const bool releasingHeldSuper = (id == kKeySuper_L || id == kKeySuper_R) &&
+                                    (m_chordRemapSession.heldOutMods & KeyModifierSuper) != 0;
+    if (isChordRemapSourceModifierKey(id, button) || releasingHeldSuper) {
       endChordRemapSession(std::string{});
     } else {
       mask = effectiveChordRemapMask(mask);

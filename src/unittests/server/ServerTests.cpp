@@ -1158,11 +1158,18 @@ void ServerTests::deferredSuper_chordFiresWithoutWinLeak()
     server.onKeyUp(kKeyTab, KeyModifierSuper, 0, nullptr);
     remote.clearKeys();
 
-    // Super release ends the session; no Super down/up ever reaches the
-    // client, only the session clear.
+    // Super release ends the session (clearing the held-out modifiers) and
+    // relays its own key-up. The invariant that matters: no Super DOWN ever
+    // reached the client, so no Win-chord leaked -- and the session is
+    // always cleared, so nothing stays held on the target.
     server.onKeyUp(kKeySuper_L, 0, 0x38, nullptr);
-    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys().size(), 2u);
     QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
+    QCOMPARE(remote.keys()[1].kind, RecordedKeyEvent::Kind::Up);
+    QCOMPARE(remote.keys()[1].id, kKeySuper_L);
+    for (const auto &key : remote.keys()) {
+      QVERIFY(!(key.kind == RecordedKeyEvent::Kind::Down && key.id == kKeySuper_L));
+    }
     QVERIFY(!server.m_deferredSuper.active);
     QVERIFY(!server.m_chordRemapSession.active);
 
