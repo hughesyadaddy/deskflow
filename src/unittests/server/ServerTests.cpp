@@ -1240,4 +1240,71 @@ void ServerTests::deferredSuper_droppedOnScreenSwitch()
   }
 }
 
+
+void ServerTests::heldModifier_releasedOnScreenSwitch()
+{
+  // THE STUCK-WIN BUG, from the field logs: the server emits a real Win
+  // down on the client (deferred Super resolving to a genuine Win combo),
+  // then the cursor leaves that screen while the key is still held. The
+  // release must be delivered to the screen being ABANDONED -- previously
+  // it followed the cursor, and the old screen kept Win physically down,
+  // turning every later letter into a Win shortcut.
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    // Super held, then a non-chord key: the withheld Win down is delivered.
+    server.onKeyDown(kKeySuper_L, KeyModifierSuper, 0x38, "en", nullptr);
+    server.onKeyDown(static_cast<KeyID>('e'), KeyModifierSuper, 0x0E, "en", nullptr);
+    QVERIFY(server.m_modifiersHeldOnActive.count(0x38) == 1);
+    remote.clearKeys();
+
+    // Cursor leaves tiny11 while Win is still held there.
+    server.switchScreen(fixture.primary, 512, 384, false);
+
+    // The Win release must have gone to tiny11 before the leave.
+    bool releasedSuper = false;
+    for (const auto &key : remote.keys()) {
+      if (key.kind == RecordedKeyEvent::Kind::Up && key.id == kKeySuper_L) {
+        releasedSuper = true;
+      }
+    }
+    QVERIFY(releasedSuper);
+    QVERIFY(server.m_modifiersHeldOnActive.empty());
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::heldModifier_forgottenWhenClientDies()
+{
+  // A dying proxy cannot take a release over the wire; the claim must be
+  // dropped so it never leaks onto the next active screen.
+  LeakedServerFixture fixture;
+  loadConfigWithSuperTabRemap(fixture.config);
+  fixture.init("server");
+  RecordingRemoteClient remote("tiny11");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeySuper_L, KeyModifierSuper, 0x38, "en", nullptr);
+    server.onKeyDown(static_cast<KeyID>('e'), KeyModifierSuper, 0x0E, "en", nullptr);
+    QVERIFY(!server.m_modifiersHeldOnActive.empty());
+
+    server.forceLeaveClient(&remote);
+    QVERIFY(server.m_modifiersHeldOnActive.empty());
+
+    server.m_clients.erase("tiny11");
+  }
+}
+
 QTEST_MAIN(ServerTests)

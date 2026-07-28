@@ -36,4 +36,6 @@ private Q_SLOTS:
   void deferredSuper_chordFiresWithoutWinLeak();
   void deferredSuper_nonChordKeyEmitsRealWinCombo();
   void deferredSuper_droppedOnScreenSwitch();
+  void heldModifier_releasedOnScreenSwitch();
+  void heldModifier_forgottenWhenClientDies();
 };

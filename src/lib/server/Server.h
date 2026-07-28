@@ -573,6 +573,27 @@ private:
 
   //! True when \p screen has at least one chord-remap entry (caseless).
   bool screenHasChordRemaps(const std::string &screen) const;
+
+  //! Modifier keys the server has injected DOWN on the active client and not
+  //! yet released (button -> KeyID).
+  /*!
+  The single source of truth for "what is this server holding down over
+  there". Every path that injects a modifier records it here and every
+  boundary that abandons the screen (switch, forced leave, disconnect,
+  teardown) releases everything in it. Without one authoritative ledger the
+  release depended on whichever feature happened to inject the key -- chord
+  hold-through, deferred Super, or a plain relay -- and any path that missed
+  it left a modifier physically held on the target, where it silently turns
+  ordinary letters into shortcuts.
+  */
+  std::map<KeyButton, KeyID> m_modifiersHeldOnActive;
+
+  //! Record/forget a modifier the server injected on the active client.
+  void noteModifierSentToActive(KeyID id, KeyButton button);
+  void forgetModifierSentToActive(KeyButton button);
+
+  //! Release every modifier this server is holding on the active client.
+  void releaseModifiersHeldOnActive();
   //! Clears we could not deliver because the session's client was already
   //! disconnecting (screen name -> held out-mods). Flushed to the fresh
   //! connection on reconnect-adoption so the target never keeps a synthetic

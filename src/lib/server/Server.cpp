@@ -152,6 +152,54 @@ bool Server::isChordRemapSourceModifierKey(KeyID id, KeyButton button) const
   return ::isChordRemapSourceModifierRelease(id, button, m_chordRemapSession.entry.inMods);
 }
 
+namespace {
+//! True for the modifier KeyIDs whose loss strands input on the target.
+bool isTrackedModifierKeyId(KeyID id)
+{
+  switch (id) {
+  case kKeySuper_L:
+  case kKeySuper_R:
+  case kKeyAlt_L:
+  case kKeyAlt_R:
+  case kKeyControl_L:
+  case kKeyControl_R:
+  case kKeyShift_L:
+  case kKeyShift_R:
+  case kKeyMeta_L:
+  case kKeyMeta_R:
+    return true;
+  default:
+    return false;
+  }
+}
+} // namespace
+
+void Server::noteModifierSentToActive(KeyID id, KeyButton button)
+{
+  if (isTrackedModifierKeyId(id)) {
+    m_modifiersHeldOnActive[button] = id;
+  }
+}
+
+void Server::forgetModifierSentToActive(KeyButton button)
+{
+  m_modifiersHeldOnActive.erase(button);
+}
+
+void Server::releaseModifiersHeldOnActive()
+{
+  if (m_modifiersHeldOnActive.empty()) {
+    return;
+  }
+  if (m_active != nullptr) {
+    for (const auto &[button, id] : m_modifiersHeldOnActive) {
+      LOG_DEBUG("releasing modifier 0x%04x held on \"%s\"", id, getName(m_active).c_str());
+      m_active->keyUp(id, 0, button);
+    }
+  }
+  m_modifiersHeldOnActive.clear();
+}
+
 void Server::cancelChordRemapSession()
 {
   // Structural boundary (switch/teardown/rescue/disconnect): a Super held
@@ -665,6 +713,11 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     // a Super still deferred (no chord/session yet) must not follow the
     // cursor to the next screen
     m_deferredSuper = {};
+    // Anything this server is physically holding on the screen we are
+    // leaving must be released HERE, while m_active still points at it.
+    // Otherwise the release lands on the next screen and the old one keeps
+    // the modifier held -- the stuck-Win bug.
+    releaseModifiersHeldOnActive();
     // leave active screen
     if (!m_active->leave()) {
       // cannot leave screen
@@ -2047,6 +2100,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
       m_deferredSuper.consumedByChord = true;
     } else {
       // Real Win combo: deliver the withheld Super down, then the key.
+      noteModifierSentToActive(m_deferredSuper.id, m_deferredSuper.button);
       m_active->keyDown(m_deferredSuper.id, mask, m_deferredSuper.button, lang);
       m_deferredSuper.emitted = true;
       LOG_DEBUG("emitting deferred super down (non-chord key) for \"%s\"", getName(m_active).c_str());
@@ -2076,6 +2130,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
+    noteModifierSentToActive(id, button);
     m_active->keyDown(id, mask, button, lang);
   } else {
     if (!screens && m_keyboardBroadcasting) {
@@ -2113,11 +2168,13 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
         return; // its chord already completed; nothing left to send
       }
       if (deferred.emitted) {
+        forgetModifierSentToActive(button);
         m_active->keyUp(id, mask, button);
         return;
       }
       m_active->keyDown(deferred.id, mask, deferred.button, std::string{});
       m_active->keyUp(deferred.id, mask, deferred.button);
+      forgetModifierSentToActive(deferred.button);
       LOG_DEBUG("deferred super resolved as lone tap for \"%s\"", getName(m_active).c_str());
       return;
     }
@@ -2141,6 +2198,7 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
+    forgetModifierSentToActive(button);
     m_active->keyUp(id, mask, button);
   } else {
     if (!screens && m_keyboardBroadcasting) {
@@ -2652,6 +2710,11 @@ void Server::removeOldClient(BaseClientProxy *client)
 void Server::forceLeaveClient(const BaseClientProxy *client)
 {
   if (const auto *active = (m_activeSaver != nullptr) ? m_activeSaver : m_active; active == client) {
+    // The proxy is dying: whatever we hold there cannot be released over the
+    // wire. Drop the ledger so it never leaks onto whichever screen becomes
+    // active next; the client's own enter-time sanitize covers the physical
+    // key if it reconnects.
+    m_modifiersHeldOnActive.clear();
     if (m_chordRemapSession.active) {
       // The active client is disconnecting: the clear below goes into a dead
       // socket, so queue it for the reconnect before cancelling.
