@@ -108,6 +108,10 @@ public:
   //! holding (stale injected keys from a lost release). Secondary only.
   void sanitizeStaleModifiers() const;
 
+  //! Periodic self-heal: release modifiers physically down that this client
+  //! does not believe it is holding (runs on the 1s fix timer).
+  void auditStaleModifiers() const;
+
   // IPlatformScreen overrides
   void enable() override;
   void disable() override;

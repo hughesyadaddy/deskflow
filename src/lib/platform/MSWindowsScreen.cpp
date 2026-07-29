@@ -253,7 +253,7 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
   if (m_isPrimary) {
     return;
   }
-  m_desks->sanitizeStaleModifiers();
+  m_desks->sanitizeStaleModifiers(m_keyState != nullptr ? m_keyState->getActiveModifiers() : 0);
   // The releases just changed the OS modifier state behind KeyState's back.
   // Without a resync the shadow still says (e.g.) Ctrl is held, and
   // KeyMap::keysForModifierState then emits NO modifier press for a key that
@@ -322,6 +322,16 @@ void MSWindowsScreen::leave()
 
   // tell desk that we're leaving and tell it the keyboard layout
   m_desks->leave(m_keyLayout);
+
+  if (!m_isPrimary) {
+    // The cursor is leaving this screen: NOTHING the server was holding may
+    // survive the visit. Release unconditionally (believed mask 0) rather
+    // than trusting our own shadow -- if the shadow wrongly thinks a
+    // modifier is still legitimately held, comparing against it is exactly
+    // how a stuck Win outlived the visit. Shift is excluded by the audit
+    // table, so local capitals are unaffected.
+    m_desks->sanitizeStaleModifiers(0);
+  }
 
   if (m_isPrimary) {
     LOG_VERBOSE("centering cursor on leave: %+d, %+d", m_xCenter, m_yCenter);
@@ -1480,6 +1490,29 @@ void MSWindowsScreen::handleFixes()
   if (m_keyState->didGroupsChange()) {
     updateKeys();
   }
+
+  // Continuously heal stranded modifiers while the server is driving this
+  // screen. Doing this only at enter/enable meant a modifier lost DURING a
+  // visit stayed held for the whole visit -- a held Win turns every letter
+  // into a shortcut and breaks shift-capitals, and the user cannot clear it
+  // from the far end. Five previous fixes each closed one way for a release
+  // to go missing (chord sessions, deferred Super, relay ledger, screen
+  // switches); this stops depending on the sender being correct at all: if
+  // a modifier is physically down that we do not believe we are holding, it
+  // is stale by definition, whatever lost it.
+  auditStaleModifiers();
+}
+
+void MSWindowsScreen::auditStaleModifiers() const
+{
+  // Secondary only, and only while the server is actually driving: when the
+  // cursor is elsewhere the local user owns this keyboard and any held
+  // modifier is legitimately theirs. Shift is excluded inside the desk-side
+  // audit's table, so typing capitals locally is never disturbed.
+  if (m_isPrimary || !m_isOnScreen || m_keyState == nullptr) {
+    return;
+  }
+  m_desks->sanitizeStaleModifiers(m_keyState->getActiveModifiers());
 }
 
 void MSWindowsScreen::fixClipboardViewer()

@@ -247,12 +247,12 @@ void MSWindowsDesks::getCursorPos(int32_t &x, int32_t &y) const
   y = pos.y;
 }
 
-void MSWindowsDesks::sanitizeStaleModifiers() const
+void MSWindowsDesks::sanitizeStaleModifiers(KeyModifierMask believedMask) const
 {
   // Synchronous: the desk queue is FIFO, and waiting for the ack guarantees
   // the stale releases have landed before the caller (enable/enter) returns
   // and the server starts sending real input.
-  sendMessage(DESKFLOW_MSG_SANITIZE_MODS, 0, 0);
+  sendMessage(DESKFLOW_MSG_SANITIZE_MODS, static_cast<WPARAM>(believedMask), 0);
 }
 
 void MSWindowsDesks::fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool /*isAutoRepeat*/) const
@@ -368,7 +368,7 @@ namespace {
 // desktop actually receiving input. Running this on the main screen thread
 // silently no-ops on LogonUI / secure-desktop / post-desk-switch -- the log
 // would claim a release that never landed.
-void deskSanitizeStaleModifiers()
+void deskSanitizeStaleModifiers(KeyModifierMask believedMask)
 {
   struct StaleCheck
   {
@@ -383,9 +383,16 @@ void deskSanitizeStaleModifiers()
   // with no visual feedback. A stuck Shift is also self-evident and
   // self-correcting for the user, unlike a stuck Win/Alt/Ctrl, which turns
   // ordinary typing into shortcuts -- that is what this guard is for.
-  static const StaleCheck kModifiers[] = {
-      {VK_LWIN, true},      {VK_RWIN, true},      {VK_LMENU, false},
-      {VK_RMENU, true},     {VK_LCONTROL, false}, {VK_RCONTROL, true},
+  struct StaleCheckMasked
+  {
+    UINT vk;
+    bool extended;
+    KeyModifierMask bit;
+  };
+  static const StaleCheckMasked kModifiers[] = {
+      {VK_LWIN, true, KeyModifierSuper},       {VK_RWIN, true, KeyModifierSuper},
+      {VK_LMENU, false, KeyModifierAlt},       {VK_RMENU, true, KeyModifierAlt},
+      {VK_LCONTROL, false, KeyModifierControl}, {VK_RCONTROL, true, KeyModifierControl},
   };
   // Menu masking: Windows opens the Start menu on a bare Win up (and focuses
   // app menu bars on a bare Alt up). A stuck-key cleanup must never read as
@@ -393,8 +400,8 @@ void deskSanitizeStaleModifiers()
   // a no-op key (unassigned VK 0xE8) to break the tap sequence -- the same
   // trick remappers use.
   bool maskMenu = false;
-  for (const auto &[vk, extended] : kModifiers) {
-    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
+  for (const auto &[vk, extended, bit] : kModifiers) {
+    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0 || (believedMask & bit) != 0) {
       continue;
     }
     if (vk == VK_LWIN || vk == VK_RWIN || vk == VK_LMENU || vk == VK_RMENU) {
@@ -412,9 +419,12 @@ void deskSanitizeStaleModifiers()
     SendInput(2, dummy, sizeof(INPUT));
   }
 
-  for (const auto &[vk, extended] : kModifiers) {
+  for (const auto &[vk, extended, bit] : kModifiers) {
     if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
       continue;
+    }
+    if ((believedMask & bit) != 0) {
+      continue; // we are legitimately holding this one right now
     }
     INPUT input{};
     input.type = INPUT_KEYBOARD;
@@ -846,7 +856,7 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       break;
 
     case DESKFLOW_MSG_SANITIZE_MODS:
-      deskSanitizeStaleModifiers();
+      deskSanitizeStaleModifiers(static_cast<KeyModifierMask>(msg.wParam));
       break;
 
     case DESKFLOW_MSG_FAKE_KEY:

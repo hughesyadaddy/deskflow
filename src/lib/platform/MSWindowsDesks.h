@@ -151,7 +151,7 @@ public:
 
   //! Release stale physically-held modifiers on the input-desktop-bound desk
   //! thread (synchronous). See deskSanitizeStaleModifiers in the .cpp.
-  void sanitizeStaleModifiers() const;
+  void sanitizeStaleModifiers(KeyModifierMask believedMask) const;
 
   //! Fake mouse press/release
   /*!
