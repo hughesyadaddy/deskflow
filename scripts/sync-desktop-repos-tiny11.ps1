@@ -32,8 +32,29 @@ if (-not (Test-Path $mouser)) {
   Move-Item (Join-Path $extract 'Mouser-working') $mouser
 }
 Set-Location $mouser
+# The bootstrap above unpacks a ZIP, which leaves no .git -- so this pull was
+# skipped forever and every build used the same stale snapshot (Mouser fixes
+# silently never reached Windows). Convert a ZIP-sourced tree into a real
+# clone once, then keep it current.
+if (-not (Test-Path (Join-Path $mouser '.git'))) {
+  Write-Host 'Mouser: converting ZIP snapshot to a git clone'
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  git init -q 2>&1 | Out-Null
+  git remote add fork 'https://github.com/hughesyadaddy/Mouser.git' 2>&1 | Out-Null
+  git fetch --depth=1 fork working 2>&1 | Out-Null
+  git checkout -q -f -B working FETCH_HEAD 2>&1 | Out-Null
+  git branch --set-upstream-to=fork/working working 2>&1 | Out-Null
+  $ErrorActionPreference = $prevEAP
+}
 if (Test-Path (Join-Path $mouser '.git')) {
-  git pull --ff-only 2>$null
+  # git writes progress to stderr; with ErrorActionPreference=Stop that is a
+  # NativeCommandError which aborted the whole deploy before the build ran.
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  git pull --ff-only 2>&1 | Out-Null
+  $ErrorActionPreference = $prevEAP
+  Write-Host ("Mouser source: " + (git log --oneline -1))
 }
 Write-Host "Mouser source at $mouser"
 if (-not (Test-Path (Join-Path $mouser '.venv'))) {
