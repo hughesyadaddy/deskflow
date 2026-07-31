@@ -1162,17 +1162,8 @@ void MSWindowsKeyState::getKeyMap(deskflow::KeyMap &keyMap)
   ActivateKeyboardLayout(activeLayout, 0);
 }
 
-double MSWindowsKeyState::secondsSinceLastInjection() const
-{
-  if (m_lastInjectionTime <= 0.0) {
-    return 1.0e9; // nothing injected yet: treat as idle forever
-  }
-  return Arch::time() - m_lastInjectionTime;
-}
-
 void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
 {
-  m_lastInjectionTime = Arch::time();
   switch (keystroke.m_type) {
   case Keystroke::KeyType::Button: {
     LOG(

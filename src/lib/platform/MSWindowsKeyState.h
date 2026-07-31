@@ -27,14 +27,6 @@ This class maps KeyIDs to keystrokes.
 class MSWindowsKeyState : public KeyState
 {
 public:
-  //! Seconds since the server last injected any key through this client.
-  /*!
-  A modifier the server is legitimately holding is refreshed by the traffic
-  that keeps it alive; silence means whatever set it is gone. Used to expire
-  a believed-held Super so a lost release can never outlive the keystrokes
-  that caused it.
-  */
-  double secondsSinceLastInjection() const;
   MSWindowsKeyState(
       MSWindowsDesks *desks, void *eventTarget, IEventQueue *events, std::vector<std::string> layouts,
       bool isLangSyncEnabled
@@ -177,7 +169,6 @@ protected:
   KeyModifierMask &getActiveModifiersRValue() override;
 
 private:
-  double m_lastInjectionTime = 0.0;
 
   using GroupList = std::vector<HKL>;
 

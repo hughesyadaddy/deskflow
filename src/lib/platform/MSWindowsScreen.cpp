@@ -1491,60 +1491,42 @@ void MSWindowsScreen::handleFixes()
     updateKeys();
   }
 
-  // Continuously heal stranded modifiers while the server is driving this
-  // screen. Doing this only at enter/enable meant a modifier lost DURING a
-  // visit stayed held for the whole visit -- a held Win turns every letter
-  // into a shortcut and breaks shift-capitals, and the user cannot clear it
-  // from the far end. Five previous fixes each closed one way for a release
-  // to go missing (chord sessions, deferred Super, relay ledger, screen
-  // switches); this stops depending on the sender being correct at all: if
-  // a modifier is physically down that we do not believe we are holding, it
-  // is stale by definition, whatever lost it.
+  // Enforce the modifier invariant (see auditStaleModifiers).
   auditStaleModifiers();
 }
 
 void MSWindowsScreen::auditStaleModifiers()
 {
+  // INVARIANT: while this machine is being driven remotely, no modifier is
+  // physically held here unless this client is deliberately holding it.
+  //
+  // Ownership is layered, and each layer has exactly one job:
+  //   1. Injection (MSWindowsDesks::sendInputMessage) must not lose events.
+  //      It reports failures and re-posts a dropped key-up; losing a release
+  //      silently is what stranded modifiers in the first place.
+  //   2. The server releases what it holds on a screen before abandoning it
+  //      (Server::m_modifiersHeldOnActive).
+  //   3. This reconciler is the backstop -- defence in depth, not the plan.
+  //      It compares the OS against the intended state and corrects drift.
+  //
   // Secondary only, and only while the server is actually driving: when the
   // cursor is elsewhere the local user owns this keyboard and any held
-  // modifier is legitimately theirs. Shift is excluded inside the desk-side
-  // audit's table, so typing capitals locally is never disturbed.
+  // modifier is legitimately theirs. Shift is excluded from the desk-side
+  // table for the same reason -- GetAsyncKeyState cannot distinguish a
+  // modifier we injected from one a human is holding, and wrongly releasing
+  // Shift silently lowercases what someone is typing (passwords included),
+  // whereas a stray Win/Alt/Ctrl turns every letter into a shortcut.
   if (m_isPrimary || !m_isOnScreen || m_keyState == nullptr) {
     return;
   }
 
-  KeyModifierMask believed = m_keyState->getActiveModifiers();
-
-  // THE INVARIANT: Windows must never be left holding Super. Comparing
-  // against `believed` alone cannot deliver that -- when the shadow itself
-  // is wrong (a lost release, or a desync from fast keying) it vouches for
-  // the very key that is stuck, and the audit skips it forever.
-  //
-  // So Super additionally carries a lease: the server can only be holding
-  // it while it is actively typing, and every injected keystroke renews the
-  // lease. After kSuperLeaseSeconds of injection silence a still-down Super
-  // is stale by definition, whatever the shadow claims, and is released.
-  // Dropping an idle Super is harmless -- the next keystroke re-applies it
-  // from that event's own modifier mask -- whereas keeping it turns every
-  // letter into a shortcut. Alt/Ctrl deliberately have NO lease so a held
-  // Alt-Tab switcher survives.
-  constexpr double kSuperLeaseSeconds = 1.5;
-  bool leaseExpired = false;
-  if ((believed & KeyModifierSuper) != 0 && m_keyState->secondsSinceLastInjection() > kSuperLeaseSeconds) {
-    LOG_DEBUG("super lease expired (%.1fs idle); treating as stale", m_keyState->secondsSinceLastInjection());
-    believed &= ~static_cast<KeyModifierMask>(KeyModifierSuper);
-    leaseExpired = true;
-  }
-
-  m_desks->sanitizeStaleModifiers(believed);
-
-  // Resync the shadow to what the OS now actually holds. Without this the
-  // shadow would still claim Super is down, and KeyMap would emit no Win
-  // press for the next Win+key combo (the modifier would silently go
-  // missing instead of being stuck -- trading one bug for another).
-  if (leaseExpired) {
-    m_keyState->updateKeyState();
-  }
+  // The client's own key state is the intended state: it records exactly
+  // what this client has injected and not released. Anything the OS reports
+  // held that the intended state does not is a divergence -- which, now that
+  // injection reports its failures instead of dropping events silently,
+  // should never happen. Correct it and say so loudly: a line here is a real
+  // bug worth chasing, not routine housekeeping.
+  m_desks->sanitizeStaleModifiers(m_keyState->getActiveModifiers());
 }
 
 void MSWindowsScreen::fixClipboardViewer()
