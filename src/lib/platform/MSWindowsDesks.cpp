@@ -382,11 +382,6 @@ namespace {
 // would claim a release that never landed.
 void deskSanitizeStaleModifiers(uint32_t heldByUsBits)
 {
-  struct StaleCheck
-  {
-    UINT vk;
-    bool extended;
-  };
   // SHIFT IS DELIBERATELY ABSENT. GetAsyncKeyState cannot tell an injected
   // modifier from one the user is physically holding, and this runs on core
   // (re)start -- including the per-desktop relaunch when LogonUI appears,
