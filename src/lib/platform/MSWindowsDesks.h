@@ -227,7 +227,9 @@ private:
   //! Post a message to the active desk thread and block until it is processed.
   void sendMessage(UINT, WPARAM, LPARAM) const;
   //! Post a self-contained fake-input message without waiting (latency path).
-  void sendInputMessage(UINT, WPARAM, LPARAM) const;
+  //! Post a fire-and-forget injection message. False = the event was
+  //! DROPPED (queue full / no desk); the caller's key state is now suspect.
+  bool sendInputMessage(UINT, WPARAM, LPARAM) const;
 
   // work around for messed up keyboard events from low-level hooks
   HWND getForegroundWindow() const;

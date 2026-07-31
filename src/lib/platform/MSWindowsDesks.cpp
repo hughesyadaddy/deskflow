@@ -257,7 +257,18 @@ void MSWindowsDesks::sanitizeStaleModifiers(KeyModifierMask believedMask) const
 
 void MSWindowsDesks::fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool /*isAutoRepeat*/) const
 {
-  sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey));
+  if (sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey))) {
+    return;
+  }
+  // The event never reached the injector. A dropped key-UP is the dangerous
+  // half: the key stays physically down with nothing left to release it, so
+  // repair it here rather than waiting for the periodic audit. The release
+  // is posted through the same desk thread (the only one bound to the input
+  // desktop); if even that cannot be queued the audit remains the backstop.
+  if ((flags & KEYEVENTF_KEYUP) != 0) {
+    LOG_WARN("re-posting dropped key-up for vk=0x%02x", virtualKey);
+    sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey));
+  }
 }
 
 void MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
@@ -453,7 +464,7 @@ void MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
   }
 }
 
-void MSWindowsDesks::sendInputMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
+bool MSWindowsDesks::sendInputMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
 {
   // Fire-and-forget for self-contained fake-input messages (move/button/
   // wheel/key). The payload is entirely in wParam/lParam and there is no
@@ -464,9 +475,33 @@ void MSWindowsDesks::sendInputMessage(UINT msg, WPARAM wParam, LPARAM lParam) co
   // desk thread does NOT ack these (see deskThread), so a stale ready signal
   // can never satisfy a later synchronous waiter. FIFO ordering per thread
   // queue preserves key down/up and move sequencing.
-  if (m_activeDesk != nullptr && m_activeDesk->m_window != nullptr) {
-    PostThreadMessage(m_activeDesk->m_threadID, msg, wParam, lParam);
+  if (m_activeDesk == nullptr || m_activeDesk->m_window == nullptr) {
+    // No desk to inject on: a key-up dropped here leaves the key physically
+    // held with nothing to release it. Never silent.
+    LOG_ERR("dropped injected input (no active desk): msg=%u wParam=0x%llx", msg, (unsigned long long)wParam);
+    return false;
   }
+
+  // PostThreadMessage FAILS when the target queue is full -- Windows caps a
+  // thread queue at 10000 messages, and hammering the keyboard while the
+  // pointer streams moves through this same queue reaches it. Ignoring the
+  // result silently discarded injected events; when the casualty was a
+  // modifier's key-UP, that modifier stayed physically down forever (the
+  // stuck Windows key). Queue-full is transient, so yield and retry before
+  // giving up, and never fail silently.
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (PostThreadMessage(m_activeDesk->m_threadID, msg, wParam, lParam)) {
+      return true;
+    }
+    const DWORD error = GetLastError();
+    if (error != ERROR_NOT_ENOUGH_QUOTA) {
+      LOG_ERR("failed to post injected input: msg=%u error=%lu", msg, error);
+      return false;
+    }
+    Sleep(0); // let the desk thread drain, then retry
+  }
+  LOG_ERR("dropped injected input after retries (desk queue full): msg=%u wParam=0x%llx", msg, (unsigned long long)wParam);
+  return false;
 }
 
 HCURSOR
