@@ -253,7 +253,7 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
   if (m_isPrimary) {
     return;
   }
-  m_desks->sanitizeStaleModifiers(m_keyState != nullptr ? m_keyState->getActiveModifiers() : 0);
+  m_desks->sanitizeStaleModifiers(m_keyState != nullptr ? m_keyState->injectedModifierBits() : 0);
   // The releases just changed the OS modifier state behind KeyState's back.
   // Without a resync the shadow still says (e.g.) Ctrl is held, and
   // KeyMap::keysForModifierState then emits NO modifier press for a key that
@@ -1526,7 +1526,7 @@ void MSWindowsScreen::auditStaleModifiers()
   // injection reports its failures instead of dropping events silently,
   // should never happen. Correct it and say so loudly: a line here is a real
   // bug worth chasing, not routine housekeeping.
-  m_desks->sanitizeStaleModifiers(m_keyState->getActiveModifiers());
+  m_desks->sanitizeStaleModifiers(m_keyState->injectedModifierBits());
 }
 
 void MSWindowsScreen::fixClipboardViewer()

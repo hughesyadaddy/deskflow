@@ -713,17 +713,17 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     // a Super still deferred (no chord/session yet) must not follow the
     // cursor to the next screen
     m_deferredSuper = {};
-    // Anything this server is physically holding on the screen we are
-    // leaving must be released HERE, while m_active still points at it.
-    // Otherwise the release lands on the next screen and the old one keeps
-    // the modifier held -- the stuck-Win bug.
-    releaseModifiersHeldOnActive();
-    // leave active screen
+    // Ask the screen to leave FIRST: a refused leave means we are staying,
+    // and releasing beforehand would drop modifiers on a screen we never
+    // left. Only once the leave is agreed do we release what we hold there
+    // -- while m_active still points at it, so the release cannot land on
+    // the next screen (the stuck-Win bug).
     if (!m_active->leave()) {
       // cannot leave screen
       LOG_WARN("can't leave screen");
       return;
     }
+    releaseModifiersHeldOnActive();
 
     // update the primary client's clipboards if we're leaving the
     // primary screen.
@@ -2076,7 +2076,11 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
 
   // Keyboard rescue: five plain Esc downs within 2s soft-restarts local core.
   if (m_escTapRescue.noteEscDown(id, mask)) {
+    // The rescue tears this core down: release what we hold on the active
+    // screen first, or the restart strands it there (the one structural
+    // boundary that used to skip the ledger).
     cancelChordRemapSession();
+    releaseModifiersHeldOnActive();
     requestLocalCoreRestart();
     return;
   }

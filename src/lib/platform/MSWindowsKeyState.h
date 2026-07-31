@@ -9,6 +9,7 @@
 
 #include "deskflow/KeyState.h"
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,16 @@ This class maps KeyIDs to keystrokes.
 class MSWindowsKeyState : public KeyState
 {
 public:
+  //! Bitfield of modifier VKs this client has injected DOWN and not released.
+  /*!
+  Derived only from injection outcomes, never from the OS -- reading the OS
+  back would let a stuck modifier certify itself as intended. Bit order
+  matches the table in MSWindowsDesks' stale-modifier audit.
+  */
+  uint32_t injectedModifierBits() const;
+
+  //! Index of \p vk in the tracked-modifier table, or -1.
+  static int modifierVkIndex(WORD vk);
   MSWindowsKeyState(
       MSWindowsDesks *desks, void *eventTarget, IEventQueue *events, std::vector<std::string> layouts,
       bool isLangSyncEnabled
@@ -169,6 +180,9 @@ protected:
   KeyModifierMask &getActiveModifiersRValue() override;
 
 private:
+  void noteInjectedModifier(WORD vk, bool held);
+  std::set<WORD> m_injectedModifierVks;
+
 
   using GroupList = std::vector<HKL>;
 

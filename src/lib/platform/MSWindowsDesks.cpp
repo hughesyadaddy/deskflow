@@ -247,28 +247,29 @@ void MSWindowsDesks::getCursorPos(int32_t &x, int32_t &y) const
   y = pos.y;
 }
 
-void MSWindowsDesks::sanitizeStaleModifiers(KeyModifierMask believedMask) const
+void MSWindowsDesks::sanitizeStaleModifiers(uint32_t heldByUsBits) const
 {
   // Synchronous: the desk queue is FIFO, and waiting for the ack guarantees
   // the stale releases have landed before the caller (enable/enter) returns
   // and the server starts sending real input.
-  sendMessage(DESKFLOW_MSG_SANITIZE_MODS, static_cast<WPARAM>(believedMask), 0);
+  sendMessage(DESKFLOW_MSG_SANITIZE_MODS, static_cast<WPARAM>(heldByUsBits), 0);
 }
 
-void MSWindowsDesks::fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool /*isAutoRepeat*/) const
+bool MSWindowsDesks::fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool /*isAutoRepeat*/) const
 {
   if (sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey))) {
-    return;
+    return true;
   }
-  // The event never reached the injector. A dropped key-UP is the dangerous
-  // half: the key stays physically down with nothing left to release it, so
-  // repair it here rather than waiting for the periodic audit. The release
-  // is posted through the same desk thread (the only one bound to the input
-  // desktop); if even that cannot be queued the audit remains the backstop.
-  if ((flags & KEYEVENTF_KEYUP) != 0) {
+  // A dropped key-UP is the dangerous half: the key stays physically down
+  // with nothing left to release it. Retry once, but only when there is a
+  // desk to post to -- otherwise the retry is a guaranteed second failure
+  // and a duplicate error line. The caller records the outcome, and the
+  // audit remains the backstop.
+  if ((flags & KEYEVENTF_KEYUP) != 0 && m_activeDesk != nullptr && m_activeDesk->m_window != nullptr) {
     LOG_WARN("re-posting dropped key-up for vk=0x%02x", virtualKey);
-    sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey));
+    return sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey));
   }
+  return false;
 }
 
 void MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
@@ -379,7 +380,7 @@ namespace {
 // desktop actually receiving input. Running this on the main screen thread
 // silently no-ops on LogonUI / secure-desktop / post-desk-switch -- the log
 // would claim a release that never landed.
-void deskSanitizeStaleModifiers(KeyModifierMask believedMask)
+void deskSanitizeStaleModifiers(uint32_t heldByUsBits)
 {
   struct StaleCheck
   {
@@ -394,16 +395,17 @@ void deskSanitizeStaleModifiers(KeyModifierMask believedMask)
   // with no visual feedback. A stuck Shift is also self-evident and
   // self-correcting for the user, unlike a stuck Win/Alt/Ctrl, which turns
   // ordinary typing into shortcuts -- that is what this guard is for.
-  struct StaleCheckMasked
+  // Index order is the contract shared with MSWindowsKeyState::modifierVkIndex.
+  // Left and right variants are tracked separately: a legitimately held Left
+  // Alt must never vouch for a stranded AltGr.
+  struct StaleCheck
   {
     UINT vk;
     bool extended;
-    KeyModifierMask bit;
   };
-  static const StaleCheckMasked kModifiers[] = {
-      {VK_LWIN, true, KeyModifierSuper},       {VK_RWIN, true, KeyModifierSuper},
-      {VK_LMENU, false, KeyModifierAlt},       {VK_RMENU, true, KeyModifierAlt},
-      {VK_LCONTROL, false, KeyModifierControl}, {VK_RCONTROL, true, KeyModifierControl},
+  static const StaleCheck kModifiers[] = {
+      {VK_LWIN, true},      {VK_RWIN, true},      {VK_LMENU, false},
+      {VK_RMENU, true},     {VK_LCONTROL, false}, {VK_RCONTROL, true},
   };
   // Menu masking: Windows opens the Start menu on a bare Win up (and focuses
   // app menu bars on a bare Alt up). A stuck-key cleanup must never read as
@@ -411,8 +413,9 @@ void deskSanitizeStaleModifiers(KeyModifierMask believedMask)
   // a no-op key (unassigned VK 0xE8) to break the tap sequence -- the same
   // trick remappers use.
   bool maskMenu = false;
-  for (const auto &[vk, extended, bit] : kModifiers) {
-    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0 || (believedMask & bit) != 0) {
+  for (size_t i = 0; i < sizeof(kModifiers) / sizeof(kModifiers[0]); ++i) {
+    const auto &[vk, extended] = kModifiers[i];
+    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0 || (heldByUsBits & (1u << i)) != 0) {
       continue;
     }
     if (vk == VK_LWIN || vk == VK_RWIN || vk == VK_LMENU || vk == VK_RMENU) {
@@ -430,19 +433,20 @@ void deskSanitizeStaleModifiers(KeyModifierMask believedMask)
     SendInput(2, dummy, sizeof(INPUT));
   }
 
-  for (const auto &[vk, extended, bit] : kModifiers) {
+  for (size_t i = 0; i < sizeof(kModifiers) / sizeof(kModifiers[0]); ++i) {
+    const auto &[vk, extended] = kModifiers[i];
     if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
       continue;
     }
-    if ((believedMask & bit) != 0) {
-      continue; // we are legitimately holding this one right now
+    if ((heldByUsBits & (1u << i)) != 0) {
+      continue; // we injected this one and have not released it yet
     }
     INPUT input{};
     input.type = INPUT_KEYBOARD;
     input.ki.wVk = static_cast<WORD>(vk);
     input.ki.dwFlags = KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
     if (SendInput(1, &input, sizeof(input)) == 1) {
-      LOG_WARN("released stuck modifier vk=0x%02x (believed mask 0x%04x)", vk, believedMask);
+      LOG_WARN("released stuck modifier vk=0x%02x (injected bits 0x%02x)", vk, heldByUsBits);
     } else {
       LOG_WARN("failed to release stuck modifier vk=0x%02x: %d", vk, GetLastError());
     }
@@ -498,7 +502,7 @@ bool MSWindowsDesks::sendInputMessage(UINT msg, WPARAM wParam, LPARAM lParam) co
       LOG_ERR("failed to post injected input: msg=%u error=%lu", msg, error);
       return false;
     }
-    Sleep(0); // let the desk thread drain, then retry
+    SwitchToThread(); // Sleep(0) only yields to equal priority on this core
   }
   LOG_ERR("dropped injected input after retries (desk queue full): msg=%u wParam=0x%llx", msg, (unsigned long long)wParam);
   return false;
@@ -891,7 +895,7 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       break;
 
     case DESKFLOW_MSG_SANITIZE_MODS:
-      deskSanitizeStaleModifiers(static_cast<KeyModifierMask>(msg.wParam));
+      deskSanitizeStaleModifiers(static_cast<uint32_t>(msg.wParam));
       break;
 
     case DESKFLOW_MSG_FAKE_KEY:

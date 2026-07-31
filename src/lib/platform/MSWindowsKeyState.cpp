@@ -1162,6 +1162,40 @@ void MSWindowsKeyState::getKeyMap(deskflow::KeyMap &keyMap)
   ActivateKeyboardLayout(activeLayout, 0);
 }
 
+void MSWindowsKeyState::noteInjectedModifier(WORD vk, bool held)
+{
+  if (modifierVkIndex(vk) < 0) {
+    return;
+  }
+  if (held) {
+    m_injectedModifierVks.insert(vk);
+  } else {
+    m_injectedModifierVks.erase(vk);
+  }
+}
+
+int MSWindowsKeyState::modifierVkIndex(WORD vk)
+{
+  static const WORD kTracked[] = {VK_LWIN, VK_RWIN, VK_LMENU, VK_RMENU, VK_LCONTROL, VK_RCONTROL};
+  for (int i = 0; i < static_cast<int>(sizeof(kTracked) / sizeof(kTracked[0])); ++i) {
+    if (kTracked[i] == vk) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+uint32_t MSWindowsKeyState::injectedModifierBits() const
+{
+  uint32_t bits = 0;
+  for (const WORD vk : m_injectedModifierVks) {
+    if (const int index = modifierVkIndex(vk); index >= 0) {
+      bits |= (1u << index);
+    }
+  }
+  return bits;
+}
+
 void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
 {
   switch (keystroke.m_type) {
@@ -1194,7 +1228,13 @@ void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
 
     // vk,sc,flags,keystroke.m_data.m_button.m_repeat
 
-    m_desks->fakeKeyEvent(vk, scanCode, flags, keystroke.m_data.m_button.m_repeat);
+    const bool injected = m_desks->fakeKeyEvent(vk, scanCode, flags, keystroke.m_data.m_button.m_repeat);
+    // Record what WE are holding, from what actually reached the injector.
+    // This must never be derived from GetKeyboardState: a physically stuck
+    // modifier would be read back as "intended", and the audit that exists
+    // to release it would skip it forever. A drop simply means the key is
+    // not held, so the state stays truthful either way.
+    noteInjectedModifier(vk, injected && (flags & KEYEVENTF_KEYUP) == 0);
 
     // synthesize event
     // m_desks->fakeKeyEvent(button, vk,
