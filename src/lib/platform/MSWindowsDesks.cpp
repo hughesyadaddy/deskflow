@@ -431,7 +431,7 @@ void deskSanitizeStaleModifiers(KeyModifierMask believedMask)
     input.ki.wVk = static_cast<WORD>(vk);
     input.ki.dwFlags = KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
     if (SendInput(1, &input, sizeof(input)) == 1) {
-      LOG_WARN("released stuck modifier vk=0x%02x", vk);
+      LOG_WARN("released stuck modifier vk=0x%02x (believed mask 0x%04x)", vk, believedMask);
     } else {
       LOG_WARN("failed to release stuck modifier vk=0x%02x: %d", vk, GetLastError());
     }

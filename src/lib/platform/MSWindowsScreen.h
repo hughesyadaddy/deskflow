@@ -110,7 +110,7 @@ public:
 
   //! Periodic self-heal: release modifiers physically down that this client
   //! does not believe it is holding (runs on the 1s fix timer).
-  void auditStaleModifiers() const;
+  void auditStaleModifiers();
 
   // IPlatformScreen overrides
   void enable() override;

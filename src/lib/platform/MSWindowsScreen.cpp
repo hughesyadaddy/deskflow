@@ -1503,7 +1503,7 @@ void MSWindowsScreen::handleFixes()
   auditStaleModifiers();
 }
 
-void MSWindowsScreen::auditStaleModifiers() const
+void MSWindowsScreen::auditStaleModifiers()
 {
   // Secondary only, and only while the server is actually driving: when the
   // cursor is elsewhere the local user owns this keyboard and any held
@@ -1512,7 +1512,39 @@ void MSWindowsScreen::auditStaleModifiers() const
   if (m_isPrimary || !m_isOnScreen || m_keyState == nullptr) {
     return;
   }
-  m_desks->sanitizeStaleModifiers(m_keyState->getActiveModifiers());
+
+  KeyModifierMask believed = m_keyState->getActiveModifiers();
+
+  // THE INVARIANT: Windows must never be left holding Super. Comparing
+  // against `believed` alone cannot deliver that -- when the shadow itself
+  // is wrong (a lost release, or a desync from fast keying) it vouches for
+  // the very key that is stuck, and the audit skips it forever.
+  //
+  // So Super additionally carries a lease: the server can only be holding
+  // it while it is actively typing, and every injected keystroke renews the
+  // lease. After kSuperLeaseSeconds of injection silence a still-down Super
+  // is stale by definition, whatever the shadow claims, and is released.
+  // Dropping an idle Super is harmless -- the next keystroke re-applies it
+  // from that event's own modifier mask -- whereas keeping it turns every
+  // letter into a shortcut. Alt/Ctrl deliberately have NO lease so a held
+  // Alt-Tab switcher survives.
+  constexpr double kSuperLeaseSeconds = 1.5;
+  bool leaseExpired = false;
+  if ((believed & KeyModifierSuper) != 0 && m_keyState->secondsSinceLastInjection() > kSuperLeaseSeconds) {
+    LOG_DEBUG("super lease expired (%.1fs idle); treating as stale", m_keyState->secondsSinceLastInjection());
+    believed &= ~static_cast<KeyModifierMask>(KeyModifierSuper);
+    leaseExpired = true;
+  }
+
+  m_desks->sanitizeStaleModifiers(believed);
+
+  // Resync the shadow to what the OS now actually holds. Without this the
+  // shadow would still claim Super is down, and KeyMap would emit no Win
+  // press for the next Win+key combo (the modifier would silently go
+  // missing instead of being stuck -- trading one bug for another).
+  if (leaseExpired) {
+    m_keyState->updateKeyState();
+  }
 }
 
 void MSWindowsScreen::fixClipboardViewer()
