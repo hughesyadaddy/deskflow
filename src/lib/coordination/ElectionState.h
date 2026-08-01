@@ -32,17 +32,21 @@ struct ElectionTuning
   double claimCooldownS = 1.5;
   //! Claim heartbeat cadence while server.
   double heartbeatIntervalS = 3.0;
-  //! Genuine-input burst to promote: count within window. Stiff enough that
-  //! sparse phantom motion (idle optical-sensor drift on an attached mouse)
-  //! cannot promote; sustained human motion trivially clears it.
-  int burstCount = 6;
-  double burstWindowS = 0.60;
+  //! Genuine-input burst to promote: count within window.
+  //! Responsiveness wins: this is the gesture a user makes to take their
+  //! cursor back, and a threshold tuned to exclude phantom drift made
+  //! reclaiming the cursor feel impossible. Drift is handled by the
+  //! escalating cooldown below, not by making the human work harder.
+  int burstCount = 4;
+  double burstWindowS = 0.40;
   //! Anti-war escalation: each role flip within \c flapWindowS doubles the
   //! LOCAL promotion cooldown (base selfCooldownS) up to \c maxSelfCooldownS.
   //! Following a claim stays at base cooldown -- yielding is always safe;
   //! re-claiming is what wars.
   double flapWindowS = 30.0;
-  double maxSelfCooldownS = 20.0;
+  //! Capped low: a long cooldown is indistinguishable from "the KVM is
+  //! broken" when the user is trying to grab their cursor back.
+  double maxSelfCooldownS = 6.0;
   //! Stricter burst while the shared cursor is on this screen, so
   //! forwarded motion echoes can never promote a passive client.
   int burstCountCursorHere = 12;
