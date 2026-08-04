@@ -931,12 +931,41 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       // Head-of-queue peeking (never a filtered drain) preserves ordering
       // with interleaved button/key/wheel messages exactly.
       MSG next;
-      for (int drained = 0; drained < deskflow::platform::kMaxCoalescedMoves &&
-                            PeekMessage(&next, nullptr, 0, 0, PM_NOREMOVE) && next.message == DESKFLOW_MSG_FAKE_MOVE;
-           ++drained) {
+      int movesDrained = 0;
+      for (; movesDrained < deskflow::platform::kMaxCoalescedMoves &&
+             PeekMessage(&next, nullptr, 0, 0, PM_NOREMOVE) && next.message == DESKFLOW_MSG_FAKE_MOVE;
+           ++movesDrained) {
         PeekMessage(&next, nullptr, 0, 0, PM_REMOVE);
         msg.wParam = next.wParam;
         msg.lParam = next.lParam;
+      }
+      // Latency probe: msg.time is when the sender posted this move, so
+      // (now - msg.time) is exactly how long it sat in the desk queue before
+      // reaching SendInput. Reported once a second with the worst case and
+      // how many messages had to be collapsed -- a large age or a large
+      // coalesce count means the backlog is here; small values mean the lag
+      // is upstream (capture, network) and not in the injector.
+      {
+        static ULONGLONG s_windowStart = 0;
+        static DWORD s_maxAge = 0;
+        static int s_maxDrained = 0;
+        static int s_moves = 0;
+        const ULONGLONG now = GetTickCount64();
+        const DWORD age = static_cast<DWORD>(now - static_cast<ULONGLONG>(msg.time));
+        s_maxAge = (age > s_maxAge) ? age : s_maxAge;
+        s_maxDrained = (movesDrained > s_maxDrained) ? movesDrained : s_maxDrained;
+        ++s_moves;
+        if (s_windowStart == 0) {
+          s_windowStart = now;
+        } else if (now - s_windowStart >= 1000) {
+          LOG_INFO(
+              "move latency: %d moves/s, worst queue age %lums, worst coalesced %d", s_moves, s_maxAge, s_maxDrained
+          );
+          s_windowStart = now;
+          s_maxAge = 0;
+          s_maxDrained = 0;
+          s_moves = 0;
+        }
       }
       deskMouseMove(static_cast<int32_t>(msg.wParam), static_cast<int32_t>(msg.lParam));
       ackNeeded = false;
