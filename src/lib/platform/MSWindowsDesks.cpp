@@ -321,7 +321,18 @@ void MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
   }
 
   // do it
-  sendInputMessage(DESKFLOW_MSG_FAKE_BUTTON, flags, data);
+  if (sendInputMessage(DESKFLOW_MSG_FAKE_BUTTON, flags, data)) {
+    return;
+  }
+  // A dropped button-RELEASE is the same hazard as a dropped key-up, and a
+  // worse one in practice: nothing audits mouse buttons (the stale-modifier
+  // sweep only covers Win/Alt/Ctrl), so a lost release leaves the button
+  // physically held with no backstop -- every move becomes a drag and every
+  // click a double. Retry it, as the key path does.
+  if (!press && m_activeDesk != nullptr && m_activeDesk->m_window != nullptr) {
+    LOG_WARN("re-posting dropped mouse button release (flags=0x%08x)", flags);
+    sendInputMessage(DESKFLOW_MSG_FAKE_BUTTON, flags, data);
+  }
 }
 
 void MSWindowsDesks::fakeMouseMove(int32_t x, int32_t y) const
