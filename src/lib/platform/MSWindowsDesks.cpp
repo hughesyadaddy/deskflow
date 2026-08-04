@@ -97,6 +97,17 @@ static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
   SendInput(1, &inp, sizeof(inp));
 }
 
+//! Worst SendInput duration seen since the last report (microseconds).
+/*!
+The discriminator for injected-input lag. SendInput serializes against the
+system input queue and waits on every low-level hook (up to
+LowLevelHooksTimeout, 300ms by default). If this is large, injection is
+BLOCKING and the culprit is a hook or input-queue owner. If it stays in
+microseconds while queued moves still age, the desk thread simply was not
+SCHEDULED -- a host/CPU problem, not an input one.
+*/
+static LONG64 g_maxSendInputUs = 0;
+
 static void send_mouse_input(DWORD dwFlags, DWORD dx, DWORD dy, DWORD dwData)
 {
   INPUT inp;
@@ -107,7 +118,20 @@ static void send_mouse_input(DWORD dwFlags, DWORD dx, DWORD dy, DWORD dwData)
   inp.mi.mouseData = dwData;
   inp.mi.time = 0;
   inp.mi.dwExtraInfo = 0;
+
+  LARGE_INTEGER freq;
+  LARGE_INTEGER start;
+  const bool timed = QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&start);
   SendInput(1, &inp, sizeof(inp));
+  if (timed) {
+    LARGE_INTEGER end;
+    if (QueryPerformanceCounter(&end) && freq.QuadPart > 0) {
+      const LONG64 us = ((end.QuadPart - start.QuadPart) * 1000000) / freq.QuadPart;
+      if (us > g_maxSendInputUs) {
+        g_maxSendInputUs = us;
+      }
+    }
+  }
 }
 
 //
@@ -959,8 +983,10 @@ void MSWindowsDesks::deskThread(const void *vdesk)
           s_windowStart = now;
         } else if (now - s_windowStart >= 1000) {
           LOG_INFO(
-              "move latency: %d moves/s, worst queue age %lums, worst coalesced %d", s_moves, s_maxAge, s_maxDrained
+              "move latency: %d moves/s, worst queue age %lums, worst coalesced %d, worst SendInput %lldus", s_moves,
+              s_maxAge, s_maxDrained, static_cast<long long>(g_maxSendInputUs)
           );
+          g_maxSendInputUs = 0;
           s_windowStart = now;
           s_maxAge = 0;
           s_maxDrained = 0;
