@@ -499,7 +499,13 @@ bool MSWindowsDesks::sendInputMessage(UINT msg, WPARAM wParam, LPARAM lParam) co
     }
     SwitchToThread(); // Sleep(0) only yields to equal priority on this core
   }
-  LOG_ERR("dropped injected input after retries (desk queue full): msg=%u wParam=0x%llx", msg, (unsigned long long)wParam);
+  // Rate-limited: under a flood this fires per event, and logging in the
+  // injection path amplifies the very overload it is reporting.
+  static ULONGLONG s_lastDropLog = 0;
+  if (const ULONGLONG now = GetTickCount64(); now - s_lastDropLog > 1000) {
+    s_lastDropLog = now;
+    LOG_ERR("dropped injected input after retries (desk queue full): msg=%u wParam=0x%llx", msg, (unsigned long long)wParam);
+  }
   return false;
 }
 
@@ -945,15 +951,32 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       break;
     }
 
-    case DESKFLOW_MSG_FAKE_WHEEL:
-      // XXX -- add support for x-axis scrolling
-      if (msg.lParam != 0) {
-        send_mouse_input(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)msg.lParam);
+    case DESKFLOW_MSG_FAKE_WHEEL: {
+      // Backlog valve, same as the move paths: a fast scroll arrives as a
+      // burst of one message per notch, and each injection is serialized
+      // behind every WH_MOUSE_LL hook on the system (Mouser, PowerToys,
+      // overlays). Without this the burst becomes an unbounded input
+      // backlog that freezes the cursor and chokes the machine.
+      // Deltas are SUMMED, never dropped, so scroll distance is preserved
+      // exactly -- one bigger notch instead of many queued small ones.
+      int64_t hDelta = static_cast<int32_t>(msg.wParam);
+      int64_t vDelta = static_cast<int32_t>(msg.lParam);
+      MSG next;
+      for (int drained = 0; drained < deskflow::platform::kMaxCoalescedMoves &&
+                            PeekMessage(&next, nullptr, 0, 0, PM_NOREMOVE) && next.message == DESKFLOW_MSG_FAKE_WHEEL;
+           ++drained) {
+        PeekMessage(&next, nullptr, 0, 0, PM_REMOVE);
+        hDelta += static_cast<int32_t>(next.wParam);
+        vDelta += static_cast<int32_t>(next.lParam);
       }
-      if (msg.wParam != 0) {
-        send_mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, (DWORD)msg.wParam);
+      if (vDelta != 0) {
+        send_mouse_input(MOUSEEVENTF_WHEEL, 0, 0, static_cast<DWORD>(static_cast<int32_t>(vDelta)));
+      }
+      if (hDelta != 0) {
+        send_mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, static_cast<DWORD>(static_cast<int32_t>(hDelta)));
       }
       ackNeeded = false;
+    }
       break;
 
     case DESKFLOW_MSG_CURSOR_POS: {
