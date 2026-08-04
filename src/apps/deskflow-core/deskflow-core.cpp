@@ -9,6 +9,10 @@
 #include "AutoModeRunner.h"
 #include "CoreArgParser.h"
 
+#if defined(Q_OS_WIN)
+#include <windows.h>
+#endif
+
 #include "arch/Arch.h"
 #include "base/EventQueue.h"
 #include "base/Log.h"
@@ -153,6 +157,19 @@ int main(int argc, char **argv)
       CloseHandle(globalMutex);
     }
     return s_exitDuplicate;
+  }
+#endif
+
+#if defined(Q_OS_WIN)
+  // Input injection is latency-critical: every millisecond this process
+  // waits to be scheduled is visible cursor lag, and the desk thread
+  // already asks for THREAD_PRIORITY_ABOVE_NORMAL -- which a NORMAL
+  // process class caps. Raising the class lets that elevation actually
+  // take effect, so a busy background app (screen capture, indexing)
+  // cannot delay injected input. ABOVE_NORMAL needs no special rights;
+  // HIGH/REALTIME would starve the rest of the desktop.
+  if (!SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)) {
+    LOG_WARN("could not raise process priority: %lu", GetLastError());
   }
 #endif
 
