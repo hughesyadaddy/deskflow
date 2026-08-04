@@ -10,6 +10,9 @@
 #include "CoreArgParser.h"
 
 #if defined(Q_OS_WIN)
+// WIN32_LEAN_AND_MEAN: plain windows.h drags in the legacy winsock.h, which
+// then collides with the winsock2 headers this translation unit already has.
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
 
