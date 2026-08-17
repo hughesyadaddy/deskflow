@@ -20,7 +20,21 @@ elseif(BUILD_OSX_BUNDLE)
   set(BUNDLE_EXECUTABLE_NAME "${target}")
   set(BUNDLE_BUNDLE_NAME "${target}")
   set(BUNDLE_DISPLAY_NAME "${target}")
-  set(BUNDLE_GUI_IDENTIFIER "${CMAKE_PROJECT_REV_FQDN}")
+  # Fork-specific macOS bundle identifier, deliberately NOT CMAKE_PROJECT_REV_FQDN.
+  #
+  # macOS 26.2 corrupts SystemUIServer's per-bundle-identifier menu-bar state when an
+  # app runs: the status item gets a nominal slot but is laid out off the menu bar
+  # (measured at y=1280-1310 on a 1296pt screen), and the damage persists for that
+  # identifier across relaunches. Restarting the menu-bar services, deleting the
+  # saved NSStatusItem Preferred Position, and relaunching all fail -- the app
+  # re-poisons itself every start. Only a different identifier holds; the same fix
+  # was verified on Mouser. macOS 26.5.1 is unaffected, so this works around an OS
+  # bug rather than app behaviour.
+  #
+  # Scoped to the macOS bundle only: CMAKE_PROJECT_REV_FQDN also names the Linux
+  # .desktop/.metainfo files and drives QIcon::fromTheme lookups via kRevFqdnName,
+  # so changing it globally would break Linux packaging and icons.
+  set(BUNDLE_GUI_IDENTIFIER "io.github.hughesyadaddy.deskflow")
   set(BUNDLE_ICON_FILE ${target}.icns)
   set(BUNDLE_INFO_STRING "${CMAKE_PROJECT_DESCRIPTION}")
   set(BUNDLE_COPYRIGHT "${CMAKE_PROJECT_COPYRIGHT}")
