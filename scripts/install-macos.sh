@@ -90,6 +90,25 @@ restart_deskflow() {
   open "$INSTALL_APP" --args --show
 }
 
+restart_mouser() {
+  [[ "$RESTART" -eq 1 ]] || return 0
+  # Mouser bridges to deskflow-core over a local socket and holds per-process
+  # state for it. Replacing the bundle gives deskflow-core a new identity, and
+  # Mouser's auto-mode reconnect then churns against the stale session --
+  # observed dropping and reconnecting every 5-15s indefinitely, renegotiating
+  # focus each cycle and pulling the cursor between screens. Mouser does not
+  # recover on its own, so bounce it whenever Deskflow is reinstalled.
+  local mouser_app="/Applications/Mouser.app"
+  [[ -d "$mouser_app" ]] || return 0
+  pgrep -f "Mouser.app/Contents/MacOS/Mouser" >/dev/null 2>&1 || return 0
+  echo "== Restarting Mouser (clears stale deskflow bridge state) =="
+  osascript -e 'tell application "Mouser" to quit' 2>/dev/null || true
+  sleep 2
+  pkill -x Mouser 2>/dev/null || true
+  sleep 1
+  open "$mouser_app"
+}
+
 install_bundle() {
   echo "== Installing to $INSTALL_APP =="
   if [[ -e "$INSTALL_APP" ]]; then
@@ -155,4 +174,5 @@ quit_deskflow
 install_bundle
 copy_login_bridge_script
 restart_deskflow
+restart_mouser
 echo "== Done: $INSTALL_APP =="

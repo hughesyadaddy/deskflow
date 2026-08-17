@@ -346,6 +346,23 @@ function Ensure-DeskflowSigning {
   }
 }
 
+function Restart-Mouser {
+  # Mouser bridges to deskflow-core over a local socket and holds per-process
+  # state for it. Reinstalling gives deskflow-core a new identity, and Mouser's
+  # auto-mode reconnect then churns against the stale session -- observed on
+  # macOS dropping and reconnecting every 5-15s indefinitely, renegotiating
+  # focus each cycle and pulling the cursor between screens. Mouser does not
+  # recover on its own, so bounce it whenever Deskflow is reinstalled.
+  $proc = Get-Process -Name 'Mouser' -ErrorAction SilentlyContinue
+  if (-not $proc) { return }
+  $exe = $proc | Select-Object -First 1 -ExpandProperty Path -ErrorAction SilentlyContinue
+  if (-not $exe) { $exe = 'C:\Program Files\Mouser\Mouser.exe' }
+  Write-Host '== Restarting Mouser (clears stale deskflow bridge state) =='
+  $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 2
+  if (Test-Path $exe) { Start-Process -FilePath $exe | Out-Null }
+}
+
 function Assert-CanonicalRuntime {
   param([string]$InstallDir)
 
@@ -422,6 +439,7 @@ Start-DeskflowService
 
 if (-not $NoRestart) {
   Start-DeskflowGui -InstallRoot $InstallDir
+  Restart-Mouser
 }
 
 Assert-CanonicalRuntime -InstallDir $InstallDir
