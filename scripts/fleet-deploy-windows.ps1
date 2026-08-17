@@ -3,7 +3,7 @@
 param(
   [string]$DeskflowRoot = $env:FLEET_DESKFLOW_ROOT,
   [string]$MouserRoot = $env:FLEET_MOUSER_ROOT,
-  [string]$Branch = $(if ($env:FLEET_BRANCH) { $env:FLEET_BRANCH } else { 'refactor/fleet-state-hub' }),
+  [string]$Branch = $(if ($env:FLEET_BRANCH) { $env:FLEET_BRANCH } else { 'main' }),
   [int]$DeployDeskflow = $(if ($null -ne $env:FLEET_DEPLOY_DESKFLOW) { [int]$env:FLEET_DEPLOY_DESKFLOW } else { 1 }),
   [int]$DeployMouser = $(if ($null -ne $env:FLEET_DEPLOY_MOUSER) { [int]$env:FLEET_DEPLOY_MOUSER } else { 1 })
 )

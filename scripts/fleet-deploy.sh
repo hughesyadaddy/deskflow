@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fleet redeploy orchestrator — run from hackintosh.
-# Pulls refactor/fleet-state-hub on each machine and runs signed local build/install.
+# Pulls main on each machine and runs signed local build/install.
 #
 # Setup:
 #   cp scripts/fleet.env.example scripts/fleet.env
@@ -51,7 +51,7 @@ fi
 # shellcheck disable=SC1091
 source "$ENV_FILE"
 
-FLEET_BRANCH="${FLEET_BRANCH:-refactor/fleet-state-hub}"
+FLEET_BRANCH="${FLEET_BRANCH:-main}"
 FLEET_HOSTS="${FLEET_HOSTS:-hackintosh macbookpro tiny11}"
 LOCAL_ID="$(hostname -s | tr '[:upper:]' '[:lower:]')"
 

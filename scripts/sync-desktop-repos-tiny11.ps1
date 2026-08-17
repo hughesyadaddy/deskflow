@@ -19,7 +19,7 @@ if (-not (Test-Path $deskflow)) {
   throw "Missing canonical deskflow at $deskflow"
 }
 Set-Location $deskflow
-git pull --ff-only origin refactor/fleet-state-hub | Out-Host
+git pull --ff-only origin main | Out-Host
 Write-Host "deskflow: $(git log -1 --oneline)"
 
 if (-not (Test-Path $mouser)) {
