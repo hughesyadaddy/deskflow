@@ -904,11 +904,11 @@ Additionally, check you are able to %1 the server config file: %2</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>no coordination peers configured -- add the other computers first</source>
+        <source>bridge binary not found at %1</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>bridge binary not found at %1</source>
+        <source>no coordination peers configured — add the other computers first</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -1446,6 +1446,30 @@ Enabling this setting will disable the server config GUI.</source>
         <translation type="unfinished">Сбросить до значений по умолчанию</translation>
     </message>
     <message>
+        <source>Update login agent…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Reinstall login agent…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Install the login-window LaunchAgent (admin prompt). Takes effect after logout or restart.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Login agent is already installed and up to date. Log out or restart this Mac to use it at the login screen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not install the login-window bridge: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Login agent installed. Log out or restart this Mac, then control it from your elected server.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>Automatic</source>
         <translation>Автоматически</translation>
     </message>
@@ -1567,6 +1591,14 @@ Enabling this setting will disable the server config GUI.</source>
     </message>
     <message>
         <source>Refresh</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Install login agent…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save settings and install the login-window LaunchAgent (admin prompt). Takes effect after logout or restart.</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

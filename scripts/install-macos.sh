@@ -84,11 +84,10 @@ restart_deskflow() {
   # Brief pause: macOS may relaunch login-item apps after the bundle is replaced.
   sleep 2
   echo "== Launching $INSTALL_APP =="
-  # No --show: deploys restart the app silently to the tray instead of popping
-  # the settings window over whatever the user is doing.
+  # --show brings the window to the front and sets a regular menu-bar presence.
   # If an instance is already running, a second launch pings it via the GUI socket
   # and exits immediately (single-instance), so this is safe after reinstall.
-  open -g "$INSTALL_APP"
+  open "$INSTALL_APP" --args --show
 }
 
 install_bundle() {
@@ -103,22 +102,14 @@ install_bundle() {
     local stage
     stage="$(mktemp -d "${TMPDIR:-/tmp}/deskflow-install.XXXXXX")"
     echo "Using staged cmake --install (macdeployqt + bundle layout)"
-    if cmake --install "$BUILD_DIR" --prefix "$stage" && [[ -d "$stage/Deskflow.app" ]]; then
-      cp -R "$stage/Deskflow.app" "$INSTALL_APP"
+    cmake --install "$BUILD_DIR" --prefix "$stage"
+    if [[ ! -d "$stage/Deskflow.app" ]]; then
       rm -rf "$stage"
-    elif [[ -d "$SOURCE_APP" ]]; then
-      rm -rf "$stage"
-      echo "warning: cmake --install failed — using signed build tree at $SOURCE_APP" >&2
-      cp -R "$SOURCE_APP" "$INSTALL_APP"
-    else
-      rm -rf "$stage"
-      echo "error: staged install failed and no build tree at $SOURCE_APP" >&2
-      if [[ -d "${INSTALL_APP}.bak" ]]; then
-        mv "${INSTALL_APP}.bak" "$INSTALL_APP"
-        echo "restored previous install from ${INSTALL_APP}.bak" >&2
-      fi
+      echo "error: staged install did not produce Deskflow.app" >&2
       exit 1
     fi
+    cp -R "$stage/Deskflow.app" "$INSTALL_APP"
+    rm -rf "$stage"
   elif [[ -d "$SOURCE_APP" ]]; then
     echo "Using build tree copy from $SOURCE_APP"
     cp -R "$SOURCE_APP" "$INSTALL_APP"
@@ -150,7 +141,18 @@ install_bundle() {
   fi
 }
 
+copy_login_bridge_script() {
+  local script="$ROOT/scripts/install-login-bridge-macos.sh"
+  local dest="$INSTALL_APP/Contents/Resources/install-login-bridge-macos.sh"
+  if [[ -f "$script" ]]; then
+    mkdir -p "$INSTALL_APP/Contents/Resources"
+    install -m 755 "$script" "$dest"
+    echo "== Installed login bridge helper: $dest =="
+  fi
+}
+
 quit_deskflow
 install_bundle
+copy_login_bridge_script
 restart_deskflow
 echo "== Done: $INSTALL_APP =="

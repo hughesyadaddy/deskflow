@@ -928,6 +928,16 @@
             </item>
            </layout>
           </item>
+          <item>
+           <widget class="QPushButton" name="btnInstallLoginBridge">
+            <property name="text">
+             <string>Install login agent…</string>
+            </property>
+            <property name="toolTip">
+             <string>Save settings and install the login-window LaunchAgent (admin prompt). Takes effect after logout or restart.</string>
+            </property>
+           </widget>
+          </item>
          </layout>
         </widget>
        </item>

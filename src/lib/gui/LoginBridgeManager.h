@@ -48,6 +48,18 @@ public:
    */
   static bool apply(bool enabled, double scale, QString *error);
 
+  /// Absolute path to `install-login-bridge-macos.sh` when bundled or in a dev tree.
+  static QString installScriptPath();
+
+  /**
+   * @brief Run the install script (admin prompt inside the script).
+   * Persists settings to disk first so the script reads current peers/port/scale.
+   */
+  static bool runInstallScript(double scale, QString *error);
+
+  /// True when driver, bridge binary, and peers are present.
+  static bool canInstall(QString *reason = nullptr);
+
   /// True when the installed LaunchAgent plist matches current coordination/core settings.
   static bool installedAgentMatchesCurrentSettings(double scale);
 
