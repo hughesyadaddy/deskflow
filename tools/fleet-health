@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""fleet-health — verify signing, TCC, session and mesh health across the fleet.
+
+Usage:
+  tools/fleet-health [--host all|local|<id>]
+                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|all]
+                     [--json] [--env PATH]
+
+Reads scripts/fleet.env (same format as fleet-doctor / fleet-deploy.sh):
+  FLEET_HOSTS="hackintosh macbookpro tiny11"
+  FLEET_SSH_<id>=<ssh target|local>
+  FLEET_SSH_USER_<id>=<user>          (optional)
+  FLEET_OS_<id>=macos|windows         (optional; default: tiny11/win*/tiny* => windows)
+  FLEET_ADDR_<id>=<host/ip>           (optional; address peers use for the mesh check)
+  FLEET_DESKFLOW_PORT=24800           (optional)
+  FLEET_DESKFLOW_PATH_windows=C:/Users/alexh/Desktop/deskflow
+  DESKFLOW_SIGN_THUMBPRINT=<sha1>     (Windows Authenticode thumbprint)
+
+Environment overrides:
+  DESKFLOW_EXPECT_AUTHORITY  expected `Authority=` prefix (default "Apple Development")
+  DESKFLOW_EXPECT_TEAM       expected `TeamIdentifier=` (default: value on the main binary)
+
+Exit status is 0 only when every check on every host passes. stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+TOOLS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = TOOLS_DIR.parent
+DEFAULT_ENV_FILE = REPO_ROOT / "scripts" / "fleet.env"
+IDENTIFIERS_FILE = TOOLS_DIR / "fleet-health.identifiers"
+
+ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh")
+MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc"}
+WIN_ONLY = {"authenticode"}
+
+MAC_APPS = ("/Applications/Deskflow.app", "/Applications/Mouser.app")
+DESKFLOW_CORE = "/Applications/Deskflow.app/Contents/MacOS/deskflow-core"
+MOUSER_LABEL = "io.github.hughesyadaddy.mouser"
+DEFAULT_PORT = 24800
+DEFAULT_AUTHORITY = "Apple Development"
+WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
+
+PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+
+# --------------------------------------------------------------------------- env
+
+
+def parse_env_file(path: Path) -> Dict[str, str]:
+    """Parse a shell-style KEY=VALUE file (comments, export, quotes)."""
+    env: Dict[str, str] = {}
+    if not path.exists():
+        return env
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if value[:1] in ("'", '"') and value[-1:] == value[:1] and len(value) >= 2:
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].strip()
+        env[key] = value
+    return env
+
+
+def local_id() -> str:
+    return socket.gethostname().split(".")[0].lower()
+
+
+@dataclass
+class Host:
+    id: str
+    target: str  # ssh target or "local"
+    user: str
+    os: str  # "macos" | "windows"
+    addr: str  # address other seats use to reach this seat
+
+    @property
+    def is_local(self) -> bool:
+        return self.target == "local"
+
+
+def guess_os(host_id: str, env: Dict[str, str]) -> str:
+    explicit = env.get(f"FLEET_OS_{host_id}", "").lower()
+    if explicit in ("macos", "windows"):
+        return explicit
+    lowered = host_id.lower()
+    if lowered == "tiny11" or lowered.startswith(("win", "tiny")):
+        return "windows"
+    return "macos"
+
+
+def load_hosts(env: Dict[str, str], want: str, this_id: Optional[str] = None) -> List[Host]:
+    this_id = (this_id or local_id()).lower()
+    ids = env.get("FLEET_HOSTS", "").split()
+    if want == "local":
+        if this_id in [i.lower() for i in ids]:
+            ids = [i for i in ids if i.lower() == this_id]
+        else:
+            ids = [this_id]
+            env = dict(env, **{f"FLEET_SSH_{this_id}": "local"})
+    elif want != "all":
+        if want not in ids:
+            raise SystemExit(f"fleet-health: unknown host '{want}' (FLEET_HOSTS={ids})")
+    hosts: List[Host] = []
+    for hid in ids:
+        target = env.get(f"FLEET_SSH_{hid}", "") or hid
+        if hid.lower() == this_id:
+            target = "local"
+        os_name = guess_os(hid, env)
+        default_user = "alexh" if os_name == "windows" else os.environ.get("USER", "")
+        user = env.get(f"FLEET_SSH_USER_{hid}", "") or default_user
+        addr = env.get(f"FLEET_ADDR_{hid}", "") or (hid if target == "local" else target)
+        hosts.append(Host(hid, target, user, os_name, addr))
+    if want not in ("all", "local"):
+        hosts = [h for h in hosts if h.id == want]
+    return hosts
+
+
+# ------------------------------------------------------------------------ runner
+
+Runner = Callable[[Host, str], Tuple[int, str, str]]
+"""A runner executes `cmd` on `host` and returns (rc, stdout, stderr)."""
+
+
+def subprocess_runner(host: Host, cmd: str) -> Tuple[int, str, str]:
+    if host.is_local:
+        argv: Sequence[str] = ["sh", "-c", cmd] if host.os == "macos" else ["cmd.exe", "/c", cmd]
+    else:
+        argv = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            f"{host.user}@{host.target}" if host.user else host.target,
+            cmd,
+        ]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout running: {cmd}"
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+# ----------------------------------------------------------------------- results
+
+
+@dataclass
+class Result:
+    host: str
+    check: str
+    status: str
+    detail: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status != FAIL
+
+
+# --------------------------------------------------------------- command builders
+# Kept as functions so tests can key a fake runner on the exact command string.
+
+
+def macho_scan_cmd(apps: Sequence[str] = MAC_APPS) -> str:
+    """One remote round-trip: enumerate Mach-Os and dump codesign info per file."""
+    finds = []
+    for app in apps:
+        macos = f"{app}/Contents/MacOS"
+        frameworks = f"{app}/Contents/Frameworks"
+        finds.append(f"find {shlex.quote(macos)} -type f 2>/dev/null")
+        finds.append(
+            f"find {shlex.quote(frameworks)} -type f \\( -name '*.dylib' -o -perm -u+x \\) "
+            f"-not -path '*/Resources/*' -not -path '*/Headers/*' 2>/dev/null"
+        )
+    return (
+        "for f in $({ " + "; ".join(finds) + "; }); do "
+        'echo "=== $f"; codesign -dvv --verbose=4 "$f" 2>&1; '
+        'echo "--- verify"; codesign --verify --deep --strict "$f" 2>&1; echo "rc=$?"; '
+        "done"
+    )
+
+
+TCC_QUERY = (
+    "select service,client,auth_value,hex(csreq) from access "
+    "where client like '%deskflow%' or client like '%mouser%'"
+)
+
+
+USER_TCC_DB = '"$HOME/Library/Application Support/com.apple.TCC/TCC.db"'
+# Accessibility and ListenEvent (Input Monitoring) grants are stored in the
+# SYSTEM database, not the per-user one. Reading it needs Full Disk Access for
+# the calling process (sshd-remote / Terminal), same as the user database.
+SYSTEM_TCC_DB = '"/Library/Application Support/com.apple.TCC/TCC.db"'
+
+
+def tcc_query_cmd(db: str = SYSTEM_TCC_DB) -> str:
+    return f"sqlite3 -readonly {db} {shlex.quote(TCC_QUERY)}"
+
+
+def csreq_decode_cmd(hex_blob: str) -> str:
+    return f"printf '%s' {shlex.quote(hex_blob)} | xxd -r -p | csreq -r- -t"
+
+
+def check_permissions_cmd() -> str:
+    return f"{DESKFLOW_CORE} --check-permissions"
+
+
+def launchctl_cmd() -> str:
+    return 'launchctl print "gui/$(id -u)"'
+
+
+def deskflow_gui_running_cmd() -> str:
+    # The GUI executable is Contents/MacOS/Deskflow (capital D); deskflow-core is the daemon.
+    return "pgrep -f 'Deskflow.app/Contents/MacOS/Deskflow$'"
+
+
+def nc_cmd(addr: str, port: int) -> str:
+    return f"nc -z -w3 {shlex.quote(addr)} {port}"
+
+
+def ps1_cmd(root: str, checks: Sequence[str], thumbprint: str, port: int, peers: Sequence[str]) -> str:
+    script = root.rstrip("/") + "/tools/fleet-health.ps1"
+    parts = [
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File",
+        f'"{script}"',
+        "-Checks", ",".join(checks),
+        "-Port", str(port),
+    ]
+    if thumbprint:
+        parts += ["-Thumbprint", thumbprint]
+    if peers:
+        parts += ["-Peers", ",".join(peers)]
+    return " ".join(parts)
+
+
+# ------------------------------------------------------------------ mac parsing
+
+
+@dataclass
+class MachO:
+    path: str
+    authorities: List[str]
+    team: str
+    identifier: str
+    adhoc: bool
+    verify_rc: int
+    verify_out: str
+
+
+def parse_macho_scan(output: str) -> List[MachO]:
+    entries: List[MachO] = []
+    cur: Optional[dict] = None
+    in_verify = False
+    for line in output.splitlines():
+        if line.startswith("=== "):
+            if cur:
+                entries.append(_finish(cur))
+            cur = {"path": line[4:].strip(), "auth": [], "team": "", "id": "", "adhoc": False,
+                   "vrc": 1, "vout": []}
+            in_verify = False
+            continue
+        if cur is None:
+            continue
+        if line.strip() == "--- verify":
+            in_verify = True
+            continue
+        if in_verify:
+            m = re.match(r"rc=(\d+)", line.strip())
+            if m:
+                cur["vrc"] = int(m.group(1))
+            else:
+                cur["vout"].append(line)
+            continue
+        if line.startswith("Authority="):
+            cur["auth"].append(line[len("Authority="):].strip())
+        elif line.startswith("TeamIdentifier="):
+            cur["team"] = line[len("TeamIdentifier="):].strip()
+        elif line.startswith("Identifier="):
+            cur["id"] = line[len("Identifier="):].strip()
+        elif line.startswith("Signature=adhoc"):
+            cur["adhoc"] = True
+    if cur:
+        entries.append(_finish(cur))
+    return entries
+
+
+def _finish(c: dict) -> MachO:
+    return MachO(c["path"], c["auth"], c["team"], c["id"], c["adhoc"], c["vrc"],
+                 "\n".join(c["vout"]).strip())
+
+
+def load_identifier_allowlist(path: Path = IDENTIFIERS_FILE) -> List[str]:
+    if not path.exists():
+        return []
+    out = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def identifier_allowed(identifier: str, allowlist: Sequence[str]) -> bool:
+    return any(fnmatch.fnmatchcase(identifier, pat) for pat in allowlist)
+
+
+_VERSION_TAIL = re.compile(r"^(\.\d+)*$")
+
+
+def identifier_is_filename_derived(path: str, identifier: str) -> bool:
+    """True when `identifier` is codesign's default derivation from the file name.
+
+    codesign strips the extension and trailing version components, e.g.
+    libpcre2-16.0.dylib -> libpcre2-16, _ssl.cpython-313-darwin.so -> _ssl.cpython-313-darwin.
+    An LC_UUID-style suffix (libfoo-5555) never matches because the stem does not start with it.
+    """
+    if not identifier:
+        return False
+    stem = re.sub(r"\.(dylib|so|bundle)$", "", Path(path).name)
+    if not stem.startswith(identifier):
+        return False
+    return bool(_VERSION_TAIL.match(stem[len(identifier):]))
+
+
+def is_first_party(path: str) -> bool:
+    return "/Contents/MacOS/" in path
+
+
+# -------------------------------------------------------------------- checker
+
+
+class FleetHealth:
+    def __init__(self, hosts: List[Host], env: Dict[str, str], runner: Runner = subprocess_runner,
+                 allowlist: Optional[Sequence[str]] = None, osenv: Optional[Dict[str, str]] = None):
+        self.hosts = hosts
+        self.env = env
+        self.runner = runner
+        self.allowlist = list(allowlist) if allowlist is not None else load_identifier_allowlist()
+        self.osenv = osenv if osenv is not None else dict(os.environ)
+        self.port = int(env.get("FLEET_DESKFLOW_PORT") or DEFAULT_PORT)
+        self._scan_cache: Dict[str, Tuple[int, List[MachO], str]] = {}
+        self.results: List[Result] = []
+
+    # -- helpers
+    def _add(self, host: Host, check: str, status: str, detail: str) -> None:
+        self.results.append(Result(host.id, check, status, detail))
+
+    def _scan(self, host: Host) -> Tuple[int, List[MachO], str]:
+        if host.id not in self._scan_cache:
+            rc, out, err = self.runner(host, macho_scan_cmd())
+            self._scan_cache[host.id] = (rc, parse_macho_scan(out), (out + err).strip())
+        return self._scan_cache[host.id]
+
+    def _scan_or_fail(self, host: Host, check: str) -> Optional[List[MachO]]:
+        rc, entries, raw = self._scan(host)
+        if not entries:
+            tail = raw.splitlines()[-1] if raw else "no output"
+            self._add(host, check, FAIL, f"no Mach-Os found (rc={rc}): {tail}")
+            return None
+        return entries
+
+    # -- macOS checks
+    def check_sign(self, host: Host) -> None:
+        entries = self._scan_or_fail(host, "sign")
+        if entries is None:
+            return
+        expect_auth = self.osenv.get("DESKFLOW_EXPECT_AUTHORITY") or DEFAULT_AUTHORITY
+        expect_team = self.osenv.get("DESKFLOW_EXPECT_TEAM") or entries[0].team
+        problems = []
+        for e in entries:
+            name = Path(e.path).name
+            if not any(a.startswith(expect_auth) for a in e.authorities):
+                problems.append(f"{name}: no Authority={expect_auth}*")
+            if not e.team or e.team != expect_team:
+                problems.append(f"{name}: TeamIdentifier={e.team or 'not set'} != {expect_team or '?'}")
+            if e.verify_rc != 0:
+                problems.append(f"{name}: verify --deep --strict rc={e.verify_rc}")
+        if problems:
+            self._add(host, "sign", FAIL, "; ".join(problems))
+        else:
+            self._add(host, "sign", PASS,
+                      f"{len(entries)} Mach-Os signed by {expect_auth}* team {expect_team}")
+
+    def check_no_adhoc(self, host: Host) -> None:
+        entries = self._scan_or_fail(host, "no-adhoc")
+        if entries is None:
+            return
+        adhoc = [Path(e.path).name for e in entries if e.adhoc]
+        if adhoc:
+            self._add(host, "no-adhoc", FAIL, "Signature=adhoc: " + ", ".join(adhoc))
+        else:
+            self._add(host, "no-adhoc", PASS, f"{len(entries)} Mach-Os, none ad-hoc")
+
+    def check_identifiers(self, host: Host) -> None:
+        entries = self._scan_or_fail(host, "identifiers")
+        if entries is None:
+            return
+        if not self.allowlist:
+            self._add(host, "identifiers", FAIL, f"allowlist empty/missing: {IDENTIFIERS_FILE}")
+            return
+        # First-party binaries (Contents/MacOS/*) must be allowlisted exactly. Bundled
+        # third-party frameworks/plugins may instead carry codesign's stable
+        # filename-derived identifier; UUID-style suffixes fail either way.
+        bad = []
+        for e in entries:
+            if identifier_allowed(e.identifier, self.allowlist):
+                continue
+            if not is_first_party(e.path) and identifier_is_filename_derived(e.path, e.identifier):
+                continue
+            bad.append(f"{Path(e.path).name}={e.identifier or '?'}")
+        if bad:
+            self._add(host, "identifiers", FAIL, "not in allowlist: " + ", ".join(bad))
+        else:
+            self._add(host, "identifiers", PASS, f"{len(entries)} identifiers stable/allowlisted")
+
+    def check_tcc(self, host: Host) -> None:
+        rows: List[List[str]] = []
+        for label, db in (("system", SYSTEM_TCC_DB), ("user", USER_TCC_DB)):
+            rc, out, err = self.runner(host, tcc_query_cmd(db))
+            if rc != 0:
+                self._add(host, "tcc", FAIL,
+                          f"sqlite3 {label} TCC.db rc={rc}: {(err or out).strip()[:160]} "
+                          "(needs Full Disk Access for sshd-remote/Terminal)")
+                return
+            rows += [line.split("|") for line in out.splitlines() if line.strip()]
+        problems: List[str] = []
+        granted = {"kTCCServiceAccessibility": False, "kTCCServiceListenEvent": False}
+        for row in rows:
+            if len(row) < 4:
+                problems.append(f"unparseable row: {'|'.join(row)}")
+                continue
+            service, client, auth, hexblob = row[0], row[1], row[2], row[3]
+            if service in granted:
+                if auth == "2":
+                    if "deskflow" in client.lower():
+                        granted[service] = True
+                else:
+                    problems.append(f"{service} {client} auth_value={auth} (want 2)")
+            if not hexblob:
+                problems.append(f"{service} {client}: empty csreq")
+                continue
+            drc, dout, derr = self.runner(host, csreq_decode_cmd(hexblob))
+            req = dout.strip()
+            if drc != 0:
+                problems.append(f"{service} {client}: csreq decode rc={drc} {derr.strip()[:80]}")
+            elif "cdhash" in req:
+                problems.append(f"{service} {client}: csreq is cdhash-based")
+            elif "certificate leaf[subject.CN]" not in req:
+                problems.append(f"{service} {client}: csreq lacks certificate leaf[subject.CN]")
+        for service, ok in granted.items():
+            if not ok:
+                problems.append(f"{service}: no deskflow client with auth_value=2")
+        prc, pout, perr = self.runner(host, check_permissions_cmd())
+        ptext = (pout + perr).lower()
+        if prc != 0:
+            if prc == 127 or "unrecognized" in ptext or "unknown option" in ptext \
+                    or "invalid option" in ptext or "unknown argument" in ptext:
+                problems.append("deskflow-core lacks --check-permissions")
+            else:
+                problems.append(f"deskflow-core --check-permissions rc={prc}: {(pout + perr).strip()[:120]}")
+        if problems:
+            self._add(host, "tcc", FAIL, "; ".join(problems))
+        else:
+            self._add(host, "tcc", PASS,
+                      f"{len(rows)} rows cert-based; AX+ListenEvent granted; --check-permissions ok")
+
+    def check_session_mac(self, host: Host) -> None:
+        problems = []
+        rc, out, err = self.runner(host, launchctl_cmd())
+        if rc != 0:
+            problems.append(f"launchctl print gui/$UID rc={rc}")
+        elif MOUSER_LABEL not in out:
+            problems.append(f"{MOUSER_LABEL} not loaded in gui/$UID")
+        rc, out, err = self.runner(host, deskflow_gui_running_cmd())
+        if rc != 0 or not out.strip():
+            problems.append("Deskflow GUI not running")
+        if problems:
+            self._add(host, "session", FAIL, "; ".join(problems))
+        else:
+            self._add(host, "session", PASS, f"{MOUSER_LABEL} loaded; Deskflow GUI running")
+
+    def check_mesh_leg_mac(self, src: Host, dst: Host) -> None:
+        rc, out, err = self.runner(src, nc_cmd(dst.addr, self.port))
+        status = PASS if rc == 0 else FAIL
+        detail = f"{src.id} -> {dst.id} ({dst.addr}:{self.port}) " + ("ok" if rc == 0 else f"rc={rc}")
+        self._add(src, "mesh", status, detail)
+
+    # -- Windows checks (delegated to tools/fleet-health.ps1)
+    def run_windows(self, host: Host, checks: Sequence[str], peers: Sequence[Host]) -> None:
+        root = self.env.get("FLEET_DESKFLOW_PATH_windows") or WIN_DESKFLOW_ROOT
+        thumb = self.env.get("DESKFLOW_SIGN_THUMBPRINT", "")
+        peer_addrs = [p.addr for p in peers] if "mesh" in checks else []
+        cmd = ps1_cmd(root, checks, thumb, self.port, peer_addrs)
+        rc, out, err = self.runner(host, cmd)
+        payload = None
+        for candidate in (out.strip(), out.strip()[out.find("["):] if "[" in out else ""):
+            try:
+                payload = json.loads(candidate)
+                break
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(payload, list):
+            for c in checks:
+                self._add(host, c, FAIL, f"fleet-health.ps1 rc={rc}: {(err or out).strip()[:200] or 'no JSON'}")
+            return
+        seen = set()
+        for item in payload:
+            check = str(item.get("check", "?"))
+            status = str(item.get("status", FAIL)).upper()
+            if status not in (PASS, FAIL, SKIP):
+                status = FAIL
+            seen.add(check)
+            self._add(host, check, status, str(item.get("detail", "")))
+        for c in checks:
+            if c not in seen:
+                self._add(host, c, FAIL, "no result from fleet-health.ps1")
+
+    # -- driver
+    def run(self, checks: Sequence[str], explicit: bool) -> List[Result]:
+        for host in self.hosts:
+            peers = [h for h in self.hosts if h.id != host.id]
+            if host.os == "windows":
+                applicable = [c for c in checks if c not in MAC_ONLY]
+                if explicit:
+                    for c in checks:
+                        if c in MAC_ONLY:
+                            self._add(host, c, SKIP, "macOS-only check")
+                if applicable:
+                    if "mesh" in applicable and not peers:
+                        applicable = [c for c in applicable if c != "mesh"]
+                        self._add(host, "mesh", SKIP, "no peers")
+                    if applicable:
+                        self.run_windows(host, applicable, peers)
+                continue
+            for c in checks:
+                if c == "sign":
+                    self.check_sign(host)
+                elif c == "no-adhoc":
+                    self.check_no_adhoc(host)
+                elif c == "identifiers":
+                    self.check_identifiers(host)
+                elif c == "tcc":
+                    self.check_tcc(host)
+                elif c == "session":
+                    self.check_session_mac(host)
+                elif c == "mesh":
+                    if not peers:
+                        self._add(host, "mesh", SKIP, "no peers")
+                    for dst in peers:
+                        self.check_mesh_leg_mac(host, dst)
+                elif c in WIN_ONLY and explicit:
+                    self._add(host, c, SKIP, "Windows-only check")
+        return self.results
+
+
+# ------------------------------------------------------------------ output
+
+
+def format_table(results: Sequence[Result]) -> str:
+    rows = [("host", "check", "status", "detail")] + [
+        (r.host, r.check, r.status, r.detail) for r in results
+    ]
+    widths = [max(len(row[i]) for row in rows) for i in range(3)]
+    lines = []
+    for i, row in enumerate(rows):
+        lines.append(" | ".join([row[0].ljust(widths[0]), row[1].ljust(widths[1]),
+                                 row[2].ljust(widths[2]), row[3]]))
+        if i == 0:
+            lines.append("-+-".join(["-" * widths[0], "-" * widths[1], "-" * widths[2], "-" * 6]))
+    return "\n".join(lines)
+
+
+def main(argv: Optional[Sequence[str]] = None, runner: Runner = subprocess_runner) -> int:
+    ap = argparse.ArgumentParser(prog="fleet-health", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--host", default="all", help="all | local | <id> (default: all)")
+    ap.add_argument("--check", default="all", choices=ALL_CHECKS + ("all",))
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    ap.add_argument("--env", default=os.environ.get("FLEET_ENV", str(DEFAULT_ENV_FILE)),
+                    help="path to fleet.env")
+    args = ap.parse_args(argv)
+
+    env_path = Path(args.env).expanduser()
+    env = parse_env_file(env_path)
+    if not env and args.host != "local":
+        print(f"fleet-health: missing or empty {env_path} (copy scripts/fleet.env.example)", file=sys.stderr)
+        return 2
+    hosts = load_hosts(env, args.host)
+    if not hosts:
+        print("fleet-health: no hosts selected", file=sys.stderr)
+        return 2
+
+    explicit = args.check != "all"
+    checks = list(ALL_CHECKS) if not explicit else [args.check]
+    results = FleetHealth(hosts, env, runner=runner).run(checks, explicit)
+
+    ok = all(r.ok for r in results)
+    if args.json:
+        print(json.dumps({"ok": ok, "results": [asdict(r) for r in results]}, indent=2))
+    else:
+        print(format_table(results))
+        failed = sum(1 for r in results if not r.ok)
+        print(f"\n{'OK' if ok else 'FAIL'}: {len(results)} results, {failed} failed")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
