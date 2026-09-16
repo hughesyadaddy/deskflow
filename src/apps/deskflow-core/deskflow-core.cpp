@@ -7,6 +7,9 @@
  */
 
 #include "AutoModeRunner.h"
+#if SYSAPI_WIN32
+#include "deskflow/win32/AppUtilWindows.h"
+#endif
 #include "CoreArgParser.h"
 #include "PermissionCheck.h"
 
@@ -197,6 +200,9 @@ int main(int argc, char **argv)
     QObject::connect(ipcServer, &deskflow::core::ipc::IpcServer::stopProcessRequested, &app, [&runner] {
       runner.requestQuit();
     });
+#if SYSAPI_WIN32
+    AppUtilWindows::setProcessQuitHandler([&runner] { runner.requestQuit(); });
+#endif
     ipcServer->listen();
 
     QThread coreThread;

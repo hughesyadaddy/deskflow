@@ -224,6 +224,7 @@ public:
 
   //! Inject a fleet-relayed key event into the active screen (auto mode).
   void relayForwardedKey(const deskflow::coordination::RelayKeyEvent &event);
+  void releaseForwardedKeys();
 
   //@}
 

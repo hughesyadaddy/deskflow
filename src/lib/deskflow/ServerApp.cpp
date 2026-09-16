@@ -786,6 +786,11 @@ void ServerApp::registerKeyForwardHandler()
       EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget(),
       [this](const Event &event) { handleCoordinationKeyForward(event); }
   );
+  getEvents()->addHandler(EventTypes::CoordinationKeyClearAll, getEvents()->getSystemTarget(), [this](const Event &) {
+    if (m_server != nullptr) {
+      m_server->releaseForwardedKeys();
+    }
+  });
   m_keyForwardHandlerRegistered = true;
 }
 
@@ -795,6 +800,7 @@ void ServerApp::unregisterKeyForwardHandler()
     return;
   }
   getEvents()->removeHandler(EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget());
+  getEvents()->removeHandler(EventTypes::CoordinationKeyClearAll, getEvents()->getSystemTarget());
   m_keyForwardHandlerRegistered = false;
 }
 

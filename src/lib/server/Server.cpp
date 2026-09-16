@@ -2397,6 +2397,14 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
   m_active->keyRepeat(id, mask, count, button, lang);
 }
 
+void Server::releaseForwardedKeys()
+{
+  if (m_primaryClient != nullptr) {
+    LOG_INFO("coordination: peer lane failed; releasing relayed keys on the primary");
+    m_primaryClient->releaseForwardedKeys();
+  }
+}
+
 void Server::relayForwardedKey(const deskflow::coordination::RelayKeyEvent &event)
 {
   using deskflow::coordination::RelayKeyPhase;

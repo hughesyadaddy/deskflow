@@ -67,6 +67,7 @@ public:
   void fakeInputEnd();
 
   //! Inject a keyboard event relayed from a fleet peer onto the primary screen.
+  void releaseForwardedKeys();
   void injectForwardedKey(const deskflow::coordination::RelayKeyEvent &event);
 
   //@}

@@ -265,6 +265,9 @@ enum class EventTypes : uint32_t
   /// Fleet keyboard relay: a peer forwarded a key event to the server epoch.
   CoordinationKeyForward,
 
+  /// Fleet keyboard relay: the sender's lane failed; release every relayed key (no event data).
+  CoordinationKeyClearAll,
+
   /// Mesh v2: merged FleetState snapshot changed (no event data).
   CoordinationFleetStateChanged,
 

@@ -11,6 +11,7 @@
 #include "common/ExitCodes.h"
 #include "common/FleetCursor.h"
 #include "common/Settings.h"
+#include "base/Event.h"
 #include "coordination/Coordinator.h"
 #include "coordination/FleetState.h"
 #include "coordination/Peer.h"
@@ -140,6 +141,9 @@ void AutoModeRunner::epochLoop()
     return;
   }
   m_coordinator->setEventQueue(&m_events);
+  m_coordinator->setKeyClearAllHandler([this] {
+    m_events.addEvent(Event(EventTypes::CoordinationKeyClearAll, m_events.getSystemTarget()));
+  });
 
   {
     std::scoped_lock lock{m_gateMutex};

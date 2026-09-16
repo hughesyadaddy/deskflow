@@ -149,6 +149,14 @@ void PrimaryClient::keyDown(KeyID key, KeyModifierMask mask, KeyButton button, c
   (void)button;
 }
 
+void PrimaryClient::releaseForwardedKeys()
+{
+  fakeInputBegin();
+  m_screen->getPlatformScreen()->fakeAllKeysUp();
+  m_screen->getPlatformScreen()->sanitizeInjectedKeys();
+  fakeInputEnd();
+}
+
 void PrimaryClient::injectForwardedKey(const deskflow::coordination::RelayKeyEvent &event)
 {
   using deskflow::coordination::RelayKeyPhase;
