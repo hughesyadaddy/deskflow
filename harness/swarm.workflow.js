@@ -229,7 +229,7 @@ export function auditorPrompt(h, a) {
     '',
     'Hard rules from the swarm protocol:',
     `- Work only on branch ${branchFor(h.id)} created from ${a.baseBranch}; touch only the files listed above.`,
-    `- Reproduce BEFORE and AFTER on hackintosh via: ssh ${a.hackintoshSsh} 'git -C <repo> fetch && git checkout ${branchFor(h.id)} && harness/run-scenario.sh ${h.scenario} --iters 1000'`,
+    `- Reproduce BEFORE and AFTER on hackintosh via: ssh ${a.hackintoshSsh} 'git -C <repo> fetch && git checkout ${branchFor(h.id)} && harness/run-scenario.sh ${h.scenario} --seat hackintosh --iters 1000'`,
     '- No run id => hypothesis, not a finding. Set evidence.runId to "" in that case.',
     '- fixClass "mitigation" cannot close the hotspot; say so in notes.',
     'Return the finding via StructuredOutput.',

@@ -42,7 +42,7 @@ Workflow({ name: 'fleet-memory-swarm', args: {
   `pipeline(hotspots, auditor, adversary, pr)`:
   1. **Auditor** (`audit:<id>`) — branch `hotspot/<id>` from `baseBranch`,
      reproduce before/after on hackintosh with
-     `harness/run-scenario.sh <scenario> --iters 1000`, fix, test, push.
+     `harness/run-scenario.sh <scenario> --seat hackintosh --iters 1000`, fix, test, push.
      Returns the finding schema. No run id → hypothesis; the adversary is
      skipped.
   2. **Adversary** (`adversary:<id>`) — independent before/after rerun,

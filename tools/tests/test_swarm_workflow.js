@@ -155,7 +155,7 @@ test('prompts carry the hackintosh ssh reproduction command and the template pat
   const a = mod.resolveArgs({ repoPath: '/x/deskflow', ghRepo: 'hughesyadaddy/deskflow', registry })
   const p = mod.auditorPrompt(h, a)
   assert.match(p, /harness\/prompts\/auditor\.md/)
-  assert.match(p, new RegExp(`ssh hackintosh 'git -C <repo> fetch && git checkout hotspot/${h.id} && harness/run-scenario\\.sh ${h.scenario} --iters 1000'`))
+  assert.match(p, new RegExp(`ssh hackintosh 'git -C <repo> fetch && git checkout hotspot/${h.id} && harness/run-scenario\\.sh ${h.scenario} --seat hackintosh --iters 1000'`))
   const finding = { id: 'f', evidence: { runId: 'r1', deltaMB: 3 }, fixClass: 'root-cause' }
   const q = mod.adversaryPrompt(h, a, finding)
   assert.match(q, /harness\/prompts\/adversary\.md/)
