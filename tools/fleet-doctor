@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""fleet-doctor: precondition checks for every fleet seat.
+
+    tools/fleet-doctor [--host all|local|<id>]
+                       [--check env|repo|signing|session|toolchain|noise|all]
+                       [--fix] [--json]
+
+Reads scripts/fleet.env (KEY=VALUE, `~` expanded) for FLEET_HOSTS,
+FLEET_SSH_<id> (`local` or an ssh target), FLEET_SSH_USER_<id>, FLEET_BRANCH
+and FLEET_{DESKFLOW,MOUSER}_PATH_{macos,windows}. Every probe is a shell
+command run locally or over `ssh user@target '<cmd>'` (Windows targets get
+`powershell -NoProfile -Command "<cmd>"`).
+
+Exit codes: 0 all pass, 1 any check failed, 2 any host unreachable.
+No third-party dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+CHECKS = ("env", "repo", "signing", "session", "toolchain", "noise")
+PINNED_PYTHON = {"macbookpro": "3.13", "hackintosh": "3.14", "tiny11": "3.12"}
+WINDOWS_HOST_IDS = {"tiny11"}
+NOISE_HOST_IDS = {"hackintosh"}
+DEFAULT_WINDOWS_USER = "alexh"
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+RunResult = Tuple[int, str, str]
+Runner = Callable[["Host", str], RunResult]
+
+
+class HostUnreachable(Exception):
+    """Raised by a runner when the host cannot be reached."""
+
+
+@dataclass
+class Host:
+    id: str
+    target: str  # "local" or ssh target
+    user: str
+    os: str  # "macos" | "windows"
+    deskflow_path: str
+    mouser_path: str
+
+    @property
+    def is_local(self) -> bool:
+        return self.target == "local"
+
+    @property
+    def is_windows(self) -> bool:
+        return self.os == "windows"
+
+    @property
+    def ssh_dest(self) -> str:
+        return f"{self.user}@{self.target}" if self.user else self.target
+
+
+@dataclass
+class Result:
+    host: str
+    check: str
+    status: str  # pass | fail | skip | unreachable
+    detail: str = ""
+
+    def as_dict(self) -> Dict[str, str]:
+        return {"host": self.host, "check": self.check, "status": self.status, "detail": self.detail}
+
+
+@dataclass
+class Report:
+    results: List[Result] = field(default_factory=list)
+
+    def add(self, host: str, check: str, ok: bool, detail: str = "") -> None:
+        self.results.append(Result(host, check, "pass" if ok else "fail", detail))
+
+    def skip(self, host: str, check: str, detail: str) -> None:
+        self.results.append(Result(host, check, "skip", detail))
+
+    def unreachable(self, host: str, detail: str) -> None:
+        self.results.append(Result(host, "reach", "unreachable", detail))
+
+    @property
+    def exit_code(self) -> int:
+        statuses = {r.status for r in self.results}
+        if "unreachable" in statuses:
+            return 2
+        if "fail" in statuses:
+            return 1
+        return 0
+
+
+# --------------------------------------------------------------------------- config
+
+
+def parse_env_file(path: str) -> Dict[str, str]:
+    """Minimal KEY=VALUE parser: ignores comments/blank lines, strips quotes.
+
+    `~` is kept verbatim and expanded per host when commands are built (local:
+    expanduser, remote: $HOME) so a remote seat's home is never guessed locally.
+    """
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return parse_env_text(fh.read())
+
+
+def parse_env_text(text: str) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_hosts(cfg: Dict[str, str], local_user: str) -> List[Host]:
+    hosts: List[Host] = []
+    for hid in cfg.get("FLEET_HOSTS", "").split():
+        target = cfg.get(f"FLEET_SSH_{hid}", hid)
+        host_os = cfg.get(f"FLEET_OS_{hid}", "windows" if hid in WINDOWS_HOST_IDS else "macos")
+        default_user = DEFAULT_WINDOWS_USER if host_os == "windows" else local_user
+        user = cfg.get(f"FLEET_SSH_USER_{hid}", default_user)
+        suffix = "windows" if host_os == "windows" else "macos"
+        deskflow = cfg.get(f"FLEET_DESKFLOW_PATH_{suffix}", "~/Desktop/deskflow")
+        mouser = cfg.get(f"FLEET_MOUSER_PATH_{suffix}", "~/Desktop/Mouser")
+        hosts.append(Host(hid, target, user, host_os, deskflow, mouser))
+    return hosts
+
+
+def select_hosts(hosts: List[Host], selector: str) -> List[Host]:
+    if selector == "all":
+        return hosts
+    if selector == "local":
+        return [h for h in hosts if h.is_local]
+    return [h for h in hosts if h.id == selector]
+
+
+# --------------------------------------------------------------------------- runner
+
+
+def default_runner(host: Host, cmd: str) -> RunResult:
+    """Run `cmd` on `host`. Raises HostUnreachable on ssh transport failure."""
+    if host.is_local:
+        if host.is_windows:
+            argv: List[str] = ["powershell", "-NoProfile", "-Command", cmd]
+        else:
+            argv = ["/bin/sh", "-c", cmd]
+    else:
+        remote = f'powershell -NoProfile -Command "{cmd}"' if host.is_windows else cmd
+        argv = ["ssh", *SSH_OPTS, host.ssh_dest, remote]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError as exc:
+        raise HostUnreachable(f"{argv[0]} not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HostUnreachable(f"timed out: {cmd[:60]}") from exc
+    if not host.is_local and proc.returncode == 255:
+        raise HostUnreachable(proc.stderr.strip() or "ssh exit 255")
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+# --------------------------------------------------------------------------- probes
+
+
+def expand(host: Host, path: str) -> str:
+    """Expand a leading `~`: locally via expanduser, remotely as $HOME (unquoted)."""
+    if not path.startswith("~"):
+        return path
+    return os.path.expanduser(path) if host.is_local else "$HOME" + path[1:]
+
+
+def q(host: Host, path: str) -> str:
+    """Quote a path for the host's shell, expanding `~` per host."""
+    if host.is_windows:
+        return "'" + path.replace("'", "''") + "'"
+    path = expand(host, path)
+    if path.startswith("$HOME"):
+        return '"' + path + '"'
+    return "'" + path.replace("'", "'\"'\"'") + "'"
+
+
+def join(host: Host, base: str, *parts: str) -> str:
+    return "/".join([base.rstrip("/"), *parts])
+
+
+class Probe:
+    """OS-aware helpers that all checks go through."""
+
+    def __init__(self, host: Host, runner: Runner):
+        self.host = host
+        self.run = runner
+
+    def sh(self, cmd: str) -> RunResult:
+        return self.run(self.host, cmd)
+
+    def read_file(self, path: str) -> Optional[str]:
+        h = self.host
+        cmd = f"Get-Content -Raw -ErrorAction Stop {q(h, path)}" if h.is_windows else f"cat {q(h, path)}"
+        rc, out, _ = self.sh(cmd)
+        return out if rc == 0 else None
+
+    def glob(self, pattern: str) -> List[str]:
+        h = self.host
+        if h.is_windows:
+            cmd = f"Get-ChildItem -Path {q(h, pattern)} -ErrorAction SilentlyContinue | ForEach-Object FullName"
+        else:
+            cmd = f"ls -1d {expand(h, pattern)} 2>/dev/null"
+        rc, out, _ = self.sh(cmd)
+        return [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 or out.strip() else []
+
+    def is_dir(self, path: str) -> bool:
+        h = self.host
+        if h.is_windows:
+            rc, out, _ = self.sh(f"Test-Path -PathType Container {q(h, path)}")
+            return rc == 0 and out.strip().lower() == "true"
+        rc, _, _ = self.sh(f"test -d {q(h, path)}")
+        return rc == 0
+
+    def git(self, repo: str, args: str) -> Optional[str]:
+        rc, out, _ = self.sh(f"git -C {q(self.host, repo)} {args}")
+        return out.strip() if rc == 0 else None
+
+
+# --------------------------------------------------------------------------- checks
+
+
+def check_env(p: Probe, rep: Report) -> None:
+    h = p.host
+    dotenv = p.read_file(join(h, h.deskflow_path, ".env"))
+    key = "DESKFLOW_SIGN_THUMBPRINT" if h.is_windows else "DESKFLOW_CODESIGN_ID"
+    if dotenv is None:
+        rep.add(h.id, "env", False, ".env missing in deskflow repo")
+    elif not re.search(rf"^\s*{key}\s*=\s*\S+", dotenv, re.M):
+        rep.add(h.id, "env", False, f".env lacks {key}")
+    else:
+        rep.add(h.id, "env", True, f".env has {key}")
+
+    fleet_env = join(h, h.deskflow_path, "scripts", "fleet.env")
+    if p.read_file(fleet_env) is None:
+        rep.add(h.id, "env", False, "scripts/fleet.env missing")
+    else:
+        rep.add(h.id, "env", True, "scripts/fleet.env present")
+
+    leaky: List[str] = []
+    for f in p.glob(join(h, h.deskflow_path, "scripts", "fleet.env*")):
+        body = p.read_file(f) or ""
+        if "KEYCHAIN_PASSWORD" in body:
+            leaky.append(os.path.basename(f))
+    rep.add(h.id, "env", not leaky, "KEYCHAIN_PASSWORD in " + ", ".join(leaky) if leaky else "no KEYCHAIN_PASSWORD in fleet.env*")
+
+    baks = p.glob(join(h, h.deskflow_path, "scripts", "fleet.env.bak-*"))
+    rep.add(h.id, "env", not baks, "stale " + ", ".join(os.path.basename(b) for b in baks) if baks else "no fleet.env.bak-*")
+
+
+def check_repo(p: Probe, rep: Report, branch: str, heads: Dict[str, Dict[str, str]]) -> None:
+    h = p.host
+    for name, path in (("deskflow", h.deskflow_path), ("Mouser", h.mouser_path)):
+        porcelain = p.git(path, "status --porcelain")
+        if porcelain is None:
+            rep.add(h.id, "repo", False, f"{name}: not a git repo or missing at {path}")
+            continue
+        dirty = [line for line in porcelain.splitlines() if line.strip()]
+        rep.add(h.id, "repo", not dirty, f"{name}: dirty ({len(dirty)} paths)" if dirty else f"{name}: clean")
+
+        cur = p.git(path, "rev-parse --abbrev-ref HEAD") or "?"
+        rep.add(h.id, "repo", cur == branch, f"{name}: on {cur}" + ("" if cur == branch else f", expected {branch}"))
+
+        head = p.git(path, "rev-parse HEAD") or ""
+        heads.setdefault(name, {})[h.id] = head
+        if name == "Mouser":
+            remotes = (p.git(path, "remote") or "").split()
+            rep.add(h.id, "repo", "fork" in remotes, "Mouser: remote fork present" if "fork" in remotes else "Mouser: remote fork missing")
+
+
+def check_repo_fleet(rep: Report, heads: Dict[str, Dict[str, str]]) -> None:
+    for name, per_host in heads.items():
+        if len(per_host) < 2:
+            continue
+        distinct = {v for v in per_host.values() if v}
+        if len(distinct) <= 1:
+            rep.add("fleet", "repo", True, f"{name}: same HEAD on {', '.join(sorted(per_host))}")
+        else:
+            desc = ", ".join(f"{k}={v[:8] or '?'}" for k, v in sorted(per_host.items()))
+            rep.add("fleet", "repo", False, f"{name}: HEAD differs ({desc})")
+
+
+def check_signing(p: Probe, rep: Report) -> None:
+    h = p.host
+    dotenv = parse_env_text(p.read_file(join(h, h.deskflow_path, ".env")) or "")
+    if h.is_windows:
+        tp = dotenv.get("DESKFLOW_SIGN_THUMBPRINT", "")
+        if not tp:
+            rep.add(h.id, "signing", False, "DESKFLOW_SIGN_THUMBPRINT not set in .env")
+            return
+        rc, out, _ = p.sh(
+            "Get-ChildItem Cert:\\LocalMachine\\My | Where-Object { $_.Thumbprint -eq '"
+            + tp.upper() + "' } | ForEach-Object Thumbprint"
+        )
+        found = rc == 0 and tp.upper() in out.upper()
+        rep.add(h.id, "signing", found, f"cert {tp[:8]}… in Cert:\\LocalMachine\\My" if found else f"cert {tp[:8]}… not in Cert:\\LocalMachine\\My")
+        return
+
+    cache = p.read_file(join(h, h.deskflow_path, "build", "CMakeCache.txt"))
+    if cache is None:
+        rep.add(h.id, "signing", True, "no build/CMakeCache.txt (not configured)")
+    else:
+        adhoc = re.search(r"^APPLE_CODESIGN_DEV:STRING=-\s*$", cache, re.M) is not None
+        rep.add(h.id, "signing", not adhoc, "CMakeCache APPLE_CODESIGN_DEV=- (ad-hoc)" if adhoc else "CMakeCache APPLE_CODESIGN_DEV not ad-hoc")
+        lax = re.search(r"^FLEET_STRICT_SIGNING:BOOL=OFF\s*$", cache, re.M) is not None
+        rep.add(h.id, "signing", not lax, "CMakeCache FLEET_STRICT_SIGNING=OFF" if lax else "CMakeCache FLEET_STRICT_SIGNING not OFF")
+
+    ident = dotenv.get("DESKFLOW_CODESIGN_ID", "")
+    if not ident:
+        rep.add(h.id, "signing", False, "DESKFLOW_CODESIGN_ID not set in .env")
+        return
+    rc, out, _ = p.sh("security find-identity -v -p codesigning")
+    found = rc == 0 and ident in out
+    rep.add(h.id, "signing", found, f"identity {ident[:8]}… in keychain" if found else f"identity {ident[:8]}… not found by security find-identity")
+
+
+def check_session(p: Probe, rep: Report) -> None:
+    h = p.host
+    if h.is_windows:
+        rc, out, _ = p.sh("quser")
+        active = rc == 0 and any(
+            line.split()[0].lstrip(">").lower() == h.user.lower() and "active" in line.lower()
+            for line in out.splitlines()[1:] if line.strip()
+        )
+        rep.add(h.id, "session", active, f"quser: {h.user} Active" if active else f"quser: no Active session for {h.user}")
+        return
+    rc, out, _ = p.sh("stat -f %Su /dev/console")
+    console = out.strip() if rc == 0 else ""
+    rep.add(h.id, "session", console == h.user, f"console user {console or '?'}" + ("" if console == h.user else f", expected {h.user}"))
+    rc, _, err = p.sh("osascript -e 'tell application \"Terminal\" to count windows'")
+    rep.add(h.id, "session", rc == 0, "Terminal Automation granted" if rc == 0 else f"Terminal Automation probe failed: {err.strip()[:80] or 'rc ' + str(rc)}")
+
+
+def check_toolchain(p: Probe, rep: Report, pinned: Dict[str, str]) -> None:
+    h = p.host
+    want = pinned.get(h.id)
+    rc, out, err = p.sh("python --version" if h.is_windows else "python3 --version")
+    m = re.search(r"(\d+)\.(\d+)\.\d+", out + err) if rc == 0 else None
+    have = f"{m.group(1)}.{m.group(2)}" if m else None
+    if want is None:
+        rep.add(h.id, "toolchain", have is not None, f"python {have or 'missing'} (no pin for {h.id})")
+    else:
+        rep.add(h.id, "toolchain", have == want, f"python {have or 'missing'}" + ("" if have == want else f", pinned {want}"))
+
+    rc, out, _ = p.sh("cmake --version")
+    m = re.search(r"cmake version (\S+)", out)
+    rep.add(h.id, "toolchain", rc == 0 and m is not None, f"cmake {m.group(1)}" if m else "cmake missing")
+
+    dotenv = parse_env_text(p.read_file(join(h, h.deskflow_path, ".env")) or "")
+    qt = dotenv.get("QT_PREFIX", "")
+    if not qt:
+        rep.add(h.id, "toolchain", True, "QT_PREFIX not set in .env (skipped)")
+    else:
+        ok = p.is_dir(qt)
+        rep.add(h.id, "toolchain", ok, f"QT_PREFIX {qt}" + ("" if ok else " missing"))
+
+
+def check_noise(p: Probe, rep: Report, fix: bool) -> None:
+    h = p.host
+    if h.id not in NOISE_HOST_IDS:
+        rep.skip(h.id, "noise", "noise check applies to hackintosh only")
+        return
+    workers = _cursor_workers(p)
+    if workers and fix:
+        for label in workers:
+            p.sh(f'launchctl bootout "gui/$(id -u)/{label}"')
+        remaining = _cursor_workers(p)
+        fixed = [w for w in workers if w not in remaining]
+        rep.add(h.id, "noise", not remaining,
+                f"bootout {len(fixed)}/{len(workers)} cursor workers" + (f"; still loaded: {', '.join(remaining)}" if remaining else ""))
+    else:
+        rep.add(h.id, "noise", not workers, f"cursor workers loaded: {', '.join(workers)}" if workers else "no com.cursor.worker loaded")
+    rc, out, _ = p.sh("ps -A -o comm | grep -c vitest")
+    count = int(out.strip() or 0) if out.strip().isdigit() else (0 if rc == 1 else -1)
+    rep.add(h.id, "noise", count == 0, "no vitest processes" if count == 0 else f"{count if count >= 0 else '?'} vitest processes")
+
+
+def _cursor_workers(p: Probe) -> List[str]:
+    rc, out, _ = p.sh("launchctl list | grep com.cursor.worker")
+    if rc != 0:
+        return []
+    labels = []
+    for line in out.splitlines():
+        cols = line.split()
+        if cols:
+            labels.append(cols[-1])
+    return labels
+
+
+# --------------------------------------------------------------------------- driver
+
+
+def run_doctor(hosts: List[Host], checks: List[str], runner: Runner, fix: bool, branch: str,
+               pinned: Optional[Dict[str, str]] = None) -> Report:
+    rep = Report()
+    pinned = pinned or PINNED_PYTHON
+    heads: Dict[str, Dict[str, str]] = {}
+    for host in hosts:
+        p = Probe(host, runner)
+        try:
+            rc, out, err = p.sh("echo fleet-doctor-ok")
+            if rc != 0 or "fleet-doctor-ok" not in out:
+                raise HostUnreachable(err.strip() or f"probe rc {rc}")
+            if "env" in checks:
+                check_env(p, rep)
+            if "repo" in checks:
+                check_repo(p, rep, branch, heads)
+            if "signing" in checks:
+                check_signing(p, rep)
+            if "session" in checks:
+                check_session(p, rep)
+            if "toolchain" in checks:
+                check_toolchain(p, rep, pinned)
+            if "noise" in checks:
+                check_noise(p, rep, fix)
+        except HostUnreachable as exc:
+            rep.unreachable(host.id, str(exc)[:120])
+    if "repo" in checks:
+        check_repo_fleet(rep, heads)
+    return rep
+
+
+def format_table(rep: Report) -> str:
+    rows = [("host", "check", "status", "detail")] + [(r.host, r.check, r.status, r.detail) for r in rep.results]
+    widths = [max(len(row[i]) for row in rows) for i in range(3)]
+    lines = []
+    for i, row in enumerate(rows):
+        lines.append(" | ".join([row[0].ljust(widths[0]), row[1].ljust(widths[1]), row[2].ljust(widths[2]), row[3]]))
+        if i == 0:
+            lines.append("-+-".join(["-" * widths[0], "-" * widths[1], "-" * widths[2], "-" * 6]))
+    return "\n".join(lines)
+
+
+def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(prog="fleet-doctor", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", default="all", help="all | local | <id> (default: all)")
+    ap.add_argument("--check", default="all", help="env|repo|signing|session|toolchain|noise|all, comma-separable (default: all)")
+    ap.add_argument("--fix", action="store_true", help="bootout loaded com.cursor.worker.* (noise check only)")
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    ap.add_argument("--env", default=None, help=argparse.SUPPRESS)  # override scripts/fleet.env path
+    return ap.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None, runner: Optional[Runner] = None, env_path: Optional[str] = None,
+         local_user: Optional[str] = None, out=None) -> int:
+    args = parse_args(argv)
+    out = out or sys.stdout
+    env_path = args.env or env_path or os.path.join(repo_root(), "scripts", "fleet.env")
+    cfg = parse_env_file(env_path)
+    if not cfg.get("FLEET_HOSTS"):
+        print(f"fleet-doctor: no FLEET_HOSTS in {env_path}", file=sys.stderr)
+        return 2
+    checks = list(CHECKS) if args.check == "all" else [c for c in args.check.split(",") if c]
+    bad = [c for c in checks if c not in CHECKS]
+    if bad:
+        print(f"fleet-doctor: unknown check(s): {', '.join(bad)}", file=sys.stderr)
+        return 2
+    hosts = select_hosts(load_hosts(cfg, local_user or getpass.getuser()), args.host)
+    if not hosts:
+        print(f"fleet-doctor: no host matches --host {args.host}", file=sys.stderr)
+        return 2
+    rep = run_doctor(hosts, checks, runner or default_runner, args.fix, cfg.get("FLEET_BRANCH", "main"))
+    if args.json:
+        payload = {"hosts": [h.id for h in hosts], "checks": checks, "results": [r.as_dict() for r in rep.results], "exit_code": rep.exit_code}
+        print(json.dumps(payload, indent=2), file=out)
+    else:
+        print(format_table(rep), file=out)
+    return rep.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
