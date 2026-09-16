@@ -7,7 +7,9 @@
 
 #include "io/StreamBuffer.h"
 
+#include <algorithm>
 #include <assert.h>
+#include <iterator>
 
 //
 // StreamBuffer
@@ -25,19 +27,35 @@ const void *StreamBuffer::peek(uint32_t n)
     return nullptr;
   }
 
-  // reserve space in first chunk
   auto head = m_chunks.begin();
-  head->reserve(n + m_headUsed);
+
+  // fast path: the requested span already lies in the head chunk, so hand
+  // out a pointer without touching any memory.
+  if (static_cast<uint32_t>(head->size()) - m_headUsed >= n) {
+    return static_cast<const void *>(head->data() + m_headUsed);
+  }
+
+  // drop the consumed prefix before consolidating so the head does not
+  // carry dead bytes (and their capacity) across repeated consolidations.
+  if (m_headUsed > 0) {
+    head->erase(head->begin(), head->begin() + m_headUsed);
+    m_headUsed = 0;
+  }
+
+  // grow the head geometrically: a sequence of growing peeks (e.g. a
+  // reader probing for a full message) must not reallocate on every call.
+  if (head->capacity() < n) {
+    head->reserve(std::max<std::size_t>(n, head->capacity() * 2));
+  }
 
   // consolidate chunks into the first chunk until it has n bytes
-  ChunkList::iterator scan = head;
-  ++scan;
-  while (head->size() - m_headUsed < n && scan != m_chunks.end()) {
+  auto scan = std::next(head);
+  while (head->size() < n && scan != m_chunks.end()) {
     head->insert(head->end(), scan->begin(), scan->end());
     scan = m_chunks.erase(scan);
   }
 
-  return static_cast<const void *>(&(head->begin()[m_headUsed]));
+  return static_cast<const void *>(head->data());
 }
 
 void StreamBuffer::pop(uint32_t n)
@@ -67,6 +85,22 @@ void StreamBuffer::pop(uint32_t n)
   if (n > 0) {
     m_headUsed += n;
   }
+
+  // shrink policy: a head that was consolidated into a large chunk keeps
+  // its full capacity until it is popped.  Once the unread remainder fits
+  // in a normal chunk, move it into a fresh chunk and free the big one so
+  // a transient burst (e.g. a clipboard transfer) does not pin its peak.
+  Chunk &head = *scan;
+  if (head.capacity() > 2 * static_cast<std::size_t>(kChunkSize)) {
+    const auto remaining = static_cast<uint32_t>(head.size()) - m_headUsed;
+    if (remaining <= kChunkSize) {
+      Chunk compact;
+      compact.reserve(kChunkSize);
+      compact.assign(head.begin() + m_headUsed, head.end());
+      head.swap(compact);
+      m_headUsed = 0;
+    }
+  }
 }
 
 void StreamBuffer::write(const void *vdata, uint32_t n)
@@ -92,6 +126,7 @@ void StreamBuffer::write(const void *vdata, uint32_t n)
   }
   if (scan == m_chunks.end()) {
     scan = m_chunks.emplace(scan, Chunk());
+    scan->reserve(kChunkSize);
   }
 
   // append data in chunks
@@ -111,6 +146,7 @@ void StreamBuffer::write(const void *vdata, uint32_t n)
     if (n > 0) {
       ++scan;
       scan = m_chunks.emplace(scan, Chunk());
+      scan->reserve(kChunkSize);
     }
   }
 }
@@ -118,4 +154,31 @@ void StreamBuffer::write(const void *vdata, uint32_t n)
 uint32_t StreamBuffer::getSize() const
 {
   return m_size;
+}
+
+uint32_t StreamBuffer::getContiguousSize() const
+{
+  if (m_chunks.empty()) {
+    return 0;
+  }
+  return static_cast<uint32_t>(m_chunks.front().size()) - m_headUsed;
+}
+
+std::size_t StreamBuffer::getCapacity() const
+{
+  std::size_t total = 0;
+  for (const auto &chunk : m_chunks) {
+    total += chunk.capacity();
+  }
+  return total;
+}
+
+std::size_t StreamBuffer::getChunkCount() const
+{
+  return m_chunks.size();
+}
+
+uint32_t StreamBuffer::chunkSize()
+{
+  return kChunkSize;
 }

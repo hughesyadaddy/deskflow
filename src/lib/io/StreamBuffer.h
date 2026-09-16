@@ -29,13 +29,21 @@ public:
   Return a pointer to memory with the next \c n bytes in the buffer
   (which must be <= getSize()).  The caller must not modify the returned
   memory nor delete it.
+
+  If the requested span already lies inside the head chunk no bytes are
+  copied.  Otherwise the following chunks are consolidated into the head
+  chunk; the head's capacity is grown geometrically so that a sequence of
+  growing peeks does not reallocate on every call.
   */
   const void *peek(uint32_t n);
 
   //! Discard data
   /*!
   Discards the next \c n bytes.  If \c n >= getSize() then the buffer
-  is cleared.
+  is cleared.  Chunks that become fully consumed are freed, and a head
+  chunk that grew large through consolidation is compacted once the
+  remaining bytes fit in a normal chunk, so a transient burst does not
+  pin its peak allocation.
   */
   void pop(uint32_t n);
 
@@ -54,6 +62,26 @@ public:
   Returns the number of bytes in the buffer.
   */
   uint32_t getSize() const;
+
+  //! Get contiguous size
+  /*!
+  Returns the number of bytes that \c peek() can return without copying,
+  i.e. the unread bytes in the head chunk.
+  */
+  uint32_t getContiguousSize() const;
+
+  //! Get allocated capacity
+  /*!
+  Returns the sum of the capacities of all chunks, in bytes.  This is the
+  memory the buffer currently pins (excluding list node overhead).
+  */
+  std::size_t getCapacity() const;
+
+  //! Get chunk count
+  std::size_t getChunkCount() const;
+
+  //! Nominal chunk size in bytes
+  static uint32_t chunkSize();
 
   //@}
 

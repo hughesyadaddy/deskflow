@@ -19,6 +19,7 @@
 #include "net/TSocketMultiplexerMethodJob.h"
 #include <net/SslLogger.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -29,7 +30,6 @@
 //
 // SecureSocket
 //
-static const std::size_t s_maxInputBufferSize = 1024 * 1024;
 
 static const float s_retryDelay = 0.01f;
 
@@ -141,7 +141,7 @@ TCPSocket::JobResult SecureSocket::doRead()
     do {
       m_inputBuffer.write(buffer, bytesRead);
 
-      if (m_inputBuffer.getSize() > s_maxInputBufferSize) {
+      if (m_inputBuffer.getSize() > kMaxInputBufferSize) {
         break;
       }
 
@@ -174,26 +174,27 @@ TCPSocket::JobResult SecureSocket::doRead()
 TCPSocket::JobResult SecureSocket::doWrite()
 {
   using enum JobResult;
-  static bool s_retry = false;
-  static int s_retrySize = 0;
-  static int s_staticBufferSize = 0;
-  static void *s_staticBuffer = nullptr;
 
   // write data
   int bufferSize = 0;
   int bytesWrote = 0;
   int status = 0;
 
-  if (s_retry) {
-    bufferSize = s_retrySize;
+  if (m_writeRetry) {
+    // SSL_write must be retried with the same buffer and length (we do not
+    // set SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER), so reuse the staged copy.
+    bufferSize = m_writeRetrySize;
   } else {
-    bufferSize = m_outputBuffer.getSize();
+    // stage a bounded contiguous span.  The staging copy is per socket
+    // (the old shared static buffer was raced by every SecureSocket in the
+    // process and only ever grew) and capped at one pass, so a queued
+    // multi-MiB clipboard is never copied whole.
+    bufferSize = static_cast<int>(std::min(m_outputBuffer.getSize(), kMaxWritePassSize));
     if (bufferSize != 0) {
-      if (bufferSize > s_staticBufferSize) {
-        s_staticBuffer = realloc(s_staticBuffer, bufferSize);
-        s_staticBufferSize = bufferSize;
+      if (m_writeBuffer.size() < static_cast<std::size_t>(bufferSize)) {
+        m_writeBuffer.resize(bufferSize);
       }
-      memcpy(s_staticBuffer, m_outputBuffer.peek(bufferSize), bufferSize);
+      memcpy(m_writeBuffer.data(), m_outputBuffer.peek(bufferSize), bufferSize);
     }
   }
 
@@ -202,14 +203,14 @@ TCPSocket::JobResult SecureSocket::doWrite()
   }
 
   if (isSecureReady()) {
-    status = secureWrite(s_staticBuffer, bufferSize, bytesWrote);
+    status = secureWrite(m_writeBuffer.data(), bufferSize, bytesWrote);
     if (status > 0) {
-      s_retry = false;
+      m_writeRetry = false;
     } else if (status < 0) {
       return Break;
     } else if (status == 0) {
-      s_retry = true;
-      s_retrySize = bufferSize;
+      m_writeRetry = true;
+      m_writeRetrySize = bufferSize;
       return New;
     }
   } else {
@@ -218,6 +219,10 @@ TCPSocket::JobResult SecureSocket::doWrite()
 
   if (bytesWrote > 0) {
     discardWrittenData(bytesWrote);
+    if (m_outputBuffer.getSize() == 0) {
+      // drained: release the staging copy so a burst does not pin it
+      std::vector<uint8_t>().swap(m_writeBuffer);
+    }
     return New;
   }
 

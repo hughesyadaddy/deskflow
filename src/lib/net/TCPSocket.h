@@ -14,6 +14,8 @@
 #include "mt/Mutex.h"
 #include "net/IDataSocket.h"
 
+#include <atomic>
+
 class Mutex;
 class Thread;
 class ISocketMultiplexerJob;
@@ -59,6 +61,46 @@ public:
   void connect(const NetworkAddress &) override;
 
   virtual ISocketMultiplexerJob *newJob();
+
+  //! @name output buffer bound
+  //@{
+
+  //! Default cap on bytes queued for a peer that is not draining (8 MiB).
+  static constexpr uint32_t kDefaultMaxOutputBufferSize = 8 * 1024 * 1024;
+
+  //! Cap on bytes slurped from the wire ahead of the reader (1 MiB).
+  static constexpr uint32_t kMaxInputBufferSize = 1024 * 1024;
+
+  //! Bytes handed to a single writeSocket()/SSL_write() pass.
+  /*!
+  Bounds how much of the output buffer is consolidated into one contiguous
+  span per pass, so a large queued transfer is never copied whole.
+  */
+  static constexpr uint32_t kMaxWritePassSize = 64 * 1024;
+
+  //! Set the process-wide default output cap used by new sockets.
+  static void setDefaultMaxOutputBufferSize(uint32_t bytes);
+  static uint32_t defaultMaxOutputBufferSize();
+
+  //! Set this socket's output cap.
+  /*!
+  When a \c write() would push the queued output past the cap the socket
+  discards its queued output, shuts its output side and raises
+  \c StreamOutputError: the peer is not draining and buffering further only
+  grows without bound.  The stream is packet framed, so dropping individual
+  writes is not an option; the owner (ClientProxy / Client) treats the error
+  as a disconnect and the peer reconnects.
+  */
+  void setMaxOutputBufferSize(uint32_t bytes);
+  uint32_t maxOutputBufferSize() const;
+
+  //! Bytes currently queued for output.
+  uint32_t outputBufferSize() const;
+
+  //! True once a write was refused because the cap was exceeded.
+  bool outputOverflowed() const;
+
+  //@}
 
 protected:
   enum class JobResult
@@ -143,6 +185,9 @@ private:
   bool m_readable;
   bool m_writable;
   bool m_connected;
+  bool m_outputOverflowed = false;
+  uint32_t m_maxOutputBufferSize;
+  static std::atomic<uint32_t> s_defaultMaxOutputBufferSize;
   Mutex m_mutex;
   ArchSocket m_socket;
   IEventQueue *m_events;
