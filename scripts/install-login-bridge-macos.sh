@@ -14,17 +14,23 @@ AGENT_PLIST="/Library/LaunchAgents/${AGENT_LABEL}.plist"
 LEGACY_PLIST="/Library/LaunchAgents/com.kvm.autoswitch.loginwindow.plist"
 LOG_PATH="/var/log/deskflow-vhid-bridge.log"
 SCALE="${DESKFLOW_LOGIN_BRIDGE_SCALE:-}"
+SCALE_FIXED=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/install-login-bridge-macos.sh [--scale N] [--dry-run]
+Usage: scripts/install-login-bridge-macos.sh [--scale N] [--scale-fixed] [--dry-run]
 
 Installs /Library/LaunchAgents/org.deskflow.vhid-bridge.plist from Deskflow.conf.
 Requires Karabiner DriverKit VirtualHIDDevice and deskflow-vhid-bridge in the app bundle.
 
+By default the bridge is started with --calibrate: it measures its own
+counts-per-point at startup and corrects every move against the real cursor,
+so no --scale is passed. --scale N (or loginBridgeScale in config) is only a
+seed unless --scale-fixed is given, which disables calibration entirely.
+
 Environment:
   DESKFLOW_SETTINGS              Path to Deskflow.conf (default: ~/Library/Deskflow/Deskflow.conf)
-  DESKFLOW_LOGIN_BRIDGE_SCALE    Override loginBridgeScale from config
+  DESKFLOW_LOGIN_BRIDGE_SCALE    Seed scale (only authoritative with --scale-fixed)
 EOF
 }
 
@@ -32,6 +38,7 @@ dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --scale) SCALE="$2"; shift 2 ;;
+    --scale-fixed) SCALE_FIXED=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -67,7 +74,22 @@ peers_raw="$(read_ini coordination peers)"
 if [[ -z "$SCALE" ]]; then
   SCALE="$(read_ini coordination loginBridgeScale)"
 fi
-SCALE="${SCALE:-4}"
+# No default scale: the bridge self-calibrates. A configured scale is passed as
+# a seed; --scale-fixed makes it authoritative (legacy behaviour).
+scale_args=()
+if [[ -n "$SCALE" ]]; then
+  scale_args+=("<string>--scale=${SCALE}</string>")
+fi
+if [[ "$SCALE_FIXED" -eq 1 ]]; then
+  if [[ -z "$SCALE" ]]; then
+    echo "error: --scale-fixed requires --scale N (or loginBridgeScale in config)" >&2
+    exit 1
+  fi
+  scale_args+=("<string>--scale-fixed</string>")
+else
+  scale_args+=("<string>--calibrate</string>")
+fi
+scale_xml="$(printf '    %s\n' "${scale_args[@]}")"
 
 if [[ -z "$computer_name" ]]; then
   echo "error: core/computerName missing in $CONF" >&2
@@ -135,7 +157,7 @@ cat >"$staged" <<EOF
     <string>${hosts_csv}</string>
     <string>${computer_name}</string>
     <string>${port}</string>
-    <string>--scale=${SCALE}</string>
+${scale_xml}
   </array>
   <key>LimitLoadToSessionType</key><string>LoginWindow</string>
   <key>RunAtLoad</key><true/>
@@ -150,7 +172,11 @@ echo "== Login bridge agent =="
 echo "  Bridge:  $BRIDGE"
 echo "  Screen:  $computer_name"
 echo "  Port:    $port"
-echo "  Scale:   $SCALE"
+if [[ "$SCALE_FIXED" -eq 1 ]]; then
+  echo "  Scale:   $SCALE (fixed, no calibration)"
+else
+  echo "  Scale:   self-calibrating${SCALE:+ (seed $SCALE)}"
+fi
 echo "  Servers: $hosts_csv"
 echo "  Plist:   $AGENT_PLIST"
 echo
