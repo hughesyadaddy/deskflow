@@ -25,6 +25,13 @@
 #   HARNESS_MESH_TOKEN          coordination/token if not readable from Deskflow.conf
 #   HARNESS_PYTHON              python with pyobjc Quartz (default: first of
 #                               /usr/bin/python3, python3)
+#   HARNESS_EXE_<PROC>          executable sampled for <PROC> (upper-case, '-'
+#                               -> '_': HARNESS_EXE_MOUSER, HARNESS_EXE_DESKFLOW_CORE,
+#                               HARNESS_EXE_DESKFLOW); overrides the driver's
+#                               `# exe:` header and the built-in map
+#
+# --seat must name this host (`hostname -s` / FLEET_HOSTNAME); a row can only
+# be sampled where its process runs. --print-proc and --smoke are exempt.
 #
 # Drivers are sourced and must define scenario_setup, scenario_iter <n>,
 # scenario_teardown. They may use the harness_* helpers defined below.
@@ -85,11 +92,20 @@ PROC="$(header_field proc)"
 AUTOMATION="$(header_field automation)"
 ROW_SEAT="$(header_field seat)"
 DESCRIPTION="$(header_field description)"
+ROW_EXE="$(header_field exe)"
 
+# proc -> executable sampled by fleet-soak (needs --exe). Precedence:
+# HARNESS_EXE_<PROC> env > `# exe:` driver header > built-in map.
 case "$PROC" in
-  mouser|deskflow-core|deskflow) ;;
+  mouser)        EXE="/Applications/Mouser.app/Contents/MacOS/Mouser" ;;
+  deskflow-core) EXE="/Applications/Deskflow.app/Contents/MacOS/deskflow-core" ;;
+  deskflow)      EXE="/Applications/Deskflow.app/Contents/MacOS/Deskflow" ;;
   *) die "$DRIVER: '# proc:' must be mouser|deskflow-core|deskflow (got '$PROC')" ;;
 esac
+[ -z "$ROW_EXE" ] || EXE="$ROW_EXE"
+EXE_VAR="HARNESS_EXE_$(echo "$PROC" | tr 'a-z-' 'A-Z_')"
+[ -z "${!EXE_VAR:-}" ] || EXE="${!EXE_VAR}"
+case "$EXE" in /*) ;; *) die "exe for $PROC must be an absolute path (got '$EXE')" ;; esac
 case "$AUTOMATION" in
   full|partial|manual) ;;
   *) die "$DRIVER: '# automation:' must be full|partial|manual (got '$AUTOMATION')" ;;
@@ -109,6 +125,13 @@ mkdir -p "$(dirname "$OUT")"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="$ROW-$TS"
 HOST="${FLEET_HOSTNAME:-$(hostname -s)}"
+
+# A row is sampled on the seat whose process it measures: refuse to run for
+# another seat from here (the sampler would read this host's processes and
+# label them as the seat's). --smoke only exercises the driver, so it is exempt.
+if [ "$SMOKE" != 1 ] && [ "$SEAT" != "$HOST" ]; then
+  die "--seat $SEAT does not match this host ($HOST); run the row on $SEAT (or --smoke)"
+fi
 
 # ----------------------------------------------------- manual refusal -------
 if [ "$AUTOMATION" = manual ] && [ "${FLEET_OPERATOR:-0}" != 1 ]; then
@@ -137,9 +160,17 @@ take_lock() {
     flock 9
   else
     # macOS ships no flock(1): mkdir is atomic, so spin on a lock directory.
+    # A crashed owner leaves the directory behind: the owner file records its
+    # pid, and a lock whose pid is gone is reclaimed instead of waited on.
     LOCK_DIR="$LOCK_FILE.d"
-    local waited=0
+    local waited=0 owner_pid
     until mkdir "$LOCK_DIR" 2>/dev/null; do
+      owner_pid="$(awk 'NR==1{print $1}' "$LOCK_DIR/owner" 2>/dev/null || true)"
+      if [ -n "$owner_pid" ] && ! kill -0 "$owner_pid" 2>/dev/null; then
+        echo "run-scenario: reclaiming stale lock $LOCK_DIR (owner pid $owner_pid is gone)"
+        rm -rf "$LOCK_DIR"
+        continue
+      fi
       if [ "$waited" = 0 ]; then echo "run-scenario: waiting for $LOCK_DIR"; fi
       sleep 1
       waited=$((waited + 1))
@@ -148,8 +179,9 @@ take_lock() {
   fi
 }
 
+# --seat == host is already enforced above, so the seat alone decides.
 ON_HACKINTOSH=0
-if [ "$SEAT" = hackintosh ] && [ "$HOST" = hackintosh ]; then
+if [ "$SEAT" = hackintosh ]; then
   ON_HACKINTOSH=1
 fi
 
@@ -167,7 +199,7 @@ baseline_gate() {
 
 # ------------------------------------------------------- driver helpers -----
 LOG_DIR="$RUNS_DIR/logs/$PROC"
-LOG_FILE="$LOG_DIR/$ROW-$TS.log"
+LOG_FILE="$LOG_DIR/$RUN_ID.log"
 mkdir -p "$LOG_DIR"
 
 harness_log() {
@@ -311,23 +343,27 @@ harness_sleep() {
 }
 
 export HARNESS_SMOKE="$SMOKE"
-export HARNESS_ROW="$ROW" HARNESS_PROC="$PROC" HARNESS_SEAT="$SEAT" HARNESS_RUN_ID="$RUN_ID"
+export HARNESS_ROW="$ROW" HARNESS_PROC="$PROC" HARNESS_EXE="$EXE" HARNESS_SEAT="$SEAT" HARNESS_RUN_ID="$RUN_ID"
 export HARNESS_LOG_FILE="$LOG_FILE" HARNESS_OUT="$OUT" HARNESS_ITERS="$ITERS"
 
 # ------------------------------------------------------------- sampler ------
 sample_once() {
-  # sample_once <phase> -> JSON line (also appended to $OUT by fleet-soak)
-  "$FLEET_SOAK" sample --once --label "$PROC" --out "$OUT" 2>>"$LOG_FILE" || {
-    harness_log "fleet-soak sample --once failed ($1)"
+  # sample_once <phase> -> the sample JSON line fleet-soak appended to $OUT.
+  # fleet-soak prints nothing without --verbose, so the record is read back
+  # from the out file rather than captured from stdout.
+  if ! "$FLEET_SOAK" sample --once --label "$PROC" --exe "$EXE" --out "$OUT" >/dev/null 2>>"$LOG_FILE"; then
+    harness_log "fleet-soak sample --once failed ($1)" >&2   # stdout is the captured record
     echo "{}"
-  }
+    return 0
+  fi
+  tail -n1 "$OUT" 2>/dev/null || echo "{}"
 }
 
 SAMPLER_PID=""
 start_sampler() {
   (
     while sleep "$SAMPLE_INTERVAL"; do
-      "$FLEET_SOAK" sample --once --label "$PROC" --out "$OUT" >/dev/null 2>>"$LOG_FILE" || true
+      "$FLEET_SOAK" sample --once --label "$PROC" --exe "$EXE" --out "$OUT" >/dev/null 2>>"$LOG_FILE" || true
     done
   ) &
   SAMPLER_PID=$!
@@ -341,19 +377,23 @@ stop_sampler() {
 }
 
 metric_of() {
-  # metric_of <json> <phys_footprint|ports> -> number or empty
+  # metric_of <json> <footprint|ports> -> number or empty. fleet-soak writes
+  # the footprint already in MB (phys_footprint_mb on macOS, private_bytes_mb
+  # on Windows) and ports as mach_ports / handles.
   HARNESS_JSON="$1" harness_python - "$2" <<'PY'
 import json, os, sys
 key = sys.argv[1]
 aliases = {
-    "phys_footprint": ("phys_footprint", "private_bytes", "value", "metric_value"),
-    "ports": ("ports", "mach_ports", "handles", "handle_count"),
+    "footprint": ("phys_footprint_mb", "private_bytes_mb"),
+    "ports": ("mach_ports", "handles"),
 }
 try:
     lines = (os.environ.get("HARNESS_JSON") or "").strip().splitlines()
     obj = json.loads(lines[-1]) if lines else {}
+    if obj.get("header"):
+        obj = {}
     for k in aliases[key]:
-        if k in obj and isinstance(obj[k], (int, float)):
+        if isinstance(obj.get(k), (int, float)) and not isinstance(obj.get(k), bool):
             print(obj[k]); break
 except Exception:  # noqa: BLE001
     pass
@@ -361,9 +401,9 @@ PY
 }
 
 delta_mb() {
-  # delta_mb <before-bytes> <after-bytes> -> "+x.xx" MB or n/a
+  # delta_mb <before-MB> <after-MB> -> "+x.xx" (MB) or n/a
   if [ -z "$1" ] || [ -z "$2" ]; then echo n/a; return; fi
-  harness_python -c 'import sys; a,b=float(sys.argv[1]),float(sys.argv[2]); print(f"{(b-a)/1048576:+.2f}")' "$1" "$2"
+  harness_python -c 'import sys; a,b=float(sys.argv[1]),float(sys.argv[2]); print(f"{b-a:+.2f}")' "$1" "$2"
 }
 delta_int() {
   if [ -z "$1" ] || [ -z "$2" ]; then echo n/a; return; fi
@@ -406,7 +446,7 @@ printf '{"header":true,"row":"%s","proc":"%s","seat":"%s","host":"%s","automatio
   "$ROW" "$PROC" "$SEAT" "$HOST" "$AUTOMATION" "$RUN_ID" "$ITERS" \
   "$([ "$SMOKE" = 1 ] && echo true || echo false)" "${DESCRIPTION//\"/\\\"}" >>"$OUT"
 
-harness_log "run-id: $RUN_ID proc=$PROC seat=$SEAT iters=$ITERS smoke=$SMOKE"
+harness_log "run $RUN_ID proc=$PROC exe=$EXE seat=$SEAT host=$HOST iters=$ITERS smoke=$SMOKE"
 harness_log "log: $LOG_FILE"
 harness_log "out: $OUT"
 
@@ -435,8 +475,8 @@ scenario_teardown || { harness_log "scenario_teardown failed"; FAILED=1; }
 stop_sampler
 AFTER="$(sample_once after)"
 
-B_FOOT="$(metric_of "$BEFORE" phys_footprint)"
-A_FOOT="$(metric_of "$AFTER" phys_footprint)"
+B_FOOT="$(metric_of "$BEFORE" footprint)"
+A_FOOT="$(metric_of "$AFTER" footprint)"
 B_PORTS="$(metric_of "$BEFORE" ports)"
 A_PORTS="$(metric_of "$AFTER" ports)"
 DELTA_MB="$(delta_mb "$B_FOOT" "$A_FOOT")"
@@ -444,9 +484,11 @@ DELTA_PORTS="$(delta_int "$B_PORTS" "$A_PORTS")"
 
 harness_log "Δ phys_footprint: $DELTA_MB MB (before=${B_FOOT:-n/a} after=${A_FOOT:-n/a})"
 harness_log "Δ ports: $DELTA_PORTS (before=${B_PORTS:-n/a} after=${A_PORTS:-n/a})"
-echo "run-id: $RUN_ID"
-echo "deltaMB: $DELTA_MB"
-echo "deltaPorts: $DELTA_PORTS"
+# The same three lines go to the run log ($LOG_DIR/$RUN_ID.log) so that
+# harness/check-pr.sh can verify a PR's run-id:/deltaMB: against the record.
+for line in "run-id: $RUN_ID" "deltaMB: $DELTA_MB" "deltaPorts: $DELTA_PORTS"; do
+  echo "$line" | tee -a "$LOG_FILE"
+done
 
 if [ "$FAILED" != 0 ]; then
   harness_log "result: FAIL"

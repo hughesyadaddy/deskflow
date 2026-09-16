@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# proc: deskflow-core
+# proc: mouser
 # automation: partial
 # seat: hackintosh
 # description: with no physical mouse on this seat, hand the server role to a peer over the mesh, reconnect as client, then take it back
@@ -8,6 +8,10 @@
 # "mouse absent" precondition -- receiver unplugged / mouse asleep -- has no
 # userland command, so the driver records it as a TODO and expects the
 # operator to run it with the mouse detached. Sourced by harness/run-scenario.sh.
+#
+# `# proc: mouser`: the hotspot this row serves (M2, reconnect loop) is a
+# Mouser leak. The driver drives the Deskflow mesh only to move the mouse away
+# and back; the process sampled before/after is Mouser.
 
 MAR_PEER_HOST=""
 MAR_PEER_NAME=""

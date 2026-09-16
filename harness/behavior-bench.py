@@ -26,7 +26,9 @@ lazily and only for the `bench` and `listener` subcommands that touch the real
 event system; everything else (statistics, baseline write/compare, matching)
 is pure python so it can be unit-tested without injecting input.
 
-Exit codes: 0 pass, 1 regression, 2 invalid (no baseline, no Quartz, bad args).
+Exit codes: 0 pass, 1 regression, 2 invalid (no baseline, no Quartz, bad args),
+3 refused: --baseline would overwrite an existing harness/baselines/behavior-<seat>.json
+(set FLEET_OPERATOR=1 to re-baseline on purpose).
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ DEFAULT_BASELINE_DIR = HERE / "baselines"
 EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_INVALID = 2
+EXIT_REFUSED = 3
 
 
 # --------------------------------------------------------------------------
@@ -500,8 +503,31 @@ def build_parser():
     return p
 
 
+def refuse_baseline_overwrite(args):
+    """--baseline must not silently replace a seat's baseline.
+
+    A baseline is the reference every later comparison is judged against; an
+    accidental re-run with --baseline would launder a regression into the new
+    normal. Refuse (exit 3) when behavior-<seat>.json already exists unless
+    the operator says FLEET_OPERATOR=1.
+    """
+    if not getattr(args, "baseline", False):
+        return None
+    if os.environ.get("FLEET_OPERATOR") == "1":
+        return None
+    path = baseline_path(args.seat, getattr(args, "baseline_dir", None))
+    if path.exists():
+        print(f"behavior-bench: refusing --baseline: {path} exists; "
+              f"set FLEET_OPERATOR=1 to overwrite the {args.seat} baseline", file=sys.stderr)
+        return EXIT_REFUSED
+    return None
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    refused = refuse_baseline_overwrite(args)
+    if refused is not None:
+        return refused
     return args.fn(args)
 
 

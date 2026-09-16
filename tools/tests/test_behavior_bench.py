@@ -238,6 +238,44 @@ def test_bench_sh_baseline_then_compare_all(tmp_path):
     assert "FAIL" in r.stdout and "PASS" in r.stdout
 
 
+def test_bench_sh_baseline_refuses_to_overwrite_unless_operator(tmp_path, monkeypatch):
+    bdir = tmp_path / "baselines"
+    steady = [5.0] * 200
+    runs = _write_runs(tmp_path, "runs.json", _runs(steady, steady, steady))
+    env = {"FLEET_OPERATOR": ""}
+    r = _bench("--evaluate", str(runs), "--proc", "mouser", "--seat", "hackintosh", "--baseline",
+               "--baseline-dir", str(bdir), env=env)
+    assert r.returncode == 0, r.stderr
+    path = bdir / "behavior-hackintosh.json"
+    before = path.read_text()
+
+    slow = [50.0] * 200
+    runs2 = _write_runs(tmp_path, "runs2.json", _runs(slow, slow, slow))
+    r = _bench("--evaluate", str(runs2), "--proc", "mouser", "--seat", "hackintosh", "--baseline",
+               "--baseline-dir", str(bdir), env=env)
+    assert r.returncode == 3
+    assert "refusing --baseline" in r.stderr and "FLEET_OPERATOR=1" in r.stderr
+    assert path.read_text() == before          # untouched
+    # another seat's baseline is a different file: not refused
+    r = _bench("--evaluate", str(runs2), "--proc", "mouser", "--seat", "macbookpro", "--baseline",
+               "--baseline-dir", str(bdir), env=env)
+    assert r.returncode == 0, r.stderr
+    # --all on an existing file is refused once, up front (not after the first proc wrote)
+    r = _bench("--evaluate", str(runs2), "--all", "--seat", "hackintosh", "--baseline",
+               "--baseline-dir", str(bdir), env=env)
+    assert r.returncode == 3
+    assert path.read_text() == before
+    # the operator may re-baseline
+    r = _bench("--evaluate", str(runs2), "--proc", "mouser", "--seat", "hackintosh", "--baseline",
+               "--baseline-dir", str(bdir), env={"FLEET_OPERATOR": "1"})
+    assert r.returncode == 0, r.stderr
+    assert json.loads(path.read_text())["mouser"]["p50_ms"] == 50.0
+    # comparing (no --baseline) never needs the operator flag
+    r = _bench("--evaluate", str(runs2), "--proc", "mouser", "--seat", "hackintosh",
+               "--baseline-dir", str(bdir), env=env)
+    assert r.returncode == 0, r.stderr
+
+
 def test_bench_sh_no_baseline_exits_2(tmp_path):
     runs = _write_runs(tmp_path, "runs.json", _runs([1.0], [1.0]))
     r = _bench("--evaluate", str(runs), "--proc", "mouser", "--seat", "ghost",

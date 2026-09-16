@@ -25,7 +25,7 @@ branch and exactly the files listed below. Nothing else.
    `run_id` in the JSONL header of `harness/runs/{{scenario}}.jsonl`):
 
    ```
-   ssh {{hackintoshSsh}} 'git -C <repo> fetch && git checkout {{branch}} && harness/run-scenario.sh {{scenario}} --iters 1000'
+   ssh {{hackintoshSsh}} 'git -C <repo> fetch && git checkout {{branch}} && harness/run-scenario.sh {{scenario}} --seat hackintosh --iters 1000'
    ```
 
    `<repo>` is the checkout of `{{ghRepo}}` on the seat (same basename as

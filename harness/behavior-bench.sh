@@ -14,7 +14,8 @@
 # 5 runs x 200, first run dropped. --baseline writes
 # harness/baselines/behavior-<seat>.json (merged per proc); otherwise compares:
 # pass = p50 and p95 within +/-10 % of baseline AND delivered == sent.
-# Exit: 0 pass, 1 regression, 2 invalid (no baseline / no Quartz / bad args).
+# Exit: 0 pass, 1 regression, 2 invalid (no baseline / no Quartz / bad args),
+# 3 refused (--baseline would overwrite an existing baseline; FLEET_OPERATOR=1).
 #
 # All logic lives in behavior-bench.py (python3 stdlib; Quartz via PyObjC only
 # for live measurement). This wrapper only routes arguments.

@@ -4,11 +4,16 @@
   fleet-soak sampler: one sample per process every 60 s.
 
   Install (edit __REPO__ to the checkout path on this seat, e.g.
-  /Users/alexhughes/Desktop/deskflow):
+  /Users/alexhughes/Desktop/deskflow, and __HOME__ to $HOME; launchd does not
+  expand ~):
 
-    sed "s#__REPO__#$PWD#g" tools/launchd/com.fleet.soak.plist \
+    sed -e "s#__REPO__#$PWD#g" -e "s#__HOME__#$HOME#g" tools/launchd/com.fleet.soak.plist \
       > ~/Library/LaunchAgents/com.fleet.soak.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet.soak.plist
+
+  stdout/stderr go to ~/Library/Logs/fleet-soak.log (not /tmp: that is purged
+  on reboot and by the periodic cleaner, which is exactly when a soak's
+  sampler errors matter).
 
   Uninstall:
 
@@ -20,7 +25,12 @@
   appending to latest so a multi-day soak stays in one file per process).
   The label for deskflow-core is a plain name (it is a child of the GUI app,
   not a launchd job), so its restart_count is null and restarts are detected
-  from (exe, pid, start_time) tuple changes.
+  from (exe, pid, start_time) tuple changes; the JSONL header's
+  `restart_source` records this. The GUI app's launchd label is dynamic
+  (application.io.github.hughesyadaddy.deskflow.<n>.<m>), so fleet-soak falls
+  back to matching gui/$UID jobs by `program = <exe>`. The exe is the real
+  binary name `Deskflow` (capital D); ps matching is case-insensitive either
+  way.
 -->
 <plist version="1.0">
 <dict>
@@ -48,7 +58,7 @@
     <string>--label</string>
     <string>io.github.hughesyadaddy.deskflow</string>
     <string>--exe</string>
-    <string>/Applications/Deskflow.app/Contents/MacOS/deskflow</string>
+    <string>/Applications/Deskflow.app/Contents/MacOS/Deskflow</string>
   </array>
   <key>StartInterval</key>
   <integer>60</integer>
@@ -61,9 +71,9 @@
   <key>Nice</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/tmp/com.fleet.soak.out.log</string>
+  <string>__HOME__/Library/Logs/fleet-soak.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/com.fleet.soak.err.log</string>
+  <string>__HOME__/Library/Logs/fleet-soak.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>

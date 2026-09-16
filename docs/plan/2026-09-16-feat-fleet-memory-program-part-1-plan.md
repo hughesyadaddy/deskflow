@@ -152,7 +152,7 @@ Pester for PowerShell). Scenario drivers and swarm artifacts live in
 - Prompts read from `harness/prompts/auditor.md` and `harness/prompts/adversary.md`.
 - Auditor: branch `hotspot/<id>` from `baseBranch`, implements + tests,
   pushes; runs the scenario on hackintosh via `ssh hackintosh 'git -C <repo>
-  fetch && git checkout hotspot/<id> && harness/run-scenario.sh <scenario>
+  fetch && git checkout hotspot/<id> && harness/run-scenario.sh <scenario> --seat hackintosh
   --iters 1000'` before and after. hackintosh scenario runs are serialized by
   `flock harness/.hackintosh.lock` inside `run-scenario.sh`. `run-scenario.sh`
   exits 3 on hackintosh unless `tools/fleet-soak report --in
