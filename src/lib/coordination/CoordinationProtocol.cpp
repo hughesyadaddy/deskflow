@@ -10,6 +10,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include <chrono>
+
 namespace deskflow::coordination::protocol {
 
 namespace {
@@ -57,11 +59,14 @@ void decodeKeyBody(const QJsonObject &object, Message &message)
   message.keyMask = static_cast<uint16_t>(object[QStringLiteral("mask")].toInt());
   message.keyButton = static_cast<uint16_t>(object[QStringLiteral("button")].toInt());
   message.keyLang = object[QStringLiteral("lang")].toString().toStdString();
+  const auto sentValue = object[QStringLiteral("sent")];
+  message.keySentAtMs =
+      sentValue.isString() ? sentValue.toString().toLongLong() : static_cast<int64_t>(sentValue.toDouble());
 }
 
 std::string encodeKeyMessage(
     const char *type, const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button,
-    const std::string &lang, const std::string &token
+    const std::string &lang, const std::string &token, int64_t seq, int64_t sentAtMs
 )
 {
   QJsonObject object;
@@ -72,6 +77,12 @@ std::string encodeKeyMessage(
   object[QStringLiteral("mask")] = mask;
   object[QStringLiteral("button")] = button;
   object[QStringLiteral("lang")] = QString::fromStdString(lang);
+  if (seq > 0) {
+    object[QStringLiteral("seq")] = static_cast<qint64>(seq);
+  }
+  if (sentAtMs > 0) {
+    object[QStringLiteral("sent")] = static_cast<qint64>(sentAtMs);
+  }
   putToken(object, token);
   return serialize(object);
 }
@@ -187,6 +198,8 @@ Message decode(const std::string &line)
     message.type = Message::Type::Hello;
   } else if (type == QStringLiteral("fleet")) {
     message.type = Message::Type::Fleet;
+  } else if (type == QStringLiteral("keyclear")) {
+    message.type = Message::Type::KeyClearAll;
   } else {
     return message;
   }
@@ -202,6 +215,9 @@ Message decode(const std::string &line)
 
   if (message.type == Message::Type::KeyFwd || message.type == Message::Type::Key) {
     decodeKeyBody(object, message);
+  }
+  if (message.type == Message::Type::KeyClearAll) {
+    message.name = object[QStringLiteral("from")].toString().toStdString();
   }
 
   if (message.type == Message::Type::Hello) {
@@ -255,10 +271,25 @@ std::string encodeStatus(const std::string &token)
 
 std::string encodeKey(
     const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button, const std::string &lang,
-    const std::string &token
+    const std::string &token, int64_t seq, int64_t sentAtMs
 )
 {
-  return encodeKeyMessage("key", from, phase, id, mask, button, lang, token);
+  return encodeKeyMessage("key", from, phase, id, mask, button, lang, token, seq, sentAtMs);
+}
+
+std::string encodeKeyClearAll(const std::string &from, const std::string &token)
+{
+  QJsonObject object;
+  object[QStringLiteral("t")] = QStringLiteral("keyclear");
+  object[QStringLiteral("from")] = QString::fromStdString(from);
+  putToken(object, token);
+  return serialize(object);
+}
+
+int64_t wallClockMs()
+{
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 std::string encodeHello(int meshVersion, const std::string &name, const std::string &token)

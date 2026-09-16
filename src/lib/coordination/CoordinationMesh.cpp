@@ -459,23 +459,65 @@ void PeerOutbox::stop()
   }
 }
 
-uint64_t PeerOutbox::enqueueLocked(std::string line, ReplyHandler onReply)
+void PeerOutbox::setFailureHandler(FailureHandler handler)
+{
+  std::scoped_lock lock{m_mutex};
+  m_onFailure = std::move(handler);
+}
+
+uint64_t PeerOutbox::enqueueLocked(Job job)
 {
   const uint64_t ticket = ++m_posted;
-  m_queue.push_back(Job{std::move(line), std::move(onReply), ticket});
+  job.ticket = ticket;
+  m_queue.push_back(std::move(job));
   if (m_queue.size() > kMaxQueuedLines) {
-    m_queue.pop_front();
-    ++m_resolved; // dropped counts as resolved for forward() waiters
+    // Drop the oldest NON-sticky line; a sticky resync line is never the
+    // victim (it is the one line that must survive a wedged peer).
+    auto victim = std::find_if(m_queue.begin(), m_queue.end(), [](const Job &queued) { return !queued.sticky; });
+    if (victim == m_queue.end()) {
+      victim = m_queue.begin();
+    }
+    m_queue.erase(victim);
+    m_jobDone.notify_all(); // a forward() waiting on the victim learns "not delivered" now
     LOG_WARN("coordination: outbox to %s full (%zu queued); dropped the oldest line", m_ip.c_str(), kMaxQueuedLines);
   }
   return ticket;
+}
+
+bool PeerOutbox::pendingLocked(uint64_t ticket) const
+{
+  if (m_inFlightTicket == ticket) {
+    return true;
+  }
+  return std::any_of(m_queue.begin(), m_queue.end(), [ticket](const Job &job) { return job.ticket == ticket; });
 }
 
 void PeerOutbox::post(std::string line, ReplyHandler onReply)
 {
   {
     std::scoped_lock lock{m_mutex};
-    enqueueLocked(std::move(line), std::move(onReply));
+    Job job;
+    job.line = std::move(line);
+    job.onReply = std::move(onReply);
+    enqueueLocked(std::move(job));
+  }
+  m_wake.notify_all();
+}
+
+void PeerOutbox::postSticky(std::string line)
+{
+  {
+    std::scoped_lock lock{m_mutex};
+    const auto existing = std::find_if(m_queue.begin(), m_queue.end(), [&line](const Job &queued) {
+      return queued.sticky && queued.line == line;
+    });
+    if (existing != m_queue.end()) {
+      return; // already pending; it goes out on the next successful attempt
+    }
+    Job job;
+    job.line = std::move(line);
+    job.sticky = true;
+    enqueueLocked(std::move(job));
   }
   m_wake.notify_all();
 }
@@ -486,30 +528,26 @@ bool PeerOutbox::forward(std::string line, int graceMs)
   {
     std::scoped_lock lock{m_mutex};
     if (m_state == State::Backoff) {
-      if (m_clock() < m_nextAttemptAt) {
-        return false;
-      }
-      // Window open: queue the line so the lane makes its attempt now
-      // and re-settles the state. Reported as not delivered regardless
-      // (the key stays local); a Reachable result serves the next key.
-      enqueueLocked(std::move(line), {});
-      m_wake.notify_all();
+      // Never queue a key behind a failed lane: the caller types it locally
+      // now, and a late delivery on the peer is a phantom Down. The lane
+      // re-settles on its own (sticky resync line, periodic posts).
       return false;
     }
-    ticket = enqueueLocked(std::move(line), {});
+    Job job;
+    job.line = std::move(line);
+    job.isKey = true;
+    job.deadline = m_clock() + kKeyDeadlineS;
+    ticket = enqueueLocked(std::move(job));
   }
   m_wake.notify_all();
 
+  // Wait for THIS send to complete (Reachable: one LAN connect, a few ms)
+  // or for the lane to settle (Unknown). A timeout is reported as "not
+  // delivered": the key stays local.
   std::unique_lock lock{m_mutex};
-  if (m_state == State::Reachable) {
-    return true;
-  }
-  // Unknown: give the lane thread a short, bounded chance to resolve this
-  // very job. A timeout is reported as "not delivered" (the key stays
-  // local); the attempt itself keeps running and settles the state.
-  m_jobDone.wait_for(lock, std::chrono::milliseconds(graceMs), [&] { return m_resolved >= ticket || m_stop; });
-  if (m_resolved >= ticket) {
-    return m_state == State::Reachable;
+  m_jobDone.wait_for(lock, std::chrono::milliseconds(graceMs), [&] { return !pendingLocked(ticket) || m_stop; });
+  if (!pendingLocked(ticket)) {
+    return m_deliveredKeys.erase(ticket) > 0;
   }
   // Timed out. The caller handles the key locally now, so a late delivery
   // would type it twice: withdraw it unless the lane already picked it up
@@ -518,9 +556,20 @@ bool PeerOutbox::forward(std::string line, int graceMs)
       std::find_if(m_queue.begin(), m_queue.end(), [ticket](const Job &job) { return job.ticket == ticket; });
   if (pending != m_queue.end()) {
     m_queue.erase(pending);
-    ++m_resolved;
   }
   return false;
+}
+
+void PeerOutbox::discardKeys()
+{
+  std::scoped_lock lock{m_mutex};
+  const auto removed = std::remove_if(m_queue.begin(), m_queue.end(), [](const Job &job) { return job.isKey; });
+  const auto count = std::distance(removed, m_queue.end());
+  m_queue.erase(removed, m_queue.end());
+  if (count > 0) {
+    LOG_DEBUG("coordination: outbox to %s discarded %ld queued key line(s)", m_ip.c_str(), static_cast<long>(count));
+  }
+  m_jobDone.notify_all();
 }
 
 PeerOutbox::State PeerOutbox::state() const
@@ -547,6 +596,12 @@ bool PeerOutbox::idle() const
   return m_queue.empty() && !m_inFlight;
 }
 
+uint64_t PeerOutbox::expiredKeys() const
+{
+  std::scoped_lock lock{m_mutex};
+  return m_expiredKeys;
+}
+
 std::string PeerOutbox::otherAddressLocked(const std::string &host) const
 {
   if (m_lan.empty() || m_lan == m_ip) {
@@ -563,7 +618,21 @@ void PeerOutbox::pump(double now)
     bool alternateOnFailure = false;
     {
       std::scoped_lock lock{m_mutex};
+      // Expired keys are discarded before any connect: by now the hook has
+      // handled them locally (forward() timed out) and a late delivery is
+      // exactly the phantom Down this lane exists to prevent.
+      bool expired = false;
+      while (!m_queue.empty() && m_queue.front().isKey && m_queue.front().deadline > 0 &&
+             now > m_queue.front().deadline) {
+        m_queue.pop_front();
+        ++m_expiredKeys;
+        expired = true;
+        LOG_DEBUG("coordination: outbox to %s discarded an expired key line", m_ip.c_str());
+      }
       if (m_queue.empty() || now < m_nextAttemptAt || m_stop) {
+        if (expired) {
+          m_jobDone.notify_all();
+        }
         return;
       }
       job = std::move(m_queue.front());
@@ -573,6 +642,10 @@ void PeerOutbox::pump(double now)
       // address on the same attempt; in backoff it is one connect per window.
       alternateOnFailure = m_state != State::Backoff;
       m_inFlight = true;
+      m_inFlightTicket = job.ticket;
+      if (expired) {
+        m_jobDone.notify_all();
+      }
     }
 
     std::string reply;
@@ -593,15 +666,22 @@ void PeerOutbox::pump(double now)
       }
     }
 
+    FailureHandler onFailure;
     {
       std::scoped_lock lock{m_mutex};
       m_inFlight = false;
+      m_inFlightTicket = 0;
       if (ok) {
         m_state = State::Reachable;
         m_backoffS = 0.0;
         m_nextAttemptAt = 0.0;
         m_preferLan = !m_lan.empty() && host == m_lan;
-        ++m_resolved;
+        if (job.isKey) {
+          if (m_deliveredKeys.size() > kMaxQueuedLines * 4) {
+            m_deliveredKeys.clear(); // waiters that gave up never collect
+          }
+          m_deliveredKeys.insert(job.ticket);
+        }
       } else {
         m_backoffS = m_backoffS <= 0.0 ? kBackoffMinS : std::min(m_backoffS * 2.0, kBackoffMaxS);
         m_state = State::Backoff;
@@ -610,20 +690,38 @@ void PeerOutbox::pump(double now)
           m_preferLan = !m_preferLan; // alternate lan/ip across windows
         }
         // Everything behind the failed line is stale by now (>= one
-        // connect timeout old); periodic senders re-post.
-        if (!m_queue.empty()) {
-          LOG_WARN(
-              "coordination: peer %s unreachable; dropped %zu queued line(s) (retry in %.0f s)", host.c_str(),
-              m_queue.size(), m_backoffS
-          );
-          m_queue.clear();
+        // connect timeout old); periodic senders re-post. Sticky resync
+        // lines are the exception: they wait at the head for the peer.
+        std::deque<Job> kept;
+        if (job.sticky) {
+          kept.push_back(std::move(job));
         }
-        m_resolved = m_posted;
+        size_t dropped = 0;
+        for (auto &queued : m_queue) {
+          if (queued.sticky) {
+            kept.push_back(std::move(queued));
+          } else {
+            ++dropped;
+          }
+        }
+        if (dropped > 0) {
+          LOG_WARN(
+              "coordination: peer %s unreachable; dropped %zu queued line(s) (retry in %.0f s)", host.c_str(), dropped,
+              m_backoffS
+          );
+        }
+        m_queue = std::move(kept);
+        if (alternateOnFailure) {
+          onFailure = m_onFailure; // first failure of this outage
+        }
       }
     }
     m_jobDone.notify_all();
 
     if (!ok) {
+      if (onFailure) {
+        onFailure();
+      }
       return;
     }
     if (job.onReply) {

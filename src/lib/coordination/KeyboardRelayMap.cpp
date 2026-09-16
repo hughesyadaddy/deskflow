@@ -12,9 +12,7 @@
 
 namespace deskflow::coordination {
 
-namespace {
-
-KeyModifierMask activeModifiers()
+KeyModifierMask relayOsHeldModifiers()
 {
   KeyModifierMask mask = 0;
   if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
@@ -29,6 +27,14 @@ KeyModifierMask activeModifiers()
   if (GetAsyncKeyState(VK_LWIN) & 0x8000 || GetAsyncKeyState(VK_RWIN) & 0x8000) {
     mask |= KeyModifierSuper;
   }
+  return mask;
+}
+
+namespace {
+
+KeyModifierMask activeModifiers()
+{
+  KeyModifierMask mask = relayOsHeldModifiers();
   if (GetKeyState(VK_CAPITAL) & 1) {
     mask |= KeyModifierCapsLock;
   }
@@ -178,18 +184,27 @@ bool mapRelayKeyFromHook(
     KeyButton &button, Message::KeyPhase &phase
 )
 {
+  KeyModifierMask modifiers = activeModifiers();
+  if (vkCode == VK_CAPITAL && !keyUp && !isRepeat) {
+    // The LL hook fires before the OS commits the toggle, so the sampled caps
+    // state is the PRE-toggle value; flip it so the relayed mask carries the
+    // post-toggle intent deterministically instead of racing the OS.
+    modifiers ^= KeyModifierCapsLock;
+  }
+  return mapRelayKeyFromHook(vkCode, scanCode, isExtended, keyUp, isRepeat, modifiers, id, mask, button, phase);
+}
+
+bool mapRelayKeyFromHook(
+    int vkCode, int scanCode, bool isExtended, bool keyUp, bool isRepeat, KeyModifierMask modifiers, KeyID &id,
+    KeyModifierMask &mask, KeyButton &button, Message::KeyPhase &phase
+)
+{
   (void)isExtended;
   (void)scanCode;
 
   phase = keyUp ? Message::KeyPhase::Up : (isRepeat ? Message::KeyPhase::Repeat : Message::KeyPhase::Down);
   button = static_cast<KeyButton>(vkCode);
-  mask = activeModifiers();
-  if (vkCode == VK_CAPITAL && !keyUp && !isRepeat) {
-    // The LL hook fires before the OS commits the toggle, so the sampled caps
-    // state is the PRE-toggle value; flip it so the relayed mask carries the
-    // post-toggle intent deterministically instead of racing the OS.
-    mask ^= KeyModifierCapsLock;
-  }
+  mask = modifiers;
   id = mapRelayVirtualKey(vkCode, (mask & KeyModifierShift) != 0, (mask & KeyModifierCapsLock) != 0);
   if (keyUp) {
     // Release is matched on the target by BUTTON, so the id is cleared. But
