@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.fleet.selftest — weekly fleet self-test (Sunday 04:00, local time).
+
+  Runs, from the deskflow checkout in ~/Desktop/deskflow:
+    scripts/fleet-deploy.sh --self-test --json tools/state/selftest-<date>.json
+  and then, only if it exists, harness/canary.sh --seat hackintosh.
+  Output goes to tools/state/selftest.log. Because it rebuilds and reinstalls
+  every seat, it must run in the GUI session (codesign needs the login
+  keychain), so install it as a per-user LaunchAgent:
+
+    cp tools/launchd/com.fleet.selftest.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.fleet.selftest.plist
+    launchctl print gui/$UID/com.fleet.selftest      # verify it is loaded
+
+  Run it now:      launchctl kickstart -k gui/$UID/com.fleet.selftest
+  Remove it:       launchctl bootout gui/$UID/com.fleet.selftest
+
+  Set FLEET_DESKFLOW_CHECKOUT below if the repo lives somewhere other than
+  ~/Desktop/deskflow. A missed slot (machine asleep) runs at next wake.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fleet.selftest</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>set -euo pipefail; cd "${FLEET_DESKFLOW_CHECKOUT:-$HOME/Desktop/deskflow}"; mkdir -p tools/state; exec >>tools/state/selftest.log 2>&amp;1; echo "=== com.fleet.selftest $(date -u +%FT%TZ) ==="; scripts/fleet-deploy.sh --self-test --json "tools/state/selftest-$(date +%F).json"; if [ -x harness/canary.sh ]; then harness/canary.sh --seat hackintosh; fi</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Nice</key>
+  <integer>5</integer>
+</dict>
+</plist>
