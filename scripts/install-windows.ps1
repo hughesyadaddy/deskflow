@@ -304,46 +304,19 @@ function Start-DeskflowGui {
   }
 }
 
-function Ensure-DeskflowSigning {
+function Invoke-DeskflowSigning {
   # UIAccess (letting the core reach elevated windows so an elevated PowerToys
   # doesn't block its input) requires the core exe to be Authenticode-signed by
   # a cert that chains to a trusted root, and installed under Program Files.
-  # For a private fleet we self-sign with a machine-local cert and trust it in
-  # LocalMachine\Root + TrustedPublisher. No CA, no cost, Secure Boot untouched.
-  param([string[]]$Paths)
-
-  $subject = 'CN=Deskflow Fleet Code Signing'
-  $cert = Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert -ErrorAction SilentlyContinue |
-    Where-Object { $_.Subject -eq $subject } | Sort-Object NotAfter -Descending | Select-Object -First 1
-
-  if (-not $cert) {
-    Write-Host "== Creating self-signed Deskflow fleet code-signing cert =="
-    $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject `
-      -CertStoreLocation Cert:\LocalMachine\My -KeyUsage DigitalSignature `
-      -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddYears(10)
-  }
-
-  # Trust the cert so the signature verifies (root) and is an allowed publisher.
-  foreach ($store in @('Root', 'TrustedPublisher')) {
-    $path = "Cert:\LocalMachine\$store"
-    $exists = Get-ChildItem $path -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $cert.Thumbprint }
-    if (-not $exists) {
-      $store2 = New-Object System.Security.Cryptography.X509Certificates.X509Store($store, 'LocalMachine')
-      $store2.Open('ReadWrite')
-      $store2.Add($cert)
-      $store2.Close()
-      Write-Host "  trusted fleet cert in LocalMachine\$store"
-    }
-  }
-
-  foreach ($p in $Paths) {
-    if (-not (Test-Path $p)) { continue }
-    $res = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -HashAlgorithm SHA256
-    if ($res.Status -ne 'Valid') {
-      throw "failed to sign $p (status: $($res.Status))"
-    }
-    Write-Host "  signed $(Split-Path $p -Leaf)"
-  }
+  # All signing goes through scripts/sign-windows.ps1 (signtool + the fleet
+  # thumbprint from DESKFLOW_SIGN_THUMBPRINT), which signs every .exe/.dll
+  # under the install root and throws on any missing prerequisite or verify
+  # failure. This script no longer mints self-signed certs or writes to the
+  # LocalMachine\Root / TrustedPublisher stores.
+  param([string]$InstallRoot)
+  $signer = Join-Path $PSScriptRoot 'sign-windows.ps1'
+  if (-not (Test-Path $signer)) { throw "sign-windows.ps1 missing at $signer" }
+  & $signer -Root $InstallRoot
 }
 
 function Restart-Mouser {
@@ -429,9 +402,11 @@ $daemon = Join-Path $InstallDir 'deskflow-daemon.exe'
 $gui = Join-Path $InstallDir 'deskflow.exe'
 $core = Join-Path $InstallDir 'deskflow-core.exe'
 
-# Sign the installed binaries so the core's UIAccess manifest bit is honored
+# Sign every installed binary so the core's UIAccess manifest bit is honored
 # (Windows silently ignores UIAccess on an unsigned or non-Program-Files exe).
-Ensure-DeskflowSigning -Paths @($core, $gui, $daemon)
+# Must run before the service/GUI start: signtool needs write access to the
+# images, and running exes are locked.
+Invoke-DeskflowSigning -InstallRoot $InstallDir
 
 Ensure-DeskflowService -DaemonPath $daemon
 Set-DeskflowRunRegistry -GuiPath $gui
