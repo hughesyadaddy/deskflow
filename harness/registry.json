@@ -7,145 +7,243 @@
       "id": "D1-coordinator-blocking-connects",
       "repo": "deskflow",
       "title": "Coordinator: blocking per-peer connects on worker thread and in input callbacks",
-      "files": ["src/lib/coordination/Coordinator.cpp", "src/lib/coordination/Coordinator.h", "src/lib/coordination/CoordinationMesh.cpp", "src/lib/coordination/CoordinationMesh.h", "src/unittests/lib/coordination/CoordinatorTests.cpp"],
+      "files": [
+        "src/lib/coordination/Coordinator.cpp",
+        "src/lib/coordination/Coordinator.h",
+        "src/lib/coordination/CoordinationMesh.cpp",
+        "src/lib/coordination/CoordinationMesh.h",
+        "src/unittests/lib/coordination/CoordinatorTests.cpp"
+      ],
       "scenario": "peer-unreachable",
       "proc": "deskflow-core",
       "seat": "hackintosh",
       "budgetMB": 200,
-      "evidence": {"file": "src/lib/coordination/Coordinator.cpp", "line": 263, "token": "sendLineToPeers"},
+      "evidence": {
+        "file": "src/lib/coordination/Coordinator.cpp",
+        "line": 263,
+        "token": "sendLineToPeers"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "D2-automode-epoch-rebuild",
       "repo": "deskflow",
       "title": "AutoModeRunner: full ServerApp/ClientApp + screen + tap rebuild per epoch flip",
-      "files": ["src/apps/deskflow-core/AutoModeRunner.cpp", "src/apps/deskflow-core/AutoModeRunner.h"],
+      "files": [
+        "src/apps/deskflow-core/AutoModeRunner.cpp",
+        "src/apps/deskflow-core/AutoModeRunner.h"
+      ],
       "scenario": "epoch-flip",
       "proc": "deskflow-core",
       "seat": "hackintosh",
       "budgetMB": 100,
-      "evidence": {"file": "src/apps/deskflow-core/AutoModeRunner.cpp", "line": 119, "token": "epochLoop"},
+      "evidence": {
+        "file": "src/apps/deskflow-core/AutoModeRunner.cpp",
+        "line": 90,
+        "token": "epochLoop"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "D3-socket-buffers",
       "repo": "deskflow",
       "title": "TCPSocket/SecureSocket unbounded output buffer; StreamBuffer::peek full consolidation",
-      "files": ["src/lib/net/TCPSocket.cpp", "src/lib/net/TCPSocket.h", "src/lib/net/SecureSocket.cpp", "src/lib/net/SecureSocket.h", "src/lib/io/StreamBuffer.cpp", "src/lib/io/StreamBuffer.h", "src/unittests/lib/net/TCPSocketTests.cpp", "src/unittests/lib/io/StreamBufferTests.cpp"],
+      "files": [
+        "src/lib/net/TCPSocket.cpp",
+        "src/lib/net/TCPSocket.h",
+        "src/lib/net/SecureSocket.cpp",
+        "src/lib/net/SecureSocket.h",
+        "src/lib/io/StreamBuffer.cpp",
+        "src/lib/io/StreamBuffer.h",
+        "src/unittests/lib/net/TCPSocketTests.cpp",
+        "src/unittests/lib/io/StreamBufferTests.cpp"
+      ],
       "scenario": "screen-switch",
       "proc": "deskflow-core",
       "seat": "hackintosh",
       "budgetMB": 50,
-      "evidence": {"file": "src/lib/net/TCPSocket.cpp", "line": 157, "token": "m_outputBuffer"},
+      "evidence": {
+        "file": "src/lib/net/TCPSocket.cpp",
+        "line": 157,
+        "token": "m_outputBuffer"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "D4-server-clipboard-copies",
       "repo": "deskflow",
       "title": "Server holds clipboard twice plus once per client proxy; marshall() per screen switch",
-      "files": ["src/lib/server/Server.cpp", "src/lib/server/Server.h", "src/lib/server/ClientProxy1_0.cpp", "src/lib/server/ClientProxy1_0.h", "src/unittests/lib/server/ServerClipboardTests.cpp"],
+      "files": [
+        "src/lib/server/Server.cpp",
+        "src/lib/server/Server.h",
+        "src/lib/server/ClientProxy1_0.cpp",
+        "src/lib/server/ClientProxy1_0.h",
+        "src/unittests/lib/server/ServerClipboardTests.cpp"
+      ],
       "scenario": "clipboard-10mb",
       "proc": "deskflow-core",
       "seat": "hackintosh",
       "budgetMB": 60,
-      "evidence": {"file": "src/lib/server/Server.cpp", "line": 764, "token": "marshall"},
+      "evidence": {
+        "file": "src/lib/server/Server.cpp",
+        "line": 764,
+        "token": "marshall"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "D5-unretained-runloops",
       "repo": "deskflow",
       "title": "OSXKeyboardRelayMonitor / OSXLocalInputMonitor store CFRunLoopGetCurrent() without CFRetain",
-      "files": ["src/lib/platform/OSXKeyboardRelayMonitor.mm", "src/lib/platform/OSXKeyboardRelayMonitor.h", "src/lib/platform/OSXLocalInputMonitor.mm", "src/lib/platform/OSXLocalInputMonitor.h"],
+      "files": [
+        "src/lib/coordination/OSXKeyboardRelayMonitor.mm",
+        "src/lib/coordination/OSXLocalInputMonitor.mm"
+      ],
       "scenario": "epoch-flip",
       "proc": "deskflow-core",
       "seat": "hackintosh",
       "budgetMB": 10,
-      "evidence": {"file": "src/lib/platform/OSXKeyboardRelayMonitor.mm", "line": 288, "token": "CFRunLoopGetCurrent"},
+      "evidence": {
+        "file": "src/lib/coordination/OSXKeyboardRelayMonitor.mm",
+        "line": 288,
+        "token": "CFRunLoopGetCurrent"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "D6-osxscreen-polling",
       "repo": "deskflow",
       "title": "OSXScreen 1 s pasteboard sync + AXIsProcessTrusted polling",
-      "files": ["src/lib/platform/OSXScreen.mm", "src/lib/platform/OSXScreen.h"],
+      "files": [
+        "src/lib/platform/OSXScreen.mm",
+        "src/lib/platform/OSXScreen.h"
+      ],
       "scenario": "lock-unlock",
       "proc": "deskflow-core",
       "seat": "hackintosh",
       "budgetMB": 20,
-      "evidence": {"file": "src/lib/platform/OSXScreen.mm", "line": 680, "token": "m_clipboardTimer"},
+      "evidence": {
+        "file": "src/lib/platform/OSXScreen.mm",
+        "line": 680,
+        "token": "m_clipboardTimer"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "M1-iokit-scroll-manager-leak",
       "repo": "Mouser",
       "title": "macos_iokit_scroll.start(): stop() runs before self._manager is assigned, leaking an IOHIDManager per scroll tick",
-      "files": ["core/macos_iokit_scroll.py", "tests/test_macos_iokit_scroll.py"],
+      "files": [
+        "core/macos_iokit_scroll.py",
+        "tests/test_macos_iokit_scroll.py"
+      ],
       "scenario": "scroll-im-denied",
       "proc": "mouser",
       "seat": "hackintosh",
       "budgetMB": 500,
-      "evidence": {"file": "core/macos_iokit_scroll.py", "line": 167, "token": "self._manager = manager"},
+      "evidence": {
+        "file": "core/macos_iokit_scroll.py",
+        "line": 167,
+        "token": "self._manager = manager"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "M2-reconnect-loop",
       "repo": "Mouser",
       "title": "hid_gesture reconnect loop at 4 Hz forever with full IOHIDManager lifecycle per pass; unbounded _report_queue",
-      "files": ["core/hid_gesture.py", "tests/test_hid_gesture_reconnect.py"],
+      "files": [
+        "core/hid_gesture.py",
+        "tests/test_hid_gesture_reconnect.py"
+      ],
       "scenario": "mouse-absent-reconnect",
       "proc": "mouser",
       "seat": "hackintosh",
       "budgetMB": 2000,
-      "evidence": {"file": "core/hid_gesture.py", "line": 3266, "token": "_wait_reconnect"},
+      "evidence": {
+        "file": "core/hid_gesture.py",
+        "line": 3266,
+        "token": "_wait_reconnect"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "M3-status-item-and-icons",
       "repo": "Mouser",
       "title": "NSStatusItem/PyObjC target/QSvgRenderer rebuilt per window toggle; NSImage-backed icons rebuilt per Add-Profile open",
-      "files": ["main_qml.py", "tests/test_status_item.py", "tests/test_icon_providers.py"],
+      "files": [
+        "main_qml.py",
+        "tests/test_status_item.py",
+        "tests/test_icon_providers.py"
+      ],
       "scenario": "window-toggle",
       "proc": "mouser",
       "seat": "hackintosh",
       "budgetMB": 300,
-      "evidence": {"file": "main_qml.py", "line": 769, "token": "_install_native_macos_status_item"},
+      "evidence": {
+        "file": "main_qml.py",
+        "line": 769,
+        "token": "_install_native_macos_status_item"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "M4-app-detector-polling",
       "repo": "Mouser",
       "title": "AppDetector polls NSWorkspace.frontmostApplication() at 3.3 Hz",
-      "files": ["core/app_detector.py", "tests/test_app_detector.py"],
+      "files": [
+        "core/app_detector.py",
+        "tests/test_app_detector.py"
+      ],
       "scenario": "window-toggle",
       "proc": "mouser",
       "seat": "hackintosh",
       "budgetMB": 50,
-      "evidence": {"file": "core/app_detector.py", "line": 189, "token": "frontmostApplication"},
+      "evidence": {
+        "file": "core/app_detector.py",
+        "line": 189,
+        "token": "frontmostApplication"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "M5-mouse-hook-bridge-crossings",
       "repo": "Mouser",
       "title": "mouse_hook_macos: 4-6 ObjC bridge calls per mouse event at up to 1 kHz",
-      "files": ["core/mouse_hook_macos.py", "tests/test_mouse_hook_macos.py"],
+      "files": [
+        "core/mouse_hook_macos.py",
+        "tests/test_mouse_hook_macos.py"
+      ],
       "scenario": "scroll-im-granted",
       "proc": "mouser",
       "seat": "hackintosh",
       "budgetMB": 50,
-      "evidence": {"file": "core/mouse_hook_macos.py", "line": 293, "token": "CGEventGetLocation"},
+      "evidence": {
+        "file": "core/mouse_hook_macos.py",
+        "line": 293,
+        "token": "CGEventGetLocation"
+      },
       "fixClass": "root-cause"
     },
     {
       "id": "M6-engine-thread-churn",
       "repo": "Mouser",
       "title": "engine: threading.Timer per button press, battery poll thread overlap on reconnect",
-      "files": ["core/engine.py", "tests/test_engine_threads.py"],
+      "files": [
+        "core/engine.py",
+        "tests/test_engine_threads.py"
+      ],
       "scenario": "bt-sleep-wake",
       "proc": "mouser",
       "seat": "hackintosh",
       "budgetMB": 30,
-      "evidence": {"file": "core/engine.py", "line": 247, "token": "threading.Timer"},
+      "evidence": {
+        "file": "core/engine.py",
+        "line": 247,
+        "token": "threading.Timer"
+      },
       "fixClass": "root-cause"
     }
-  ]
+  ],
+  "commit": "735d5ea67"
 }
