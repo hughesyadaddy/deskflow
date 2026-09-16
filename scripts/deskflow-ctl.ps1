@@ -377,7 +377,7 @@ function Get-AssertSingleProblems {
   $bridges = @($procs | Where-Object { $_.Name -ieq 'deskflow-vhid-bridge.exe' })
   if ($bridges.Count -ne 0) { $problems += "deskflow-vhid-bridge.exe count=$($bridges.Count) (want 0)" }
 
-  return ,$problems
+  return $problems
 }
 
 function Assert-DeskflowSingle {
