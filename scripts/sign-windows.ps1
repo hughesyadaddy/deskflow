@@ -172,8 +172,28 @@ function Invoke-SignTool {
   return [pscustomobject]@{ ExitCode = $code; Output = ($out -join "`n") }
 }
 
+function Get-VendorSignedFiles {
+  # Files that already carry a Valid signature from another publisher
+  # (Microsoft dxil.dll, Qt, OpenSSL) are left alone: re-signing vendor
+  # binaries buys nothing and the verify gate accepts them as Valid.
+  param([string[]]$Files, [string]$Tp)
+  $vendor = @()
+  foreach ($f in $Files) {
+    $sig = Get-AuthenticodeSignature -FilePath $f
+    $cert = if ($sig.PSObject.Properties['SignerCertificate']) { $sig.SignerCertificate } else { $null }
+    $signer = if ($cert) { "$($cert.Thumbprint)".ToUpperInvariant() } else { '' }
+    if ("$($sig.Status)" -eq 'Valid' -and $signer -ne $Tp -and $signer -ne '') { $vendor += $f }
+  }
+  return $vendor
+}
+
 function Invoke-SignFiles {
   param([string]$SignTool, [string]$Tp, [string[]]$Files, [string]$Timestamp, [bool]$NoTimestampOk = $false)
+  $vendor = @(Get-VendorSignedFiles -Files $Files -Tp $Tp)
+  if ($vendor.Count -gt 0) {
+    Write-Host "== leaving $($vendor.Count) vendor-signed file(s) untouched =="
+    $Files = @($Files | Where-Object { $vendor -notcontains $_ })
+  }
   if ($Files.Count -eq 0) { return }
   $base = @('sign', '/sm', '/sha1', $Tp, '/fd', 'SHA256')
   $withTs = $base + @('/td', 'SHA256', '/tr', $Timestamp)
@@ -213,7 +233,7 @@ function Invoke-SignFiles {
 }
 
 function Test-SignedFiles {
-  param([string[]]$Files, [string]$Tp)
+  param([string[]]$Files, [string]$Tp, [string[]]$Vendor = @())
   $bad = @()
   foreach ($f in $Files) {
     $sig = Get-AuthenticodeSignature -FilePath $f
@@ -224,7 +244,7 @@ function Test-SignedFiles {
     $msg = if ($sig.PSObject.Properties['StatusMessage']) { $sig.StatusMessage } else { '' }
     if ($status -ne 'Valid') {
       $bad += "$f : status $status ($msg)"
-    } elseif ($signer -ne $Tp) {
+    } elseif ($signer -ne $Tp -and -not $Vendor.Contains($f)) {
       $bad += "$f : signed by $signer, expected $Tp"
     }
   }
@@ -262,8 +282,9 @@ function Invoke-SignWindows {
     Write-Host "== Verifying signatures on $($files.Count) file(s) against $tp =="
   }
 
-  Test-SignedFiles -Files $files -Tp $tp
-  Write-Host "== Signature OK: $($files.Count) file(s) signed by $tp =="
+  $vendor = @(Get-VendorSignedFiles -Files $files -Tp $tp)
+  Test-SignedFiles -Files $files -Tp $tp -Vendor $vendor
+  Write-Host "== Signature OK: $($files.Count - $vendor.Count) file(s) signed by $tp, $($vendor.Count) vendor-signed =="
   return $files
 }
 
