@@ -16,19 +16,24 @@
     session       `sc query Deskflow` reports RUNNING; deskflow and Mouser
                   processes exist with SessionId -ne 0; quser shows an Active session.
     mesh          Test-NetConnection to each -Peers entry on -Port succeeds.
+    instances     scripts\deskflow-ctl.ps1 assert-single exits 0: exactly one
+                  daemon (session 0, == service PID), one service-owned core and
+                  one GUI in the console session, all from the install root,
+                  no bridge, nothing from any other path.
 
 .EXAMPLE
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\fleet-health.ps1 -Checks authenticode,session
 #>
 [CmdletBinding()]
 param(
-  [string]$Checks = "authenticode,session,mesh",
+  [string]$Checks = "authenticode,session,mesh,instances",
   [string]$Thumbprint = "",
   [string]$Peers = "",
   [int]$Port = 24800,
   [string[]]$InstallRoots = @("C:\Program Files\Deskflow", "C:\Program Files\Mouser"),
   [string]$ServiceName = "Deskflow",
-  [string[]]$GuiProcesses = @("deskflow", "Mouser")
+  [string[]]$GuiProcesses = @("deskflow", "Mouser"),
+  [string]$Ctl = ""
 )
 
 Set-StrictMode -Version 2
@@ -140,6 +145,35 @@ function Test-Session([string]$Service, [string[]]$Procs) {
   New-Result "session" "PASS" ("service {0} RUNNING; {1} in interactive session; quser Active" -f $Service, ($Procs -join "+"))
 }
 
+function Resolve-Ctl([string]$Explicit) {
+  if ($Explicit) { return $Explicit }
+  $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+  return (Join-Path $root "scripts\deskflow-ctl.ps1")
+}
+
+function Invoke-CtlAssertSingle([string]$CtlPath) {
+  # Returns @{ ok; text }. The ctl throws on any mismatch; the exception text
+  # carries the problem list.
+  if (-not (Test-Path -LiteralPath $CtlPath)) {
+    return @{ ok = $false; text = "deskflow-ctl.ps1 missing at $CtlPath" }
+  }
+  try {
+    $out = & $CtlPath assert-single 2>&1 | Out-String
+    return @{ ok = $true; text = $out.Trim() }
+  } catch {
+    return @{ ok = $false; text = ("" + $_.Exception.Message).Trim() }
+  }
+}
+
+function Test-Instances([string]$CtlPath) {
+  $r = Invoke-CtlAssertSingle $CtlPath
+  $text = ($r.text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join "; "
+  if ($r.ok) {
+    return New-Result "instances" "PASS" $text
+  }
+  New-Result "instances" "FAIL" $text
+}
+
 function Test-Mesh([string[]]$PeerList, [int]$P) {
   $out = @()
   if ($PeerList.Count -eq 0) {
@@ -157,15 +191,16 @@ function Test-Mesh([string[]]$PeerList, [int]$P) {
 
 function Invoke-FleetHealth {
   param([string]$Checks, [string]$Thumbprint, [string]$Peers, [int]$Port,
-        [string[]]$InstallRoots, [string]$ServiceName, [string[]]$GuiProcesses)
+        [string[]]$InstallRoots, [string]$ServiceName, [string[]]$GuiProcesses, [string]$Ctl = "")
   $results = @()
   $wanted = @($Checks.Split(",") | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
-  if ($wanted -contains "all") { $wanted = @("authenticode", "session", "mesh") }
+  if ($wanted -contains "all") { $wanted = @("authenticode", "session", "mesh", "instances") }
   foreach ($c in $wanted) {
     switch ($c) {
       "authenticode" { $results += Test-Authenticode (Resolve-Thumbprint $Thumbprint) $InstallRoots }
       "session"      { $results += Test-Session $ServiceName $GuiProcesses }
       "mesh"         { $results += Test-Mesh @($Peers.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }) $Port }
+      "instances"    { $results += Test-Instances (Resolve-Ctl $Ctl) }
       default        { $results += New-Result $c "SKIP" "macOS-only check" }
     }
   }
@@ -174,7 +209,7 @@ function Invoke-FleetHealth {
 
 if ($MyInvocation.InvocationName -ne ".") {
   $r = Invoke-FleetHealth -Checks $Checks -Thumbprint $Thumbprint -Peers $Peers -Port $Port `
-    -InstallRoots $InstallRoots -ServiceName $ServiceName -GuiProcesses $GuiProcesses
+    -InstallRoots $InstallRoots -ServiceName $ServiceName -GuiProcesses $GuiProcesses -Ctl $Ctl
   # Always emit a JSON *array*, even for a single result.
   $json = ConvertTo-Json -InputObject @($r) -Depth 3 -Compress
   if (-not $json.StartsWith("[")) { $json = "[" + $json + "]" }

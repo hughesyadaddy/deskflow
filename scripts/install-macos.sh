@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Quit running Deskflow processes, install the built .app to /Applications, restart.
+# Stop Deskflow via launchd, install the built .app to /Applications, start it again.
+#
+# Process lifecycle goes through scripts/deskflow-ctl only (launchctl
+# bootout / bootstrap): no pattern kills, no `open`. This script touches
+# nothing but the Deskflow bundle and its two launchd agents; other apps that
+# talk to deskflow-core are owned by their own installers.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,15 +22,17 @@ INSTALL_APP="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
 INSTALL_ROOT="$(dirname "$INSTALL_APP")"
 APP_NAME="$(basename "$INSTALL_APP" .app)"
 SOURCE_APP="$ROOT/$BUILD_DIR/bin/Deskflow.app"
+CTL="$ROOT/scripts/deskflow-ctl"
 RESTART=1
 
 usage() {
   cat <<'EOF'
 Usage: scripts/install-macos.sh [--no-restart] [--install-app PATH]
 
-Quits Deskflow (GUI, deskflow-core, deskflow-vhid-bridge), installs the built
-bundle to /Applications/Deskflow.app (or DESKFLOW_INSTALL_APP), clears quarantine,
-verifies codesign when possible, and relaunches from the install path.
+Stops Deskflow through scripts/deskflow-ctl (launchctl bootout), installs the
+built bundle to /Applications/Deskflow.app (or DESKFLOW_INSTALL_APP), clears
+quarantine, verifies codesign (fatal on failure), and starts it again through
+scripts/deskflow-ctl (launchctl bootstrap). --no-restart leaves it stopped.
 
 Requires a prior Release build (build/bin/Deskflow.app or cmake --install).
 EOF
@@ -45,68 +52,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 quit_deskflow() {
-  echo "== Stopping Deskflow processes =="
-  osascript -e 'tell application "Deskflow" to quit' 2>/dev/null || true # fleet:allow app may not be running
-
-  local -a patterns=(
-    deskflow-core
-    "${APP_NAME}.app/Contents/MacOS/${APP_NAME}"
-    deskflow-vhid-bridge
-  )
-  for _ in $(seq 1 20); do
-    local alive=0
-    for pat in "${patterns[@]}"; do
-      if pgrep -f "$pat" >/dev/null 2>&1; then
-        alive=1
-        pkill -f "$pat" 2>/dev/null || true # fleet:allow process may exit between pgrep and pkill
-      fi
-    done
-    [[ "$alive" -eq 0 ]] && break
-    sleep 0.5
-  done
-  for pat in "${patterns[@]}"; do
-    pkill -9 -f "$pat" 2>/dev/null || true # fleet:allow nothing left to kill is the goal
-  done
-
-  # Wait until the GUI singleton lock is released before replacing the bundle.
-  for _ in $(seq 1 20); do
-    if ! pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1 &&
-       ! pgrep -x deskflow-core >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.5
-  done
-  echo "warning: some Deskflow processes may still be running" >&2
+  echo "== Stopping Deskflow (deskflow-ctl stop) =="
+  [[ -x "$CTL" ]] || { echo "error: $CTL missing or not executable" >&2; exit 1; }
+  DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" stop
 }
 
-restart_deskflow() {
+start_deskflow() {
   [[ "$RESTART" -eq 1 ]] || return 0
-  # Brief pause: macOS may relaunch login-item apps after the bundle is replaced.
-  sleep 2
-  echo "== Launching $INSTALL_APP =="
-  # --show brings the window to the front and sets a regular menu-bar presence.
-  # If an instance is already running, a second launch pings it via the GUI socket
-  # and exits immediately (single-instance), so this is safe after reinstall.
-  open "$INSTALL_APP" --args --show
-}
-
-restart_mouser() {
-  [[ "$RESTART" -eq 1 ]] || return 0
-  # Mouser bridges to deskflow-core over a local socket and holds per-process
-  # state for it. Replacing the bundle gives deskflow-core a new identity, and
-  # Mouser's auto-mode reconnect then churns against the stale session --
-  # observed dropping and reconnecting every 5-15s indefinitely, renegotiating
-  # focus each cycle and pulling the cursor between screens. Mouser does not
-  # recover on its own, so bounce it whenever Deskflow is reinstalled.
-  local mouser_app="/Applications/Mouser.app"
-  [[ -d "$mouser_app" ]] || return 0
-  pgrep -f "Mouser.app/Contents/MacOS/Mouser" >/dev/null 2>&1 || return 0
-  echo "== Restarting Mouser (clears stale deskflow bridge state) =="
-  osascript -e 'tell application "Mouser" to quit' 2>/dev/null || true # fleet:allow Mouser may ignore the quit event
-  sleep 2
-  pkill -x Mouser 2>/dev/null || true # fleet:allow already quit cleanly
-  sleep 1
-  open "$mouser_app"
+  echo "== Starting Deskflow (deskflow-ctl start) =="
+  DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" start
 }
 
 # Fatal unless the bundle verifies AND deskflow-core carries a real (non ad-hoc)
@@ -183,19 +137,20 @@ install_bundle() {
   fi
 }
 
-copy_login_bridge_script() {
-  local script="$ROOT/scripts/install-login-bridge-macos.sh"
+# The login-bridge installer is bundled into Contents/Resources by CMake
+# (src/apps/deskflow-gui/CMakeLists.txt, MACOSX_PACKAGE_LOCATION) BEFORE the
+# bundle is signed, so it is covered by the seal. Never copy files into the
+# bundle after verify_signature: that invalidates the signature we just checked.
+verify_login_bridge_bundled() {
   local dest="$INSTALL_APP/Contents/Resources/install-login-bridge-macos.sh"
-  if [[ -f "$script" ]]; then
-    mkdir -p "$INSTALL_APP/Contents/Resources"
-    install -m 755 "$script" "$dest"
-    echo "== Installed login bridge helper: $dest =="
+  if [[ ! -f "$dest" ]]; then
+    echo "error: $dest missing — the bundle was built without the login bridge helper (rebuild; do not copy it in post-sign)" >&2
+    exit 1
   fi
 }
 
 quit_deskflow
 install_bundle
-copy_login_bridge_script
-restart_deskflow
-restart_mouser
+verify_login_bridge_bundled
+start_deskflow
 echo "== Done: $INSTALL_APP =="

@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
-# scripts/install-macos.sh — the signature check is fatal, never a warning.
+# scripts/install-macos.sh — the signature check is fatal, never a warning,
+# and the process lifecycle goes through scripts/deskflow-ctl (launchctl).
 #
-# The real script runs against a temp install path with cmake/codesign/osascript/
-# pgrep/pkill/xattr/open/sleep replaced by PATH shims that log to $SHIM_LOG.
+# The real script runs against a temp install path with cmake/codesign/
+# launchctl/ps/xattr/sleep replaced by PATH shims that log to $SHIM_LOG.
 # `codesign -dv` output is controlled per test via $SHIM_CODESIGN_DV.
 
 SCRIPT="$BATS_TEST_DIRNAME/../../scripts/install-macos.sh"
@@ -38,7 +39,10 @@ setup() {
   BUILD="$TMP/build"
   APP="$TMP/Applications/Deskflow.app"
   export SHIM_LOG="$TMP/calls.log"
-  mkdir -p "$SHIMS" "$BUILD" "$TMP/Applications"
+  export SHIM_STATE="$TMP/state"
+  export HOME="$TMP/home"
+  export DESKFLOW_CTL_AGENT_DIR="$TMP/LaunchAgents"
+  mkdir -p "$SHIMS" "$BUILD" "$TMP/Applications" "$SHIM_STATE" "$HOME"
   : >"$SHIM_LOG"
   # Presence of cmake_install.cmake selects the staged `cmake --install` path.
   : >"$BUILD/cmake_install.cmake"
@@ -51,8 +55,11 @@ if [[ "${1:-}" == "--install" ]]; then
     [[ "$1" == "--prefix" ]] && prefix="$2"
     shift
   done
-  mkdir -p "$prefix/Deskflow.app/Contents/MacOS"
+  mkdir -p "$prefix/Deskflow.app/Contents/MacOS" "$prefix/Deskflow.app/Contents/Resources"
   : > "$prefix/Deskflow.app/Contents/MacOS/deskflow-core"
+  chmod +x "$prefix/Deskflow.app/Contents/MacOS/deskflow-core"
+  # CMake bundles the login-bridge installer as a Resource before signing.
+  [[ -n "${SHIM_OMIT_BRIDGE:-}" ]] || : > "$prefix/Deskflow.app/Contents/Resources/install-login-bridge-macos.sh"
 fi
 exit 0
 EOF
@@ -70,16 +77,35 @@ esac
 exit 0
 EOF
 
-  for tool in osascript pkill xattr open; do
+  # Any legacy process tool must never be reached; fail loudly if it is.
+  for tool in osascript pkill pgrep open; do
     make_shim "$tool" <<EOF
 echo "$tool \$*" >> "\$SHIM_LOG"
-exit 0
+echo "$tool must not be called by install-macos.sh" >&2
+exit 99
 EOF
   done
+  make_shim xattr <<'EOF'
+echo "xattr $*" >> "$SHIM_LOG"
+exit 0
+EOF
+  # Fake launchd: nothing loaded; bootstrap of the core reports a pid so
+  # deskflow-ctl start succeeds.
+  make_shim launchctl <<'EOF'
+echo "launchctl $*" >> "$SHIM_LOG"
+case "${1:-}" in
+  print)
+    [[ -f "$SHIM_STATE/loaded-${2##*/}" ]] || exit 113
+    echo "	pid = 4242"
+    ;;
+  bootstrap) touch "$SHIM_STATE/loaded-$(basename "$3" .plist)" ;;
+esac
+exit 0
+EOF
   # Nothing is running.
-  make_shim pgrep <<'EOF'
-echo "pgrep $*" >> "$SHIM_LOG"
-exit 1
+  make_shim ps <<'EOF'
+echo "ps $*" >> "$SHIM_LOG"
+exit 0
 EOF
   # Keep the suite fast.
   make_shim sleep <<'EOF'
@@ -90,7 +116,7 @@ EOF
   export DESKFLOW_BUILD_DIR="$BUILD"
   export DESKFLOW_INSTALL_APP="$APP"
   export SHIM_CODESIGN_DV="$SIGNED_DV"
-  unset SHIM_CODESIGN_VERIFY_RC SHIM_CODESIGN_DV_RC
+  unset SHIM_CODESIGN_VERIFY_RC SHIM_CODESIGN_DV_RC SHIM_OMIT_BRIDGE
 }
 
 teardown() {
@@ -116,7 +142,7 @@ log_lacks() {
   fi
 }
 
-@test "signed bundle installs, verifies, and relaunches" {
+@test "signed bundle installs, verifies, and restarts through launchd (ctl stop -> swap -> ctl start)" {
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Codesign verify OK"* ]]
@@ -125,7 +151,35 @@ log_lacks() {
   [ -f "$APP/Contents/MacOS/deskflow-core" ]
   log_has "codesign --verify --deep --strict $APP"
   log_has "codesign -dv $APP/Contents/MacOS/deskflow-core"
-  log_has "open $APP --args --show"
+  log_has "launchctl bootstrap gui/$(id -u) $DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow-core.plist"
+  log_has "launchctl bootstrap gui/$(id -u) $DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow.plist"
+  # stop (ps inventory) happens before the bundle swap, start after verify
+  stop_line="$(grep -n '^ps ' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  verify_line="$(grep -n '^codesign --verify' "$SHIM_LOG" | cut -d: -f1)"
+  start_line="$(grep -n 'launchctl bootstrap' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  [ "$stop_line" -lt "$verify_line" ]
+  [ "$verify_line" -lt "$start_line" ]
+  log_lacks "open "
+  log_lacks "pkill"
+  log_lacks "osascript"
+}
+
+@test "no pkill/pgrep/open/osascript and no Mouser reference remain in the script" {
+  run grep -nE '^[^#]*[[:space:]](pkill|pgrep|killall|osascript|open)[[:space:]]' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -ni 'mouser' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -nE 'restart_mouser|copy_login_bridge_script' "$SCRIPT"
+  [ "$status" -ne 0 ]
+}
+
+@test "nothing is copied into the bundle after signature verification (login bridge must be bundled by CMake)" {
+  SHIM_OMIT_BRIDGE=1 run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"install-login-bridge-macos.sh missing"* ]]
+  log_lacks "launchctl bootstrap"
+  run grep -n 'install -m 755' "$SCRIPT"
+  [ "$status" -ne 0 ]
 }
 
 @test "codesign --verify failure exits 1 and does not relaunch" {
@@ -134,21 +188,21 @@ log_lacks() {
   [[ "$output" == *"codesign --verify --deep --strict failed"* ]]
   [[ "$output" != *"Codesign verify OK"* ]]
   [[ "$output" != *"Installed unsigned"* ]]
-  log_lacks "open "
+  log_lacks "launchctl bootstrap"
 }
 
 @test "ad-hoc signature (no Authority) exits 1" {
   SHIM_CODESIGN_DV="$ADHOC_DV" run bash "$SCRIPT"
   [ "$status" -eq 1 ]
   [[ "$output" == *"no Authority="* ]]
-  log_lacks "open "
+  log_lacks "launchctl bootstrap"
 }
 
 @test "Authority without a TeamIdentifier exits 1" {
   SHIM_CODESIGN_DV="$NO_TEAM_DV" run bash "$SCRIPT"
   [ "$status" -eq 1 ]
   [[ "$output" == *"no TeamIdentifier="* ]]
-  log_lacks "open "
+  log_lacks "launchctl bootstrap"
 }
 
 @test "codesign -dv itself failing exits 1" {
@@ -162,7 +216,8 @@ log_lacks() {
   [ "$status" -eq 1 ]
   run bash "$SCRIPT" --no-restart
   [ "$status" -eq 0 ]
-  log_lacks "open "
+  log_lacks "launchctl bootstrap"
+  log_has "launchctl print"
 }
 
 @test "every remaining '|| true' is tagged fleet:allow" {

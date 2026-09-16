@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# deskflow-ctl — the ONE way to stop/start/restart Deskflow on macOS.
+#
+#   scripts/deskflow-ctl stop           launchctl bootout both agents, wait, escalate
+#   scripts/deskflow-ctl start          render + launchctl bootstrap (core, then GUI)
+#   scripts/deskflow-ctl restart        launchctl kickstart -k (bootstrap if unloaded)
+#   scripts/deskflow-ctl status         inventory: launchd state + every Deskflow process
+#   scripts/deskflow-ctl assert-single  exit 0 only when exactly one core (owned by
+#                                       launchd) and exactly one GUI run from the
+#                                       canonical bundle, and nothing runs from
+#                                       any other path
+#
+# launchd is the only owner of deskflow-core and the GUI:
+#   gui/$UID/io.github.hughesyadaddy.deskflow-core   deskflow-core auto (KeepAlive on crash)
+#   gui/$UID/io.github.hughesyadaddy.deskflow        Deskflow GUI (RunAtLoad)
+# The login-window bridge (/Library/LaunchAgents/org.deskflow.vhid-bridge.plist)
+# is untouched. Mouser is never touched: it is an independent agent with its
+# own installer.
+#
+# Env: DESKFLOW_INSTALL_APP (default /Applications/Deskflow.app),
+#      DESKFLOW_CTL_STOP_TIMEOUT / DESKFLOW_CTL_START_TIMEOUT (seconds).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
+APP="${APP%/}"
+CORE_LABEL="io.github.hughesyadaddy.deskflow-core"
+GUI_LABEL="io.github.hughesyadaddy.deskflow"
+AGENT_DIR="${DESKFLOW_CTL_AGENT_DIR:-$HOME/Library/LaunchAgents}"
+LOG_DIR="$HOME/Library/Logs/Deskflow"
+TEMPLATE_DIR="$ROOT/tools/launchd"
+STOP_TIMEOUT="${DESKFLOW_CTL_STOP_TIMEOUT:-10}"
+START_TIMEOUT="${DESKFLOW_CTL_START_TIMEOUT:-15}"
+ESCALATE_TIMEOUT="${DESKFLOW_CTL_ESCALATE_TIMEOUT:-5}"
+DOMAIN="gui/$(id -u)"
+
+# `kill` is a bash builtin; disable it so the external binary is used and a
+# PATH shim can observe the escalation in tests.
+enable -n kill 2>/dev/null || true # fleet:allow builtin may already be disabled
+
+usage() { sed -n '2,25p' "${BASH_SOURCE[0]}"; }
+die() { echo "deskflow-ctl: $*" >&2; exit 1; }
+log() { echo "== deskflow-ctl: $* =="; }
+
+# ---------------------------------------------------------------- inventory
+# Every Deskflow-named process on the box, by executable path (never by
+# pattern). Output lines: "<pid>\t<uid>\t<path>".
+inventory() {
+  ps -axo pid=,uid=,comm= 2>/dev/null | awk '
+    {
+      pid=$1; uid=$2; $1=""; $2=""; sub(/^  */, "");
+      path=$0; n=split(path, parts, "/"); base=parts[n];
+      if (base == "deskflow-core" || base == "Deskflow" || base == "deskflow" ||
+          base == "deskflow-vhid-bridge" || index(path, "Deskflow.app/Contents/MacOS/") > 0)
+        printf "%s\t%s\t%s\n", pid, uid, path
+    }'
+}
+
+canonical_path() { [[ "$1" == "$APP/Contents/MacOS/"* ]]; }
+
+pids_under_bundle() {
+  inventory | awk -F'\t' -v app="$APP/Contents/MacOS/" 'index($3, app) == 1 { print $1 }'
+}
+
+count_role() {
+  # $1 = basename, $2 = "canonical" | "any"
+  local base="$1" scope="${2:-canonical}" n=0 pid uid path
+  while IFS=$'\t' read -r pid uid path; do
+    [[ "$(basename "$path")" == "$base" ]] || continue
+    if [[ "$scope" == "canonical" ]]; then canonical_path "$path" || continue; fi
+    n=$((n + 1))
+  done < <(inventory)
+  echo "$n"
+}
+
+# --------------------------------------------------------------- launchd
+agent_loaded() { launchctl print "$DOMAIN/$1" >/dev/null 2>&1; }
+
+agent_pid() {
+  # Prints the pid launchd reports for a label, or nothing when not running.
+  launchctl print "$DOMAIN/$1" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }'
+}
+
+render_agent() {
+  # $1 = label. Renders tools/launchd/<label>.plist into $AGENT_DIR with the
+  # bundle and home substituted; only rewrites when the content changed.
+  local label="$1" src="$TEMPLATE_DIR/$1.plist" dst="$AGENT_DIR/$1.plist" tmp
+  [[ -f "$src" ]] || die "missing template $src"
+  mkdir -p "$AGENT_DIR" "$LOG_DIR"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+  sed -e "s#__APP__#$APP#g" -e "s#__HOME__#$HOME#g" "$src" >"$tmp"
+  if [[ -f "$dst" ]] && cmp -s "$tmp" "$dst"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$dst"
+    chmod 644 "$dst"
+    log "rendered $dst"
+  fi
+}
+
+bootstrap_agent() {
+  local label="$1" plist="$AGENT_DIR/$1.plist"
+  render_agent "$label"
+  if agent_loaded "$label"; then
+    # Already loaded (e.g. previous start with KeepAlive false and a clean
+    # exit): kickstart runs it if it is not running.
+    launchctl kickstart "$DOMAIN/$label"
+  else
+    launchctl bootstrap "$DOMAIN" "$plist"
+  fi
+}
+
+bootout_agent() {
+  local label="$1"
+  agent_loaded "$label" || return 0
+  launchctl bootout "$DOMAIN/$label" || die "launchctl bootout $DOMAIN/$label failed"
+}
+
+kickstart_agent() {
+  local label="$1"
+  if agent_loaded "$label"; then
+    launchctl kickstart -k "$DOMAIN/$label"
+  else
+    bootstrap_agent "$label"
+  fi
+}
+
+# ------------------------------------------------------------------- verbs
+wait_gone() {
+  # Wait up to $1 seconds for no process to run from the bundle.
+  local deadline=$(( $(date +%s) + $1 ))
+  while [[ -n "$(pids_under_bundle)" ]]; do
+    (( $(date +%s) >= deadline )) && return 1
+    sleep 0.5
+  done
+  return 0
+}
+
+cmd_stop() {
+  log "stop (launchctl bootout $DOMAIN/{$GUI_LABEL,$CORE_LABEL})"
+  bootout_agent "$GUI_LABEL"
+  bootout_agent "$CORE_LABEL"
+  if wait_gone "$STOP_TIMEOUT"; then
+    log "stopped"
+    return 0
+  fi
+  # Escalate by PID only — never `pkill -f`, which also matches Mouser and
+  # anything with "deskflow" in its argv.
+  local sig
+  for sig in TERM KILL; do
+    local pids
+    pids="$(pids_under_bundle)"
+    [[ -n "$pids" ]] || break
+    log "escalating: SIG$sig to $(echo "$pids" | tr '\n' ' ')"
+    for pid in $pids; do
+      kill "-$sig" "$pid" 2>/dev/null || true # fleet:allow pid may have exited already
+    done
+    wait_gone "$ESCALATE_TIMEOUT" && break
+  done
+  if [[ -n "$(pids_under_bundle)" ]]; then
+    die "processes still running from $APP after SIGKILL: $(pids_under_bundle | tr '\n' ' ')"
+  fi
+  log "stopped (escalated)"
+}
+
+cmd_start() {
+  [[ -d "$APP" ]] || die "bundle missing: $APP"
+  [[ -x "$APP/Contents/MacOS/deskflow-core" ]] || die "missing $APP/Contents/MacOS/deskflow-core"
+  log "start ($DOMAIN/$CORE_LABEL then $DOMAIN/$GUI_LABEL)"
+  bootstrap_agent "$CORE_LABEL"
+  local deadline=$(( $(date +%s) + START_TIMEOUT ))
+  while [[ -z "$(agent_pid "$CORE_LABEL")" ]]; do
+    (( $(date +%s) >= deadline )) && die "deskflow-core did not start under launchd within ${START_TIMEOUT}s (see $LOG_DIR/deskflow-core.log)"
+    sleep 0.5
+  done
+  bootstrap_agent "$GUI_LABEL"
+  log "started: core pid $(agent_pid "$CORE_LABEL")"
+}
+
+cmd_restart() {
+  log "restart (launchctl kickstart -k)"
+  kickstart_agent "$CORE_LABEL"
+  kickstart_agent "$GUI_LABEL"
+}
+
+cmd_status() {
+  local label pid
+  echo "bundle: $APP"
+  for label in "$CORE_LABEL" "$GUI_LABEL"; do
+    if agent_loaded "$label"; then
+      pid="$(agent_pid "$label")"
+      echo "agent: $label loaded pid=${pid:-none}"
+    else
+      echo "agent: $label not loaded"
+    fi
+  done
+  echo "processes (pid uid path canonical):"
+  local uid path
+  while IFS=$'\t' read -r pid uid path; do
+    if canonical_path "$path"; then
+      echo "  $pid $uid $path yes"
+    else
+      echo "  $pid $uid $path NO"
+    fi
+  done < <(inventory)
+}
+
+cmd_assert_single() {
+  local problems=() pid uid path
+  local cores gui bridge core_pid launchd_pid
+  cores="$(count_role deskflow-core)"
+  gui="$(count_role Deskflow)"
+  bridge="$(count_role deskflow-vhid-bridge any)"
+  while IFS=$'\t' read -r pid uid path; do
+    canonical_path "$path" || problems+=("non-canonical process pid=$pid $path")
+  done < <(inventory)
+  [[ "$cores" -eq 1 ]] || problems+=("deskflow-core count=$cores (want 1)")
+  [[ "$gui" -eq 1 ]] || problems+=("Deskflow GUI count=$gui (want 1)")
+  [[ "$bridge" -le 1 ]] || problems+=("deskflow-vhid-bridge count=$bridge (want <=1)")
+  launchd_pid="$(agent_pid "$CORE_LABEL")"
+  if [[ -z "$launchd_pid" ]]; then
+    problems+=("$CORE_LABEL has no running pid under launchd")
+  elif [[ "$cores" -eq 1 ]]; then
+    core_pid="$(inventory | awk -F'\t' -v app="$APP/Contents/MacOS/deskflow-core" '$3 == app { print $1 }')"
+    [[ "$core_pid" == "$launchd_pid" ]] || problems+=("deskflow-core pid $core_pid is not launchd's ($launchd_pid)")
+  fi
+  if ((${#problems[@]})); then
+    printf 'deskflow-ctl assert-single: FAIL\n' >&2
+    printf '  %s\n' "${problems[@]}" >&2
+    return 1
+  fi
+  echo "deskflow-ctl assert-single: OK (core=1 launchd-owned, gui=1, bridge=$bridge)"
+}
+
+case "${1:-}" in
+  stop) cmd_stop ;;
+  start) cmd_start ;;
+  restart) cmd_restart ;;
+  status) cmd_status ;;
+  assert-single) cmd_assert_single ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; die "unknown verb '${1:-}'" ;;
+esac

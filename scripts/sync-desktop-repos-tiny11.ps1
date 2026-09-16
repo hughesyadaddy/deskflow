@@ -78,17 +78,11 @@ cd /d C:\Users\alexh\Desktop\deskflow
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Install
 '@ | Set-Content -Path (Join-Path $env:USERPROFILE 'build_deskflow.bat') -Encoding ASCII
 
-@'
-$ErrorActionPreference = 'Continue'
-$src = Join-Path $env:USERPROFILE 'Desktop\Mouser'
-$py = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" | Select-Object -First 1 -ExpandProperty FullName
-if (-not (Test-Path $src)) { throw "Missing $src" }
-Set-Location $src
-if (-not (Test-Path "$src\.venv")) { & $py -m venv .venv; & "$src\.venv\Scripts\python.exe" -m pip install --quiet -r requirements.txt pyinstaller }
-Stop-Process -Name Mouser -Force -ErrorAction SilentlyContinue
-$env:MOUSER_PYTHON = "$src\.venv\Scripts\python.exe"
-& "$src\.venv\Scripts\python.exe" scripts\build_and_install.py 2>&1 | Select-Object -Last 6
-'@ | Set-Content -Path (Join-Path $env:USERPROFILE 'mouser-build-tiny11.ps1') -Encoding UTF8
+# The old ~\mouser-build-tiny11.ps1 helper stopped Mouser by image name before
+# building. Mouser's lifecycle belongs to the Mouser installer (MOUSER_RESTART=1
+# via fleet-deploy-windows.ps1), so that helper is no longer written; remove a
+# stale copy so nobody runs it by habit.
+Remove-Item -Path (Join-Path $env:USERPROFILE 'mouser-build-tiny11.ps1') -Force -ErrorAction SilentlyContinue
 
 Write-Host '=== Canonical repos ==='
 Write-Host "deskflow: $deskflow"

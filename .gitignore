@@ -52,6 +52,7 @@ CMakeFiles/*
 /scripts/*
 !/scripts/*.ps1
 !/scripts/*.sh
+!/scripts/deskflow-ctl
 !/scripts/fleet.env.example
 
 # fleet tooling state (tools/ and harness/ themselves are tracked)

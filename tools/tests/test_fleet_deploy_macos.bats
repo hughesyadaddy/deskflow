@@ -18,7 +18,7 @@ setup() {
   : >"$SHIM_LOG"
 
   # The deploy script calls the repo's install script; stub it inside the fake root.
-  printf '#!/usr/bin/env bash\necho "install-macos.sh $*" >> "$SHIM_LOG"\n' >"$FAKE_ROOT/scripts/install-macos.sh"
+  printf '#!/usr/bin/env bash\necho "install-macos.sh $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"\n' >"$FAKE_ROOT/scripts/install-macos.sh"
   : >"$MOUSER/scripts/build_macos_gui_session.py"
 
   make_shim cmake <<'EOF'
@@ -68,7 +68,7 @@ EOF
   # python3 stands in for both the Mouser build and tools/fleet-gui-exec.py.
   # For the latter it honours the documented interface: `-- cmd args...` is exec'd.
   make_shim python3 <<'EOF'
-echo "python3 $*" >> "$SHIM_LOG"
+echo "python3 $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"
 if [[ "${1:-}" == *fleet-gui-exec.py ]]; then
   shift
   while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done
@@ -277,6 +277,19 @@ script_lacks() {
 }
 
 # --- Mouser -------------------------------------------------------------------
+
+@test "order is deskflow then Mouser, and MOUSER_RESTART=1 reaches only the Mouser step" {
+  write_env "ABCDEF0123456789"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_has "install-macos.sh  MOUSER_RESTART=unset"
+  log_has "python3 scripts/build_macos_gui_session.py MOUSER_RESTART=1"
+  install_line="$(grep -n 'install-macos.sh' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  mouser_line="$(grep -n 'build_macos_gui_session.py' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  [ "$install_line" -lt "$mouser_line" ]
+  # the deploy itself never stops/starts Mouser; the Mouser installer does
+  script_lacks 'pkill|killall|Mouser.app|osascript'
+}
 
 @test "Mouser pull adds the fork remote when missing, then fetch/checkout/pull --ff-only fork BRANCH" {
   write_env "ABCDEF0123456789"
