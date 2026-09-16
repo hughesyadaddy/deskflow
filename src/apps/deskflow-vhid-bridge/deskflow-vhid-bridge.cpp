@@ -55,6 +55,8 @@
 #include <pqrs/karabiner/driverkit/virtual_hid_device_driver.hpp>
 #include <pqrs/karabiner/driverkit/virtual_hid_device_service.hpp>
 
+#include "common/SingleInstanceLock.h"
+
 namespace {
 
 namespace hr = pqrs::karabiner::driverkit::virtual_hid_device_driver::hid_report;
@@ -1313,6 +1315,21 @@ int main(int argc, char **argv)
         "[port [width height [scale_factor]]] [--size=WxH] [--scale=S] [--coord-port=N]"
     );
     return 2;
+  }
+
+  // Exactly one bridge per machine may own the virtual HID device. A second
+  // launch (launchd retry racing a still-draining predecessor, or a manual
+  // start) exits cleanly so launchd does not treat it as a crash loop. The
+  // lock is a kernel-released flock, held until this process dies.
+  using deskflow::SingleInstanceLock;
+  const auto instanceLock =
+      SingleInstanceLock::tryAcquire(SingleInstanceLock::Role::VhidBridge, SingleInstanceLock::Scope::Machine);
+  if (!instanceLock) {
+    log_line("another deskflow-vhid-bridge is already running: " + SingleInstanceLock::lastMessage());
+    return 0;
+  }
+  if (const auto msg = SingleInstanceLock::lastMessage(); !msg.empty()) {
+    log_line(msg);
   }
 
   // Comma-separated server candidates: in auto-switch mode only the elected

@@ -21,6 +21,7 @@
 #include <initguid.h>
 
 #include "../../driver/deskflow-vhid/public/deskflow_vhid_ioctl.h"
+#include "common/SingleInstanceLock.h"
 
 #include <cstdio>
 #include <cstring>
@@ -262,6 +263,18 @@ void runDemoUac(VhidClient &client)
 int main(int argc, char *argv[])
 {
   const char *mode = (argc >= 2) ? argv[1] : "test";
+
+  // Exactly one bridge per machine may own deskflow-vhid.sys. The lock is a
+  // Global\ mutex (crosses sessions and the secure desktop) held until this
+  // process exits; a second launch exits 0 so the service does not treat it
+  // as a crash.
+  using deskflow::SingleInstanceLock;
+  const auto instanceLock =
+      SingleInstanceLock::tryAcquire(SingleInstanceLock::Role::VhidBridge, SingleInstanceLock::Scope::Machine);
+  if (!instanceLock) {
+    log_line(("another deskflow-vhid-bridge is already running: " + SingleInstanceLock::lastMessage()).c_str());
+    return 0;
+  }
 
   VhidClient client;
   if (!client.open()) {

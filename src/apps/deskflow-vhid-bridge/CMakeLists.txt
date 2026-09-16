@@ -37,7 +37,13 @@ foreach(dir IN ITEMS "${vhid_sdk_root}/include" "${vhid_sdk_root}/vendor/vendor/
   endif()
 endforeach()
 
-add_executable(${target} deskflow-vhid-bridge.cpp)
+# SingleInstanceLock is Qt-free; compile it in directly rather than linking
+# `common`, which would pull Qt into the login-window bridge.
+add_executable(${target}
+  deskflow-vhid-bridge.cpp
+  ${CMAKE_SOURCE_DIR}/src/lib/common/SingleInstanceLock.cpp
+)
+target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/src/lib)
 
 # The pqrs headers want C++2b; keep this target self-contained rather than
 # raising the project-wide standard.

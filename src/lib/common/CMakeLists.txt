@@ -24,6 +24,8 @@ add_library(common STATIC
   Settings.cpp
   QSettingsProxy.cpp
   QSettingsProxy.h
+  SingleInstanceLock.cpp
+  SingleInstanceLock.h
   UrlConstants.h
   ${CMAKE_CURRENT_BINARY_DIR}/Constants.h
   ${CMAKE_CURRENT_BINARY_DIR}/VersionInfo.h

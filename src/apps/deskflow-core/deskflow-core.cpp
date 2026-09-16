@@ -22,6 +22,7 @@
 #include "base/Log.h"
 #include "common/Constants.h"
 #include "common/ExitCodes.h"
+#include "common/SingleInstanceLock.h"
 #include "coordination/KeyboardRescue.h"
 #include "deskflow/App.h"
 #include "deskflow/ClientApp.h"
@@ -39,12 +40,13 @@
 
 #include <QApplication>
 #include <QFileInfo>
-#include <QSharedMemory>
 #include <QTextStream>
 #include <QThread>
 
+#include <chrono>
 #include <iostream>
 #include <memory>
+#include <optional>
 
 void qtMessageHandler(QtMsgType type, const QMessageLogContext &context, const QString &message)
 {
@@ -138,39 +140,35 @@ int main(int argc, char **argv)
   }
 
   // Before we check any more args we need to check for a duplicate process.
-  // Create a shared memory segment with a unique key
-  // This is to prevent a new instance from running if one is already running
-  QSharedMemory sharedMemory(kCoreBinName);
-
-  // Attempt to attach first and detach in order to clean up stale shm chunks
-  // This can happen if the previous instance was killed or crashed
-  if (sharedMemory.attach())
-    sharedMemory.detach();
-
-  if (!sharedMemory.create(1) && parser.singleInstanceOnly()) {
-    LOG_WARN("an instance of deskflow core is already running");
-    return s_exitDuplicate;
-  }
-
-#if defined(Q_OS_WIN)
-  // QSharedMemory lives in the per-session Local\ kernel namespace, so a
-  // login-screen (SYSTEM/elevated) core and a user-session core can coexist
-  // and fight over keyboard hooks and the mesh identity. A Global\ mutex
-  // dedupes across sessions; the watchdog owns replacing a stale core.
-  HANDLE globalMutex = CreateMutexW(nullptr, TRUE, L"Global\\deskflow-core-single-instance");
-  const DWORD mutexError = GetLastError();
-  if (parser.singleInstanceOnly() &&
-      ((globalMutex != nullptr && mutexError == ERROR_ALREADY_EXISTS) ||
-       (globalMutex == nullptr && mutexError == ERROR_ACCESS_DENIED))) {
-    // ACCESS_DENIED: the mutex exists but was created at a higher integrity
-    // level (elevated/SYSTEM core) -- still a duplicate.
-    LOG_WARN("an instance of deskflow core is already running in another session");
-    if (globalMutex != nullptr) {
-      CloseHandle(globalMutex);
+  // Two locks, both held for the life of the process (the kernel releases
+  // them on death, so a crash never leaves a stale guard):
+  //   Session -- one core per logged-in user.
+  //   Machine -- one core per host, so a LoginWindow/root core and a
+  //              user-session core cannot both grab the input hooks. The
+  //              machine lock waits briefly so a bridge handoff can drain.
+  std::optional<deskflow::SingleInstanceLock> sessionLock;
+  std::optional<deskflow::SingleInstanceLock> machineLock;
+  if (parser.singleInstanceOnly()) {
+    using deskflow::SingleInstanceLock;
+    sessionLock = SingleInstanceLock::tryAcquire(SingleInstanceLock::Role::Core, SingleInstanceLock::Scope::Session);
+    if (!sessionLock) {
+      LOG_ERR("an instance of deskflow core is already running: %s", SingleInstanceLock::lastMessage().c_str());
+      return s_exitDuplicate;
     }
-    return s_exitDuplicate;
+    machineLock = SingleInstanceLock::tryAcquire(
+        SingleInstanceLock::Role::Core, SingleInstanceLock::Scope::Machine, std::chrono::seconds(3)
+    );
+    if (!machineLock) {
+      LOG_ERR(
+          "an instance of deskflow core is already running in another session: %s",
+          SingleInstanceLock::lastMessage().c_str()
+      );
+      return s_exitDuplicate;
+    }
+    if (const auto msg = SingleInstanceLock::lastMessage(); !msg.empty()) {
+      LOG_WARN("%s", msg.c_str());
+    }
   }
-#endif
 
 #if defined(Q_OS_WIN)
   // Input injection is latency-critical: every millisecond this process
