@@ -10,6 +10,7 @@
 #include "common/ExitCodes.h"
 #include "common/I18N.h"
 #include "common/PlatformInfo.h"
+#include "common/SingleInstanceLock.h"
 #include "common/UrlConstants.h"
 #include "common/VersionInfo.h"
 #include "gui/Diagnostic.h"
@@ -25,7 +26,6 @@
 #include <QCommandLineParser>
 #include <QLocalSocket>
 #include <QMessageBox>
-#include <QSharedMemory>
 
 #if defined(Q_OS_MACOS)
 #include <Carbon/Carbon.h>
@@ -104,21 +104,17 @@ int main(int argc, char *argv[])
     return s_exitSuccess;
   }
 
-  const auto shmId = QStringLiteral("%1-gui").arg(kAppId);
-  // Create a shared memory segment with a unique key
-  // This is to prevent a new instance from running if one is already running
-  QSharedMemory sharedMemory(shmId);
-
-  // Attempt to attach first and detach in order to clean up stale shm chunks
-  // This can happen if the previous instance was killed or crashed
-  if (sharedMemory.attach())
-    sharedMemory.detach();
-
-  // If we can create 1 byte of SHM we are the only instance
-  if (!sharedMemory.create(1)) {
+  // One GUI per logged-in user. The lock is a kernel-released flock/mutex
+  // held for the life of the process, so a crashed GUI never blocks the next
+  // launch. MainWindow only removes/relistens the "raise window" QLocalServer
+  // after this point, i.e. only once we are provably the sole instance.
+  using deskflow::SingleInstanceLock;
+  const auto instanceLock = SingleInstanceLock::tryAcquire(SingleInstanceLock::Role::Gui, SingleInstanceLock::Scope::Session);
+  if (!instanceLock) {
     // Ping the running instance to have it show itself
+    const auto socketName = QStringLiteral("%1-gui").arg(kAppId);
     QLocalSocket socket;
-    socket.connectToServer(shmId, QLocalSocket::ReadOnly);
+    socket.connectToServer(socketName, QLocalSocket::ReadOnly);
     if (!socket.waitForConnected()) {
       // If we can't connect to the other instance tell the user its running.
       // This should never happen but just incase we should show something
