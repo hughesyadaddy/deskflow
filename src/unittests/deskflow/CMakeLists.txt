@@ -54,6 +54,14 @@ create_test(
 )
 
 create_test(
+  NAME MouserLinkTests
+  DEPENDS app
+  LIBS arch base ${extra_libs}
+  SOURCE MouserLinkTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/deskflow"
+)
+
+create_test(
   NAME IpcServerLocalRestartTests
   DEPENDS app
   LIBS arch base ${extra_libs}

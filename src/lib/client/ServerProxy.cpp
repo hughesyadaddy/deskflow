@@ -12,12 +12,11 @@
 #include "base/Log.h"
 #include "client/Client.h"
 #include "client/HidConsumer.h"
-#include "client/MouserClient.h"
-#include "client/MouserSinkManifest.h"
 #include "common/Settings.h"
 #include "deskflow/Clipboard.h"
 #include "deskflow/ClipboardChunk.h"
 #include "deskflow/DeskflowException.h"
+#include "deskflow/MouserLink.h"
 #include "deskflow/OptionTypes.h"
 #include "deskflow/ProtocolTypes.h"
 #include "deskflow/ProtocolUtil.h"
@@ -65,8 +64,9 @@ ServerProxy::~ServerProxy()
 
 void ServerProxy::stopMouserHidDelivery()
 {
-  deskflow::client::clearMouserSinkManifest();
-  m_mouserClient.reset();
+  // The link belongs to the process: dropping our pointer must not tear
+  // the Mouser session down (it survives role flips and reconnects).
+  m_mouserLink = nullptr;
 }
 
 void ServerProxy::resetKeepAliveAlarm()
@@ -846,21 +846,22 @@ void ServerProxy::setServerLanguages()
   m_layoutManager.setRemoteLayouts(serverLayout);
 }
 
-MouserClient *ServerProxy::mouserDeliveryOrNull()
+deskflow::MouserLink *ServerProxy::mouserDeliveryOrNull()
 {
-  if (!deskflow::client::mouserHidDeliveryEnabled()) {
-    if (m_mouserClient != nullptr) {
+  auto &link = deskflow::MouserLink::shared();
+  // Under the lego contract Mouser's token file is the on/off switch; the
+  // client/mouserEnabled setting only gates the legacy fallback.
+  if (link.mode() != deskflow::MouserLink::Mode::Lego && !deskflow::client::mouserHidDeliveryEnabled()) {
+    if (m_mouserLink != nullptr) {
       stopMouserHidDelivery();
     }
     return nullptr;
   }
-  if (m_mouserClient == nullptr) {
-    const auto port = Settings::value(Settings::Client::MouserPort).toInt();
-    const auto token = Settings::value(Settings::Client::MouserToken).toString();
-    m_mouserClient = std::make_unique<MouserClient>(port, token.toStdString());
-    deskflow::client::writeMouserSinkManifest(port, token);
+  if (m_mouserLink == nullptr) {
+    m_mouserLink = &link;
+    m_mouserLink->setRole(deskflow::MouserLink::Role::Client);
   }
-  return m_mouserClient.get();
+  return m_mouserLink;
 }
 
 void ServerProxy::mouserData()

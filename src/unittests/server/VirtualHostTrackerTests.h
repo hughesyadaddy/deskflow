@@ -19,4 +19,6 @@ private Q_SLOTS:
   void detachSendsDisconnectAndClearsHost();
   void hostsActiveClientMatchesRelayTarget();
   void connectPayloadOverrideBypassesCachedLine();
+  void primaryFocusSendsFocusAwayNotDisconnect();
+  void changedConnectLineIsReannounced();
 };

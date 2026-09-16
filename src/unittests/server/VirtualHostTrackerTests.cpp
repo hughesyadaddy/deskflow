@@ -40,12 +40,14 @@ void VirtualHostTrackerTests::connectsOnRemoteFocus()
   std::vector<SentLine> sent;
   tracker.setConnectLine(R"({"type":"connect","device":"mouse"})");
   tracker.onFocusChange(
-      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), captureSend(sent)
+      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), "remote", captureSend(sent)
   );
 
-  QCOMPARE(sent.size(), static_cast<size_t>(1));
+  QCOMPARE(sent.size(), static_cast<size_t>(2));
   QCOMPARE(sent[0].client, &remote);
   QCOMPARE(sent[0].line, R"({"type":"connect","device":"mouse"})");
+  QCOMPARE(sent[1].client, &remote);
+  QCOMPARE(sent[1].line, VirtualHostTracker::focusLine("remote", true));
   QCOMPARE(tracker.host(), reinterpret_cast<BaseClientProxy *>(&remote));
 }
 
@@ -59,17 +61,36 @@ void VirtualHostTrackerTests::movesVirtualHostWhenFocusChanges()
   std::vector<SentLine> sent;
   tracker.setConnectLine(R"({"type":"connect"})");
   tracker.onFocusChange(
-      reinterpret_cast<BaseClientProxy *>(&remoteA), reinterpret_cast<BaseClientProxy *>(&primary), captureSend(sent)
+      reinterpret_cast<BaseClientProxy *>(&remoteA), reinterpret_cast<BaseClientProxy *>(&primary), "remote", captureSend(sent)
   );
   tracker.onFocusChange(
-      reinterpret_cast<BaseClientProxy *>(&remoteB), reinterpret_cast<BaseClientProxy *>(&primary), captureSend(sent)
+      reinterpret_cast<BaseClientProxy *>(&remoteB), reinterpret_cast<BaseClientProxy *>(&primary), "remote", captureSend(sent)
   );
 
-  QCOMPARE(sent.size(), static_cast<size_t>(3));
-  QCOMPARE(sent[1].line, VirtualHostTracker::kDefaultDisconnect);
-  QCOMPARE(sent[1].client, &remoteA);
-  QCOMPARE(sent[2].client, &remoteB);
+  // A: connect + focus(here); then on the switch: A gets focus(away),
+  // B gets connect (first time) + focus(here). Never a disconnect.
+  QCOMPARE(sent.size(), static_cast<size_t>(5));
+  QCOMPARE(sent[2].client, &remoteA);
+  QCOMPARE(sent[2].line, VirtualHostTracker::focusLine("remote", false));
+  QCOMPARE(sent[3].client, &remoteB);
+  QCOMPARE(sent[3].line, R"({"type":"connect"})");
+  QCOMPARE(sent[4].client, &remoteB);
+  QCOMPARE(sent[4].line, VirtualHostTracker::focusLine("remote", true));
   QCOMPARE(tracker.host(), reinterpret_cast<BaseClientProxy *>(&remoteB));
+
+  // Back to A: it is already attached, so only the focus notice travels.
+  tracker.onFocusChange(
+      reinterpret_cast<BaseClientProxy *>(&remoteA), reinterpret_cast<BaseClientProxy *>(&primary), "remote",
+      captureSend(sent)
+  );
+  QCOMPARE(sent.size(), static_cast<size_t>(7));
+  QCOMPARE(sent[5].client, &remoteB);
+  QCOMPARE(sent[5].line, VirtualHostTracker::focusLine("remote", false));
+  QCOMPARE(sent[6].client, &remoteA);
+  QCOMPARE(sent[6].line, VirtualHostTracker::focusLine("remote", true));
+  for (const auto &entry : sent) {
+    QVERIFY(entry.line != VirtualHostTracker::kDefaultDisconnect);
+  }
 }
 
 void VirtualHostTrackerTests::skipsConnectOnPrimaryFocus()
@@ -80,7 +101,7 @@ void VirtualHostTrackerTests::skipsConnectOnPrimaryFocus()
   std::vector<SentLine> sent;
   tracker.setConnectLine(R"({"type":"connect"})");
   tracker.onFocusChange(
-      reinterpret_cast<BaseClientProxy *>(&primary), reinterpret_cast<BaseClientProxy *>(&primary), captureSend(sent)
+      reinterpret_cast<BaseClientProxy *>(&primary), reinterpret_cast<BaseClientProxy *>(&primary), "remote", captureSend(sent)
   );
 
   QVERIFY(sent.empty());
@@ -96,7 +117,7 @@ void VirtualHostTrackerTests::clearHostIfClearsMatchingHost()
   std::vector<SentLine> sent;
   tracker.setConnectLine(R"({"type":"connect"})");
   tracker.onFocusChange(
-      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), captureSend(sent)
+      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), "remote", captureSend(sent)
   );
   tracker.clearHostIf(reinterpret_cast<BaseClientProxy *>(&remote));
   QCOMPARE(tracker.host(), nullptr);
@@ -111,14 +132,15 @@ void VirtualHostTrackerTests::detachSendsDisconnectAndClearsHost()
   std::vector<SentLine> sent;
   tracker.setConnectLine(R"({"type":"connect"})");
   tracker.onFocusChange(
-      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), captureSend(sent)
+      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), "remote", captureSend(sent)
   );
   tracker.detach(captureSend(sent), R"({"type":"custom-disconnect"})");
 
-  QCOMPARE(sent.size(), static_cast<size_t>(2));
-  QCOMPARE(sent[1].line, R"({"type":"custom-disconnect"})");
-  QCOMPARE(sent[1].client, &remote);
+  QCOMPARE(sent.size(), static_cast<size_t>(3));
+  QCOMPARE(sent[2].line, R"({"type":"custom-disconnect"})");
+  QCOMPARE(sent[2].client, &remote);
   QCOMPARE(tracker.host(), nullptr);
+  QVERIFY(!tracker.isAttached(reinterpret_cast<BaseClientProxy *>(&remote)));
 }
 
 void VirtualHostTrackerTests::hostsActiveClientMatchesRelayTarget()
@@ -130,7 +152,7 @@ void VirtualHostTrackerTests::hostsActiveClientMatchesRelayTarget()
   std::vector<SentLine> sent;
   tracker.setConnectLine(R"({"type":"connect"})");
   tracker.onFocusChange(
-      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), captureSend(sent)
+      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), "remote", captureSend(sent)
   );
 
   QVERIFY(tracker.hostsActiveClient(reinterpret_cast<BaseClientProxy *>(&remote)));
@@ -146,12 +168,59 @@ void VirtualHostTrackerTests::connectPayloadOverrideBypassesCachedLine()
   std::vector<SentLine> sent;
   tracker.setConnectLine(R"({"type":"connect","cached":true})");
   tracker.onFocusChange(
-      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), captureSend(sent),
+      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), "remote", captureSend(sent),
       R"({"type":"connect","override":true})"
   );
 
-  QCOMPARE(sent.size(), static_cast<size_t>(1));
+  QCOMPARE(sent.size(), static_cast<size_t>(2));
   QCOMPARE(sent[0].line, R"({"type":"connect","override":true})");
+}
+
+void VirtualHostTrackerTests::primaryFocusSendsFocusAwayNotDisconnect()
+{
+  VirtualHostTracker tracker;
+  char primary{};
+  char remote{};
+
+  std::vector<SentLine> sent;
+  tracker.setConnectLine(R"({"type":"connect"})");
+  tracker.onFocusChange(
+      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), "remote",
+      captureSend(sent)
+  );
+  tracker.onFocusChange(
+      reinterpret_cast<BaseClientProxy *>(&primary), reinterpret_cast<BaseClientProxy *>(&primary), "primary",
+      captureSend(sent)
+  );
+
+  QCOMPARE(sent.size(), static_cast<size_t>(3));
+  QCOMPARE(sent[2].client, &remote);
+  QCOMPARE(sent[2].line, VirtualHostTracker::focusLine("primary", false));
+  QCOMPARE(tracker.host(), nullptr);
+  QVERIFY(tracker.isAttached(reinterpret_cast<BaseClientProxy *>(&remote)));
+}
+
+void VirtualHostTrackerTests::changedConnectLineIsReannounced()
+{
+  VirtualHostTracker tracker;
+  char primary{};
+  char remote{};
+
+  std::vector<SentLine> sent;
+  tracker.setConnectLine(R"({"type":"connect","device":"a"})");
+  tracker.onFocusChange(
+      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), "remote",
+      captureSend(sent)
+  );
+  tracker.setConnectLine(R"({"type":"connect","device":"b"})");
+  tracker.onFocusChange(
+      reinterpret_cast<BaseClientProxy *>(&remote), reinterpret_cast<BaseClientProxy *>(&primary), "remote",
+      captureSend(sent)
+  );
+
+  QCOMPARE(sent.size(), static_cast<size_t>(4));
+  QCOMPARE(sent[2].line, R"({"type":"connect","device":"b"})");
+  QCOMPARE(sent[3].line, VirtualHostTracker::focusLine("remote", true));
 }
 
 QTEST_MAIN(VirtualHostTrackerTests)

@@ -10,10 +10,6 @@ add_library(client STATIC
   HidConsumer.h
   HidSink.cpp
   HidSink.h
-  MouserClient.cpp
-  MouserClient.h
-  MouserSinkManifest.cpp
-  MouserSinkManifest.h
   ServerProxy.cpp
   ServerProxy.h
 )

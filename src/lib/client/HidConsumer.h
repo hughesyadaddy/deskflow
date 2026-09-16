@@ -13,7 +13,9 @@
 
 #include "client/HidSink.h"
 
-class MouserClient;
+namespace deskflow {
+class MouserLink;
+}
 
 namespace deskflow::client {
 
@@ -40,6 +42,6 @@ void deliverRawHidReport(DeliverFn &&deliver, uint16_t deviceId, const std::stri
   deliver(encodeHidReportAsSinkFrame(deviceId, bytes));
 }
 
-void deliverRawHidReportToMouser(MouserClient *client, uint16_t deviceId, const std::string &bytes);
+void deliverRawHidReportToMouser(deskflow::MouserLink *link, uint16_t deviceId, const std::string &bytes);
 
 } // namespace deskflow::client

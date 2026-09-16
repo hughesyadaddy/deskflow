@@ -18,6 +18,7 @@
 #include "deskflow/ClientApp.h"
 #include "deskflow/DeskflowException.h"
 #include "deskflow/DisplayInvalidException.h"
+#include "deskflow/MouserLink.h"
 #include "deskflow/ServerApp.h"
 
 #include <QThread>
@@ -92,6 +93,9 @@ AutoModeRunner::~AutoModeRunner()
   // Belt and braces: epochLoop() joins on every exit path, but a runner
   // destroyed before/without running must still not leak the thread.
   stopDeferredThread();
+  // Say goodbye to Mouser while logging is still alive (the shared link's
+  // own static destructor would otherwise do it silently at exit).
+  deskflow::MouserLink::shared().stop("shutdown");
 }
 
 void AutoModeRunner::run(QThread &coreThread)
@@ -301,6 +305,11 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
   }
 
   m_coordinator->updateKeyboardRelayForRole(role);
+  // The Mouser link is process-scoped (it must outlive every epoch); the
+  // epoch only tells it which role is running.
+  deskflow::MouserLink::shared().setRole(
+      role == Role::Server ? deskflow::MouserLink::Role::Server : deskflow::MouserLink::Role::Client
+  );
 
   // Screen enter/leave handlers are scoped to this client epoch so stale
   // events from a prior epoch cannot set cursorScreenKnown after reset.
@@ -409,6 +418,7 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
   }
 
   m_coordinator->updateKeyboardRelayForRole(Role::Init);
+  deskflow::MouserLink::shared().setRole(deskflow::MouserLink::Role::None);
 
   m_exitCode = result;
   return result;
