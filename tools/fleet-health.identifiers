@@ -1,0 +1,16 @@
+# Code identifier allowlist for `tools/fleet-health --check identifiers`.
+# One entry per line; `#` starts a comment. Entries are matched with
+# fnmatch-style globs against the `Identifier=` line of `codesign -dvv`.
+# An identifier with an LC_UUID-style suffix (e.g. `org.deskflow.deskflow-5555`)
+# is NOT matched by the exact entries below and therefore fails the check.
+#
+# Binaries under Contents/MacOS/ (first-party) MUST match an entry here.
+# Bundled third-party dylibs/plugins under Contents/Frameworks/ may instead
+# carry codesign's filename-derived identifier (libpcre2-16.0.dylib -> libpcre2-16).
+org.deskflow.deskflow
+org.deskflow.deskflow-core
+org.deskflow.deskflow-vhid-bridge
+io.github.hughesyadaddy.deskflow
+io.github.hughesyadaddy.mouser
+# Bundled Qt frameworks carry their own stable identifiers.
+org.qt-project.*
