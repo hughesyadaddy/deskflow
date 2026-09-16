@@ -180,6 +180,26 @@ Describe 'fleet-deploy-windows.ps1 structure' {
     $script:Text | Should -Match "if \(\`$DeployMouser -eq 1 -and \`$needsBootstrap -and \(Test-Path \`$sync\)\)"
   }
 
+  It 'never stops or kills Mouser itself; MOUSER_RESTART=1 is scoped to Deploy-Mouser' {
+    $script:Text | Should -Not -Match 'Stop-Process[^\n]*Mouser'
+    $script:Text | Should -Not -Match 'taskkill[^\n]*Mouser'
+    $deploy = $script:Functions['Deploy-Mouser'].Extent.Text
+    $deploy | Should -Match "\`$env:MOUSER_RESTART = '1'"
+    # set inside try, restored in finally, before signing
+    $deploy.IndexOf("`$env:MOUSER_RESTART = '1'") | Should -BeLessThan $deploy.IndexOf('build_and_install.py')
+    $deploy | Should -Match 'finally\s*\{[^}]*MOUSER_RESTART'
+    # The Deskflow step must not carry MOUSER_RESTART.
+    $script:Functions['Deploy-Deskflow'].Extent.Text | Should -Not -Match 'MOUSER_RESTART'
+  }
+
+  It 'ends with deskflow-ctl.ps1 assert-single after Deskflow and Mouser deploy' {
+    $script:Functions.Keys | Should -Contain 'Assert-DeskflowSingle'
+    $script:Functions['Assert-DeskflowSingle'].Extent.Text | Should -Match "deskflow-ctl\.ps1'"
+    $script:Functions['Assert-DeskflowSingle'].Extent.Text | Should -Match 'assert-single'
+    $script:Text.LastIndexOf('Assert-DeskflowSingle') | Should -BeGreaterThan $script:Text.LastIndexOf('Deploy-Mouser')
+    $script:Text.LastIndexOf('Assert-DeskflowSingle') | Should -BeGreaterThan $script:Text.LastIndexOf('Deploy-Deskflow')
+  }
+
   It 'contains no "|| true"-style swallowing of failures' {
     $script:Text | Should -Not -Match '\|\|\s*true'
     $script:Text | Should -Not -Match '-ErrorAction\s+SilentlyContinue[^\n]*git'

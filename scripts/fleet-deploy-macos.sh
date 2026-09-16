@@ -139,6 +139,8 @@ build_install_deskflow() {
   cd "$DESKFLOW_ROOT"
   echo "== [$HOST_TAG] deskflow build + install =="
   gui_exec cmake --build build --target deskflow-core Deskflow deskflow-vhid-bridge -j"$(sysctl -n hw.ncpu)"
+  # install-macos.sh restarts Deskflow through scripts/deskflow-ctl (launchd).
+  # It never touches Mouser; MOUSER_RESTART is set only in deploy_mouser.
   gui_exec bash scripts/install-macos.sh
   if ! codesign --verify --deep --strict /Applications/Deskflow.app; then
     fail "codesign --verify --deep --strict /Applications/Deskflow.app failed — refusing to call this deploy a success"
@@ -175,8 +177,10 @@ deploy_mouser() {
     git log -1 --oneline
   fi
 
-  echo "== [$HOST_TAG] Mouser build + install (GUI session) =="
-  python3 scripts/build_macos_gui_session.py
+  # MOUSER_RESTART=1 is scoped to the Mouser step only: the Mouser installer
+  # owns Mouser's restart. The Deskflow step above never touches Mouser.
+  echo "== [$HOST_TAG] Mouser build + install (GUI session, MOUSER_RESTART=1) =="
+  MOUSER_RESTART=1 python3 scripts/build_macos_gui_session.py
 }
 
 main() {

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Deskflow GUI (tray app) — launched once per login by launchd, never by
+  `open`. Rendered into ~/Library/LaunchAgents by `scripts/deskflow-ctl start`
+  (__APP__ -> the installed bundle, __HOME__ -> $HOME).
+
+  RunAtLoad starts it at bootstrap/login; KeepAlive is false so a user quit
+  from the tray sticks. `scripts/deskflow-ctl restart` relaunches it with
+  `launchctl kickstart -k`.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.hughesyadaddy.deskflow</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__APP__/Contents/MacOS/Deskflow</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/Deskflow/deskflow-gui.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/Deskflow/deskflow-gui.log</string>
+</dict>
+</plist>

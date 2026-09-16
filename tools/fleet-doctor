@@ -43,6 +43,18 @@ STRICT_SIGNING_FLIP = (
     "cmake -S . -B build -DFLEET_STRICT_SIGNING=ON -DAPPLE_CODESIGN_DEV=$DESKFLOW_CODESIGN_ID "
     "(or FLEET_RECONFIGURE=1 fleet-deploy); the CMakeLists.txt default stays OFF until the human flips it"
 )
+# The only paths Deskflow may run from. Anything else (a build tree, a stale
+# copy, a second install) is what `scripts/deskflow-ctl assert-single` rejects;
+# fleet-doctor surfaces it early as a warning.
+CANONICAL_DESKFLOW_PREFIX = {
+    "macos": "/Applications/Deskflow.app/Contents/MacOS/",
+    "windows": "C:\\Program Files\\Deskflow\\",
+}
+DESKFLOW_PROCESS_NAMES = {"deskflow", "deskflow-core", "deskflow-vhid-bridge", "deskflow-daemon"}
+PS_DESKFLOW_PATHS = (
+    "Get-CimInstance Win32_Process -Filter \"Name LIKE 'deskflow%'\" -ErrorAction SilentlyContinue | "
+    "ForEach-Object { if ($_.ExecutablePath) { $_.ExecutablePath } else { '<unreadable> ' + $_.Name } }"
+)
 # osascript probes shared with tools/fleet-gui-exec.py's preconditions.
 OSA_COUNT_TERMINAL_WINDOWS = 'tell application "Terminal" to count windows'
 OSA_COUNT_MODAL_DIALOGS = (
@@ -84,7 +96,7 @@ class Host:
 class Result:
     host: str
     check: str
-    status: str  # pass | fail | skip | unreachable
+    status: str  # pass | warn | fail | skip | unreachable
     detail: str = ""
 
     def as_dict(self) -> Dict[str, str]:
@@ -100,6 +112,10 @@ class Report:
 
     def skip(self, host: str, check: str, detail: str) -> None:
         self.results.append(Result(host, check, "skip", detail))
+
+    def warn(self, host: str, check: str, detail: str) -> None:
+        """Advisory only: shown in the table, never changes the exit code."""
+        self.results.append(Result(host, check, "warn", detail))
 
     def unreachable(self, host: str, detail: str) -> None:
         self.results.append(Result(host, "reach", "unreachable", detail))
@@ -388,6 +404,41 @@ def check_signing(p: Probe, rep: Report) -> None:
     rep.add(h.id, "signing", found, f"identity {ident[:8]}… in keychain" if found else f"identity {ident[:8]}… not found by security find-identity")
 
 
+def deskflow_process_paths(p: Probe) -> List[str]:
+    """Executable paths of every running Deskflow process (empty when none)."""
+    h = p.host
+    if h.is_windows:
+        rc, out, _ = p.sh(PS_DESKFLOW_PATHS)
+        return [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+    rc, out, _ = p.sh("ps -axo comm=")
+    if rc != 0:
+        return []
+    paths = []
+    for ln in out.splitlines():
+        path = ln.strip()
+        base = path.rsplit("/", 1)[-1].lower()
+        if base in DESKFLOW_PROCESS_NAMES or "deskflow.app/contents/macos/" in path.lower():
+            paths.append(path)
+    return paths
+
+
+def non_canonical_deskflow_paths(paths: List[str], os_name: str) -> List[str]:
+    prefix = CANONICAL_DESKFLOW_PREFIX[os_name].lower()
+    return [p for p in paths if not p.lower().startswith(prefix)]
+
+
+def check_session_process_paths(p: Probe, rep: Report) -> None:
+    """Warn (never fail) when a Deskflow process runs from a non-canonical path."""
+    h = p.host
+    paths = deskflow_process_paths(p)
+    bad = non_canonical_deskflow_paths(paths, h.os)
+    if bad:
+        rep.warn(h.id, "session", "non-canonical Deskflow process path(s): " + ", ".join(sorted(set(bad)))
+                 + "  -> scripts/deskflow-ctl assert-single will fail; stop them with scripts/deskflow-ctl stop")
+    else:
+        rep.add(h.id, "session", True, f"{len(paths)} Deskflow process(es), all under {CANONICAL_DESKFLOW_PREFIX[h.os]}")
+
+
 def check_session(p: Probe, rep: Report) -> None:
     h = p.host
     if h.is_windows:
@@ -397,6 +448,7 @@ def check_session(p: Probe, rep: Report) -> None:
             for line in out.splitlines()[1:] if line.strip()
         )
         rep.add(h.id, "session", active, f"quser: {h.user} Active" if active else f"quser: no Active session for {h.user}")
+        check_session_process_paths(p, rep)
         return
     rc, out, _ = p.sh("stat -f %Su /dev/console")
     console = out.strip() if rc == 0 else ""
@@ -421,6 +473,7 @@ def check_session(p: Probe, rep: Report) -> None:
             dialogs = 0
         rep.add(h.id, "session", dialogs == 0, "System Events Automation granted; no modal dialogs" if dialogs == 0 else
                 f"{dialogs} modal dialog(s) open on the console. Human step: dismiss the dialog on the Mac's screen, then retry")
+    check_session_process_paths(p, rep)
 
 
 def check_toolchain(p: Probe, rep: Report, pinned: Dict[str, str]) -> None:

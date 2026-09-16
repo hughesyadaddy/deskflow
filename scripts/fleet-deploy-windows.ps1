@@ -1,5 +1,8 @@
-# Runs ON tiny11 (local or via SSH). Pull fleet branch, build, install Deskflow + Mouser.
 #requires -Version 5.1
+# Runs ON tiny11 (local or via SSH). Pull fleet branch, build, install Deskflow + Mouser.
+# Deskflow's process lifecycle is owned by scripts/deskflow-ctl.ps1 (called from
+# install-windows.ps1); this script never stops or kills Mouser -- the Mouser
+# installer restarts Mouser itself when MOUSER_RESTART=1.
 param(
   [string]$DeskflowRoot = $env:FLEET_DESKFLOW_ROOT,
   [string]$MouserRoot = $env:FLEET_MOUSER_ROOT,
@@ -80,6 +83,14 @@ function Deploy-Deskflow {
   if ($LASTEXITCODE -ne 0) { throw "deskflow build/install failed (exit $LASTEXITCODE)" }
 }
 
+function Assert-DeskflowSingle {
+  if ($DeployDeskflow -ne 1) { return }
+  $ctl = Join-Path $DeskflowRoot 'scripts\deskflow-ctl.ps1'
+  if (-not (Test-Path $ctl)) { throw "deskflow-ctl.ps1 missing at $ctl" }
+  Write-Host "== [$hostName] deskflow-ctl assert-single =="
+  & $ctl assert-single
+}
+
 function Sync-MouserRepo {
   Set-Location $MouserRoot
   if (-not (Test-Path (Join-Path $MouserRoot '.git'))) {
@@ -126,24 +137,32 @@ function Deploy-Mouser {
   }
   Sync-MouserRepo
 
-  Write-Host "== [$hostName] Mouser build + install =="
-  $bat = Join-Path $env:USERPROFILE 'build-mouser.bat'
-  if (Test-Path $bat) {
-    Invoke-Native -Label 'Mouser build (build-mouser.bat)' -FilePath 'cmd.exe' -ArgumentList @('/c', $bat)
-  } else {
-    Set-Location $MouserRoot
-    $py = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" -ErrorAction SilentlyContinue |
-      Select-Object -First 1 -ExpandProperty FullName
-    if (-not $py) { throw 'Python not found for Mouser' }
-    $venvPy = Join-Path $MouserRoot '.venv\Scripts\python.exe'
-    if (-not (Test-Path (Join-Path $MouserRoot '.venv'))) {
-      Invoke-Native -Label 'Mouser venv create' -FilePath $py -ArgumentList @('-m', 'venv', (Join-Path $MouserRoot '.venv'))
-      Invoke-Native -Label 'Mouser pip install' -FilePath $venvPy `
-        -ArgumentList @('-m', 'pip', 'install', '--quiet', '-r', 'requirements.txt', 'pyinstaller')
+  # MOUSER_RESTART=1 is scoped to the Mouser step only: the Mouser installer
+  # (build_and_install.py) owns Mouser's restart. Nothing in this script stops
+  # or kills Mouser.
+  Write-Host "== [$hostName] Mouser build + install (MOUSER_RESTART=1) =="
+  $prevRestart = $env:MOUSER_RESTART
+  $env:MOUSER_RESTART = '1'
+  try {
+    $bat = Join-Path $env:USERPROFILE 'build-mouser.bat'
+    if (Test-Path $bat) {
+      Invoke-Native -Label 'Mouser build (build-mouser.bat)' -FilePath 'cmd.exe' -ArgumentList @('/c', $bat)
+    } else {
+      Set-Location $MouserRoot
+      $py = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+      if (-not $py) { throw 'Python not found for Mouser' }
+      $venvPy = Join-Path $MouserRoot '.venv\Scripts\python.exe'
+      if (-not (Test-Path (Join-Path $MouserRoot '.venv'))) {
+        Invoke-Native -Label 'Mouser venv create' -FilePath $py -ArgumentList @('-m', 'venv', (Join-Path $MouserRoot '.venv'))
+        Invoke-Native -Label 'Mouser pip install' -FilePath $venvPy `
+          -ArgumentList @('-m', 'pip', 'install', '--quiet', '-r', 'requirements.txt', 'pyinstaller')
+      }
+      Invoke-Native -Label 'Mouser build_and_install.py' -FilePath $venvPy `
+        -ArgumentList @((Join-Path $MouserRoot 'scripts\build_and_install.py'))
     }
-    Stop-Process -Name Mouser -Force -ErrorAction SilentlyContinue
-    Invoke-Native -Label 'Mouser build_and_install.py' -FilePath $venvPy `
-      -ArgumentList @((Join-Path $MouserRoot 'scripts\build_and_install.py'))
+  } finally {
+    if ($null -eq $prevRestart) { Remove-Item Env:MOUSER_RESTART -ErrorAction SilentlyContinue } else { $env:MOUSER_RESTART = $prevRestart }
   }
 
   # Sign the PyInstaller output (Mouser.exe + every bundled .dll) with the
@@ -175,5 +194,9 @@ if ($DeployDeskflow -eq 1) {
   Deploy-Deskflow
 }
 Deploy-Mouser
+
+# Final gate: exactly one daemon (session 0), one service-owned core and one
+# GUI in the console session, all from the canonical install root.
+Assert-DeskflowSingle
 
 Write-Host "=== done: $hostName ==="

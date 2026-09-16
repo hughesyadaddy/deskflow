@@ -62,6 +62,18 @@ def tcc_rows(ax=2, listen=2):
     )
 
 
+CTL_OK = "deskflow-ctl assert-single: OK (core=1 launchd-owned, gui=1, bridge=0)"
+CTL_FAIL = ("deskflow-ctl assert-single: FAIL\n"
+            "  deskflow-core count=2 (want 1)\n"
+            "  non-canonical process pid=777 /tmp/build/bin/deskflow-core\n")
+
+# Fixture JSON as emitted by tools/fleet-health.ps1 for --check instances.
+WIN_INSTANCES_PASS = [{"check": "instances", "status": "PASS",
+                       "detail": "deskflow-ctl assert-single: OK (daemon=1 session 0 pid 1000; core=1 child of service in session 1; gui=1; bridge=0)"}]
+WIN_INSTANCES_FAIL = [{"check": "instances", "status": "FAIL",
+                       "detail": "deskflow-ctl assert-single: FAIL; deskflow-core.exe count=2 (want 1); deskflow.exe count=0 (want 1)"}]
+
+
 class FakeRunner:
     """Canned (rc, stdout, stderr) keyed by (host_id, command)."""
 
@@ -94,8 +106,10 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.csreq_decode_cmd("FADE0C00BB")): (0, CSREQ_CERT + "\n", ""),
         (hid, fh.csreq_decode_cmd("FADE0C00CC")): (0, CSREQ_CERT.replace("deskflow-core", "mouser") + "\n", ""),
         (hid, fh.check_permissions_cmd()): (0, "accessibility: granted\niohid: granted\n", ""),
-        (hid, fh.launchctl_cmd()): (0, "gui/501 => {\n\tservices = {\n\t\tio.github.hughesyadaddy.mouser\n\t}\n}", ""),
+        (hid, fh.launchctl_cmd()): (0, "gui/501 => {\n\tservices = {\n\t\tio.github.hughesyadaddy.mouser\n"
+                                    "\t\tio.github.hughesyadaddy.deskflow-core\n\t}\n}", ""),
         (hid, fh.deskflow_gui_running_cmd()): (0, "4242\n", ""),
+        (hid, fh.ctl_assert_single_cmd()): (0, CTL_OK + "\n", ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, 24800))] = (0, "", "")
@@ -359,7 +373,73 @@ def test_session_mac_pass_and_fail():
     results, _ = run_checks([mac()], t, ["session"])
     assert results[0].status == "FAIL"
     assert "io.github.hughesyadaddy.mouser not loaded" in results[0].detail
+    assert "io.github.hughesyadaddy.deskflow-core not loaded" in results[0].detail
     assert "Deskflow GUI not running" in results[0].detail
+    # launchd owns deskflow-core: a loaded Mouser alone is not enough
+    t = mac_ok_table()
+    t[("macbookpro", fh.launchctl_cmd())] = (0, "gui/501 => { services = { io.github.hughesyadaddy.mouser } }", "")
+    results, _ = run_checks([mac()], t, ["session"])
+    assert results[0].status == "FAIL" and "deskflow-core not loaded" in results[0].detail
+
+
+# ------------------------------------------------------------- instances
+
+
+def test_instances_cmd_expands_home_and_targets_the_ctl():
+    assert fh.ctl_assert_single_cmd() == '"$HOME"/Desktop/deskflow/scripts/deskflow-ctl assert-single'
+    assert fh.ctl_assert_single_cmd("/opt/df/") == "/opt/df/scripts/deskflow-ctl assert-single"
+    assert "instances" in fh.ALL_CHECKS
+
+
+def test_instances_mac_pass_and_fail():
+    results, runner = run_checks([mac()], mac_ok_table(), ["instances"])
+    assert results[0].status == "PASS" and "core=1" in results[0].detail
+    assert ("macbookpro", fh.ctl_assert_single_cmd()) in runner.calls
+    t = mac_ok_table()
+    t[("macbookpro", fh.ctl_assert_single_cmd())] = (1, "", CTL_FAIL)
+    results, _ = run_checks([mac()], t, ["instances"])
+    assert results[0].status == "FAIL"
+    assert "rc=1" in results[0].detail
+    assert "deskflow-core count=2 (want 1)" in results[0].detail
+    assert "non-canonical process pid=777" in results[0].detail
+
+
+def test_instances_mac_root_from_env():
+    t = {("macbookpro", fh.ctl_assert_single_cmd("/srv/deskflow")): (0, CTL_OK, "")}
+    results, _ = run_checks([mac()], t, ["instances"], env={"FLEET_DESKFLOW_PATH_macos": "/srv/deskflow"})
+    assert results[0].status == "PASS"
+
+
+def test_instances_windows_via_ps1_fixture_json():
+    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["instances"], "", 24800, [])
+    assert "-Checks instances" in cmd
+    t = {("tiny11", cmd): (0, json.dumps(WIN_INSTANCES_PASS), "")}
+    results, _ = run_checks([win()], t, ["instances"])
+    assert results[0].status == "PASS" and "core=1 child of service" in results[0].detail
+    t = {("tiny11", cmd): (1, json.dumps(WIN_INSTANCES_FAIL), "")}
+    results, _ = run_checks([win()], t, ["instances"])
+    assert results[0].status == "FAIL" and "deskflow-core.exe count=2" in results[0].detail
+
+
+def test_instances_is_included_in_all(tmp_path, capsys):
+    env_file = write_env(tmp_path)
+    runner = FakeRunner(mac_ok_table())
+    rc = fh.main(["--json", "--env", str(env_file)], runner=runner)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert [r for r in out["results"] if r["check"] == "instances"][0]["status"] == "PASS"
+    assert ("macbookpro", fh.ctl_assert_single_cmd()) in runner.calls
+
+
+def test_scan_includes_deskflow_prio_and_flags_it_when_adhoc():
+    assert "ls /usr/local/bin/deskflow-prio 2>/dev/null" in fh.macho_scan_cmd()
+    t = mac_ok_table()
+    t[("macbookpro", fh.macho_scan_cmd())] = (0, good_scan() + codesign_block("/usr/local/bin/deskflow-prio", "dfprio", adhoc=True), "")
+    results, _ = run_checks([mac()], t, ["sign", "no-adhoc", "identifiers"])
+    by = {r.check: r for r in results}
+    assert by["no-adhoc"].status == "FAIL" and "deskflow-prio" in by["no-adhoc"].detail
+    assert by["sign"].status == "FAIL" and "deskflow-prio" in by["sign"].detail
+    assert by["identifiers"].status == "FAIL" and "deskflow-prio=dfprio" in by["identifiers"].detail
 
 
 # ------------------------------------------------------------------ mesh
@@ -475,7 +555,7 @@ def test_main_all_checks_single_mac_host(tmp_path, capsys):
     rc = fh.main(["--env", str(env_file)], runner=FakeRunner(mac_ok_table()))
     text = capsys.readouterr().out
     assert rc == 0
-    for check in ("sign", "no-adhoc", "identifiers", "tcc", "session", "mesh"):
+    for check in ("sign", "no-adhoc", "identifiers", "tcc", "session", "mesh", "instances"):
         assert f"| {check}" in text
     assert "authenticode" not in text  # windows-only, not shown for a mac unless explicit
 

@@ -1,12 +1,15 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Quit Deskflow, install the Release build to Program Files, restart service + GUI.
+  Stop Deskflow via deskflow-ctl, install the Release build to Program Files, start it again.
 .DESCRIPTION
-  Stops every Deskflow process (any path), removes rogue install copies, copies the
-  windeployqt-staged build from build/bin/Release into DESKFLOW_INSTALL_DIR,
-  registers the Deskflow service, starts it once, and launches a single deskflow.exe
-  from the canonical install directory.
+  Process lifecycle goes through scripts/deskflow-ctl.ps1 only:
+    ctl stop  -> remove rogue install copies -> copy the windeployqt-staged
+    build from build/bin/Release into DESKFLOW_INSTALL_DIR -> ctl start
+    (sign, sc create/config, Start-Service, wait for the service-owned core,
+    launch one GUI into the console session) -> ctl assert-single.
+  This script never kills by image name and never touches Mouser (Mouser has
+  its own installer).
 
   Re-launches elevated when installing under Program Files without admin rights.
 .EXAMPLE
@@ -23,14 +26,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
-$script:DeskflowProcessNames = @(
-  'deskflow', 'deskflow-core', 'deskflow-daemon', 'deskflow-vhid-bridge'
-)
+$script:Ctl = Join-Path $PSScriptRoot 'deskflow-ctl.ps1'
 
-function Invoke-TaskKill {
-  param([string]$ImageName)
-  # taskkill writes to stderr on failure; must not trip $ErrorActionPreference = 'Stop'
-  cmd.exe /c "taskkill /F /T /IM `"$ImageName`" >nul 2>&1"
+function Invoke-DeskflowCtl {
+  # Run a deskflow-ctl verb in-process (we are already elevated by Assert-Admin).
+  param([Parameter(Mandatory)][string]$CtlVerb, [string]$Dir, [switch]$NoGui)
+  if (-not (Test-Path $script:Ctl)) { throw "deskflow-ctl.ps1 missing at $script:Ctl" }
+  $ctlArgs = @{ Verb = $CtlVerb; InstallDir = $Dir }
+  if ($NoGui) { $ctlArgs.NoGui = $true }
+  & $script:Ctl @ctlArgs
 }
 
 function Import-DeskflowEnv {
@@ -73,88 +77,6 @@ function Assert-Admin {
   exit $proc.ExitCode
 }
 
-function Get-DeskflowProcesses {
-  Get-CimInstance Win32_Process -Filter "Name LIKE 'deskflow%'" -ErrorAction SilentlyContinue
-}
-
-function Stop-ProcessTree {
-  param([int]$ProcessId)
-  # /T tree-kills watchdog-spawned children; elevated /F reaches SYSTEM (session 0).
-  cmd.exe /c "taskkill /F /T /PID $ProcessId >nul 2>&1"
-  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-}
-
-function Remove-DeskflowService {
-  # The daemon is a watchdog: it respawns deskflow-core. It MUST be stopped and
-  # removed before killing cores, or the killed core is immediately relaunched.
-  $svc = Get-CimInstance Win32_Service -Filter "Name='Deskflow'" -ErrorAction SilentlyContinue
-  if (-not $svc) { return }
-
-  if ($svc.State -eq 'Running') {
-    Stop-Service -Name Deskflow -Force -ErrorAction SilentlyContinue
-  }
-
-  # Wait for the SCM to report Stopped; force-kill the daemon PID if it hangs so
-  # the watchdog thread cannot spawn another core.
-  $deadline = (Get-Date).AddSeconds(10)
-  while ((Get-Date) -lt $deadline) {
-    $s = Get-Service -Name Deskflow -ErrorAction SilentlyContinue
-    if (-not $s -or $s.Status -eq 'Stopped') { break }
-    Start-Sleep -Milliseconds 500
-  }
-  $running = Get-CimInstance Win32_Service -Filter "Name='Deskflow'" -ErrorAction SilentlyContinue
-  if ($running -and $running.ProcessId -gt 0) {
-    Write-Host "  force-killing daemon service PID $($running.ProcessId)"
-    Stop-ProcessTree -ProcessId $running.ProcessId
-  }
-
-  sc.exe stop Deskflow 2>$null | Out-Null
-  sc.exe delete Deskflow 2>$null | Out-Null
-
-  # Wait until the service is fully removed before continuing so a re-create
-  # later cannot collide with a delete that is still pending.
-  $deadline = (Get-Date).AddSeconds(10)
-  while ((Get-Date) -lt $deadline) {
-    if (-not (Get-Service -Name Deskflow -ErrorAction SilentlyContinue)) { break }
-    Start-Sleep -Milliseconds 500
-  }
-}
-
-function Stop-DeskflowAll {
-  Write-Host '== Stopping Deskflow service and all processes =='
-
-  Remove-DeskflowService
-
-  # Kill every Deskflow process in EVERY session. A stale core can run as SYSTEM
-  # in session 0 (watchdog/secure-desktop) alongside a user-session core, because
-  # the single-instance guard uses per-session namespaces. Tree-kill by PID so
-  # both die regardless of session.
-  $deadline = (Get-Date).AddSeconds(25)
-  while ((Get-Date) -lt $deadline) {
-    $procs = @(Get-DeskflowProcesses)
-    if ($procs.Count -eq 0) { break }
-
-    foreach ($proc in $procs) {
-      Write-Host "  killing PID $($proc.ProcessId) $($proc.Name) session=$($proc.SessionId) ($($proc.ExecutablePath))"
-      Stop-ProcessTree -ProcessId $proc.ProcessId
-    }
-
-    foreach ($name in $script:DeskflowProcessNames) {
-      Invoke-TaskKill "$name.exe"
-    }
-
-    Start-Sleep -Milliseconds 750
-  }
-
-  $remaining = @(Get-DeskflowProcesses)
-  if ($remaining.Count -gt 0) {
-    $detail = ($remaining | ForEach-Object { "$($_.Name) pid=$($_.ProcessId) session=$($_.SessionId) path=$($_.ExecutablePath)" }) -join '; '
-    throw "Could not stop all Deskflow processes: $detail"
-  }
-
-  Write-Host '== All Deskflow processes stopped =='
-}
-
 function Get-RogueInstallPaths {
   param([string]$CanonicalDir)
 
@@ -181,44 +103,21 @@ function Remove-RogueInstalls {
 
   if ($Paths.Count -eq 0) { return }
 
-  Stop-DeskflowAll
+  # ctl stop only reaches processes under the canonical root; a rogue copy
+  # running from elsewhere is stopped by PID here before its directory goes.
+  foreach ($rogue in $Paths) {
+    $rogueFull = [System.IO.Path]::GetFullPath($rogue).TrimEnd('\').ToLowerInvariant()
+    Get-CimInstance Win32_Process -Filter "Name LIKE 'deskflow%'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant().StartsWith($rogueFull + '\') } |
+      ForEach-Object {
+        Write-Host "  stopping rogue PID $($_.ProcessId) ($($_.ExecutablePath))"
+        cmd.exe /c "taskkill /F /T /PID $($_.ProcessId) >nul 2>&1"
+      }
+  }
   foreach ($rogue in $Paths) {
     Write-Host "Removing rogue install: $rogue"
     Remove-Item -LiteralPath $rogue -Recurse -Force -ErrorAction SilentlyContinue
   }
-}
-
-function Ensure-DeskflowService {
-  param([string]$DaemonPath)
-
-  if (-not (Test-Path $DaemonPath)) {
-    throw "deskflow-daemon.exe not found at $DaemonPath"
-  }
-
-  $binPath = "`"$DaemonPath`""
-  if (Get-Service -Name Deskflow -ErrorAction SilentlyContinue) {
-    Write-Host '== Updating Deskflow Windows service =='
-    sc.exe config Deskflow binPath= $binPath start= auto | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "sc.exe config failed ($LASTEXITCODE)" }
-  } else {
-    Write-Host '== Creating Deskflow Windows service =='
-    sc.exe create Deskflow binPath= $binPath start= auto DisplayName= "Deskflow" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed ($LASTEXITCODE)" }
-  }
-}
-
-function Start-DeskflowService {
-  $svc = Get-Service -Name Deskflow -ErrorAction SilentlyContinue
-  if (-not $svc) { return }
-
-  if ($svc.Status -eq 'Running') {
-    Write-Host '== Deskflow service already running; restarting =='
-    Restart-Service Deskflow -Force
-  } else {
-    Write-Host '== Starting Deskflow service =='
-    Start-Service Deskflow
-  }
-  Write-Host ("== Service status: " + (Get-Service Deskflow).Status + " ==")
 }
 
 function Set-DeskflowRunRegistry {
@@ -230,124 +129,6 @@ function Set-DeskflowRunRegistry {
   if ($existing -ne $target) {
     Write-Host "Updating login startup entry -> $GuiPath"
     Set-ItemProperty -Path $runKey -Name 'Deskflow' -Value $target
-  }
-}
-
-function Get-InteractiveSession {
-  # The session that owns explorer.exe is the interactive console session.
-  # Returns @{ SessionId; User } or $null when nobody is logged in.
-  $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
-    Sort-Object SessionId | Select-Object -First 1
-  if (-not $explorer) { return $null }
-  $owner = Invoke-CimMethod -InputObject $explorer -MethodName GetOwner -ErrorAction SilentlyContinue
-  if (-not $owner -or -not $owner.User) { return $null }
-  $user = if ($owner.Domain) { "$($owner.Domain)\$($owner.User)" } else { $owner.User }
-  [pscustomobject]@{ SessionId = [int]$explorer.SessionId; User = $user }
-}
-
-function Start-GuiInSession {
-  # Start-Process from a session-0 (service/SSH) context lands the GUI in session 0,
-  # invisible to the user and prone to spawning a duplicate core. An interactive
-  # scheduled task launches into the user's active console session instead.
-  param([string]$Gui, [string]$WorkDir, [string]$User)
-
-  $taskName = 'DeskflowInstallLaunch'
-  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-  # No --show: deploys should restart the GUI silently to tray, not pop the window.
-  $action = New-ScheduledTaskAction -Execute $Gui -WorkingDirectory $WorkDir
-  $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive
-  Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-  try {
-    Start-ScheduledTask -TaskName $taskName
-    Start-Sleep -Seconds 3
-  } finally {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-  }
-}
-
-function Start-DeskflowGui {
-  param([string]$InstallRoot)
-
-  $gui = Join-Path $InstallRoot 'deskflow.exe'
-  if (-not (Test-Path $gui)) { throw "deskflow.exe not found at $gui" }
-
-  $canonicalGui = [System.IO.Path]::GetFullPath($gui).ToLowerInvariant()
-
-  foreach ($proc in @(Get-DeskflowProcesses)) {
-    $path = if ($proc.ExecutablePath) { $proc.ExecutablePath.ToLowerInvariant() } else { '' }
-    if ($proc.Name -ieq 'deskflow.exe' -and $path -eq $canonicalGui) {
-      Write-Host "== deskflow.exe already running from $InstallRoot; not launching a second GUI =="
-      return
-    }
-    if ($proc.Name -ieq 'deskflow.exe') {
-      Write-Host "  stopping extra GUI PID $($proc.ProcessId) ($($proc.ExecutablePath))"
-      Stop-ProcessTree -ProcessId $proc.ProcessId
-    }
-  }
-
-  Start-Sleep -Seconds 1
-  if (Get-Process -Name deskflow -ErrorAction SilentlyContinue) {
-    throw 'deskflow.exe still running after cleanup; refusing to launch another instance.'
-  }
-
-  $mySession = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
-  $interactive = Get-InteractiveSession
-
-  if ($interactive -and $interactive.SessionId -ne $mySession) {
-    Write-Host "== Launching GUI in active session $($interactive.SessionId) as $($interactive.User) =="
-    Start-GuiInSession -Gui $gui -WorkDir $InstallRoot -User $interactive.User
-  } elseif ($mySession -ne 0) {
-    Write-Host "== Launching single GUI (tray): $gui =="
-    Start-Process -FilePath $gui -WorkingDirectory $InstallRoot
-  } else {
-    Write-Host '== No interactive session; GUI will start at next login (Run key) =='
-  }
-}
-
-function Invoke-DeskflowSigning {
-  # UIAccess (letting the core reach elevated windows so an elevated PowerToys
-  # doesn't block its input) requires the core exe to be Authenticode-signed by
-  # a cert that chains to a trusted root, and installed under Program Files.
-  # All signing goes through scripts/sign-windows.ps1 (signtool + the fleet
-  # thumbprint from DESKFLOW_SIGN_THUMBPRINT), which signs every .exe/.dll
-  # under the install root and throws on any missing prerequisite or verify
-  # failure. This script no longer mints self-signed certs or writes to the
-  # LocalMachine\Root / TrustedPublisher stores.
-  param([string]$InstallRoot)
-  $signer = Join-Path $PSScriptRoot 'sign-windows.ps1'
-  if (-not (Test-Path $signer)) { throw "sign-windows.ps1 missing at $signer" }
-  & $signer -Root $InstallRoot
-}
-
-function Restart-Mouser {
-  # Mouser bridges to deskflow-core over a local socket and holds per-process
-  # state for it. Reinstalling gives deskflow-core a new identity, and Mouser's
-  # auto-mode reconnect then churns against the stale session -- observed on
-  # macOS dropping and reconnecting every 5-15s indefinitely, renegotiating
-  # focus each cycle and pulling the cursor between screens. Mouser does not
-  # recover on its own, so bounce it whenever Deskflow is reinstalled.
-  $proc = Get-Process -Name 'Mouser' -ErrorAction SilentlyContinue
-  if (-not $proc) { return }
-  $exe = $proc | Select-Object -First 1 -ExpandProperty Path -ErrorAction SilentlyContinue
-  if (-not $exe) { $exe = 'C:\Program Files\Mouser\Mouser.exe' }
-  Write-Host '== Restarting Mouser (clears stale deskflow bridge state) =='
-  $proc | Stop-Process -Force -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 2
-  if (Test-Path $exe) { Start-Process -FilePath $exe | Out-Null }
-}
-
-function Assert-CanonicalRuntime {
-  param([string]$InstallDir)
-
-  $canonical = [System.IO.Path]::GetFullPath($InstallDir).ToLowerInvariant()
-  $foreign = @(Get-DeskflowProcesses | Where-Object {
-      $_.ExecutablePath -and
-      (-not ($_.ExecutablePath.ToLowerInvariant().StartsWith($canonical)))
-    })
-
-  if ($foreign.Count -gt 0) {
-    $detail = ($foreign | ForEach-Object { "$($_.Name) $($_.ExecutablePath)" }) -join '; '
-    throw "Deskflow still running from non-canonical paths: $detail"
   }
 }
 
@@ -377,7 +158,7 @@ if (-not (Test-Path (Join-Path $releaseDir 'deskflow.exe'))) {
   throw "Release build not found at $releaseDir - configure and build first."
 }
 
-Stop-DeskflowAll
+Invoke-DeskflowCtl -CtlVerb stop -Dir $InstallDir
 
 $roguePaths = Get-RogueInstallPaths -CanonicalDir $InstallDir
 Remove-RogueInstalls -Paths $roguePaths -CanonicalDir $InstallDir
@@ -398,26 +179,19 @@ if ($srcWidgets.Length -ne $dstWidgets.Length) {
   throw "Qt runtime mismatch after install (expected $($srcWidgets.Length) bytes, got $($dstWidgets.Length))."
 }
 
-$daemon = Join-Path $InstallDir 'deskflow-daemon.exe'
 $gui = Join-Path $InstallDir 'deskflow.exe'
-$core = Join-Path $InstallDir 'deskflow-core.exe'
-
-# Sign every installed binary so the core's UIAccess manifest bit is honored
-# (Windows silently ignores UIAccess on an unsigned or non-Program-Files exe).
-# Must run before the service/GUI start: signtool needs write access to the
-# images, and running exes are locked.
-Invoke-DeskflowSigning -InstallRoot $InstallDir
-
-Ensure-DeskflowService -DaemonPath $daemon
 Set-DeskflowRunRegistry -GuiPath $gui
-Start-DeskflowService
 
-if (-not $NoRestart) {
-  Start-DeskflowGui -InstallRoot $InstallDir
-  Restart-Mouser
+# ctl start: sign (sign-windows.ps1) -> sc create/config -> Start-Service ->
+# wait for the service-owned deskflow-core -> one GUI in the console session.
+# Signing happens inside ctl start, before anything is running, because
+# signtool needs write access to the images and running exes are locked.
+if ($NoRestart) {
+  Invoke-DeskflowCtl -CtlVerb start -Dir $InstallDir -NoGui
+} else {
+  Invoke-DeskflowCtl -CtlVerb start -Dir $InstallDir
+  Invoke-DeskflowCtl -CtlVerb 'assert-single' -Dir $InstallDir
 }
-
-Assert-CanonicalRuntime -InstallDir $InstallDir
 
 Write-Host "== Done: single install at $InstallDir =="
 $svcPath = (Get-CimInstance Win32_Service -Filter "Name='Deskflow'" -ErrorAction SilentlyContinue).PathName

@@ -155,3 +155,38 @@ Describe "Invoke-FleetHealth" {
     $parsed[0].status | Should -Be "FAIL"
   }
 }
+
+Describe "Test-Instances" {
+  It "passes when deskflow-ctl.ps1 assert-single exits cleanly" {
+    Mock Test-Path { $true }
+    Mock Invoke-CtlAssertSingle { @{ ok = $true; text = "deskflow-ctl assert-single: OK (daemon=1 session 0 pid 1000; core=1 child of service in session 1; gui=1; bridge=0)" } }
+    $r = Test-Instances "C:\x\scripts\deskflow-ctl.ps1"
+    $r.check | Should -Be "instances"
+    $r.status | Should -Be "PASS"
+    $r.detail | Should -Match "core=1"
+  }
+
+  It "fails with the ctl's problem list when assert-single throws" {
+    Mock Invoke-CtlAssertSingle { @{ ok = $false; text = "deskflow-ctl assert-single: FAIL`n  deskflow-core.exe count=2 (want 1)`n  deskflow.exe count=0 (want 1)" } }
+    $r = Test-Instances "C:\x\scripts\deskflow-ctl.ps1"
+    $r.status | Should -Be "FAIL"
+    $r.detail | Should -Match "deskflow-core.exe count=2"
+    $r.detail | Should -Match "deskflow.exe count=0"
+  }
+
+  It "fails when the ctl script is missing" {
+    $r = Test-Instances (Join-Path $TestDrive "nope\deskflow-ctl.ps1")
+    $r.status | Should -Be "FAIL"
+    $r.detail | Should -Match "missing"
+  }
+
+  It "is part of the default check set and of 'all'" {
+    Mock Test-Authenticode { New-Result "authenticode" "PASS" "" }
+    Mock Test-Session { New-Result "session" "PASS" "" }
+    Mock Test-Mesh { @(New-Result "mesh" "SKIP" "no peers") }
+    Mock Test-Instances { New-Result "instances" "PASS" "ok" }
+    $r = Invoke-FleetHealth -Checks "all" -Thumbprint "" -Peers "" -Port 24800 -InstallRoots @() -ServiceName "Deskflow" -GuiProcesses @()
+    @($r | ForEach-Object { $_.check }) | Should -Contain "instances"
+    Should -Invoke Test-Instances -Times 1
+  }
+}

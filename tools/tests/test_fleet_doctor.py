@@ -85,6 +85,8 @@ def mac_responses(hid, python="3.14", console=LOCAL_USER):
         (hid, "test -d '/opt/Qt/6.8.3/macos'"): (0, ""),
         (hid, "launchctl list | grep com.cursor.worker"): (1, ""),
         (hid, "grep -c vitest"): (1, "0\n"),
+        (hid, "ps -axo comm="): (0, "/sbin/launchd\n/Applications/Deskflow.app/Contents/MacOS/deskflow-core\n"
+                                    "/Applications/Deskflow.app/Contents/MacOS/Deskflow\n/Applications/Mouser.app/Contents/MacOS/Mouser\n"),
     }
 
 
@@ -107,6 +109,8 @@ def win_responses(hid="tiny11"):
         (hid, "python --version"): (0, "Python 3.12.4\n"),
         (hid, "cmake --version"): (0, "cmake version 3.31.2\n"),
         (hid, "Test-Path -PathType Container 'C:/Qt/6.8.3/msvc2022_64'"): (0, "True\n"),
+        (hid, "Name LIKE 'deskflow%'"): (0, "C:\\Program Files\\Deskflow\\deskflow-daemon.exe\n"
+                                        "C:\\Program Files\\Deskflow\\deskflow-core.exe\nC:\\Program Files\\Deskflow\\deskflow.exe\n"),
     }
 
 
@@ -400,6 +404,47 @@ def test_session_terminal_failure_names_the_human_step(fleet_doctor, healthy, fl
     assert code == 1
     fails = rows(payload, host="macbookpro", check="session", status="fail")
     assert len(fails) == 1 and "Human step:" in fails[0]["detail"] and "control Terminal" in fails[0]["detail"]
+
+
+def test_session_reports_canonical_deskflow_process_paths(fleet_doctor, healthy, fleet_env):
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--check", "session")
+    assert code == 0
+    for host, prefix in (("hackintosh", "/Applications/Deskflow.app/Contents/MacOS/"),
+                         ("tiny11", "C:\\Program Files\\Deskflow\\")):
+        row = [r for r in rows(payload, host=host, check="session") if "Deskflow process" in r["detail"]]
+        assert row and row[0]["status"] == "pass" and prefix in row[0]["detail"]
+    assert rows(payload, status="warn") == []
+
+
+@pytest.mark.parametrize("host, needle, out, bad", [
+    ("hackintosh", "ps -axo comm=",
+     "/Applications/Deskflow.app/Contents/MacOS/deskflow-core\n/Users/u/Desktop/deskflow/build/bin/deskflow-core\n",
+     "/Users/u/Desktop/deskflow/build/bin/deskflow-core"),
+    ("macbookpro", "ps -axo comm=",
+     "/Applications/Deskflow.app/Contents/MacOS/Deskflow\n/Applications/Deskflow.app.bak/Contents/MacOS/deskflow-core\n",
+     "/Applications/Deskflow.app.bak/Contents/MacOS/deskflow-core"),
+    ("tiny11", "Name LIKE 'deskflow%'",
+     "C:\\Program Files\\Deskflow\\deskflow-daemon.exe\nC:\\Users\\alexh\\Desktop\\deskflow\\build\\bin\\Release\\deskflow-core.exe\n",
+     "C:\\Users\\alexh\\Desktop\\deskflow\\build\\bin\\Release\\deskflow-core.exe"),
+])
+def test_session_warns_on_non_canonical_deskflow_process_path(fleet_doctor, healthy, fleet_env, host, needle, out, bad):
+    healthy.set(host, needle, 0, out)
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", host, "--check", "session")
+    # a warning is advisory: exit code stays 0
+    assert code == 0
+    warns = rows(payload, host=host, check="session", status="warn")
+    assert len(warns) == 1
+    assert "non-canonical Deskflow process path" in warns[0]["detail"]
+    assert bad in warns[0]["detail"]
+    assert "deskflow-ctl" in warns[0]["detail"]
+    assert rows(payload, host=host, check="session", status="fail") == []
+
+
+def test_non_canonical_helper_ignores_mouser_and_is_case_insensitive(fleet_doctor):
+    fd = fleet_doctor
+    assert fd.non_canonical_deskflow_paths(["/applications/deskflow.app/contents/macos/deskflow-core"], "macos") == []
+    assert fd.non_canonical_deskflow_paths(["c:\\program files\\deskflow\\deskflow.exe"], "windows") == []
+    assert fd.non_canonical_deskflow_paths(["/tmp/deskflow-core"], "macos") == ["/tmp/deskflow-core"]
 
 
 def test_session_uses_fleet_ssh_user_override(fleet_doctor, healthy, tmp_path):

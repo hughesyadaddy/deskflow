@@ -3,7 +3,7 @@
 
 Usage:
   tools/fleet-health [--host all|local|<id>]
-                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|all]
+                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|instances|all]
                      [--json] [--env PATH]
 
 Reads scripts/fleet.env (same format as fleet-doctor / fleet-deploy.sh):
@@ -13,8 +13,21 @@ Reads scripts/fleet.env (same format as fleet-doctor / fleet-deploy.sh):
   FLEET_OS_<id>=macos|windows         (optional; default: tiny11/win*/tiny* => windows)
   FLEET_ADDR_<id>=<host/ip>           (optional; address peers use for the mesh check)
   FLEET_DESKFLOW_PORT=24800           (optional)
+  FLEET_DESKFLOW_PATH_macos=~/Desktop/deskflow   (where scripts/deskflow-ctl lives)
   FLEET_DESKFLOW_PATH_windows=C:/Users/alexh/Desktop/deskflow
   DESKFLOW_SIGN_THUMBPRINT=<sha1>     (Windows Authenticode thumbprint)
+
+Checks:
+  sign/no-adhoc/identifiers  codesign state of every Mach-O in the app bundles
+                             plus /usr/local/bin/deskflow-prio (macOS)
+  tcc                        TCC grants are cert-based and granted (macOS)
+  authenticode               Authenticode thumbprint on every exe/dll (Windows)
+  session                    agents loaded / GUI running in the console session
+  mesh                       every seat reaches every other seat on the port
+  instances                  `scripts/deskflow-ctl assert-single` on each host:
+                             exactly one Deskflow core (owned by launchd / the
+                             service) and one GUI from the canonical path, nothing
+                             else. Exit 0 from the ctl = PASS.
 
 Environment overrides:
   DESKFLOW_EXPECT_AUTHORITY  expected `Authority=` prefix (default "Apple Development")
@@ -43,13 +56,18 @@ REPO_ROOT = TOOLS_DIR.parent
 DEFAULT_ENV_FILE = REPO_ROOT / "scripts" / "fleet.env"
 IDENTIFIERS_FILE = TOOLS_DIR / "fleet-health.identifiers"
 
-ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh")
+ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh", "instances")
 MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc"}
 WIN_ONLY = {"authenticode"}
 
 MAC_APPS = ("/Applications/Deskflow.app", "/Applications/Mouser.app")
+# Loose Mach-Os outside any bundle that must still carry the fleet signature.
+MAC_EXTRA_BINARIES = ("/usr/local/bin/deskflow-prio",)
+MAC_DESKFLOW_ROOT = "~/Desktop/deskflow"
 DESKFLOW_CORE = "/Applications/Deskflow.app/Contents/MacOS/deskflow-core"
 MOUSER_LABEL = "io.github.hughesyadaddy.mouser"
+# launchd is the only owner of deskflow-core on macOS (scripts/deskflow-ctl).
+DESKFLOW_CORE_LABEL = "io.github.hughesyadaddy.deskflow-core"
 DEFAULT_PORT = 24800
 DEFAULT_AUTHORITY = "Apple Development"
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
@@ -189,7 +207,7 @@ class Result:
 # Kept as functions so tests can key a fake runner on the exact command string.
 
 
-def macho_scan_cmd(apps: Sequence[str] = MAC_APPS) -> str:
+def macho_scan_cmd(apps: Sequence[str] = MAC_APPS, extra: Sequence[str] = MAC_EXTRA_BINARIES) -> str:
     """One remote round-trip: enumerate Mach-Os and dump codesign info per file."""
     finds = []
     for app in apps:
@@ -200,6 +218,8 @@ def macho_scan_cmd(apps: Sequence[str] = MAC_APPS) -> str:
             f"find {shlex.quote(frameworks)} -type f \\( -name '*.dylib' -o -perm -u+x \\) "
             f"-not -path '*/Resources/*' -not -path '*/Headers/*' 2>/dev/null"
         )
+    for path in extra:
+        finds.append(f"ls {shlex.quote(path)} 2>/dev/null")
     return (
         "for f in $({ " + "; ".join(finds) + "; }); do "
         'echo "=== $f"; codesign -dvv --verbose=4 "$f" 2>&1; '
@@ -244,6 +264,16 @@ def deskflow_gui_running_cmd() -> str:
 
 def nc_cmd(addr: str, port: int) -> str:
     return f"nc -z -w3 {shlex.quote(addr)} {port}"
+
+
+def ctl_assert_single_cmd(root: str = MAC_DESKFLOW_ROOT) -> str:
+    """scripts/deskflow-ctl assert-single; `~` becomes $HOME so it expands on the remote."""
+    root = root.rstrip("/")
+    if root.startswith("~"):
+        root = '"$HOME"' + root[1:]
+    else:
+        root = shlex.quote(root)
+    return f"{root}/scripts/deskflow-ctl assert-single"
 
 
 def ps1_cmd(root: str, checks: Sequence[str], thumbprint: str, port: int, peers: Sequence[str]) -> str:
@@ -497,15 +527,31 @@ class FleetHealth:
         rc, out, err = self.runner(host, launchctl_cmd())
         if rc != 0:
             problems.append(f"launchctl print gui/$UID rc={rc}")
-        elif MOUSER_LABEL not in out:
-            problems.append(f"{MOUSER_LABEL} not loaded in gui/$UID")
+        else:
+            for label in (MOUSER_LABEL, DESKFLOW_CORE_LABEL):
+                if label not in out:
+                    problems.append(f"{label} not loaded in gui/$UID")
         rc, out, err = self.runner(host, deskflow_gui_running_cmd())
         if rc != 0 or not out.strip():
             problems.append("Deskflow GUI not running")
         if problems:
             self._add(host, "session", FAIL, "; ".join(problems))
         else:
-            self._add(host, "session", PASS, f"{MOUSER_LABEL} loaded; Deskflow GUI running")
+            self._add(host, "session", PASS,
+                      f"{MOUSER_LABEL} + {DESKFLOW_CORE_LABEL} loaded; Deskflow GUI running")
+
+    def check_instances_mac(self, host: Host) -> None:
+        root = self.env.get("FLEET_DESKFLOW_PATH_macos") or MAC_DESKFLOW_ROOT
+        rc, out, err = self.runner(host, ctl_assert_single_cmd(root))
+        text = (out + err).strip()
+        if rc == 0:
+            last = text.splitlines()[-1] if text else "assert-single: OK"
+            self._add(host, "instances", PASS, last)
+        else:
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            problems = [ln for ln in lines if not ln.startswith("deskflow-ctl assert-single")]
+            self._add(host, "instances", FAIL,
+                      f"deskflow-ctl assert-single rc={rc}: " + ("; ".join(problems) or "no output")[:300])
 
     def check_mesh_leg_mac(self, src: Host, dst: Host) -> None:
         rc, out, err = self.runner(src, nc_cmd(dst.addr, self.port))
@@ -571,6 +617,8 @@ class FleetHealth:
                     self.check_tcc(host)
                 elif c == "session":
                     self.check_session_mac(host)
+                elif c == "instances":
+                    self.check_instances_mac(host)
                 elif c == "mesh":
                     if not peers:
                         self._add(host, "mesh", SKIP, "no peers")

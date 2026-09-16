@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  deskflow-core (auto mode) — launchd is the ONLY owner of this process.
+
+  Rendered into ~/Library/LaunchAgents by `scripts/deskflow-ctl start`
+  (__APP__ -> the installed bundle, __HOME__ -> $HOME; launchd does not expand
+  ~). Never `open`/`pkill` deskflow-core by hand; use the ctl verbs:
+
+    scripts/deskflow-ctl stop      launchctl bootout
+    scripts/deskflow-ctl start     launchctl bootstrap
+    scripts/deskflow-ctl restart   launchctl kickstart -k
+
+  KeepAlive/SuccessfulExit=false restarts the core only after a crash or
+  non-zero exit; a clean `bootout` stays down. ThrottleInterval keeps a
+  crash loop from spinning faster than once per 5 s.
+
+  The login-window bridge stays separate:
+  /Library/LaunchAgents/org.deskflow.vhid-bridge.plist (LoginWindow, KeepAlive).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.hughesyadaddy.deskflow-core</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__APP__/Contents/MacOS/deskflow-core</string>
+    <string>auto</string>
+  </array>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/Deskflow/deskflow-core.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/Deskflow/deskflow-core.log</string>
+</dict>
+</plist>
