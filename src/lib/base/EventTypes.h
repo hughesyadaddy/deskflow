@@ -88,6 +88,10 @@ enum class EventTypes : uint32_t
 
   OsxScreenConfirmSleep,
 
+  /** OSXScreen posts this to itself from lock/unlock/wake notifications so the
+      key state is reconciled with OS truth on the event-loop thread. */
+  OsxScreenResyncKeyState,
+
   /// This event is sent whenever a server accepts a client.
   ClientListenerAccepted,
 

@@ -111,6 +111,25 @@ public:
     // Default implementation does nothing
   }
 
+  //! Force a toggle modifier (CapsLock/NumLock/ScrollLock) to a state
+  /*!
+  Drives the OS lock state for \p bit to \p on without faking a key press
+  when the OS already agrees. Default implementation does nothing.
+  */
+  virtual void setToggleState(KeyModifierMask bit, bool on)
+  {
+  }
+
+  //! Release modifiers this process injected that the OS still reports down
+  /*!
+  Reconciles injected modifier state with OS truth (e.g. after lock/unlock,
+  wake or a lost key-up). Never touches modifiers the user physically holds.
+  Default implementation does nothing.
+  */
+  virtual void sanitizeInjectedKeys()
+  {
+  }
+
   //! Fake ctrl+alt+del
   /*!
   Synthesize a press of ctrl+alt+del.  Return true if processing is

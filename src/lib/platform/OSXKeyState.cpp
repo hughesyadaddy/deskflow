@@ -14,6 +14,7 @@
 
 #include <Carbon/Carbon.h>
 #include <IOKit/hidsystem/IOHIDLib.h>
+#include <IOKit/hidsystem/IOHIDParameter.h>
 #include <pthread.h>
 
 #pragma clang diagnostic push
@@ -480,6 +481,11 @@ int32_t OSXKeyState::pollActiveGroup() const
 
 void OSXKeyState::pollPressedKeys(KeyButtonSet &pressedKeys) const
 {
+  if (m_hooks.pressedKeys) {
+    m_hooks.pressedKeys(pressedKeys);
+    return;
+  }
+
   ::KeyMap km;
   GetKeys(km);
   const uint8_t *m = reinterpret_cast<const uint8_t *>(km);
@@ -576,13 +582,180 @@ CGEventFlags OSXKeyState::getKeyboardEventFlags() const
 {
   // set the event flags for special keys
   // http://tinyurl.com/pxl742y
-  CGEventFlags modifiers = getModifierStateAsOSXFlags();
+  // The device-dependent (NX_DEVICEL*KEYMASK) bits used to be omitted
+  // whenever caps lock was on, which made Shift+Caps combos post as plain
+  // caps: apps that key off the device bits saw no shift at all. The device
+  // bits only describe shift/ctrl/alt/cmd and are independent of the caps
+  // lock state, so always carry them.
+  return getModifierStateAsOSXFlags() | getDeviceDependedFlags();
+}
 
-  if (!m_capsPressed) {
-    modifiers |= getDeviceDependedFlags();
+CGEventFlags OSXKeyState::modifierFlagForVirtualKey(uint8_t virtualKey)
+{
+  switch (virtualKey) {
+  case s_shiftVK:
+    return kCGEventFlagMaskShift;
+  case s_controlVK:
+    return kCGEventFlagMaskControl;
+  case s_altVK:
+    return kCGEventFlagMaskAlternate;
+  case s_superVK:
+    return kCGEventFlagMaskCommand;
+  case s_capsLockVK:
+    return kCGEventFlagMaskAlphaShift;
+  default:
+    return 0;
+  }
+}
+
+void OSXKeyState::setHooks(Hooks hooks)
+{
+  m_hooks = std::move(hooks);
+}
+
+std::set<uint8_t> OSXKeyState::injectedModifiers() const
+{
+  return m_injectedModifiers;
+}
+
+CGEventFlags OSXKeyState::osModifierFlags() const
+{
+  if (m_hooks.osModifierFlags) {
+    return m_hooks.osModifierFlags();
+  }
+  return CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+}
+
+void OSXKeyState::reseedShadowFlagsFromOS()
+{
+  const CGEventFlags os = osModifierFlags();
+  m_shiftPressed = (os & kCGEventFlagMaskShift) != 0;
+  m_controlPressed = (os & kCGEventFlagMaskControl) != 0;
+  m_altPressed = (os & kCGEventFlagMaskAlternate) != 0;
+  m_superPressed = (os & kCGEventFlagMaskCommand) != 0;
+  m_capsPressed = (os & kCGEventFlagMaskAlphaShift) != 0;
+  LOG_DEBUG("reseeded shadow modifier flags from os: 0x%llx", static_cast<unsigned long long>(os));
+}
+
+bool OSXKeyState::getCapsLockState(bool &on) const
+{
+  if (m_hooks.getCapsLockState) {
+    return m_hooks.getCapsLockState(on);
+  }
+  auto driver = getEventDriver();
+  if (!driver) {
+    return false;
+  }
+  return IOHIDGetModifierLockState(driver, kIOHIDCapsLockState, &on) == KERN_SUCCESS;
+}
+
+bool OSXKeyState::setCapsLockState(bool on)
+{
+  if (m_hooks.setCapsLockState) {
+    return m_hooks.setCapsLockState(on);
+  }
+  auto driver = getEventDriver();
+  if (!driver) {
+    return false;
+  }
+  return IOHIDSetModifierLockState(driver, kIOHIDCapsLockState, on) == KERN_SUCCESS;
+}
+
+void OSXKeyState::setToggleState(KeyModifierMask bit, bool on)
+{
+  // Num lock and scroll lock have no OS-level lock state on macOS.
+  if (bit != KeyModifierCapsLock) {
+    return;
   }
 
-  return modifiers;
+  bool current = false;
+  bool known = getCapsLockState(current);
+  if (!known) {
+    current = (osModifierFlags() & kCGEventFlagMaskAlphaShift) != 0;
+    known = true;
+  }
+  if (current == on) {
+    m_capsPressed = on;
+    LOG_DEBUG("caps lock already %s", on ? "on" : "off");
+    return;
+  }
+
+  if (setCapsLockState(on)) {
+    LOG_DEBUG("set caps lock %s via IOHIDSystem", on ? "on" : "off");
+  } else {
+    // user-session path unavailable: fall back to a synthetic caps press,
+    // but only because we verified above that the OS disagrees with `on`.
+    LOG_DEBUG("IOHIDSetModifierLockState unavailable, faking caps lock press");
+    setKeyboardModifiers(s_capsLockVK, true);
+    if (postHIDVirtualKey(s_capsLockVK, true) != KERN_SUCCESS) {
+      postKeyboardKey(s_capsLockVK, true);
+    }
+    setKeyboardModifiers(s_capsLockVK, false);
+    if (postHIDVirtualKey(s_capsLockVK, false) != KERN_SUCCESS) {
+      postKeyboardKey(s_capsLockVK, false);
+    }
+  }
+
+  // keep the shadow in step with what the OS now says
+  bool actual = on;
+  if (!getCapsLockState(actual)) {
+    actual = (osModifierFlags() & kCGEventFlagMaskAlphaShift) != 0;
+  }
+  m_capsPressed = actual;
+}
+
+void OSXKeyState::sanitizeInjectedKeys()
+{
+  // Start from OS truth so the release we post below carries the real
+  // global flags for every other modifier.
+  reseedShadowFlagsFromOS();
+  const CGEventFlags os = osModifierFlags();
+
+  KeyButtonSet physical;
+  pollPressedKeys(physical);
+
+  const std::set<uint8_t> injected = m_injectedModifiers;
+  for (uint8_t virtualKey : injected) {
+    const CGEventFlags flag = modifierFlagForVirtualKey(virtualKey);
+    if (flag == 0 || flag == kCGEventFlagMaskAlphaShift) {
+      // caps is a lock, not a held key; setToggleState() owns it
+      m_injectedModifiers.erase(virtualKey);
+      continue;
+    }
+    if ((os & flag) == 0) {
+      // the OS already considers it up; nothing to release
+      m_injectedModifiers.erase(virtualKey);
+      continue;
+    }
+    setKeyboardModifiers(virtualKey, false);
+    if (postHIDVirtualKey(virtualKey, false) != KERN_SUCCESS) {
+      postKeyboardKey(virtualKey, false);
+    }
+    m_injectedModifiers.erase(virtualKey);
+    LOG_INFO("released injected modifier 0x%02x", virtualKey);
+  }
+
+  // Modifiers the OS reports down that we never injected belong to the user
+  // (or to another injector); leave them alone.
+  for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
+    const CGEventFlags flag = modifierFlagForVirtualKey(static_cast<uint8_t>(virtualKey));
+    if ((os & flag) != 0 && physical.count(mapVirtualKeyToKeyButton(virtualKey)) > 0) {
+      LOG_DEBUG("leaving physically held modifier 0x%02x", virtualKey);
+    }
+  }
+}
+
+void OSXKeyState::updateKeyState()
+{
+  reseedShadowFlagsFromOS();
+  KeyState::updateKeyState();
+}
+
+void OSXKeyState::fakeAllKeysUp()
+{
+  KeyState::fakeAllKeysUp();
+  m_injectedModifiers.clear();
+  reseedShadowFlagsFromOS();
 }
 
 void OSXKeyState::setKeyboardModifiers(CGKeyCode virtualKey, bool keyDown)
@@ -611,6 +784,10 @@ void OSXKeyState::setKeyboardModifiers(CGKeyCode virtualKey, bool keyDown)
 
 kern_return_t OSXKeyState::postHIDVirtualKey(uint8_t virtualKey, bool postDown)
 {
+  if (m_hooks.postHIDKey) {
+    return m_hooks.postHIDKey(virtualKey, postDown, isModifier(virtualKey) ? getKeyboardEventFlags() : 0);
+  }
+
   NXEventData event;
   bzero(&event, sizeof(NXEventData));
   auto driver = getEventDriver();
@@ -662,6 +839,16 @@ void OSXKeyState::fakeKey(const Keystroke &keystroke)
     if (postHIDVirtualKey(virtualKey, keyDown) != KERN_SUCCESS) {
       LOG_WARN("fail to post hid event");
       postKeyboardKey(virtualKey, keyDown);
+    }
+
+    // remember which modifiers we hold down so sanitizeInjectedKeys() can
+    // release exactly those and nothing the user is physically holding.
+    if (virtualKey <= 0xff && modifierFlagForVirtualKey(static_cast<uint8_t>(virtualKey)) != 0) {
+      if (keyDown) {
+        m_injectedModifiers.insert(static_cast<uint8_t>(virtualKey));
+      } else {
+        m_injectedModifiers.erase(static_cast<uint8_t>(virtualKey));
+      }
     }
 
     break;
