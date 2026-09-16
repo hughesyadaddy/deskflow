@@ -61,6 +61,7 @@ private Q_SLOTS:
   void outbox_reachableFailureResettlesOnRetry();
   void outbox_forwardUnknownReturnsWithinGrace();
   void outbox_forwardTimeoutWithdrawsQueuedKey();
+  void outbox_forwardTimeoutSwallowsInFlightKey();
   void outbox_reachableForwardReportsOnlyCompletedSends();
   void outbox_expiredKeyDiscardedBeforeConnect();
   void outbox_failureInvokesHandlerOnceAndKeepsStickyLine();
@@ -68,7 +69,7 @@ private Q_SLOTS:
   void outbox_queueIsCapped();
   void protocol_keyCarriesSeqAndSentAt();
   void protocol_keyClearAllRoundTrips();
-  void keyReceive_dropsStaleDownKeepsUp();
+  void keyReceive_ignoresWallClockAndDropsDuplicateSeq();
   void keyReceive_clearAllInvokesHandlerAfterGating();
   void keyLaneFailure_resyncsLedgerAndPostsStickyClearAll();
   void relayStop_forwardedHoldsAreReleasedOnTheKeyLane();
@@ -402,11 +403,12 @@ void CoordinatorTests::outbox_forwardUnknownReturnsWithinGrace()
   outbox.start();
 
   // Unknown + slow peer: the hook gets an answer within the grace, not
-  // after the connect. (The key's own connect is already in flight and
-  // cannot be recalled; see outbox_forwardTimeoutWithdrawsQueuedKey for
-  // the queued case.)
+  // after the connect. The key's own connect is already in flight and
+  // cannot be recalled, so the answer is "delivered" (swallow locally; see
+  // outbox_forwardTimeoutSwallowsInFlightKey) -- never "local", which typed
+  // it on both machines.
   auto started = std::chrono::steady_clock::now();
-  QVERIFY(!outbox.forward("key", 20));
+  QVERIFY(outbox.forward("key", 20));
   QVERIFY(elapsedMs(started) < 150.0);
   outbox.stop();
 
@@ -567,6 +569,42 @@ void CoordinatorTests::outbox_forwardTimeoutWithdrawsQueuedKey()
   QCOMPARE(slow.hosts.size(), static_cast<size_t>(1)); // "hello" only
 }
 
+void CoordinatorTests::outbox_forwardTimeoutSwallowsInFlightKey()
+{
+  // The grace ran out while the key's OWN send was in flight (connect +
+  // alternate-address retry). It cannot be recalled and lands on the peer a
+  // moment later, so the hook must swallow it: "local" typed it twice.
+  FakeClock clock;
+  FakeTransport slow;
+  std::atomic<bool> succeed{true};
+  slow.okFor = [&succeed](const std::string &) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    return succeed.load();
+  };
+  PeerOutbox outbox("10.0.0.5", "10.0.0.6", slow.fn(), clock.fn());
+  int failures = 0;
+  outbox.setFailureHandler([&failures] { ++failures; });
+  outbox.start();
+
+  const auto started = std::chrono::steady_clock::now();
+  QVERIFY(outbox.forward("key", 20)); // in flight past the grace: delivered
+  QVERIFY(elapsedMs(started) < 150.0);
+  QVERIFY(waitFor([&outbox] { return outbox.idle(); }, 2000));
+  QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
+  QCOMPARE(slow.hosts.size(), static_cast<size_t>(1)); // sent exactly once
+  QCOMPARE(failures, 0);
+
+  // Same shape, but the in-flight send then fails on both addresses: still
+  // swallowed (a lost key beats a doubled one), and the lane's failure
+  // handler fires so the peer gets a resync (KeyClearAll).
+  succeed = false;
+  QVERIFY(outbox.forward("key2", 20));
+  QVERIFY(waitFor([&outbox] { return outbox.state() == PeerOutbox::State::Backoff; }, 2000));
+  QVERIFY(waitFor([&failures] { return failures == 1; }, 1000));
+  QCOMPARE(slow.hosts.size(), static_cast<size_t>(3)); // key2 on lan, then ip
+  outbox.stop();
+}
+
 void CoordinatorTests::outbox_queueIsCapped()
 {
   FakeClock clock;
@@ -711,14 +749,19 @@ void CoordinatorTests::protocol_keyClearAllRoundTrips()
   QCOMPARE(message.token, std::string("tok"));
 }
 
-void CoordinatorTests::keyReceive_dropsStaleDownKeepsUp()
+void CoordinatorTests::keyReceive_ignoresWallClockAndDropsDuplicateSeq()
 {
+  // The sender swallows a key the moment its lane accepts it, so any drop
+  // here loses the keystroke outright. A wall-clock age gate dropped every
+  // Down from a VM guest whose clock had drifted (keystrokes vanished);
+  // only the sender's seq may reject a delivery, and only a duplicate or
+  // reordered Down/Repeat.
   using deskflow::coordination::Role;
   CoordinatorConfig config;
   config.selfName = "hackintosh";
   config.meshPort = 0;
   config.token = "test-token";
-  config.peers = deskflow::coordination::parsePeerList("tiny11=10.0.0.3");
+  config.peers = deskflow::coordination::parsePeerList("tiny11=10.0.0.3,macbookpro=10.0.0.4");
 
   EventQueue events;
   Coordinator coordinator(config);
@@ -733,23 +776,53 @@ void CoordinatorTests::keyReceive_dropsStaleDownKeepsUp()
   events.addHandler(EventTypes::CoordinationKeyForward, events.getSystemTarget(), [&injected](const Event &) {
     ++injected;
   });
-  const auto drain = [&events] {
+  const auto drain = [&events, &injected] {
     events.addEvent(Event(EventTypes::Quit));
     events.loop();
+    const int n = injected;
+    injected = 0;
+    return n;
   };
-  const auto key = [](Message::KeyPhase phase, int64_t sentAt) {
-    return protocol::decode(protocol::encodeKey("tiny11", phase, 65, 0, 1, "en", "test-token", 1, sentAt));
+  const auto key = [](const char *from, Message::KeyPhase phase, int64_t seq, int64_t sentAt) {
+    return protocol::decode(protocol::encodeKey(from, phase, 65, 0, 1, "en", "test-token", seq, sentAt));
   };
   const int64_t now = protocol::wallClockMs();
-  const int64_t stale = now - protocol::kRelayKeyMaxAgeMs - 500;
+  const int64_t skewed = now - protocol::kRelayKeyMaxAgeMs - 5000; // a guest clock 5 s behind
+  const int64_t ahead = now + 60000;                                // or a minute ahead
 
-  coordinator.handleKeyForwardMessage(key(Message::KeyPhase::Down, now));     // fresh: injected
-  coordinator.handleKeyForwardMessage(key(Message::KeyPhase::Down, stale));   // stale Down: dropped
-  coordinator.handleKeyForwardMessage(key(Message::KeyPhase::Repeat, stale)); // stale Repeat: dropped
-  coordinator.handleKeyForwardMessage(key(Message::KeyPhase::Up, stale));     // stale Up: still released
-  coordinator.handleKeyForwardMessage(key(Message::KeyPhase::Down, 0));       // legacy: injected
-  drain();
-  QCOMPARE(injected, 3);
+  // Wall clock is not judged: skewed Downs are injected.
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 1, skewed));
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Repeat, 2, skewed));
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 3, ahead));
+  QCOMPARE(drain(), 3);
+
+  // Duplicate / reordered Down or Repeat: dropped. Per sender: another
+  // peer's low seq is its own counter.
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 3, now));   // duplicate
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Repeat, 2, now)); // reordered
+  coordinator.handleKeyForwardMessage(key("macbookpro", Message::KeyPhase::Down, 1, now));
+  QCOMPARE(drain(), 1);
+
+  // An Up is never dropped, whatever its seq (a late release is idempotent
+  // and always safer than a key left held) -- and it does not move the
+  // watermark backwards.
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Up, 2, 0));
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 3, now)); // still a duplicate
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 4, now));
+  QCOMPARE(drain(), 2);
+
+  // Legacy sender (no seq): never judged.
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 0, 0));
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 0, 0));
+  QCOMPARE(drain(), 2);
+
+  // The sender's core restarted (hello): its counter starts over.
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 1, now));
+  QCOMPARE(drain(), 0);
+  const auto hello = protocol::decode(protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "tiny11", "test-token"));
+  coordinator.onMessage(hello, [](const std::string &) {});
+  coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 1, now));
+  QCOMPARE(drain(), 1);
   events.removeHandler(EventTypes::CoordinationKeyForward, events.getSystemTarget());
 }
 
@@ -766,7 +839,11 @@ void CoordinatorTests::keyReceive_clearAllInvokesHandlerAfterGating()
   Coordinator coordinator(config);
   coordinator.setEventQueue(&events);
   int cleared = 0;
-  coordinator.setKeyClearAllHandler([&cleared] { ++cleared; });
+  std::string clearedBy;
+  coordinator.setKeyClearAllHandler([&cleared, &clearedBy](const std::string &sender) {
+    ++cleared;
+    clearedBy = sender;
+  });
 
   const auto clearFrom = [](const char *from) {
     return protocol::decode(protocol::encodeKeyClearAll(from, "test-token"));
@@ -794,6 +871,7 @@ void CoordinatorTests::keyReceive_clearAllInvokesHandlerAfterGating()
   QCOMPARE(cleared, 0);
   coordinator.onMessage(clearFrom("tiny11"), noReply);
   QCOMPARE(cleared, 1);
+  QCOMPARE(clearedBy, std::string("tiny11")); // only THAT sender's keys are released
 }
 
 void CoordinatorTests::keyLaneFailure_resyncsLedgerAndPostsStickyClearAll()
@@ -819,9 +897,11 @@ void CoordinatorTests::keyLaneFailure_resyncsLedgerAndPostsStickyClearAll()
   }
   coordinator.setRunningRole(Role::Client);
 
-  // The key rides the (Unknown) lane, whose connect times out (~700 ms):
-  // the lane fails while it was not in backoff, which is the moment the
-  // peer may be left holding forwarded keys.
+  // The key rides the (Unknown) lane behind the start-up hello probe, whose
+  // connect times out (~700 ms): still queued when the grace runs out, the
+  // key is withdrawn (Local), and the lane fails while it was not in
+  // backoff, which is the moment the peer may be left holding forwarded
+  // keys.
   QCOMPARE(
       coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"), KeyForwardResult::Local
   );

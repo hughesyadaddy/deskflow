@@ -196,6 +196,9 @@ void Server::sendReleases(BaseClientProxy *client, HeldKeys &keys, const char *w
 
 void Server::releaseKeysHeldOnActive()
 {
+  // Every relayed hold on the active client is in this ledger too, so the
+  // per-sender view empties with it.
+  m_forwardedHeld.clear();
   if (m_keysHeldOnActive.empty()) {
     return;
   }
@@ -2397,8 +2400,40 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
   m_active->keyRepeat(id, mask, count, button, lang);
 }
 
-void Server::releaseForwardedKeys()
+void Server::releaseForwardedKeys(const std::string &sender)
 {
+  // Keys the sender relayed while the cursor was on a secondary went to the
+  // active client through onKeyDown and are held THERE, not on the primary:
+  // sweeping the primary alone left them stuck (a Shift held on tiny11
+  // forever after hackintosh's lane dropped). Release exactly that sender's
+  // buttons on the active client, then sweep the primary for whatever it
+  // relayed while the cursor was home.
+  std::set<KeyButton> buttons;
+  if (sender.empty()) {
+    for (auto &[_name, held] : m_forwardedHeld) {
+      buttons.insert(held.begin(), held.end());
+    }
+    m_forwardedHeld.clear();
+  } else if (const auto held = m_forwardedHeld.find(sender); held != m_forwardedHeld.end()) {
+    buttons = std::move(held->second);
+    m_forwardedHeld.erase(held);
+  }
+  if (!buttons.empty() && m_active != nullptr && m_active != m_primaryClient) {
+    LOG_INFO(
+        "coordination: releasing %zu key(s) relayed by \"%s\" on \"%s\"", buttons.size(), sender.c_str(),
+        getName(m_active).c_str()
+    );
+    for (const KeyButton button : buttons) {
+      const auto held = m_keysHeldOnActive.find(button);
+      const KeyID id = held != m_keysHeldOnActive.end() ? held->second : kKeyNone;
+      forgetKeySentToActive(button);
+      try {
+        m_active->keyUp(id, 0, button);
+      } catch (const std::exception &e) { // NOSONAR
+        LOG_WARN("could not release relayed button 0x%04x on \"%s\": %s", button, getName(m_active).c_str(), e.what());
+      }
+    }
+  }
   if (m_primaryClient != nullptr) {
     LOG_INFO("coordination: peer lane failed; releasing relayed keys on the primary");
     m_primaryClient->releaseForwardedKeys();
@@ -2414,12 +2449,21 @@ void Server::relayForwardedKey(const deskflow::coordination::RelayKeyEvent &even
   }
   switch (event.phase) {
   case RelayKeyPhase::Up:
+    if (const auto held = m_forwardedHeld.find(event.from); held != m_forwardedHeld.end()) {
+      held->second.erase(event.button);
+      if (held->second.empty()) {
+        m_forwardedHeld.erase(held);
+      }
+    }
     onKeyUp(event.id, event.mask, event.button, nullptr);
     break;
   case RelayKeyPhase::Repeat:
     onKeyRepeat(event.id, event.mask, 1, event.button, event.lang);
     break;
   default:
+    if (event.button != 0) {
+      m_forwardedHeld[event.from].insert(event.button);
+    }
     onKeyDown(event.id, event.mask, event.button, event.lang, nullptr);
     break;
   }

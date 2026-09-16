@@ -12,6 +12,7 @@
 #include "base/Log.h"
 #include "common/Settings.h"
 #include "coordination/KeyboardRescue.h"
+#include "coordination/RelayKeyEvent.h"
 #include "deskflow/PlatformScreen.h"
 #include "deskflow/Screen.h"
 #include "deskflow/ipc/CoreIpcServer.h"
@@ -702,3 +703,112 @@ void ServerKeyLedgerTests::lockChange_pushesStateToActiveClient()
 }
 
 QTEST_MAIN(ServerKeyLedgerTests)
+
+namespace {
+
+deskflow::coordination::RelayKeyEvent relayed(
+    const char *from, deskflow::coordination::RelayKeyPhase phase, KeyID id, KeyButton button,
+    KeyModifierMask mask = 0
+)
+{
+  deskflow::coordination::RelayKeyEvent event;
+  event.from = from;
+  event.phase = phase;
+  event.id = id;
+  event.button = button;
+  event.mask = mask;
+  event.lang = "en";
+  return event;
+}
+
+} // namespace
+
+void ServerKeyLedgerTests::clearAll_releasesOnlyThatSendersKeysOnTheActiveClient()
+{
+  // The cursor is on a secondary; two fleet peers relay keys through the
+  // server, which routes them to the ACTIVE CLIENT (not the primary). When
+  // one peer's lane fails, its KeyClearAll must release exactly the keys it
+  // relayed, on the client that holds them -- the primary sweep alone left
+  // them stuck, and a blanket sweep over-released the other peer's keys.
+  using deskflow::coordination::RelayKeyPhase;
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.relayForwardedKey(relayed("tiny11", RelayKeyPhase::Down, kKeyShift_L, kButtonShift, KeyModifierShift));
+    server.relayForwardedKey(relayed("tiny11", RelayKeyPhase::Down, kKeyA, kButtonA, KeyModifierShift));
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Down, kKeyCapsLock, kButtonCaps));
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Down, static_cast<KeyID>('b'), 0x30));
+    QCOMPARE(server.m_forwardedHeld.at("tiny11").size(), 2u);
+    QCOMPARE(server.m_forwardedHeld.at("macbookpro").size(), 2u);
+    QCOMPARE(server.m_keysHeldOnActive.size(), 4u);
+
+    // a relayed Up drops its entry from the sender's set
+    server.relayForwardedKey(relayed("tiny11", RelayKeyPhase::Up, kKeyA, kButtonA));
+    QCOMPARE(server.m_forwardedHeld.at("tiny11").size(), 1u);
+    remote.keys.clear();
+
+    server.releaseForwardedKeys("tiny11");
+
+    // exactly tiny11's remaining hold (Shift) was released on the client
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyShift_L), 1);
+    const auto *up = remote.findUp(kKeyShift_L);
+    QVERIFY(up != nullptr);
+    QCOMPARE(up->button, kButtonShift);
+    QCOMPARE(up->mask, static_cast<KeyModifierMask>(0));
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyA), 0);
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyCapsLock), 0);
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, static_cast<KeyID>('b')), 0);
+    QVERIFY(!server.m_forwardedHeld.contains("tiny11"));
+    QCOMPARE(server.m_forwardedHeld.at("macbookpro").size(), 2u);
+    // ... and the active ledger no longer expects to release it on switch
+    QVERIFY(!server.m_keysHeldOnActive.contains(kButtonShift));
+    QCOMPARE(server.m_keysHeldOnActive.size(), 2u);
+
+    // an unknown sender releases nothing on the client
+    remote.keys.clear();
+    server.releaseForwardedKeys("stranger");
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyCapsLock), 0);
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, static_cast<KeyID>('b')), 0);
+
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerKeyLedgerTests::clearAll_withoutSenderReleasesEveryRelayedKey()
+{
+  // Legacy clear-all (no sender name): every relayed hold goes.
+  using deskflow::coordination::RelayKeyPhase;
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.relayForwardedKey(relayed("tiny11", RelayKeyPhase::Down, kKeyShift_L, kButtonShift, KeyModifierShift));
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Down, static_cast<KeyID>('b'), 0x30));
+    remote.keys.clear();
+
+    server.releaseForwardedKeys();
+
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyShift_L), 1);
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, static_cast<KeyID>('b')), 1);
+    QVERIFY(server.m_forwardedHeld.empty());
+    QVERIFY(server.m_keysHeldOnActive.empty());
+
+    // with the cursor home, keys relayed to the primary are not ledgered
+    // here (the primary's own key state holds and sweeps them)
+    server.switchScreen(f.primary, 512, 384, false);
+    server.relayForwardedKey(relayed("tiny11", RelayKeyPhase::Down, kKeyA, kButtonA));
+    QVERIFY(server.m_forwardedHeld.empty());
+    server.releaseForwardedKeys("tiny11");
+
+    server.m_clients.erase("remote");
+  }
+}

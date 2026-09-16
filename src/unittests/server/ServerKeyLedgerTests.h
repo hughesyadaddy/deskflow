@@ -25,4 +25,6 @@ private Q_SLOTS:
   void broadcast_keysReleasedPerScreen();
   void broadcast_offReleasesHeldKeys();
   void lockChange_pushesStateToActiveClient();
+  void clearAll_releasesOnlyThatSendersKeysOnTheActiveClient();
+  void clearAll_withoutSenderReleasesEveryRelayedKey();
 };

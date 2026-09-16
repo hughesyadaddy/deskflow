@@ -292,6 +292,10 @@ public:
   void setToggleState(KeyModifierMask toggle, bool on) override
   {
     toggles.emplace_back(toggle, on);
+    // the platform overrides (OSX/MSWindows) keep the tracked mask in step
+    // with the lock state they just applied; mirror that contract here
+    auto &tracked = getActiveModifiersRValue();
+    tracked = on ? (tracked | toggle) : (tracked & ~toggle);
   }
 
 protected:
@@ -313,6 +317,28 @@ void addOneKey(deskflow::KeyMap &map, KeyID id, KeyButton button)
   item.m_group = 0;
   item.m_button = button;
   map.addKeyEntry(item);
+  map.finish();
+}
+
+//! A Caps-sensitive layout: a Caps Lock key (locking modifier) and an 'A'
+//! that requires Caps, the shape a real uchr/scan layout produces.
+void addCapsLayout(deskflow::KeyMap &map)
+{
+  deskflow::KeyMap::KeyItem caps;
+  caps.m_id = kKeyCapsLock;
+  caps.m_group = 0;
+  caps.m_button = 0x3A;
+  caps.m_generates = KeyModifierCapsLock;
+  caps.m_lock = true;
+  map.addKeyEntry(caps);
+
+  deskflow::KeyMap::KeyItem upperA;
+  upperA.m_id = static_cast<KeyID>('A');
+  upperA.m_group = 0;
+  upperA.m_button = 0x1E;
+  upperA.m_required = KeyModifierCapsLock;
+  upperA.m_sensitive = KeyModifierShift | KeyModifierCapsLock;
+  map.addKeyEntry(upperA);
   map.finish();
 }
 
@@ -394,6 +420,38 @@ void KeyStateLedgerTests::enterSecondary_doesNotReassertWhenOsAlreadyHoldsIt()
   f.screen->enter(KeyModifierShift);
 
   QCOMPARE(f.platform->count(PlatformCall::Kind::KeyDown), 0);
+  QVERIFY(f.screen->leave());
+}
+
+void KeyStateLedgerTests::enterSecondary_reassertsModifiersIncrementally()
+{
+  // Win+Shift held across the crossing. Each re-assert press must carry
+  // only the state reached so far (OS state + the modifiers pressed before
+  // it), never the whole enter mask: handing Shift the Super bit as its
+  // desired state made mapKey() tap Super around the press -- a Start-menu
+  // flash on every Win+Shift crossing.
+  SecondaryFixture f;
+  f.platform->osModifiers = KeyModifierControl; // something the OS already holds
+
+  f.screen->enter(KeyModifierShift | KeyModifierSuper | KeyModifierCapsLock);
+
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyDown), 2);
+  const auto &calls = f.platform->calls;
+  std::vector<const PlatformCall *> downs;
+  for (const auto &c : calls) {
+    if (c.kind == PlatformCall::Kind::KeyDown) {
+      downs.push_back(&c);
+    }
+  }
+  // table order: Shift before Super
+  QCOMPARE(downs[0]->id, kKeyShift_L);
+  QCOMPARE(downs[0]->mask, static_cast<KeyModifierMask>(KeyModifierControl | KeyModifierShift));
+  QCOMPARE(downs[1]->id, kKeySuper_L);
+  QCOMPARE(downs[1]->mask, static_cast<KeyModifierMask>(KeyModifierControl | KeyModifierShift | KeyModifierSuper));
+  // lock bits never ride along as desired state
+  for (const auto *d : downs) {
+    QCOMPARE(d->mask & IKeyState::s_lockModifierMask, static_cast<KeyModifierMask>(0));
+  }
   QVERIFY(f.screen->leave());
 }
 
@@ -547,6 +605,61 @@ void KeyStateLedgerTests::fakeKeyDown_capsKeyRoutesMaskBitToSetToggleState()
   ks.fakeKeyDown(kKeyCapsLock, 0, 0x3A, "en");
   QCOMPARE(ks.toggles.size(), 2u);
   QVERIFY(!ks.toggles[1].second);
+}
+
+void KeyStateLedgerTests::fakeKeyDown_doesNotClickCapsAgainAfterSetToggleState()
+{
+  // The Caps double-toggle: enter applies Caps ON via setToggleState() (OS
+  // now on). If the tracked mask is left at "off", the first letter whose
+  // mask carries Caps makes mapKey() click the Caps key to "turn it on" --
+  // inverting it for the rest of the epoch. setToggleState() must keep the
+  // tracked mask in step, and fakeKeyDown() must judge by that mask.
+  EventQueue events;
+  deskflow::KeyMap map;
+  addCapsLayout(map);
+  RecordingKeyState ks(&events, map);
+  ks.osModifiers = 0;
+  ks.updateKeyState(); // tracked mask = OS truth = no caps
+
+  // enter with caps on (Screen::applyToggleMask -> setToggleState)
+  ks.setToggleState(KeyModifierCapsLock, true);
+  QCOMPARE(ks.toggles.size(), 1u);
+  QVERIFY((ks.getActiveModifiers() & KeyModifierCapsLock) != 0);
+
+  // the relayed Caps key itself (mask says on) must not re-apply
+  ks.fakeKeyDown(kKeyCapsLock, KeyModifierCapsLock, 0x3A, "en");
+  QCOMPARE(ks.toggles.size(), 1u);
+
+  // next letter: 'A' with caps in its mask -> exactly one press of 0x1E,
+  // and NO click of the caps button (0x3A)
+  ks.strokes.clear();
+  ks.fakeKeyDown(static_cast<KeyID>('A'), KeyModifierCapsLock, 0x10, "en");
+  for (const auto &[button, press] : ks.strokes) {
+    QVERIFY2(button != 0x3A, "caps lock was clicked again");
+  }
+  QCOMPARE(ks.strokes.size(), 1u);
+  QCOMPARE(ks.strokes[0].first, static_cast<KeyButton>(0x1E));
+  QVERIFY(ks.strokes[0].second);
+}
+
+void KeyStateLedgerTests::enable_sanitizesOnlyWhenNotEntered()
+{
+  // K2 residual: a client (never entered at enable) sweeps stale OS-held
+  // modifiers before it can be typed into; a primary (entered at enable,
+  // the user's hands are on it) does not.
+  EventQueue events;
+  {
+    auto *platform = new FakePlatformScreen(&events, false);
+    deskflow::Screen client(platform, &events);
+    client.enable();
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 1);
+  }
+  {
+    auto *platform = new FakePlatformScreen(&events, true);
+    deskflow::Screen primary(platform, &events);
+    primary.enable();
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 0);
+  }
 }
 
 void KeyStateLedgerTests::describeKey_printsCharacterWithItsCase()

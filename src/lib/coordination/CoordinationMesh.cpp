@@ -549,13 +549,23 @@ bool PeerOutbox::forward(std::string line, int graceMs)
   if (!pendingLocked(ticket)) {
     return m_deliveredKeys.erase(ticket) > 0;
   }
-  // Timed out. The caller handles the key locally now, so a late delivery
-  // would type it twice: withdraw it unless the lane already picked it up
-  // (an in-flight connect cannot be recalled).
+  // Timed out with the key still QUEUED: withdraw it. The caller handles
+  // the key locally now, and a late delivery would type it twice.
   const auto pending =
       std::find_if(m_queue.begin(), m_queue.end(), [ticket](const Job &job) { return job.ticket == ticket; });
   if (pending != m_queue.end()) {
     m_queue.erase(pending);
+    return false;
+  }
+  // Timed out with the key IN FLIGHT: the lane already picked it up (a
+  // connect plus the alternate-address retry cannot be recalled), so it
+  // most likely lands on the peer a moment from now. Reporting "local"
+  // here typed it on both machines; swallow it instead. If the send does
+  // fail, the lane's failure handler resyncs the peer (KeyClearAll), and a
+  // lost key beats a doubled one.
+  if (m_inFlightTicket == ticket) {
+    LOG_DEBUG("coordination: outbox to %s key in flight past the grace; treating as delivered", m_ip.c_str());
+    return true;
   }
   return false;
 }

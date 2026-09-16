@@ -1233,6 +1233,7 @@ bool OSXScreen::onKey(CGEventRef event)
 
   // Special handling to track state of modifiers
   if (eventKind == kCGEventFlagsChanged) {
+    m_keyState->noteHardwareModifierFlags(macMask, OSXKeyState::monotonicSeconds());
     // get old and new modifier state
     KeyModifierMask oldMask = getActiveModifiers();
     KeyModifierMask newMask = m_keyState->mapModifiersFromOSX(macMask);

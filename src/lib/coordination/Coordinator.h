@@ -155,14 +155,15 @@ public:
   /*!
   A peer that forwarded keys to this machine lost the ability to release
   them (its lane to us failed, its relay stopped, a rescue fired) and asks
-  us to release every key we hold on its behalf. The handler must call the
-  running app's fakeAllKeysUp path (Server: primary screen; Client: the
-  client screen). Invoked on a MESH HANDLER THREAD after the same gating as
-  relayed keys (running role, known peer): the handler must marshal onto
-  the app event loop itself (post an event), never touch screens directly.
-  Wired by deskflow-core next to the CoordinationKeyForward handler.
+  us to release every key we hold on its behalf. The handler receives the
+  sender's peer name and must release the keys THAT sender relayed (Server:
+  its ledger for the sender; Client: the client screen). Invoked on a MESH
+  HANDLER THREAD after the same gating as relayed keys (running role, known
+  peer): the handler must marshal onto the app event loop itself (post an
+  event), never touch screens directly. Wired by deskflow-core next to the
+  CoordinationKeyForward handler.
   */
-  void setKeyClearAllHandler(std::function<void()> handler);
+  void setKeyClearAllHandler(std::function<void(const std::string &sender)> handler);
 
 private:
   //! A lane failed while it was believed reachable: keys forwarded on it
@@ -243,9 +244,13 @@ private:
   //! Lane the last key was forwarded on (guarded by m_mutex; lanes live as
   //! long as *this). Boundary releases (stop flush) go there.
   PeerOutbox *m_lastKeyDestination = nullptr;
-  //! Per-sender key sequence (guarded by m_mutex).
+  //! Our own outgoing key sequence (guarded by m_mutex).
   int64_t m_keySeq = 0;
-  std::function<void()> m_keyClearAllHandler; //!< guarded by m_mutex
+  //! Highest key seq accepted per sender (guarded by m_mutex): a Down or
+  //! Repeat at or below it is a duplicate/reordered delivery and is dropped.
+  //! Forgotten on the sender's hello (its counter restarted with it).
+  std::map<std::string, int64_t> m_lastKeySeqBySender;
+  std::function<void(const std::string &)> m_keyClearAllHandler; //!< guarded by m_mutex
   EscTapRescue m_escTapRescue;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
   std::function<void()> m_localCoreRestartHook;

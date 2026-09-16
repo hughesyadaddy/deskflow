@@ -353,6 +353,11 @@ void Coordinator::handleHelloMessage(const Message &message, const std::function
   }
   if (!message.name.empty()) {
     clearVersionMismatch(message.name);
+    // A hello means the peer's core (re)started: its key sequence restarted
+    // with it, so forget where the old one got to or every key it sends
+    // until it catches up would be judged a duplicate.
+    std::scoped_lock lock{m_mutex};
+    m_lastKeySeqBySender.erase(message.name);
   }
   LOG_DEBUG("coordination: mesh hello from \"%s\" (v=%d)", message.name.c_str(), message.meshVersion);
   reply(protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token));
@@ -623,20 +628,20 @@ void Coordinator::handleKeyClearAllMessage(const Message &message)
   if (!acceptsRelayedKeys(message)) {
     return;
   }
-  std::function<void()> handler;
+  std::function<void(const std::string &)> handler;
   {
     std::scoped_lock lock{m_mutex};
     handler = m_keyClearAllHandler;
   }
-  LOG_INFO("coordination: key clear-all from \"%s\" -- releasing every relayed key", message.name.c_str());
+  LOG_INFO("coordination: key clear-all from \"%s\" -- releasing every key it relayed", message.name.c_str());
   if (handler) {
-    handler();
+    handler(message.name);
   } else {
     LOG_WARN("coordination: no key clear-all handler wired; relayed keys may stay held");
   }
 }
 
-void Coordinator::setKeyClearAllHandler(std::function<void()> handler)
+void Coordinator::setKeyClearAllHandler(std::function<void(const std::string &)> handler)
 {
   std::scoped_lock lock{m_mutex};
   m_keyClearAllHandler = std::move(handler);
@@ -653,20 +658,26 @@ void Coordinator::handleKeyForwardMessage(const Message &message)
     return;
   }
 
-  // Freshness (I3): a Down/Repeat that spent longer than kRelayKeyMaxAgeMs
-  // in transit was already handled locally by the sender (its forward
-  // grace is far shorter), so typing it here now is a phantom keystroke.
-  // Ups are exempt: a late release is idempotent and always safer than a
-  // key left held. Legacy senders (no stamp) are not judged.
-  if (message.keyPhase != Message::KeyPhase::Up && message.keySentAtMs > 0) {
-    const int64_t ageMs = protocol::wallClockMs() - message.keySentAtMs;
-    if (ageMs > protocol::kRelayKeyMaxAgeMs) {
+  // Duplicate / reordered delivery (I3): the sender numbers its keys, so a
+  // Down or Repeat at or below the last seq we accepted from it was already
+  // delivered (a retried line) or overtaken -- typing it again is a phantom
+  // keystroke. Ups are exempt: a late release is idempotent and always
+  // safer than a key left held. Legacy senders (no seq) are not judged.
+  //
+  // Deliberately NOT a wall-clock age check: the sender swallows the key
+  // the moment its lane accepts it, so any drop here loses the keystroke
+  // outright, and VM guests drift far past any sane age budget.
+  if (message.seq > 0) {
+    std::scoped_lock lock{m_mutex};
+    auto &lastSeq = m_lastKeySeqBySender[message.name];
+    if (message.keyPhase != Message::KeyPhase::Up && message.seq <= lastSeq) {
       LOG_DEBUG(
-          "coordination: dropping stale relay key from \"%s\" (age %lld ms, seq %lld)", message.name.c_str(),
-          static_cast<long long>(ageMs), static_cast<long long>(message.seq)
+          "coordination: dropping duplicate relay key from \"%s\" (seq %lld <= %lld)", message.name.c_str(),
+          static_cast<long long>(message.seq), static_cast<long long>(lastSeq)
       );
       return;
     }
+    lastSeq = std::max(lastSeq, message.seq);
   }
 
   bool logFirst = false;

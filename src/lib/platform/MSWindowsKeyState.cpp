@@ -1278,9 +1278,19 @@ void MSWindowsKeyState::setToggleState(KeyModifierMask bit, bool on)
     return;
   }
 
+  // Keep the tracked mask (KeyState::m_mask) in step with the lock state the
+  // OS ends up with: mapKey() decides from m_mask whether a key needs the
+  // lock flipped, so a stale bit here made the first letter with Caps in its
+  // mask click Caps a second time (inverted for the rest of the epoch).
+  const auto syncTracked = [this](KeyModifierMask lock, bool actual) {
+    auto &tracked = getActiveModifiersRValue();
+    tracked = actual ? (tracked | lock) : (tracked & ~lock);
+  };
+
   // Toggle bit, the same read pollActiveModifiers() uses.
   const bool current = (GetKeyState(vk) & 0x01) != 0;
   if (current == on) {
+    syncTracked(bit, on);
     return;
   }
 
@@ -1294,6 +1304,11 @@ void MSWindowsKeyState::setToggleState(KeyModifierMask bit, bool on)
       "toggle vk=0x%02x %s -> %s (%s)", vk, current ? "on" : "off", on ? "on" : "off",
       (downOk && upOk) ? "pressed" : "injection dropped"
   );
+  // The injected press is queued on the input desktop and GetKeyState()
+  // reflects it only once this thread's queue catches up, so trust the
+  // injection outcome for the immediate answer and the OS read otherwise.
+  const bool actual = (downOk && upOk) ? on : ((GetKeyState(vk) & 0x01) != 0);
+  syncTracked(bit, actual);
 }
 
 void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
