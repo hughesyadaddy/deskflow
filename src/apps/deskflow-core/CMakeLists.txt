@@ -5,6 +5,22 @@
 
 set(target ${CMAKE_PROJECT_NAME}-core)
 
+# Qt-free `--check-permissions` probe, split out so it can be unit-tested
+# without linking the whole core app (see src/unittests/CMakeLists.txt).
+set(permissionCheckLib ${target}-permissioncheck)
+add_library(${permissionCheckLib} STATIC
+  PermissionCheck.cpp
+  PermissionCheck.h
+)
+target_include_directories(${permissionCheckLib} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(APPLE)
+  target_sources(${permissionCheckLib} PRIVATE PermissionCheck.mm)
+  target_link_libraries(${permissionCheckLib} PUBLIC
+    "-framework ApplicationServices"
+    "-framework IOKit"
+  )
+endif()
+
 add_executable(${target}
   "${target}.cpp"
   AutoModeRunner.cpp
@@ -39,6 +55,7 @@ target_link_libraries(
   platform
   server
   app
+  ${permissionCheckLib}
   Qt6::Widgets
   ${libs})
 
