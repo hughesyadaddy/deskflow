@@ -35,6 +35,8 @@
 
 #include <AppKit/NSEvent.h>
 #include <AppKit/NSPasteboard.h>
+#include <AppKit/NSWorkspace.h>
+#include <Foundation/NSDistributedNotificationCenter.h>
 #include <AvailabilityMacros.h>
 #include <IOKit/hidsystem/event_status_driver.h>
 #include <dispatch/dispatch.h>
@@ -80,6 +82,57 @@ void setZeroSuppressionInterval();
 void avoidSupression();
 void logCursorVisibility();
 void avoidHesitatingCursor();
+
+//
+// OSXScreenImpl
+//
+// Holds the AppKit/Foundation notification observers that need the
+// injected-key state reconciled: screen lock/unlock (distributed
+// notifications from loginwindow) and wake from sleep. Each one queues an
+// OsxScreenResyncKeyState event so the actual work runs on the event-loop
+// thread like every other observer in this file.
+//
+
+class OSXScreenImpl
+{
+public:
+  explicit OSXScreenImpl(OSXScreen *screen)
+  {
+    IEventQueue *events = screen->getEvents();
+    void *target = screen->getEventTarget();
+    auto post = ^(NSNotification *note) {
+      LOG_DEBUG("session notification %s, queueing key state resync", [[note name] UTF8String]);
+      events->addEvent(Event(EventTypes::OsxScreenResyncKeyState, target));
+    };
+
+    NSDistributedNotificationCenter *dnc = [NSDistributedNotificationCenter defaultCenter];
+    m_lockObserver = [[dnc addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil usingBlock:post] retain];
+    m_unlockObserver =
+        [[dnc addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil usingBlock:post] retain];
+
+    NSNotificationCenter *wnc = [[NSWorkspace sharedWorkspace] notificationCenter];
+    m_wakeObserver =
+        [[wnc addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:nil usingBlock:post] retain];
+  }
+
+  ~OSXScreenImpl()
+  {
+    NSDistributedNotificationCenter *dnc = [NSDistributedNotificationCenter defaultCenter];
+    [dnc removeObserver:m_lockObserver];
+    [dnc removeObserver:m_unlockObserver];
+    [m_lockObserver release];
+    [m_unlockObserver release];
+
+    NSNotificationCenter *wnc = [[NSWorkspace sharedWorkspace] notificationCenter];
+    [wnc removeObserver:m_wakeObserver];
+    [m_wakeObserver release];
+  }
+
+private:
+  id m_lockObserver = nil;
+  id m_unlockObserver = nil;
+  id m_wakeObserver = nil;
+};
 
 //
 // OSXScreen
@@ -162,6 +215,15 @@ OSXScreen::OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync)
       handleConfirmSleep(e);
     });
 
+    // reconcile injected modifier state with the OS after lock/unlock/wake;
+    // runs here on the event-loop thread, queued by OSXScreenImpl's observers.
+    m_events->addHandler(EventTypes::OsxScreenResyncKeyState, getEventTarget(), [this](const auto &) {
+      LOG_DEBUG("resyncing key state after session change");
+      m_keyState->sanitizeInjectedKeys();
+      m_keyState->updateKeyState();
+    });
+    m_impl = new OSXScreenImpl(this);
+
     // create thread for monitoring system power state.
     *m_pmThreadReady = false;
     m_carbonLoopMutex = new Mutex();
@@ -169,6 +231,9 @@ OSXScreen::OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync)
     LOG_DEBUG("starting watchSystemPowerThread");
     m_pmWatchThread = new Thread(new TMethodJob<OSXScreen>(this, &OSXScreen::watchSystemPowerThread));
   } catch (...) {
+    delete m_impl;
+    m_impl = nullptr;
+    m_events->removeHandler(EventTypes::OsxScreenResyncKeyState, getEventTarget());
     m_events->removeHandler(EventTypes::OsxScreenConfirmSleep, getEventTarget());
     if (m_switchEventHandlerRef != 0) {
       RemoveEventHandler(m_switchEventHandlerRef);
@@ -225,6 +290,11 @@ OSXScreen::~OSXScreen()
   delete m_pmThreadReady;
   delete m_pmMutex;
 
+  // stop the lock/unlock/wake observers before the key state they resync
+  // goes away.
+  delete m_impl;
+  m_impl = nullptr;
+  m_events->removeHandler(EventTypes::OsxScreenResyncKeyState, getEventTarget());
   m_events->removeHandler(EventTypes::OsxScreenConfirmSleep, getEventTarget());
 
   RemoveEventHandler(m_switchEventHandlerRef);

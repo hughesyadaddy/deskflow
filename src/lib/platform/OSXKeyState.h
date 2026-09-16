@@ -13,7 +13,9 @@
 #include <Carbon/Carbon.h>
 
 #include <atomic>
+#include <functional>
 #include <map>
+#include <set>
 #include <vector>
 
 class IOSXKeyResource;
@@ -84,8 +86,39 @@ public:
   KeyModifierMask pollActiveModifiers() const override;
   int32_t pollActiveGroup() const override;
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
+  void updateKeyState() override;
+  void fakeAllKeysUp() override;
+  void setToggleState(KeyModifierMask bit, bool on) override;
+  void sanitizeInjectedKeys() override;
 
   CGEventFlags getModifierStateAsOSXFlags() const;
+
+  //! Seams for headless unit tests
+  /*!
+  Every OS touch point used by the modifier-reconciliation paths can be
+  replaced so the logic runs without reading or injecting real input. An
+  unset hook means "use the OS".
+  */
+  struct Hooks
+  {
+    // replaces CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState)
+    std::function<CGEventFlags()> osModifierFlags;
+    // replaces GetKeys() in pollPressedKeys
+    std::function<void(KeyButtonSet &)> pressedKeys;
+    // replaces IOHIDPostEvent; returns the kern_return_t of the post
+    std::function<kern_return_t(uint8_t virtualKey, bool down, CGEventFlags flags)> postHIDKey;
+    // replaces IOHIDGetModifierLockState; returns false when unavailable
+    std::function<bool(bool &capsOn)> getCapsLockState;
+    // replaces IOHIDSetModifierLockState; returns false on failure
+    std::function<bool(bool capsOn)> setCapsLockState;
+  };
+  void setHooks(Hooks hooks);
+
+  //! Virtual keys of modifiers this process has injected and not yet released
+  std::set<uint8_t> injectedModifiers() const;
+
+  //! Which OS X modifier flag a modifier virtual key drives (0 if none)
+  static CGEventFlags modifierFlagForVirtualKey(uint8_t virtualKey);
 
 protected:
   // KeyState overrides
@@ -143,6 +176,17 @@ private:
 
   void postKeyboardKey(CGKeyCode virtualKey, bool keyDown);
 
+  // OS truth for the modifier flags (hookable)
+  CGEventFlags osModifierFlags() const;
+
+  // Overwrite the shadow modifier flags with what the OS reports so the
+  // next posted event carries the real global flags, not stale ones.
+  void reseedShadowFlagsFromOS();
+
+  // Caps lock state via IOHIDSystem (hookable). Return false when unknown.
+  bool getCapsLockState(bool &on) const;
+  bool setCapsLockState(bool on);
+
 private:
   // OS X uses a physical key if 0 for the 'A' key.  deskflow reserves
   // KeyButton 0 so we offset all OS X physical key ids by this much
@@ -175,4 +219,8 @@ private:
   bool m_altPressed;
   bool m_superPressed;
   bool m_capsPressed;
+  // modifier virtual keys this process posted Down for and has not yet
+  // posted Up for; the only modifiers sanitizeInjectedKeys() may release.
+  std::set<uint8_t> m_injectedModifiers;
+  Hooks m_hooks;
 };

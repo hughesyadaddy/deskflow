@@ -21,6 +21,15 @@ private Q_SLOTS:
   void fakePollChar();
   void fakePollCharWithModifier();
   void mapKeyFromEventOffMainThreadDoesNotCrash();
+  // headless: every OS touch point is hooked, nothing is injected
+  void shadowFlagsReseedFromOsOnUpdateKeyState();
+  void keyboardEventFlagsKeepDeviceBitsWithCapsOn();
+  void sanitizeReleasesOnlyInjectedModifiers();
+  void sanitizeSkipsModifiersOsReportsUp();
+  void setToggleStateNoOpsWhenCapsMatches();
+  void setToggleStateDrivesCapsViaLockStateApi();
+  void setToggleStateFallsBackToFakeCapsPress();
+  void setToggleStateIgnoresNumAndScrollLock();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);
