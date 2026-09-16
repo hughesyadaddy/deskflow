@@ -37,7 +37,12 @@ struct Message
     Key,
     Hello,
     Fleet,
-    Rescue
+    Rescue,
+    //! Boundary resync (peer → cursor host): the sender lost track of which
+    //! of its forwarded keys the receiver still holds (lane failure, relay
+    //! stop); the receiver releases every key it holds on the sender's
+    //! behalf (fakeAllKeysUp). Idempotent, safe to deliver late.
+    KeyClearAll
   };
 
   using KeyPhase = RelayKeyPhase;
@@ -46,6 +51,7 @@ struct Message
   std::string name;
   std::string ip;
   std::string lan;
+  //! claim: election sequence. key: per-sender monotonic key sequence.
   int64_t seq = 0;
   std::string token;
   // cursor: host screen under the fleet cursor (server → peers)
@@ -56,6 +62,10 @@ struct Message
   uint16_t keyMask = 0;
   uint16_t keyButton = 0;
   std::string keyLang;
+  //! key: sender wall clock at send, ms since the Unix epoch (0 = unknown,
+  //! legacy sender). The receiver drops Down/Repeat older than
+  //! kRelayKeyMaxAgeMs so a key delayed by a wedged lane is never typed late.
+  int64_t keySentAtMs = 0;
   // hello version announcement
   int meshVersion = 0;
   // fleet fragment (decoded from `fleet` messages)
@@ -76,11 +86,22 @@ std::string encodePromote(const std::string &token);
 std::string encodeRescue(const std::string &token);
 std::string encodeStatus(const std::string &token);
 
-//! Keyboard relay (peer → cursor host).
+//! Receiver-side freshness bound for relayed Down/Repeat (ms). Ups are
+//! exempt: a late release is idempotent and always safer than a held key.
+inline constexpr int64_t kRelayKeyMaxAgeMs = 250;
+
+//! Keyboard relay (peer → cursor host). \p seq is the sender's monotonic key
+//! sequence; \p sentAtMs the sender's wall clock (see Message::keySentAtMs).
 std::string encodeKey(
     const std::string &from, RelayKeyPhase phase, uint16_t id, uint16_t mask, uint16_t button, const std::string &lang,
-    const std::string &token
+    const std::string &token, int64_t seq = 0, int64_t sentAtMs = 0
 );
+
+//! Boundary resync: release every key the receiver holds for \p from.
+std::string encodeKeyClearAll(const std::string &from, const std::string &token);
+
+//! Wall clock now, ms since the Unix epoch (the key sentAt stamp).
+int64_t wallClockMs();
 
 std::string encodeHello(int meshVersion, const std::string &name, const std::string &token);
 std::string encodeFleet(const FleetFragment &fragment, const std::string &token);

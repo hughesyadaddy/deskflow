@@ -12,8 +12,11 @@
 namespace deskflow::coordination {
 
 #if defined(__APPLE__)
+//! \p allowLayoutLookup false skips the keyboard-layout glyph translation
+//! (a main-queue hop from the tap thread): only fixed-table keys map.
 bool mapRelayKeyFromCgEvent(
-    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button
+    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button,
+    bool allowLayoutLookup = true
 );
 
 //! macOS modifier keys arrive as kCGEventFlagsChanged, not key down/up.
@@ -37,10 +40,24 @@ KeyID mediaKeyIdFromNxType(uint32_t nxKeyType);
 //! recognized media key; sets \p id and \p down (press vs release).
 bool mapRelayMediaKeyFromCgEvent(void *cgEvent, KeyID &id, bool &down);
 #elif defined(_WIN32)
+//! Samples the modifier state from the OS (GetAsyncKeyState/GetKeyState).
+//! The OS view misses modifiers whose Down the LL hook swallowed; the
+//! monitor uses the overload below with its own shadow instead.
 bool mapRelayKeyFromHook(
     int vkCode, int scanCode, bool isExtended, bool keyUp, bool isRepeat, KeyID &id, KeyModifierMask &mask,
     KeyButton &button, Message::KeyPhase &phase
 );
+
+//! Same, with the caller-resolved modifier state \p modifiers (relayed as
+//! the mask and used for the Shift/CapsLock glyph translation).
+bool mapRelayKeyFromHook(
+    int vkCode, int scanCode, bool isExtended, bool keyUp, bool isRepeat, KeyModifierMask modifiers, KeyID &id,
+    KeyModifierMask &mask, KeyButton &button, Message::KeyPhase &phase
+);
+
+//! Shift/Ctrl/Alt/Win the OS currently reports held (GetAsyncKeyState);
+//! never CapsLock. ORed with the hook's shadow (KeyboardRelayModifierShadow).
+KeyModifierMask relayOsHeldModifiers();
 
 //! Translate a virtual key to a KeyID using the given Shift/CapsLock state so
 //! shifted glyphs relay as the character the user actually typed.

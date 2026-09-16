@@ -18,4 +18,8 @@ private Q_SLOTS:
   void ledger_upFollowsForwardedDownAcrossSwitch();
   void ledger_localDownKeepsUpLocal();
   void ledger_localDownStaysLocalAfterCursorGoesRemote();
+  void routeUp_ledgerBeatsCursorForForwardedModifier();
+  void routeUp_unseenDownFollowsCursor();
+  void ledger_boundaryFlushReportsForwardedAndResyncMarksLocal();
+  void modifierShadow_tracksSwallowedShiftAndCapsToggle();
 };

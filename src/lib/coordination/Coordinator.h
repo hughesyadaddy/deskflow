@@ -151,7 +151,28 @@ public:
   //! left the actually-broken peer stuck.
   void requestFleetRescue();
 
+  //! Receiver side of the KeyClearAll boundary resync (mesh v2).
+  /*!
+  A peer that forwarded keys to this machine lost the ability to release
+  them (its lane to us failed, its relay stopped, a rescue fired) and asks
+  us to release every key we hold on its behalf. The handler must call the
+  running app's fakeAllKeysUp path (Server: primary screen; Client: the
+  client screen). Invoked on a MESH HANDLER THREAD after the same gating as
+  relayed keys (running role, known peer): the handler must marshal onto
+  the app event loop itself (post an event), never touch screens directly.
+  Wired by deskflow-core next to the CoordinationKeyForward handler.
+  */
+  void setKeyClearAllHandler(std::function<void()> handler);
+
 private:
+  //! A lane failed while it was believed reachable: keys forwarded on it
+  //! may be held on the peer with their Up now undeliverable. Re-labels
+  //! every forwarded hold Local (its Up goes to the local OS, a no-op) and
+  //! posts a sticky KeyClearAll so the peer releases them once it answers.
+  void onPeerLaneFailed(const std::string &peerName);
+  //! Relay stop: post Ups for \p buttons still held on the key destination
+  //! (regular class: kept across backoff; a late Up is idempotent).
+  void postForwardedReleases(const std::vector<KeyButton> &buttons);
   void onMessage(const Message &message, const std::function<void(const std::string &)> &reply);
   void onGenuineInput();
   void handleHelloMessage(const Message &message, const std::function<void(const std::string &)> &reply);
@@ -165,7 +186,11 @@ private:
   PeerOutbox *outboxForHostLocked(const std::string &hostName) const;
   bool mergeAndBroadcastFleetFragment(const FleetFragment &fragment, bool sendEvenIfUnchanged);
   void handleKeyForwardMessage(const Message &message);
-  bool
+  void handleKeyClearAllMessage(const Message &message);
+  //! Whether a relayed key from \p message may be injected here (running
+  //! role owns the keyboard, sender is a configured peer).
+  bool acceptsRelayedKeys(const Message &message) const;
+  KeyForwardResult
   sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
   void requestLocalCoreRestart();
 
@@ -215,6 +240,12 @@ private:
   int m_wedgeStrikes = 0;
   bool m_loggedKeyForward = false;
   bool m_loggedKeyForwardReceive = false;
+  //! Lane the last key was forwarded on (guarded by m_mutex; lanes live as
+  //! long as *this). Boundary releases (stop flush) go there.
+  PeerOutbox *m_lastKeyDestination = nullptr;
+  //! Per-sender key sequence (guarded by m_mutex).
+  int64_t m_keySeq = 0;
+  std::function<void()> m_keyClearAllHandler; //!< guarded by m_mutex
   EscTapRescue m_escTapRescue;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
   std::function<void()> m_localCoreRestartHook;

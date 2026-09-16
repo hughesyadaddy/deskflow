@@ -93,10 +93,15 @@ Coordinator::Coordinator(CoordinatorConfig config)
     if (namesEqual(peer.name, m_config.selfName) || m_outboxes.contains(peer.name)) {
       continue;
     }
-    m_outboxes.emplace(peer.name, std::make_unique<PeerOutbox>(peer.ip, peer.lan, transport, monotonicSeconds));
+    auto outbox = std::make_unique<PeerOutbox>(peer.ip, peer.lan, transport, monotonicSeconds);
+    outbox->setFailureHandler([this, name = peer.name] { onPeerLaneFailed(name); });
+    m_outboxes.emplace(peer.name, std::move(outbox));
   }
   m_inputMonitor = createLocalInputMonitor();
   m_keyboardRelay = createKeyboardRelayMonitor();
+  m_keyboardRelay->setForwardedReleaseSink([this](const std::vector<KeyButton> &buttons) {
+    postForwardedReleases(buttons);
+  });
 }
 
 Coordinator::~Coordinator()
@@ -570,6 +575,10 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
     handleKeyForwardMessage(message);
     break;
 
+  case Message::Type::KeyClearAll:
+    handleKeyClearAllMessage(message);
+    break;
+
   case Message::Type::Hello:
     handleHelloMessage(message, reply);
     break;
@@ -583,30 +592,81 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
   }
 }
 
-void Coordinator::handleKeyForwardMessage(const Message &message)
+bool Coordinator::acceptsRelayedKeys(const Message &message) const
 {
   Role role;
-  IEventQueue *events = nullptr;
   std::string selfName;
   std::string cursorHost;
   {
     std::scoped_lock lock{m_mutex};
     role = m_election.role();
-    events = m_events;
     selfName = m_config.selfName;
     cursorHost = m_fleetState.cursorHost;
   }
 
   const bool serverEpoch = role == Role::Server;
   const bool clientCursorHost = role == Role::Client && cursorHostIsLocal(selfName, cursorHost);
-  if (events == nullptr || (!serverEpoch && !clientCursorHost)) {
-    return;
+  if (!serverEpoch && !clientCursorHost) {
+    return false;
   }
   // Both paths inject keystrokes into the local OS; both require the sender
   // to be a configured peer (the shared token alone is not enough).
   if (!isKnownPeer(message.name)) {
     LOG_DEBUG("coordination: dropping relay key from unknown peer \"%s\"", message.name.c_str());
+    return false;
+  }
+  return true;
+}
+
+void Coordinator::handleKeyClearAllMessage(const Message &message)
+{
+  if (!acceptsRelayedKeys(message)) {
     return;
+  }
+  std::function<void()> handler;
+  {
+    std::scoped_lock lock{m_mutex};
+    handler = m_keyClearAllHandler;
+  }
+  LOG_INFO("coordination: key clear-all from \"%s\" -- releasing every relayed key", message.name.c_str());
+  if (handler) {
+    handler();
+  } else {
+    LOG_WARN("coordination: no key clear-all handler wired; relayed keys may stay held");
+  }
+}
+
+void Coordinator::setKeyClearAllHandler(std::function<void()> handler)
+{
+  std::scoped_lock lock{m_mutex};
+  m_keyClearAllHandler = std::move(handler);
+}
+
+void Coordinator::handleKeyForwardMessage(const Message &message)
+{
+  IEventQueue *events = nullptr;
+  {
+    std::scoped_lock lock{m_mutex};
+    events = m_events;
+  }
+  if (events == nullptr || !acceptsRelayedKeys(message)) {
+    return;
+  }
+
+  // Freshness (I3): a Down/Repeat that spent longer than kRelayKeyMaxAgeMs
+  // in transit was already handled locally by the sender (its forward
+  // grace is far shorter), so typing it here now is a phantom keystroke.
+  // Ups are exempt: a late release is idempotent and always safer than a
+  // key left held. Legacy senders (no stamp) are not judged.
+  if (message.keyPhase != Message::KeyPhase::Up && message.keySentAtMs > 0) {
+    const int64_t ageMs = protocol::wallClockMs() - message.keySentAtMs;
+    if (ageMs > protocol::kRelayKeyMaxAgeMs) {
+      LOG_DEBUG(
+          "coordination: dropping stale relay key from \"%s\" (age %lld ms, seq %lld)", message.name.c_str(),
+          static_cast<long long>(ageMs), static_cast<long long>(message.seq)
+      );
+      return;
+    }
   }
 
   bool logFirst = false;
@@ -630,12 +690,13 @@ void Coordinator::handleKeyForwardMessage(const Message &message)
   events->addEvent(Event(EventTypes::CoordinationKeyForward, events->getSystemTarget(), info));
 }
 
-bool Coordinator::sendKeyForward(
+KeyForwardResult Coordinator::sendKeyForward(
     Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang
 )
 {
   // Always observe Downs (including when routing is Local) so 5× Esc still
-  // works while the cursor is on this machine. True return = swallow Esc.
+  // works while the cursor is on this machine. Swallowed = eat this Esc
+  // WITHOUT recording it as held on a peer (its Up then stays local).
   if (phase == Message::KeyPhase::Down) {
     bool triggered = false;
     {
@@ -647,7 +708,7 @@ bool Coordinator::sendKeyForward(
       // elevated/secure-desktop core runs as a client epoch), and the wedged
       // machine is usually a different one.
       requestFleetRescue();
-      return true;
+      return KeyForwardResult::Swallowed;
     }
   }
 
@@ -655,7 +716,7 @@ bool Coordinator::sendKeyForward(
   // says Client up to a dwell before the ServerApp actually stops, and
   // Server::onKeyDown still owns the keyboard until then.
   if (runningRole() != Role::Client) {
-    return false;
+    return KeyForwardResult::Local;
   }
 
   PeerOutbox *destination = nullptr;
@@ -671,7 +732,7 @@ bool Coordinator::sendKeyForward(
 
     const auto decision = routeKeyboard(input);
     if (decision.route == KeyboardRoute::Local) {
-      return false;
+      return KeyForwardResult::Local;
     }
 
     destination = outboxForHostLocked(decision.forwardHost);
@@ -685,8 +746,13 @@ bool Coordinator::sendKeyForward(
         }
       }
     }
+    if (destination == nullptr) {
+      return KeyForwardResult::Local;
+    }
+    m_lastKeyDestination = destination;
     line = protocol::encodeKey(
-        m_config.selfName, phase, static_cast<uint16_t>(id), static_cast<uint16_t>(mask), button, lang, m_config.token
+        m_config.selfName, phase, static_cast<uint16_t>(id), static_cast<uint16_t>(mask), button, lang, m_config.token,
+        ++m_keySeq, protocol::wallClockMs()
     );
 
     if (!m_loggedKeyForward) {
@@ -694,19 +760,66 @@ bool Coordinator::sendKeyForward(
       logFirst = true;
     }
   }
-  if (destination == nullptr) {
-    return false;
-  }
   const std::string address = destination->preferredAddress();
   if (logFirst) {
     LOG_INFO("coordination: forwarding keyboard to %s", address.c_str());
   } else {
     LOG_DEBUG("coordination: forwarding keyboard to %s", address.c_str());
   }
-  // Runs inside the OS keyboard hook: enqueue and return. True (swallow
-  // the key) only while the peer is known reachable; in backoff the key
-  // stays local instead of being lost.
-  return destination->forward(line, kKeyForwardGraceMs);
+  // Runs inside the OS keyboard hook: bounded by the grace. Forwarded
+  // (swallow the key) only once the send actually completed; on backoff,
+  // timeout or failure the key stays local and is never delivered late.
+  return destination->forward(line, kKeyForwardGraceMs) ? KeyForwardResult::Forwarded : KeyForwardResult::Local;
+}
+
+void Coordinator::onPeerLaneFailed(const std::string &peerName)
+{
+  PeerOutbox *lane = nullptr;
+  bool isKeyLane = false;
+  std::string line;
+  {
+    std::scoped_lock lock{m_mutex};
+    if (m_quit) {
+      return;
+    }
+    lane = outboxByName(peerName);
+    isKeyLane = lane != nullptr && lane == m_lastKeyDestination;
+    line = protocol::encodeKeyClearAll(m_config.selfName, m_config.token);
+  }
+  if (!isKeyLane) {
+    return; // no keys were ever forwarded on this lane
+  }
+  LOG_INFO("coordination: key lane to %s failed -- resyncing held keys", peerName.c_str());
+  // Local side: every forwarded hold's Up now goes to the local OS (a
+  // no-op there) instead of being swallowed for a peer we cannot reach.
+  m_keyboardRelay->releaseForwardedLocally();
+  // Peer side: one sticky clear-all, delivered on the first attempt that
+  // succeeds, however long the backoff runs.
+  lane->postSticky(line);
+}
+
+void Coordinator::postForwardedReleases(const std::vector<KeyButton> &buttons)
+{
+  PeerOutbox *lane = nullptr;
+  std::vector<std::string> lines;
+  {
+    std::scoped_lock lock{m_mutex};
+    lane = m_lastKeyDestination;
+    if (lane == nullptr) {
+      return;
+    }
+    lines.reserve(buttons.size());
+    for (const KeyButton button : buttons) {
+      // No sentAt stamp: a release is never stale (see handleKeyForwardMessage).
+      lines.push_back(protocol::encodeKey(
+          m_config.selfName, Message::KeyPhase::Up, static_cast<uint16_t>(kKeyNone), 0, button, {}, m_config.token,
+          ++m_keySeq, 0
+      ));
+    }
+  }
+  for (auto &line : lines) {
+    lane->post(std::move(line)); // regular class: survives a backoff window
+  }
 }
 
 void Coordinator::requestLocalCoreRestart()
@@ -729,6 +842,14 @@ void Coordinator::requestFleetRescue()
     }
     line = protocol::encodeRescue(m_config.token);
   }
+  // Boundary (I4): nothing forwarded before the rescue is worth delivering
+  // after it. Queued keys would land on a restarting peer as phantom
+  // Downs, and every forwarded hold is re-labelled Local so its Up passes
+  // here (the peers' restarted cores start with nothing held).
+  for (auto &[name, outbox] : m_outboxes) {
+    outbox->discardKeys();
+  }
+  m_keyboardRelay->releaseForwardedLocally();
   // Peers first: the lanes deliver to reachable peers within milliseconds,
   // well before the local restart IPC lands, and this may run inside the
   // keyboard hook (5x Esc) so nothing here may block.

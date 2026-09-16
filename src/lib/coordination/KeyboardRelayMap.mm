@@ -13,6 +13,7 @@
 #include <ApplicationServices/ApplicationServices.h>
 #include <Carbon/Carbon.h>
 #import <Cocoa/Cocoa.h>
+#import <IOKit/hidsystem/IOLLEvent.h>
 #import <IOKit/hidsystem/ev_keymap.h>
 
 namespace deskflow::coordination {
@@ -66,21 +67,39 @@ KeyID modifierKeyIdFromVirtualKey(CGKeyCode vk)
   }
 }
 
+//! Whether the modifier key \p vk is held after this flagsChanged.
+/*!
+Hardware events carry per-SIDE device bits (NX_DEVICELSHIFTKEYMASK, ...)
+next to the generic flag. They are what decides: with the generic flag
+alone, releasing Left Shift while Right Shift stays held reads as "Shift
+still down" and the left key's release is never relayed (stuck on the
+peer). Synthetic events without device bits fall back to the generic flag.
+*/
 bool modifierIsDown(CGKeyCode vk, CGEventFlags flags)
 {
+  const auto sided = [flags](CGEventFlags generic, CGEventFlags left, CGEventFlags right, bool isLeft) {
+    if ((flags & (left | right)) != 0) {
+      return (flags & (isLeft ? left : right)) != 0;
+    }
+    return (flags & generic) != 0;
+  };
   switch (vk) {
   case kVK_Shift:
+    return sided(kCGEventFlagMaskShift, NX_DEVICELSHIFTKEYMASK, NX_DEVICERSHIFTKEYMASK, true);
   case kVK_RightShift:
-    return (flags & kCGEventFlagMaskShift) != 0;
+    return sided(kCGEventFlagMaskShift, NX_DEVICELSHIFTKEYMASK, NX_DEVICERSHIFTKEYMASK, false);
   case kVK_Control:
+    return sided(kCGEventFlagMaskControl, NX_DEVICELCTLKEYMASK, NX_DEVICERCTLKEYMASK, true);
   case kVK_RightControl:
-    return (flags & kCGEventFlagMaskControl) != 0;
+    return sided(kCGEventFlagMaskControl, NX_DEVICELCTLKEYMASK, NX_DEVICERCTLKEYMASK, false);
   case kVK_Option:
+    return sided(kCGEventFlagMaskAlternate, NX_DEVICELALTKEYMASK, NX_DEVICERALTKEYMASK, true);
   case kVK_RightOption:
-    return (flags & kCGEventFlagMaskAlternate) != 0;
+    return sided(kCGEventFlagMaskAlternate, NX_DEVICELALTKEYMASK, NX_DEVICERALTKEYMASK, false);
   case kVK_Command:
+    return sided(kCGEventFlagMaskCommand, NX_DEVICELCMDKEYMASK, NX_DEVICERCMDKEYMASK, true);
   case kVK_RightCommand:
-    return (flags & kCGEventFlagMaskCommand) != 0;
+    return sided(kCGEventFlagMaskCommand, NX_DEVICELCMDKEYMASK, NX_DEVICERCMDKEYMASK, false);
   case kVK_CapsLock:
     return (flags & kCGEventFlagMaskAlphaShift) != 0;
   default:
@@ -240,7 +259,8 @@ KeyID translateVirtualKey(CGKeyCode vk, CGEventFlags flags, const UCKeyboardLayo
 } // namespace
 
 bool mapRelayKeyFromCgEvent(
-    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button
+    void *cgEvent, Message::KeyPhase &phase, KeyID &id, KeyModifierMask &mask, KeyButton &button,
+    bool allowLayoutLookup
 )
 {
   auto *event = static_cast<CGEventRef>(cgEvent);
@@ -263,9 +283,16 @@ bool mapRelayKeyFromCgEvent(
     return true;
   }
 
+  const UInt32 keyboardType = LMGetKbdType();
+  if (!allowLayoutLookup) {
+    // Fixed-table keys only (Esc, F-keys, arrows, ...); glyph keys report
+    // kKeyNone. Never touches the main queue: for the local-mode hook path.
+    id = translateVirtualKey(vk, CGEventGetFlags(event), nullptr, keyboardType);
+    return id != kKeyNone || phase == Message::KeyPhase::Repeat;
+  }
+
   // TIS APIs assert the main dispatch queue on macOS 14+; relay tap runs on a
   // dedicated CFRunLoop thread (see OSXKeyboardRelayMonitor).
-  const UInt32 keyboardType = LMGetKbdType();
   CFDataRef layoutRef = deskflow::platform::osx::runOnMainQueue([]() -> CFDataRef {
     std::lock_guard<std::mutex> lock(g_tisMutex);
     AutoTISInputSourceRef source(TISCopyCurrentKeyboardInputSource(), CFRelease);

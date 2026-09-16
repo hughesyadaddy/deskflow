@@ -79,6 +79,7 @@ public:
       m_thread.join();
     }
     releaseRunLoop();
+    flushLedger();
   }
 
   bool running() const override
@@ -86,7 +87,50 @@ public:
     return m_active;
   }
 
+  void setForwardedReleaseSink(ForwardedReleaseSink sink) override
+  {
+    m_releaseSink = std::move(sink);
+  }
+
+  void releaseForwardedLocally() override
+  {
+    m_ledgerResyncPending = true;
+  }
+
 private:
+  //! Boundary (tap thread joined): report every forwarded hold so the
+  //! coordinator posts its Up, then forget everything. The ledger outlives
+  //! epoch flips (the monitor object does), so without this a key held
+  //! across a stop stayed pressed on the peer with nobody left to release it.
+  void flushLedger()
+  {
+    const auto held = m_ledger.forwardedButtons();
+    if (!held.empty() && m_releaseSink) {
+      std::vector<KeyButton> buttons;
+      buttons.reserve(held.size());
+      for (const int button : held) {
+        buttons.push_back(static_cast<KeyButton>(button));
+      }
+      LOG_DEBUG("coordination: relay stop releasing %zu forwarded key(s) on the peer", buttons.size());
+      m_releaseSink(buttons);
+    }
+    m_ledger.clear();
+    m_ledgerResyncPending = false;
+  }
+
+  //! Tap thread: apply a pending cross-thread resync before touching the ledger.
+  void applyPendingResync()
+  {
+    if (m_ledgerResyncPending.exchange(false)) {
+      m_ledger.releaseAllForwardedLocally();
+    }
+  }
+
+  KeyForwardResult send(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button)
+  {
+    return m_send ? m_send(phase, id, mask, button, {}) : KeyForwardResult::Local;
+  }
+
   static CGEventRef tapCallback(CGEventTapProxy, CGEventType type, CGEventRef event, void *refcon)
   {
     auto *self = static_cast<OSXKeyboardRelayMonitor *>(refcon);
@@ -98,6 +142,7 @@ private:
     }
 
     const bool isInjected = relayEventIsInjected(event);
+    self->applyPendingResync();
 
     // Consumer/media keys (volume, brightness, play/pause, ...) arrive as
     // system-defined events, not key down/up. Forward a single Down per
@@ -124,84 +169,12 @@ private:
       // the media KeyID like a normal key and needs the Up to release the VK,
       // otherwise it stays logically held. Both halves are swallowed locally.
       LOG_DEBUG("coordination: relaying media key 0x%04x %s", mediaId, down ? "down" : "up");
-      bool forwarded = false;
-      if (self->m_send) {
-        forwarded = self->m_send(down ? Message::KeyPhase::Down : Message::KeyPhase::Up, mediaId, 0, 0, {});
-      }
-      return relaySwallowDecision(event, false, false, true, forwarded);
+      const auto result = self->send(down ? Message::KeyPhase::Down : Message::KeyPhase::Up, mediaId, 0, 0);
+      return relaySwallowDecision(event, false, false, true, result != KeyForwardResult::Local);
     }
 
     if (type == kCGEventFlagsChanged) {
-      // Keep the caps toggle tracker true to the OS even when this event
-      // will not relay (local mode or injected): a stale tracker would make
-      // the next genuine remote caps press look like a no-op state and be
-      // swallowed (KeyboardRelayMap.mm relays caps per state CHANGE).
-      const bool isCapsEvent =
-          static_cast<CGKeyCode>(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)) == kVK_CapsLock;
-      const bool capsNowOn = (CGEventGetFlags(event) & kCGEventFlagMaskAlphaShift) != 0;
-
-      if (isInjected) {
-        if (isCapsEvent) {
-          self->m_capsLockOn = capsNowOn;
-        }
-        return event;
-      }
-
-      const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
-      if (passLocal) {
-        if (isCapsEvent) {
-          self->m_capsLockOn = capsNowOn;
-        } else {
-          // Record the local destination so a later Up (possibly after the
-          // cursor moved remote) is not swallowed away from this machine.
-          const auto vk = static_cast<KeyButton>(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode));
-          if ((CGEventGetFlags(event) & (kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate |
-                                         kCGEventFlagMaskCommand)) != 0) {
-            self->m_ledger.downLocal(vk);
-          } else {
-            self->m_ledger.release(vk);
-          }
-        }
-        return event;
-      }
-
-      Message::KeyPhase phase = Message::KeyPhase::Down;
-      KeyID id = 0;
-      KeyModifierMask mask = 0;
-      KeyButton button = 0;
-      if (!mapRelayModifierFromCgEvent(event, phase, id, mask, button, self->m_capsLockOn)) {
-        return event;
-      }
-
-      // Modifiers arrive here as flagsChanged, so they need the SAME
-      // destination ledger as ordinary keys: a modifier pressed while local
-      // and released while the cursor is remote must still release locally,
-      // or it stays physically held on this machine (stuck Shift = uppercase
-      // everything, stuck Cmd = shortcuts instead of typing).
-      if (phase == Message::KeyPhase::Up) {
-        const auto destination = self->m_ledger.destination(button);
-        self->m_ledger.release(button);
-        if (destination != KeyboardRelayForwardLedger::Destination::Forwarded) {
-          return event; // its Down went local (or was never seen)
-        }
-        const bool forwardedUp = self->m_send && self->m_send(phase, id, mask, button, {});
-        return forwardedUp ? nullptr : event;
-      }
-
-      bool forwarded = false;
-      if (self->m_send) {
-        forwarded = self->m_send(phase, id, mask, button, {});
-      }
-      // Caps relays as a lone Down per toggle and has no Up to pair with, so
-      // it must not claim a ledger slot.
-      if (!isCapsEvent) {
-        if (forwarded) {
-          self->m_ledger.downForwarded(button);
-        } else {
-          self->m_ledger.downLocal(button);
-        }
-      }
-      return relaySwallowDecision(event, false, false, true, forwarded);
+      return self->onFlagsChanged(event, isInjected);
     }
 
     if (type != kCGEventKeyDown && type != kCGEventKeyUp) {
@@ -216,69 +189,207 @@ private:
       return event;
     }
 
+    return self->onKey(event, type);
+  }
+
+  CGEventRef onFlagsChanged(CGEventRef event, bool isInjected)
+  {
+    // Keep the caps toggle tracker true to the OS even when this event
+    // will not relay (local mode or injected): a stale tracker would make
+    // the next genuine remote caps press look like a no-op state and be
+    // swallowed (KeyboardRelayMap.mm relays caps per state CHANGE).
+    const auto vk = static_cast<CGKeyCode>(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode));
+    const bool isCapsEvent = vk == kVK_CapsLock;
+    const bool capsNowOn = (CGEventGetFlags(event) & kCGEventFlagMaskAlphaShift) != 0;
+    const auto button = static_cast<KeyButton>(vk);
+
+    if (isInjected) {
+      if (isCapsEvent) {
+        m_capsLockOn = capsNowOn;
+      }
+      return event;
+    }
+
+    // Modifiers arrive here as flagsChanged, so they need the SAME
+    // destination ledger as ordinary keys, consulted FIRST -- before the
+    // cursor's current screen. A modifier pressed while the cursor was
+    // remote (Down forwarded) and released after it came home must still
+    // release on the PEER, or Shift/Cmd stays held there (every keystroke
+    // typed there afterwards is uppercase / a shortcut). Likewise a
+    // modifier pressed while local must release locally even if the cursor
+    // is remote by now. Only a fresh Down consults the cursor.
+    const auto destination = m_ledger.destination(button);
+    const bool passLocal = m_passThrough ? m_passThrough() : true;
+    if (keyboardRelayRouteUp(destination, passLocal) == KeyboardRelayUpRoute::Forward) {
+      Message::KeyPhase phase = Message::KeyPhase::Down;
+      KeyID id = 0;
+      KeyModifierMask mask = 0;
+      KeyButton mappedButton = 0;
+      bool isUp = false;
+      if (isCapsEvent) {
+        // Caps: the state-changing edge is the press; the state-preserving
+        // edge (tracker unchanged) is the release, which the tracker
+        // cannot express -- so decide it here from the tracker outcome.
+        isUp = !mapRelayModifierFromCgEvent(event, phase, id, mask, mappedButton, m_capsLockOn);
+        mask = 0;
+      } else {
+        isUp = mapRelayModifierFromCgEvent(event, phase, id, mask, mappedButton, m_capsLockOn) &&
+               phase == Message::KeyPhase::Up;
+      }
+      if (!isUp) {
+        // A second press edge with no release seen in between (the hook
+        // missed it): release the peer's hold and press again so the peer
+        // sees the same edges the user produced.
+        (void)send(Message::KeyPhase::Up, kKeyNone, 0, button);
+        const auto again = send(phase, id, mask, button);
+        if (again != KeyForwardResult::Forwarded) {
+          m_ledger.downLocal(button);
+        }
+        return again != KeyForwardResult::Local ? nullptr : event;
+      }
+      m_ledger.release(button);
+      const auto result = send(Message::KeyPhase::Up, kKeyNone, mask, button);
+      return result != KeyForwardResult::Local ? nullptr : event;
+    }
+
+    if (passLocal || destination == KeyboardRelayForwardLedger::Destination::Local) {
+      if (isCapsEvent) {
+        m_capsLockOn = capsNowOn;
+        m_ledger.release(button);
+      } else {
+        // Record the local destination so a later Up (possibly after the
+        // cursor moved remote) is not swallowed away from this machine.
+        if ((CGEventGetFlags(event) & (kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate |
+                                       kCGEventFlagMaskCommand)) != 0) {
+          m_ledger.downLocal(button);
+        } else {
+          m_ledger.release(button);
+        }
+      }
+      return event;
+    }
+
     Message::KeyPhase phase = Message::KeyPhase::Down;
     KeyID id = 0;
     KeyModifierMask mask = 0;
-    KeyButton button = 0;
-    const bool mapped = mapRelayKeyFromCgEvent(event, phase, id, mask, button);
-    if (!mapped && phase == Message::KeyPhase::Up) {
+    KeyButton mappedButton = 0;
+    if (!mapRelayModifierFromCgEvent(event, phase, id, mask, mappedButton, m_capsLockOn)) {
+      // Caps release edge with no forwarded hold, or an unknown key.
       return event;
     }
+    if (phase == Message::KeyPhase::Up) {
+      return event; // its Down went local (or was never seen)
+    }
+
+    const auto result = send(phase, id, mask, button);
+    switch (result) {
+    case KeyForwardResult::Forwarded:
+      m_ledger.downForwarded(button);
+      break;
+    default:
+      m_ledger.downLocal(button);
+      break;
+    }
+    return relaySwallowDecision(event, false, false, true, result != KeyForwardResult::Local);
+  }
+
+  CGEventRef onKey(CGEventRef event, CGEventType type)
+  {
+    // Phase and button are cheap (event fields); the KeyID needs the
+    // keyboard layout, which lives on the main queue (dispatch_sync from
+    // this tap thread). Only a Down that is actually leaving the machine
+    // pays for it: in local mode a stalled main thread would otherwise
+    // stall the tap on every keystroke, and past the tap timeout macOS
+    // delivers the key locally while the callback still forwards it.
+    const auto vk = static_cast<CGKeyCode>(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode));
+    const auto button = static_cast<KeyButton>(vk);
+    const bool isUp = type == kCGEventKeyUp;
+    const bool isRepeat = !isUp && CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) != 0;
 
     // Repeat/Up of a held key follow the DOWN's destination (ledger), not the
     // cursor's current screen: a mid-hold screen switch must not strand the
     // key held on one side with its release delivered to the other.
-    if (phase == Message::KeyPhase::Up) {
-      const auto destination = self->m_ledger.destination(button);
+    if (isUp) {
+      const auto destination = m_ledger.destination(button);
       if (destination == KeyboardRelayForwardLedger::Destination::Local) {
         // Its Down was delivered locally: the Up must be too, or the key
         // never releases on this machine.
-        self->m_ledger.release(button);
+        m_ledger.release(button);
         return event;
       }
+      Message::KeyPhase phase = Message::KeyPhase::Up;
+      KeyID id = kKeyNone;
+      KeyModifierMask mask = 0;
+      KeyButton mappedButton = 0;
+      mapRelayKeyFromCgEvent(event, phase, id, mask, mappedButton); // Up: no layout lookup
       if (destination == KeyboardRelayForwardLedger::Destination::Unknown) {
         // Genuinely unseen Down (ledger lost mid-hold): if the cursor is
         // remote, forward-and-swallow so the target never keeps it held.
-        const bool passLocalNow = self->m_passThrough ? self->m_passThrough() : true;
-        if (!passLocalNow && self->m_send && self->m_send(phase, id, mask, button, {})) {
+        const bool passLocalNow = m_passThrough ? m_passThrough() : true;
+        if (!passLocalNow && send(phase, id, mask, button) != KeyForwardResult::Local) {
           return nullptr;
         }
         return event;
       }
-      self->m_ledger.release(button);
-      const bool forwarded = self->m_send && self->m_send(phase, id, mask, button, {});
-      return forwarded ? nullptr : event;
+      m_ledger.release(button);
+      return send(phase, id, mask, button) != KeyForwardResult::Local ? nullptr : event;
     }
-    if (phase == Message::KeyPhase::Repeat) {
-      if (!self->m_ledger.follow(button)) {
-        return event; // Down stayed local
-      }
-      const bool forwarded = self->m_send && self->m_send(phase, id, mask, button, {});
-      return forwarded ? nullptr : event;
+
+    if (isRepeat && !m_ledger.follow(button)) {
+      return event; // Down stayed local
     }
 
     // Fresh Down: destination is decided by where the cursor is NOW.
-    const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
-    // When keys stay local, still deliver Downs to sendKeyForward so 5× Esc
-    // restart can observe taps (return true = swallow this key).
+    const bool passLocal = !isRepeat && (m_passThrough ? m_passThrough() : true);
     if (passLocal) {
-      self->m_ledger.downLocal(button);
-      if (mapped && self->m_send && self->m_send(phase, id, mask, button, {})) {
+      m_ledger.downLocal(button);
+      // Still hand the Down to the coordinator so 5x Esc rescue can observe
+      // taps while the cursor is local -- but WITHOUT the layout lookup:
+      // Esc (and every other rescue-relevant key) maps from the fixed
+      // table, and a glyph key only has to break the Esc streak, which a
+      // kKeyNone id does just as well.
+      Message::KeyPhase phase = Message::KeyPhase::Down;
+      KeyID id = kKeyNone;
+      KeyModifierMask mask = 0;
+      KeyButton mappedButton = 0;
+      mapRelayKeyFromCgEvent(event, phase, id, mask, mappedButton, false);
+      if (send(phase, id, mask, button) == KeyForwardResult::Swallowed) {
         return nullptr;
       }
       return event;
     }
 
-    bool forwarded = false;
-    if (mapped && self->m_send) {
-      forwarded = self->m_send(phase, id, mask, button, {});
+    Message::KeyPhase phase = Message::KeyPhase::Down;
+    KeyID id = 0;
+    KeyModifierMask mask = 0;
+    KeyButton mappedButton = 0;
+    const bool mapped = mapRelayKeyFromCgEvent(event, phase, id, mask, mappedButton);
+    if (isRepeat) {
+      if (!mapped) {
+        return event;
+      }
+      return send(phase, id, mask, button) != KeyForwardResult::Local ? nullptr : event;
     }
-    if (forwarded) {
-      self->m_ledger.downForwarded(button);
-    } else {
-      self->m_ledger.downLocal(button);
+
+    KeyForwardResult result = KeyForwardResult::Local;
+    if (mapped) {
+      result = send(phase, id, mask, button);
     }
-    return relaySwallowDecision(event, false, false, mapped, forwarded);
+    switch (result) {
+    case KeyForwardResult::Forwarded:
+      m_ledger.downForwarded(button);
+      break;
+    case KeyForwardResult::Swallowed:
+      // Consumed by the rescue gesture: never seen by either OS, so its Up
+      // must not chase a hold on the peer. Local = the Up passes through
+      // here as a harmless no-op.
+      m_ledger.downLocal(button);
+      return nullptr;
+    default:
+      m_ledger.downLocal(button);
+      break;
+    }
+    return relaySwallowDecision(event, false, false, mapped, result == KeyForwardResult::Forwarded);
   }
 
   void runLoop()
@@ -338,11 +449,13 @@ private:
 
   RelayPassThroughQuery m_passThrough;
   KeyForwardSend m_send;
+  ForwardedReleaseSink m_releaseSink;
   std::thread m_thread;
   std::atomic<bool> m_running{false};
   std::atomic<bool> m_active{false}; //!< tap installed and pumping
   CFMachPortRef m_tap = nullptr;
-  KeyboardRelayForwardLedger m_ledger; //!< tap-thread only
+  KeyboardRelayForwardLedger m_ledger;             //!< tap thread only (stop() after join)
+  std::atomic<bool> m_ledgerResyncPending{false}; //!< releaseForwardedLocally() -> tap thread
   bool m_capsLockOn = false;
   std::mutex m_runLoopMutex;         //!< guards m_runLoop between stop() and the monitor thread
   CFRunLoopRef m_runLoop = nullptr; //!< retained; released by stop() after join

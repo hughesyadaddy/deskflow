@@ -25,6 +25,7 @@ using deskflow::coordination::CoordinatorConfig;
 using deskflow::coordination::FleetFragment;
 using deskflow::coordination::FleetLink;
 using deskflow::coordination::FleetScreen;
+using deskflow::coordination::KeyForwardResult;
 using deskflow::coordination::Message;
 using deskflow::coordination::Role;
 namespace protocol = deskflow::coordination::protocol;
@@ -407,7 +408,7 @@ void CoordinatorFleetPublishTests::fiveEsc_requestsLocalCoreRestart()
     QCOMPARE(restartCalls, 0);
   }
   // Fifth Esc: swallow (return true) and request soft restart.
-  QVERIFY(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"));
+  QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"), KeyForwardResult::Swallowed);
   QCOMPARE(restartCalls, 1);
 
   coordinator.stop();
@@ -438,10 +439,10 @@ void CoordinatorFleetPublishTests::fiveEsc_localPass_requestsLocalCoreRestart()
   QVERIFY(coordinator.relayPassThroughLocal());
 
   for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
-    QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"));
+    QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"), KeyForwardResult::Local);
     QCOMPARE(restartCalls, 0);
   }
-  QVERIFY(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"));
+  QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"), KeyForwardResult::Swallowed);
   QCOMPARE(restartCalls, 1);
 
   coordinator.stop();
@@ -553,7 +554,7 @@ void CoordinatorFleetPublishTests::sendKeyForward_returnsFalseWithoutDestination
   }
 
   // Remote cursor but no mesh destination: must not claim the key was forwarded.
-  QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+  QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"), KeyForwardResult::Local);
 
   coordinator.stop();
 }
@@ -576,7 +577,7 @@ void CoordinatorFleetPublishTests::sendKeyForward_returnsFalseWhenMeshUnreachabl
     coordinator.m_fleetState.cursorHost = "hackintosh";
   }
 
-  QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+  QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"), KeyForwardResult::Local);
 
   coordinator.stop();
 }
@@ -599,7 +600,7 @@ void CoordinatorFleetPublishTests::sendKeyForward_returnsTrueWhenDestinationReac
   }
 
   // Mesh send targets host:localMeshPort; loopback reaches our own listener.
-  QVERIFY(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+  QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"), KeyForwardResult::Forwarded);
 
   coordinator.stop();
 }

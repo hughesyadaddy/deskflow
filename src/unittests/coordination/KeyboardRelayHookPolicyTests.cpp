@@ -10,6 +10,8 @@
 
 #include <QTest>
 
+#include <algorithm>
+
 using deskflow::coordination::KeyboardRelayHookContext;
 using deskflow::coordination::keyboardRelayHookShouldPassThrough;
 
@@ -105,6 +107,112 @@ void KeyboardRelayHookPolicyTests::ledger_localDownStaysLocalAfterCursorGoesRemo
   // Unseen buttons report Unknown (the only case that may fall back to
   // forward-and-swallow).
   QCOMPARE(ledger.destination(0x41), Destination::Unknown);
+}
+
+void KeyboardRelayHookPolicyTests::routeUp_ledgerBeatsCursorForForwardedModifier()
+{
+  using deskflow::coordination::KeyboardRelayForwardLedger;
+  using deskflow::coordination::keyboardRelayRouteUp;
+  using deskflow::coordination::KeyboardRelayUpRoute;
+  using Destination = KeyboardRelayForwardLedger::Destination;
+
+  // S1 (THE stuck Shift/Cmd bug): Shift pressed while the cursor was
+  // remote (Down forwarded), released after the cursor came home
+  // (passLocal == true by release time). The macOS flagsChanged branch
+  // checked passLocal FIRST and released the ledger without forwarding
+  // the Up -- Shift stayed held on the peer. The ledger must win.
+  QCOMPARE(keyboardRelayRouteUp(Destination::Forwarded, true), KeyboardRelayUpRoute::Forward);
+  QCOMPARE(keyboardRelayRouteUp(Destination::Forwarded, false), KeyboardRelayUpRoute::Forward);
+
+  // The mirror case: pressed local, released with the cursor remote.
+  QCOMPARE(keyboardRelayRouteUp(Destination::Local, false), KeyboardRelayUpRoute::Local);
+  QCOMPARE(keyboardRelayRouteUp(Destination::Local, true), KeyboardRelayUpRoute::Local);
+}
+
+void KeyboardRelayHookPolicyTests::routeUp_unseenDownFollowsCursor()
+{
+  using deskflow::coordination::KeyboardRelayForwardLedger;
+  using deskflow::coordination::keyboardRelayRouteUp;
+  using deskflow::coordination::KeyboardRelayUpRoute;
+  using Destination = KeyboardRelayForwardLedger::Destination;
+
+  // Only a Down the hook never saw (monitor restart mid-hold) falls back
+  // to the cursor: forward best-effort when remote, else local.
+  QCOMPARE(keyboardRelayRouteUp(Destination::Unknown, false), KeyboardRelayUpRoute::ForwardUnknown);
+  QCOMPARE(keyboardRelayRouteUp(Destination::Unknown, true), KeyboardRelayUpRoute::Local);
+}
+
+void KeyboardRelayHookPolicyTests::ledger_boundaryFlushReportsForwardedAndResyncMarksLocal()
+{
+  using deskflow::coordination::KeyboardRelayForwardLedger;
+  using Destination = KeyboardRelayForwardLedger::Destination;
+  KeyboardRelayForwardLedger ledger;
+
+  ledger.downForwarded(0xA0); // Shift held on the peer
+  ledger.downForwarded(0x5B); // Win held on the peer
+  ledger.downLocal(0x41);     // 'a' held here
+
+  // stop(): only the forwarded holds need an Up on the peer.
+  const auto held = ledger.forwardedButtons();
+  QCOMPARE(held.size(), static_cast<size_t>(2));
+  QVERIFY(std::find(held.begin(), held.end(), 0xA0) != held.end());
+  QVERIFY(std::find(held.begin(), held.end(), 0x5B) != held.end());
+  QVERIFY(std::find(held.begin(), held.end(), 0x41) == held.end());
+
+  // Lane failure / rescue: forwarded holds become Local so their Up passes
+  // to the local OS (harmless) instead of being swallowed for a peer that
+  // cannot be told; local holds are untouched.
+  ledger.releaseAllForwardedLocally();
+  QCOMPARE(ledger.destination(0xA0), Destination::Local);
+  QCOMPARE(ledger.destination(0x5B), Destination::Local);
+  QCOMPARE(ledger.destination(0x41), Destination::Local);
+  QVERIFY(ledger.forwardedButtons().empty());
+
+  ledger.clear();
+  QVERIFY(ledger.empty());
+  QCOMPARE(ledger.destination(0xA0), Destination::Unknown);
+}
+
+void KeyboardRelayHookPolicyTests::modifierShadow_tracksSwallowedShiftAndCapsToggle()
+{
+  using deskflow::coordination::KeyboardRelayModifierShadow;
+  KeyboardRelayModifierShadow shadow;
+  QCOMPARE(shadow.mask(), 0u);
+
+  // A forwarded (swallowed) Left Shift Down is invisible to
+  // GetAsyncKeyState; the shadow is what makes the next letter map as 'A'.
+  shadow.note(KeyboardRelayModifierShadow::kVkLShift, true, false);
+  QCOMPARE(shadow.mask(), static_cast<KeyModifierMask>(KeyModifierShift));
+  // Repeats do not change anything; a second side keeps the bit on release
+  // of the first.
+  shadow.note(KeyboardRelayModifierShadow::kVkLShift, true, true);
+  shadow.note(KeyboardRelayModifierShadow::kVkRShift, true, false);
+  shadow.note(KeyboardRelayModifierShadow::kVkLShift, false, false);
+  QCOMPARE(shadow.mask(), static_cast<KeyModifierMask>(KeyModifierShift));
+  shadow.note(KeyboardRelayModifierShadow::kVkRShift, false, false);
+  QCOMPARE(shadow.mask(), 0u);
+
+  shadow.note(KeyboardRelayModifierShadow::kVkLControl, true, false);
+  shadow.note(KeyboardRelayModifierShadow::kVkRMenu, true, false);
+  shadow.note(KeyboardRelayModifierShadow::kVkLWin, true, false);
+  QCOMPARE(shadow.mask(), static_cast<KeyModifierMask>(KeyModifierControl | KeyModifierAlt | KeyModifierSuper));
+  shadow.reset();
+  QCOMPARE(shadow.mask(), 0u);
+
+  // CapsLock: a swallowed VK_CAPITAL Down never reaches the OS toggle, so
+  // the shadow flips per Down edge (not on repeat, not on Up).
+  shadow.seedCapsLock(false);
+  shadow.note(KeyboardRelayModifierShadow::kVkCapital, true, false);
+  QVERIFY(shadow.capsLock());
+  QCOMPARE(shadow.mask(), static_cast<KeyModifierMask>(KeyModifierCapsLock));
+  shadow.note(KeyboardRelayModifierShadow::kVkCapital, true, true);
+  shadow.note(KeyboardRelayModifierShadow::kVkCapital, false, false);
+  QVERIFY(shadow.capsLock());
+  shadow.note(KeyboardRelayModifierShadow::kVkCapital, true, false);
+  QVERIFY(!shadow.capsLock());
+  // Non-modifier keys are ignored.
+  shadow.note(0x41, true, false);
+  QCOMPARE(shadow.mask(), 0u);
 }
 
 QTEST_MAIN(KeyboardRelayHookPolicyTests)

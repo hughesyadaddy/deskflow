@@ -115,7 +115,11 @@ connect attempt per window, alternating the LAN and stable addresses, so a
 sleeping peer costs one connect timeout per window instead of two per
 heartbeat. The last address that answered is tried first. Queued lines are
 capped, and a failed attempt discards everything queued behind it: by then
-the lines are stale, and every periodic sender re-posts.
+the lines are stale, and every periodic sender re-posts. Two job classes
+refine this: KEY lines (forward()) are never queued in backoff and expire
+kKeyDeadlineS after enqueue, so a key is never delivered late; STICKY
+lines (postSticky()) survive failed attempts, so a boundary resync always
+reaches the peer once it answers again.
 
 The transport and clock are injectable so the schedule is unit-testable
 without sockets or a thread (tests call pump() directly).
@@ -143,6 +147,16 @@ public:
   //! one connect never drops a Down while its Up still delivers (stuck
   //! modifier); every drop is logged.
   static constexpr size_t kMaxQueuedLines = 64;
+  //! A key line still queued this long after forward() enqueued it is
+  //! discarded before any connect: the hook has long since handled the key
+  //! locally, and typing it late on the peer is the phantom-Down bug.
+  static constexpr double kKeyDeadlineS = 0.150;
+
+  //! Invoked (on the lane thread, no lock held) when an attempt fails while
+  //! the lane was not already in backoff. Keys forwarded before the failure
+  //! may be held on the peer with their Up now undeliverable; the handler
+  //! resyncs (Coordinator: ledger release + sticky KeyClearAll).
+  using FailureHandler = std::function<void()>;
 
   PeerOutbox(std::string ip, std::string lan, Transport transport, Clock clock);
   PeerOutbox(const PeerOutbox &) = delete;
@@ -152,25 +166,33 @@ public:
   void start();
   void stop();
 
+  void setFailureHandler(FailureHandler handler);
+
   //! Queue \p line for delivery (kept across backoff; the oldest line is
   //! dropped past kMaxQueuedLines). \p onReply runs on the lane thread with
   //! the peer's reply line when set (query semantics); never on failure.
   void post(std::string line, ReplyHandler onReply = {});
 
+  //! Queue \p line so that it survives failed attempts: a failure keeps it
+  //! at the head of the queue (everything else queued is dropped) and it
+  //! goes out on the first attempt that succeeds. A second sticky post of
+  //! the same line replaces the first. For resync lines (KeyClearAll).
+  void postSticky(std::string line);
+
   //! Queue \p line for a key forward; never blocks past \p graceMs.
   /*!
-  Returns whether the caller may treat the line as delivered: true when the
-  peer is reachable (the send is in flight), false in backoff. Inside the
-  backoff window nothing is queued; once the window has opened the line is
-  queued anyway (still reported as not delivered) so the attempt re-settles
-  the state -- a client posts nothing else on the server lane between
-  version probes, and without this a single transient failure kept keys
-  local until the next probe. While reachability is still Unknown the call
-  waits at most \p graceMs for the attempt to resolve; on timeout the line
-  is withdrawn from the queue when it has not been picked up yet, so a key
-  reported as "kept local" is never also delivered late.
+  Returns whether the caller may treat the line as delivered. In backoff
+  nothing is queued and the answer is false (the key stays local); a key is
+  never both typed locally and delivered late. Otherwise the call waits at
+  most \p graceMs for its own send to complete and reports the outcome; on
+  timeout the line is withdrawn when it has not been picked up yet, and the
+  answer is false. A key that sits queued past kKeyDeadlineS is discarded
+  by pump() before any connect is attempted for it.
   */
   bool forward(std::string line, int graceMs);
+
+  //! Drop every queued key line (rescue: the fleet is restarting anyway).
+  void discardKeys();
 
   State state() const;
   //! Address tried first on the next attempt (last one that answered).
@@ -179,6 +201,8 @@ public:
   double nextAttemptAt() const;
   //! No queued lines and no attempt in flight.
   bool idle() const;
+  //! Key lines discarded past their deadline since construction.
+  uint64_t expiredKeys() const;
 
   //! Drive one scheduling step at \p now: attempts the queued lines when the
   //! backoff window has opened. The lane thread calls this; tests call it
@@ -191,11 +215,16 @@ private:
     std::string line;
     ReplyHandler onReply;
     uint64_t ticket = 0; //!< m_posted value at enqueue (forward() withdrawal)
+    bool isKey = false;  //!< key class: never queued in backoff, deadline-bound
+    bool sticky = false; //!< survives failed attempts (see postSticky)
+    double deadline = 0; //!< monotonic seconds; 0 = none
   };
 
   void run();
   //! Append a job; drops (and logs) the oldest past kMaxQueuedLines.
-  uint64_t enqueueLocked(std::string line, ReplyHandler onReply);
+  uint64_t enqueueLocked(Job job);
+  //! True while the job with \p ticket is queued or in flight.
+  bool pendingLocked(uint64_t ticket) const;
   std::string otherAddressLocked(const std::string &host) const;
 
   const std::string m_ip;
@@ -212,10 +241,13 @@ private:
   double m_backoffS = 0.0;
   double m_nextAttemptAt = 0.0;
   bool m_inFlight = false;
-  //! Jobs posted / resolved (sent, failed, or dropped), in FIFO order, so
-  //! forward() can wait for its own job.
+  //! Ticket counter; forward() waits until its own ticket is neither
+  //! queued nor in flight, then collects the outcome from m_deliveredKeys.
   uint64_t m_posted = 0;
-  uint64_t m_resolved = 0;
+  uint64_t m_inFlightTicket = 0;
+  std::set<uint64_t> m_deliveredKeys;
+  uint64_t m_expiredKeys = 0;
+  FailureHandler m_onFailure;
   bool m_stop = false;
   std::thread m_thread;
 };
