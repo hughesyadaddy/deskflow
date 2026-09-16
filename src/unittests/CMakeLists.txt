@@ -67,6 +67,16 @@ add_subdirectory(net)
 add_subdirectory(platform)
 add_subdirectory(server)
 
+# App-level tests for deskflow-core. AutoModeRunner's flip gate is
+# header-only, so the test needs only the header path and coordination.
+create_test(
+  NAME AutoModeRunnerTests
+  DEPENDS coordination
+  SOURCE apps/deskflow-core/AutoModeRunnerTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/apps/deskflow-core"
+)
+target_include_directories(AutoModeRunnerTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-core")
+
 #make sure to use CI only plugin on Unix
 if (UNIX AND NOT APPLE)
   set(qPA_Platform "QT_QPA_PLATFORM=minimal")

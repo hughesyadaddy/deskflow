@@ -23,6 +23,7 @@
 #include <QThread>
 
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <thread>
 
@@ -61,14 +62,37 @@ CoordinatorConfig configFromSettings()
 
 } // namespace
 
+EpochFlipGate::Config AutoModeRunner::gateConfigFromEnvironment()
+{
+  EpochFlipGate::Config config;
+  if (const char *raw = std::getenv("DESKFLOW_AUTO_DWELL_MS"); raw != nullptr && *raw != '\0') {
+    char *end = nullptr;
+    const long ms = std::strtol(raw, &end, 10);
+    if (end != raw && *end == '\0' && ms >= 0) {
+      config.minDwell = std::chrono::milliseconds(ms);
+      // Hysteresis ceiling scales with the base dwell (6x, i.e. 5 s -> 30 s).
+      config.maxDwell = std::chrono::milliseconds(ms * 6);
+    } else {
+      LOG_WARN("auto mode: ignoring invalid DESKFLOW_AUTO_DWELL_MS=\"%s\"", raw);
+    }
+  }
+  return config;
+}
+
 AutoModeRunner::AutoModeRunner(EventQueue &events, QString processName)
     : m_events(events),
-      m_processName(std::move(processName))
+      m_processName(std::move(processName)),
+      m_gate(gateConfigFromEnvironment())
 {
   // do nothing
 }
 
-AutoModeRunner::~AutoModeRunner() = default;
+AutoModeRunner::~AutoModeRunner()
+{
+  // Belt and braces: epochLoop() joins on every exit path, but a runner
+  // destroyed before/without running must still not leak the thread.
+  stopDeferredThread();
+}
 
 void AutoModeRunner::run(QThread &coreThread)
 {
@@ -82,6 +106,9 @@ void AutoModeRunner::run(QThread &coreThread)
 
 void AutoModeRunner::requestQuit()
 {
+  // Set before the coordinator fires the interrupt callback so a quit is
+  // never rate-limited like a role flip.
+  m_quitRequested = true;
   if (m_coordinator) {
     m_coordinator->requestQuit();
   }
@@ -102,13 +129,7 @@ void AutoModeRunner::epochLoop()
   }
 
   m_coordinator = std::make_unique<Coordinator>(config);
-  m_coordinator->setInterruptCallback([this] {
-    // Only interrupt an actually running app; a stale Quit in the queue
-    // would otherwise instantly kill the next epoch.
-    if (m_appRunning) {
-      m_events.addEvent(Event(EventTypes::Quit));
-    }
-  });
+  m_coordinator->setInterruptCallback([this] { onFlipRequested(); });
   if (!m_coordinator->start()) {
     LOG_CRIT("auto mode could not start the coordination mesh");
     m_exitCode = s_exitFailed;
@@ -116,8 +137,18 @@ void AutoModeRunner::epochLoop()
   }
   m_coordinator->setEventQueue(&m_events);
 
+  {
+    std::scoped_lock lock{m_gateMutex};
+    m_gateStop = false;
+  }
+  m_deferredThread = std::thread([this] { deferredInterruptThread(); });
+  LOG_INFO(
+      "auto mode: epoch flip dwell %lld ms (max %lld ms)", static_cast<long long>(m_gate.currentDwell().count()),
+      static_cast<long long>(gateConfigFromEnvironment().maxDwell.count())
+  );
+
   while (true) {
-    const RoleDecision decision = m_coordinator->awaitRoleDecision();
+    const RoleDecision decision = takeDecision();
     if (decision.quit) {
       break;
     }
@@ -128,13 +159,133 @@ void AutoModeRunner::epochLoop()
       // Pause briefly so a persistent failure cannot hot-loop. Plain
       // std sleep: Arch::sleep() requires an Arch-registered thread and
       // this is a QThread (it crashes in testCancelThread otherwise).
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::this_thread::sleep_for(kFailureBackoff);
     }
-    m_coordinator->notifyEpochEnded();
+    bool decisionWaiting = false;
+    {
+      std::scoped_lock lock{m_gateMutex};
+      decisionWaiting = m_consumedDecision != nullptr;
+    }
+    // Only re-arm the same role when the app really exited on its own;
+    // an epoch cut by the deferred timer already has its successor.
+    if (!decisionWaiting) {
+      m_coordinator->notifyEpochEnded();
+    }
   }
 
+  stopDeferredThread();
   m_coordinator->stop();
   LOG_INFO("auto mode stopped");
+}
+
+RoleDecision AutoModeRunner::takeDecision()
+{
+  {
+    std::scoped_lock lock{m_gateMutex};
+    if (m_consumedDecision) {
+      RoleDecision decision = *m_consumedDecision;
+      m_consumedDecision.reset();
+      return decision;
+    }
+  }
+  // The timer only consumes while an app runs, and this thread is the
+  // one that runs apps, so blocking here cannot race the timer.
+  return m_coordinator->awaitRoleDecision();
+}
+
+void AutoModeRunner::onFlipRequested()
+{
+  if (m_quitRequested) {
+    if (m_appRunning) {
+      m_events.addEvent(Event(EventTypes::Quit));
+    }
+    return;
+  }
+
+  std::scoped_lock lock{m_gateMutex};
+  switch (m_gate.requestFlip(EpochFlipGate::Clock::now())) {
+  case EpochFlipGate::Action::Ignored:
+    // No app running; the loop is (about to be) blocked in takeDecision().
+    break;
+  case EpochFlipGate::Action::InterruptNow:
+    if (consumePendingDecisionLocked()) {
+      m_events.addEvent(Event(EventTypes::Quit));
+    }
+    break;
+  case EpochFlipGate::Action::Deferred: {
+    const auto wait = m_gate.deferredDeadline().value() - EpochFlipGate::Clock::now();
+    LOG_INFO(
+        "coordination: role flip requested %lld ms into the epoch; deferring %lld ms (dwell %lld ms)",
+        static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(m_gate.currentDwell() - wait).count()
+        ),
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(wait).count()),
+        static_cast<long long>(m_gate.currentDwell().count())
+    );
+    m_gateCv.notify_all();
+    break;
+  }
+  case EpochFlipGate::Action::Coalesced:
+    LOG_DEBUG("coordination: role flip request coalesced into pending deferred flip");
+    break;
+  }
+}
+
+bool AutoModeRunner::consumePendingDecisionLocked()
+{
+  if (!m_coordinator->hasPendingDecision()) {
+    return false;
+  }
+  // Non-blocking here: a decision (or quit) is pending and this thread is
+  // the only consumer while an app runs (the loop is inside the app).
+  RoleDecision decision = m_coordinator->awaitRoleDecision();
+  if (!decision.quit && decision.role == m_runningRole && decision.serverAddress == m_runningServer) {
+    LOG_INFO(
+        "coordination: latest decision is the running %s epoch%s%s; keeping it (no rebuild, %d request(s) coalesced)",
+        roleName(decision.role), m_runningServer.empty() ? "" : " towards ", m_runningServer.c_str(),
+        m_gate.coalescedRequests()
+    );
+    return false;
+  }
+  m_consumedDecision = std::make_unique<RoleDecision>(std::move(decision));
+  return true;
+}
+
+void AutoModeRunner::deferredInterruptThread()
+{
+  std::unique_lock lock{m_gateMutex};
+  while (!m_gateStop) {
+    const auto deadline = m_gate.deferredDeadline();
+    if (!deadline) {
+      m_gateCv.wait(lock, [this] { return m_gateStop || m_gate.deferredDeadline().has_value(); });
+      continue;
+    }
+    m_gateCv.wait_until(lock, *deadline, [this, deadline] {
+      return m_gateStop || m_gate.deferredDeadline() != deadline;
+    });
+    if (m_gateStop) {
+      break;
+    }
+    if (!m_gate.takeDeferredIfDue(EpochFlipGate::Clock::now())) {
+      continue;
+    }
+    if (m_appRunning && consumePendingDecisionLocked()) {
+      LOG_INFO("coordination: dwell elapsed; interrupting the running epoch for the deferred flip");
+      m_events.addEvent(Event(EventTypes::Quit));
+    }
+  }
+}
+
+void AutoModeRunner::stopDeferredThread()
+{
+  {
+    std::scoped_lock lock{m_gateMutex};
+    m_gateStop = true;
+  }
+  m_gateCv.notify_all();
+  if (m_deferredThread.joinable()) {
+    m_deferredThread.join();
+  }
 }
 
 int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
@@ -167,6 +318,9 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
   ClientApp *clientAppPtr = nullptr;
   std::function<void(const Event &)> topologyReadyHandler;
 
+  // The App (and with it the platform screen / event tap / client
+  // threads) lives exactly as long as this scope; every exit path below
+  // releases it through the unique_ptr destructor.
   std::unique_ptr<App> app;
   if (role == Role::Server) {
     auto serverApp = std::make_unique<ServerApp>(&m_events, m_processName);
@@ -202,11 +356,17 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
       serverAddress.c_str()
   );
 
-  m_appRunning = true;
+  {
+    std::scoped_lock lock{m_gateMutex};
+    m_runningRole = role;
+    m_runningServer = serverAddress;
+    m_gate.epochStarted(EpochFlipGate::Clock::now());
+    m_appRunning = true;
+  }
   // A decision can land in the gap before this epoch's loop starts;
-  // re-post the interrupt so it is never lost.
+  // route it through the gate so it is never lost (and never hot-loops).
   if (m_coordinator->hasPendingDecision()) {
-    m_events.addEvent(Event(EventTypes::Quit));
+    onFlipRequested();
   }
 
   int result = s_exitFailed;
@@ -224,7 +384,14 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
   } catch (...) {
     LOG_CRIT("an unknown error occurred\n");
   }
-  m_appRunning = false;
+  {
+    std::scoped_lock lock{m_gateMutex};
+    m_appRunning = false;
+    m_gate.epochEnded(EpochFlipGate::Clock::now());
+    m_runningRole = Role::Init;
+    m_runningServer.clear();
+  }
+  m_gateCv.notify_all();
 
   if (trackCursorHere) {
     m_events.removeHandler(EventTypes::CoordinationScreenEntered, m_events.getSystemTarget());
