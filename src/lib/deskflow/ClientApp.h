@@ -73,6 +73,7 @@ public:
   void registerKeyForwardHandler();
   void unregisterKeyForwardHandler();
   void handleCoordinationKeyForward(const Event &event);
+  void handleCoordinationKeyClearAll();
   Client *getClientPtr()
   {
     return m_client;

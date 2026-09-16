@@ -786,11 +786,16 @@ void ServerApp::registerKeyForwardHandler()
       EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget(),
       [this](const Event &event) { handleCoordinationKeyForward(event); }
   );
-  getEvents()->addHandler(EventTypes::CoordinationKeyClearAll, getEvents()->getSystemTarget(), [this](const Event &) {
-    if (m_server != nullptr) {
-      m_server->releaseForwardedKeys();
-    }
-  });
+  getEvents()->addHandler(
+      EventTypes::CoordinationKeyClearAll, getEvents()->getSystemTarget(),
+      [this](const Event &event) {
+        if (m_server == nullptr) {
+          return;
+        }
+        const auto *info = dynamic_cast<const CoordinationKeyClearAllInfo *>(event.getDataObject());
+        m_server->releaseForwardedKeys(info != nullptr ? info->sender : std::string{});
+      }
+  );
   m_keyForwardHandlerRegistered = true;
 }
 

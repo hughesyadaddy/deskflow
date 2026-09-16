@@ -364,6 +364,13 @@ void ClientApp::registerKeyForwardHandler()
       EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget(),
       [this](const Event &event) { handleCoordinationKeyForward(event); }
   );
+  // A client that is the cursor host injects relayed keys into its OS (the
+  // normal fleet case), so it must honour the sender's boundary resync too:
+  // without this, a lane failure left every relayed key held here until the
+  // next leave.
+  getEvents()->addHandler(EventTypes::CoordinationKeyClearAll, getEvents()->getSystemTarget(), [this](const Event &) {
+    handleCoordinationKeyClearAll();
+  });
   m_keyForwardHandlerRegistered = true;
 }
 
@@ -373,7 +380,19 @@ void ClientApp::unregisterKeyForwardHandler()
     return;
   }
   getEvents()->removeHandler(EventTypes::CoordinationKeyForward, getEvents()->getSystemTarget());
+  getEvents()->removeHandler(EventTypes::CoordinationKeyClearAll, getEvents()->getSystemTarget());
   m_keyForwardHandlerRegistered = false;
+}
+
+void ClientApp::handleCoordinationKeyClearAll()
+{
+  if (m_clientScreen == nullptr) {
+    return;
+  }
+  LOG_INFO("coordination: peer lane failed; releasing relayed keys on the client screen");
+  IPlatformScreen *platform = m_clientScreen->getPlatformScreen();
+  platform->fakeAllKeysUp();
+  platform->sanitizeInjectedKeys();
 }
 
 void ClientApp::handleCoordinationKeyForward(const Event &event)

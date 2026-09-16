@@ -22,6 +22,7 @@ private Q_SLOTS:
   void cleanupTestCase();
   void enterSecondary_reassertsHeldShiftWhenOsLacksIt();
   void enterSecondary_doesNotReassertWhenOsAlreadyHoldsIt();
+  void enterSecondary_reassertsModifiersIncrementally();
   void enterSecondary_appliesCapsViaSetToggleState();
   void enterSecondary_clearsCapsWhenPrimaryHasItOff();
   void keyUp_mapsRealReleaseOntoReassertedModifier();
@@ -29,5 +30,7 @@ private Q_SLOTS:
   void disablePrimary_releasesInjectedKeysAndSanitizes();
   void updateKeyState_releasesSyntheticKeysBeforeZeroing();
   void fakeKeyDown_capsKeyRoutesMaskBitToSetToggleState();
+  void fakeKeyDown_doesNotClickCapsAgainAfterSetToggleState();
+  void enable_sanitizesOnlyWhenNotEntered();
   void describeKey_printsCharacterWithItsCase();
 };

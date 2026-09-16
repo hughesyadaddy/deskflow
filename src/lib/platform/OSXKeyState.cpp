@@ -15,6 +15,7 @@
 #include <Carbon/Carbon.h>
 #include <IOKit/hidsystem/IOHIDLib.h>
 #include <IOKit/hidsystem/IOHIDParameter.h>
+#include <chrono>
 #include <pthread.h>
 
 #pragma clang diagnostic push
@@ -676,6 +677,7 @@ void OSXKeyState::setToggleState(KeyModifierMask bit, bool on)
   }
   if (current == on) {
     m_capsPressed = on;
+    syncTrackedModifier(bit, on);
     LOG_DEBUG("caps lock already %s", on ? "on" : "off");
     return;
   }
@@ -702,6 +704,71 @@ void OSXKeyState::setToggleState(KeyModifierMask bit, bool on)
     actual = (osModifierFlags() & kCGEventFlagMaskAlphaShift) != 0;
   }
   m_capsPressed = actual;
+  // ... and the tracked mask too. mapKey() decides from m_mask whether a key
+  // needs Caps flipped; leaving it stale after applying the lock made the
+  // first letter with Caps in its mask click Caps a second time (inverted
+  // for the rest of the epoch).
+  syncTrackedModifier(bit, actual);
+}
+
+void OSXKeyState::syncTrackedModifier(KeyModifierMask bit, bool on)
+{
+  auto &tracked = getActiveModifiersRValue();
+  tracked = on ? (tracked | bit) : (tracked & ~bit);
+}
+
+double OSXKeyState::monotonicSeconds()
+{
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+double OSXKeyState::now() const
+{
+  if (m_hooks.monotonicNow) {
+    return m_hooks.monotonicNow();
+  }
+  return monotonicSeconds();
+}
+
+int OSXKeyState::hardwareSlotForVirtualKey(uint8_t virtualKey)
+{
+  switch (virtualKey) {
+  case s_shiftVK:
+    return 0;
+  case s_controlVK:
+    return 1;
+  case s_altVK:
+    return 2;
+  case s_superVK:
+    return 3;
+  default:
+    return -1;
+  }
+}
+
+void OSXKeyState::noteHardwareModifierFlags(CGEventFlags flags, double now)
+{
+  // Side-specific device bits only: the generic kCGEventFlagMask* bits are
+  // also set by our own injection and by lock state, so they say nothing
+  // about a physical key. Right-side bits are always hardware (we only ever
+  // post the left virtual keys). Runs on the event-tap thread: atomics only.
+  struct Side
+  {
+    int slot;
+    CGEventFlags left;
+    CGEventFlags right;
+  };
+  static constexpr Side kSides[] = {
+      {0, NX_DEVICELSHIFTKEYMASK, NX_DEVICERSHIFTKEYMASK},
+      {1, NX_DEVICELCTLKEYMASK, NX_DEVICERCTLKEYMASK},
+      {2, NX_DEVICELALTKEYMASK, NX_DEVICERALTKEYMASK},
+      {3, NX_DEVICELCMDKEYMASK, NX_DEVICERCMDKEYMASK},
+  };
+  for (const auto &side : kSides) {
+    if ((flags & (side.left | side.right)) != 0) {
+      m_lastHardwareModifierAt[side.slot].store(now, std::memory_order_relaxed);
+    }
+  }
 }
 
 void OSXKeyState::sanitizeInjectedKeys()
@@ -710,9 +777,6 @@ void OSXKeyState::sanitizeInjectedKeys()
   // global flags for every other modifier.
   reseedShadowFlagsFromOS();
   const CGEventFlags os = osModifierFlags();
-
-  KeyButtonSet physical;
-  pollPressedKeys(physical);
 
   const std::set<uint8_t> injected = m_injectedModifiers;
   for (uint8_t virtualKey : injected) {
@@ -735,13 +799,32 @@ void OSXKeyState::sanitizeInjectedKeys()
     LOG_INFO("released injected modifier 0x%02x", virtualKey);
   }
 
-  // Modifiers the OS reports down that we never injected belong to the user
-  // (or to another injector); leave them alone.
+  // Modifiers the OS reports down that we never injected: the user's, if a
+  // physical key recently drove them (a hardware flagsChanged carried the
+  // side-specific device bit within kHardwareModifierFreshS). Otherwise they
+  // are stale -- typically an injection by a previous incarnation of this
+  // process that crashed with the key held (K2): nothing on the keyboard
+  // backs them, and nobody else will ever release them. The HID key map
+  // (pollPressedKeys) is deliberately NOT consulted here: it reports a
+  // posted modifier as down just like a physical one.
+  const double at = now();
   for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
-    const CGEventFlags flag = modifierFlagForVirtualKey(static_cast<uint8_t>(virtualKey));
-    if ((os & flag) != 0 && physical.count(mapVirtualKeyToKeyButton(virtualKey)) > 0) {
-      LOG_DEBUG("leaving physically held modifier 0x%02x", virtualKey);
+    const auto vk = static_cast<uint8_t>(virtualKey);
+    const CGEventFlags flag = modifierFlagForVirtualKey(vk);
+    if ((os & flag) == 0 || injected.contains(vk)) {
+      continue;
     }
+    const int slot = hardwareSlotForVirtualKey(vk);
+    const double seenAt = slot < 0 ? at : m_lastHardwareModifierAt[slot].load(std::memory_order_relaxed);
+    if ((at - seenAt) <= kHardwareModifierFreshS) {
+      LOG_DEBUG("leaving physically held modifier 0x%02x", virtualKey);
+      continue;
+    }
+    setKeyboardModifiers(vk, false);
+    if (postHIDVirtualKey(vk, false) != KERN_SUCCESS) {
+      postKeyboardKey(vk, false);
+    }
+    LOG_INFO("released stale modifier 0x%02x (no hardware press in %.0f s)", virtualKey, kHardwareModifierFreshS);
   }
 }
 

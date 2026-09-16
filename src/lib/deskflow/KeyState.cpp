@@ -826,7 +826,11 @@ void KeyState::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton serverID, c
     // physical Caps key as DKeyDown still drives the state correctly.
     if (const KeyModifierMask lock = lockModifierForKey(id); lock != 0) {
       const bool wanted = (mask & lock) != 0;
-      if (((pollActiveModifiers() ^ mask) & lock) != 0) {
+      // Compare against the TRACKED mask, not a fresh OS poll: setToggleState()
+      // keeps m_mask in step with the OS, and m_mask is also what mapKey()
+      // consults when it decides whether a key needs the lock flipped. Judging
+      // by the poll while m_mask lagged made the next letter click Caps again.
+      if (((getActiveModifiersRValue() ^ mask) & lock) != 0) {
         LOG_DEBUG("lock key 0x%04x: applying state %s from server mask", id, wanted ? "on" : "off");
         setToggleState(lock, wanted);
       }

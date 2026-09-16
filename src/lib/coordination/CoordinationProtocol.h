@@ -63,8 +63,11 @@ struct Message
   uint16_t keyButton = 0;
   std::string keyLang;
   //! key: sender wall clock at send, ms since the Unix epoch (0 = unknown,
-  //! legacy sender). The receiver drops Down/Repeat older than
-  //! kRelayKeyMaxAgeMs so a key delayed by a wedged lane is never typed late.
+  //! legacy sender). Diagnostic only: the receiver never judges freshness
+  //! by it (VM guest clocks drift; the sender already swallowed the key, so
+  //! a drop here loses the keystroke). Late delivery is prevented on the
+  //! SENDER side (PeerOutbox key deadline + forward() withdrawal); the
+  //! receiver rejects only duplicate/reordered deliveries by \c seq.
   int64_t keySentAtMs = 0;
   // hello version announcement
   int meshVersion = 0;
@@ -86,8 +89,9 @@ std::string encodePromote(const std::string &token);
 std::string encodeRescue(const std::string &token);
 std::string encodeStatus(const std::string &token);
 
-//! Receiver-side freshness bound for relayed Down/Repeat (ms). Ups are
-//! exempt: a late release is idempotent and always safer than a held key.
+//! Nominal transit budget for a relayed Down/Repeat (ms). The sender's
+//! outbox enforces it (PeerOutbox::kKeyDeadlineS is the same idea); the
+//! receiver does NOT compare wall clocks against it any more.
 inline constexpr int64_t kRelayKeyMaxAgeMs = 250;
 
 //! Keyboard relay (peer → cursor host). \p seq is the sender's monotonic key

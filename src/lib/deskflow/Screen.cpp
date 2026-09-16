@@ -147,6 +147,14 @@ void Screen::enable()
   m_screen->updateKeyMap();
   m_screen->updateKeyState();
   m_screen->enable();
+  if (!m_entered) {
+    // K2 residual: a previous incarnation of this process may have died
+    // with a modifier injected into the OS. Nobody is typing on a screen the
+    // cursor is not on, so anything the OS still holds that no hardware
+    // press backs is stale; let the platform sweep it before the first
+    // relayed key lands on top of it.
+    m_screen->sanitizeInjectedKeys();
+  }
   if (m_isPrimary) {
     enablePrimary();
   } else {
@@ -535,7 +543,14 @@ void Screen::enterSecondary(KeyModifierMask mask)
   //    modifier-only gestures would silently lose it. Press it here and
   //    track it as synthetic so leave (or the server's real key up) releases
   //    it. Only when the OS truth disagrees -- never double-press.
+  //
+  //    The mask handed to each press is the modifier state we want AFTER
+  //    that press, built up one modifier at a time from what the OS already
+  //    holds. Passing the whole enter mask (Win|Shift) as the desired state
+  //    of the Shift press made mapKey() tap Super around it to "match" the
+  //    mask -- a Start-menu flash on every Win+Shift crossing.
   const KeyModifierMask osMods = m_screen->pollActiveModifiers();
+  KeyModifierMask desired = osMods & ~IKeyState::s_lockModifierMask;
   for (const auto &mod : kReassertedModifiers) {
     if ((mask & mod.bit) == 0 || (osMods & mod.bit) != 0) {
       continue;
@@ -543,8 +558,9 @@ void Screen::enterSecondary(KeyModifierMask mask)
     if (m_reassertedModifiers.contains(mod.bit)) {
       continue;
     }
-    LOG_DEBUG("re-asserting modifier 0x%04x held across enter", mod.bit);
-    m_screen->fakeKeyDown(mod.key, mask & ~IKeyState::s_lockModifierMask, mod.button, std::string{});
+    desired |= mod.bit;
+    LOG_DEBUG("re-asserting modifier 0x%04x held across enter (state 0x%04x)", mod.bit, desired);
+    m_screen->fakeKeyDown(mod.key, desired, mod.button, std::string{});
     m_reassertedModifiers[mod.bit] = mod.button;
   }
 }

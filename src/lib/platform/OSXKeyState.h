@@ -12,8 +12,10 @@
 
 #include <Carbon/Carbon.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <vector>
@@ -111,11 +113,28 @@ public:
     std::function<bool(bool &capsOn)> getCapsLockState;
     // replaces IOHIDSetModifierLockState; returns false on failure
     std::function<bool(bool capsOn)> setCapsLockState;
+    // replaces monotonicSeconds() (the clock sanitizeInjectedKeys() judges
+    // hardware-modifier freshness with)
+    std::function<double()> monotonicNow;
   };
   void setHooks(Hooks hooks);
 
   //! Virtual keys of modifiers this process has injected and not yet released
   std::set<uint8_t> injectedModifiers() const;
+
+  //! A modifier the OS reports down that no hardware flagsChanged backed
+  //! within this many seconds is stale (K2: stranded by a crashed
+  //! incarnation) and sanitizeInjectedKeys() releases it.
+  static constexpr double kHardwareModifierFreshS = 2.0;
+
+  //! Monotonic seconds (steady clock); the clock noteHardwareModifierFlags()
+  //! stamps are expected in.
+  static double monotonicSeconds();
+
+  //! Record a flagsChanged seen by the event tap at \p now (monotonic
+  //! seconds). Only the side-specific NX_DEVICE* bits count as evidence of
+  //! a physical key. Safe to call from the tap thread.
+  void noteHardwareModifierFlags(CGEventFlags flags, double now);
 
   //! Which OS X modifier flag a modifier virtual key drives (0 if none)
   static CGEventFlags modifierFlagForVirtualKey(uint8_t virtualKey);
@@ -187,6 +206,16 @@ private:
   bool getCapsLockState(bool &on) const;
   bool setCapsLockState(bool on);
 
+  // Keep the tracked modifier mask (KeyState::m_mask) in step with a lock
+  // bit the OS now reports.
+  void syncTrackedModifier(KeyModifierMask bit, bool on);
+
+  // Current monotonic time (hookable).
+  double now() const;
+
+  // Index into m_lastHardwareModifierAt for a modifier virtual key, or -1.
+  static int hardwareSlotForVirtualKey(uint8_t virtualKey);
+
 private:
   // OS X uses a physical key if 0 for the 'A' key.  deskflow reserves
   // KeyButton 0 so we offset all OS X physical key ids by this much
@@ -222,5 +251,12 @@ private:
   // modifier virtual keys this process posted Down for and has not yet
   // posted Up for; the only modifiers sanitizeInjectedKeys() may release.
   std::set<uint8_t> m_injectedModifiers;
+  // monotonic time a hardware flagsChanged last carried each modifier's
+  // side-specific device bit (shift, control, alt, super); written on the
+  // event-tap thread, read by sanitizeInjectedKeys()
+  std::array<std::atomic<double>, 4> m_lastHardwareModifierAt{
+      std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(),
+      std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest()
+  };
   Hooks m_hooks;
 };

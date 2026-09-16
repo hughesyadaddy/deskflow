@@ -26,10 +26,13 @@ private Q_SLOTS:
   void keyboardEventFlagsKeepDeviceBitsWithCapsOn();
   void sanitizeReleasesOnlyInjectedModifiers();
   void sanitizeSkipsModifiersOsReportsUp();
+  void sanitizeReleasesStaleModifiersWithoutRecentHardwarePress();
+  void sanitizeKeepsModifiersBackedByRecentHardwarePress();
   void setToggleStateNoOpsWhenCapsMatches();
   void setToggleStateDrivesCapsViaLockStateApi();
   void setToggleStateFallsBackToFakeCapsPress();
   void setToggleStateIgnoresNumAndScrollLock();
+  void setToggleStateKeepsTrackedMaskInStep();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);

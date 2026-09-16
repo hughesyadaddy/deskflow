@@ -224,7 +224,11 @@ public:
 
   //! Inject a fleet-relayed key event into the active screen (auto mode).
   void relayForwardedKey(const deskflow::coordination::RelayKeyEvent &event);
-  void releaseForwardedKeys();
+  //! Release every key \p sender relayed that is still held: on the active
+  //! client (routed there by relayForwardedKey while the cursor was away)
+  //! and on the primary. Other senders' holds are untouched. An empty
+  //! \p sender releases everything (legacy clear-all without a name).
+  void releaseForwardedKeys(const std::string &sender = {});
 
   //@}
 
@@ -631,6 +635,13 @@ private:
   screen on the same boundaries.
   */
   std::map<std::string, HeldKeys> m_keysHeldOnBroadcast;
+
+  //! Buttons each fleet peer relayed DOWN through relayForwardedKey() while
+  //! the cursor was on a secondary (so they are held on the active client),
+  //! keyed by sender name. A KeyClearAll from that sender releases exactly
+  //! these; keys it relayed while the cursor was on the primary are held in
+  //! the primary's own key state and swept by fakeAllKeysUp there.
+  std::map<std::string, std::set<KeyButton>> m_forwardedHeld;
 
   //! Lock-modifier bits last shipped to the active client (via CEnter or a
   //! lock-state update). Compared against the primary's OS truth on every

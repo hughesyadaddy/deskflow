@@ -185,8 +185,11 @@ public:
   nothing is queued and the answer is false (the key stays local); a key is
   never both typed locally and delivered late. Otherwise the call waits at
   most \p graceMs for its own send to complete and reports the outcome; on
-  timeout the line is withdrawn when it has not been picked up yet, and the
-  answer is false. A key that sits queued past kKeyDeadlineS is discarded
+  timeout the line is withdrawn (answer false) when it has not been picked
+  up yet, and treated as delivered (answer true) when it is already in
+  flight -- that connect cannot be recalled and typing the key locally too
+  would double it; a failed in-flight send resyncs the peer through the
+  failure handler. A key that sits queued past kKeyDeadlineS is discarded
   by pump() before any connect is attempted for it.
   */
   bool forward(std::string line, int graceMs);

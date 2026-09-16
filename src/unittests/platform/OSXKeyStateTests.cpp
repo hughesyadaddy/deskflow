@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -180,10 +181,12 @@ struct HookedState
   bool capsOn = false;
   bool capsSetSucceeds = true;
   int capsSetCalls = 0;
+  double now = 100.0; // fake monotonic clock, seconds
 
   OSXKeyState::Hooks hooks()
   {
     OSXKeyState::Hooks h;
+    h.monotonicNow = [this] { return now; };
     h.osModifierFlags = [this] { return osFlags; };
     h.pressedKeys = [this](IKeyState::KeyButtonSet &out) { out = physical; };
     h.postHIDKey = [this](uint8_t vk, bool down, CGEventFlags flags) {
@@ -279,8 +282,10 @@ void OSXKeyStateTests::sanitizeReleasesOnlyInjectedModifiers()
   os.posted.clear();
 
   // ... then the OS reports shift AND control down, control physically held
+  // (the event tap saw its hardware flagsChanged a moment ago)
   os.osFlags = kCGEventFlagMaskShift | kCGEventFlagMaskControl;
   os.physical = {buttonFor(kVK_Shift), buttonFor(kVK_Control)};
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK, os.now - 0.5);
 
   keyState.sanitizeInjectedKeys();
 
@@ -294,7 +299,8 @@ void OSXKeyStateTests::sanitizeReleasesOnlyInjectedModifiers()
   QVERIFY(keyState.injectedModifiers().empty());
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskControl));
 
-  // a second pass has nothing left to do
+  // a second pass (the OS honoured the release) has nothing left to do
+  os.osFlags = kCGEventFlagMaskControl;
   keyState.sanitizeInjectedKeys();
   QCOMPARE(os.posted.size(), size_t(1));
 }
@@ -319,6 +325,61 @@ void OSXKeyStateTests::sanitizeSkipsModifiersOsReportsUp()
   QVERIFY(os.posted.empty());
   QVERIFY(keyState.injectedModifiers().empty());
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(0));
+}
+
+void OSXKeyStateTests::sanitizeReleasesStaleModifiersWithoutRecentHardwarePress()
+{
+  // K2 residual: the process restarted (injected set empty) while the OS
+  // still holds a Command that the old incarnation posted. No hardware
+  // flagsChanged has carried a Command device bit -- ever, or within the
+  // freshness window -- so the sweep must release it.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.updateKeyMap();
+  QVERIFY(keyState.injectedModifiers().empty());
+
+  os.osFlags = kCGEventFlagMaskCommand | kCGEventFlagMaskShift;
+  // shift WAS pressed on hardware, but long ago
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK, os.now - 10.0);
+
+  keyState.sanitizeInjectedKeys();
+
+  QCOMPARE(os.posted.size(), size_t(2));
+  std::set<int> released;
+  for (const auto &p : os.posted) {
+    QVERIFY(!p.down);
+    released.insert(p.virtualKey);
+  }
+  QVERIFY(released.contains(kVK_Command));
+  QVERIFY(released.contains(kVK_Shift));
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(0));
+}
+
+void OSXKeyStateTests::sanitizeKeepsModifiersBackedByRecentHardwarePress()
+{
+  // The user is holding Shift for real: the tap saw the device bit within
+  // the freshness window (left OR right side), so the sweep leaves it.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.updateKeyMap();
+
+  os.osFlags = kCGEventFlagMaskShift | kCGEventFlagMaskAlternate;
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskShift | NX_DEVICERSHIFTKEYMASK, os.now - 1.0);
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK, os.now - 1.9);
+  keyState.sanitizeInjectedKeys();
+  QVERIFY(os.posted.empty());
+
+  // the generic flag bits alone are not evidence of hardware
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskShift | kCGEventFlagMaskAlternate, os.now + 5.0);
+  os.now += 5.0;
+  keyState.sanitizeInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(2));
 }
 
 void OSXKeyStateTests::setToggleStateNoOpsWhenCapsMatches()
@@ -412,6 +473,37 @@ void OSXKeyStateTests::setToggleStateIgnoresNumAndScrollLock()
 
   QCOMPARE(os.capsSetCalls, 0);
   QVERIFY(os.posted.empty());
+}
+
+void OSXKeyStateTests::setToggleStateKeepsTrackedMaskInStep()
+{
+  // The Caps double-toggle: after setToggleState() the OS has caps on but
+  // the tracked mask (what mapKey() consults) said off, so the next key
+  // with Caps in its mask clicked Caps again. Every exit path must sync it.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  os.capsOn = false;
+  keyState.setHooks(os.hooks());
+  QCOMPARE(keyState.getActiveModifiers() & KeyModifierCapsLock, KeyModifierMask(0));
+
+  // lock-state API path
+  keyState.setToggleState(KeyModifierCapsLock, true);
+  QVERIFY((keyState.getActiveModifiers() & KeyModifierCapsLock) != 0);
+  keyState.setToggleState(KeyModifierCapsLock, false);
+  QCOMPARE(keyState.getActiveModifiers() & KeyModifierCapsLock, KeyModifierMask(0));
+
+  // already-in-phase path still syncs (the mask may have been stale)
+  os.capsOn = true;
+  os.osFlags = kCGEventFlagMaskAlphaShift;
+  keyState.setToggleState(KeyModifierCapsLock, true);
+  QVERIFY((keyState.getActiveModifiers() & KeyModifierCapsLock) != 0);
+
+  // failed set: the mask follows what the OS actually reports
+  os.capsSetSucceeds = false;
+  keyState.setToggleState(KeyModifierCapsLock, false);
+  QVERIFY((keyState.getActiveModifiers() & KeyModifierCapsLock) != 0);
 }
 
 bool OSXKeyStateTests::isKeyPressed(const OSXKeyState &keyState, KeyButton button)
