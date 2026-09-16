@@ -34,6 +34,7 @@
 #include "platform/OSXScreenSaver.h"
 
 #include <AppKit/NSEvent.h>
+#include <AppKit/NSPasteboard.h>
 #include <AvailabilityMacros.h>
 #include <IOKit/hidsystem/event_status_driver.h>
 #include <dispatch/dispatch.h>
@@ -60,6 +61,16 @@ enum
 };
 
 static const double kCarbonLoopWaitTimeout = 10.0;
+
+// Clipboard polling cadence. Each tick is a cheap NSPasteboard changeCount
+// read; PasteboardSynchronize only runs when the count moved. 1 s while this
+// screen is the active input target (sync latency <= 1 s), 2 s when the cursor
+// is on another screen and local clipboard changes are rare.
+static const double kClipboardPollActiveSec = 1.0;
+static const double kClipboardPollIdleSec = 2.0;
+// Accessibility-trust revocation watchdog. Was 1 s; revocation is a rare
+// operator action so 5 s is plenty and cuts idle wakeups 5x.
+static const double kAxPollSec = 5.0;
 
 int getSecureInputEventPID();
 std::string getProcessName(int pid);
@@ -676,12 +687,16 @@ void OSXScreen::hideCursor()
 
 void OSXScreen::enable()
 {
-  // watch the clipboard
-  m_clipboardTimer = m_events->newTimer(1.0, nullptr);
-  m_events->addHandler(EventTypes::Timer, m_clipboardTimer, [this](const auto &) { checkClipboards(); });
+  // watch the clipboard (changeCount-gated, see clipboardPollTick)
+  m_lastPasteboardChangeCount = -1;
+  armClipboardTimer();
 
-  m_axTimer = m_events->newTimer(1.0, nullptr);
-  m_events->addHandler(EventTypes::Timer, m_axTimer, [this](const auto &) { checkAXPermissions(); });
+  m_axTimer = m_events->newTimer(kAxPollSec, nullptr);
+  m_events->addHandler(EventTypes::Timer, m_axTimer, [this](const auto &) {
+    @autoreleasepool {
+      checkAXPermissions();
+    }
+  });
 
   if (m_isPrimary) {
     // FIXME -- start watching jump zones
@@ -770,6 +785,7 @@ void OSXScreen::disable()
     m_events->removeHandler(EventTypes::Timer, m_clipboardTimer);
     m_events->deleteTimer(m_clipboardTimer);
     m_clipboardTimer = nullptr;
+    m_clipboardTimerInterval = 0.0;
   }
 
   if (m_axTimer != nullptr) {
@@ -785,6 +801,9 @@ void OSXScreen::enter()
 {
   m_isOnScreen = true;
   showCursor();
+  if (m_clipboardTimer != nullptr) {
+    armClipboardTimer(); // back to the active 1 s cadence
+  }
 
   if (m_isPrimary) {
     setZeroSuppressionInterval();
@@ -822,6 +841,9 @@ void OSXScreen::leave()
 
   // now off screen
   m_isOnScreen = false;
+  if (m_clipboardTimer != nullptr) {
+    armClipboardTimer(); // relax to the idle 2 s cadence
+  }
 }
 
 bool OSXScreen::setClipboard(ClipboardID, const IClipboard *src)
@@ -840,6 +862,44 @@ void OSXScreen::checkClipboards()
     LOG_DEBUG("clipboard changed");
     sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardClipboard);
     sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardSelection);
+  }
+}
+
+double OSXScreen::clipboardPollInterval() const
+{
+  return m_isOnScreen ? kClipboardPollActiveSec : kClipboardPollIdleSec;
+}
+
+void OSXScreen::armClipboardTimer()
+{
+  const double interval = clipboardPollInterval();
+  if (m_clipboardTimer != nullptr) {
+    if (m_clipboardTimerInterval == interval) {
+      return;
+    }
+    m_events->removeHandler(EventTypes::Timer, m_clipboardTimer);
+    m_events->deleteTimer(m_clipboardTimer);
+    m_clipboardTimer = nullptr;
+  }
+  m_clipboardTimer = m_events->newTimer(interval, nullptr);
+  m_clipboardTimerInterval = interval;
+  m_events->addHandler(EventTypes::Timer, m_clipboardTimer, [this](const auto &) { clipboardPollTick(); });
+}
+
+void OSXScreen::clipboardPollTick()
+{
+  // Every tick used to call PasteboardSynchronize (flavor resolution, XPC to
+  // pboard, autoreleased temporaries on a thread whose pool rarely drains).
+  // changeCount is a single cheap read; only fall through to the heavy path
+  // when it actually moved. Own writes via setClipboard() also bump the
+  // count; synchronize() then reports "not modified" and no event is sent,
+  // matching previous behavior.
+  @autoreleasepool {
+    const long current = static_cast<long>([[NSPasteboard generalPasteboard] changeCount]);
+    if (!clipboardChangeCountAdvanced(m_lastPasteboardChangeCount, current)) {
+      return;
+    }
+    checkClipboards();
   }
 }
 
@@ -1738,10 +1798,20 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
     screen->onKey(event);
     break;
   case kCGEventTapDisabledByTimeout:
-    // Re-enable our event-tap if we still have accessibility permissions
-    if (screen->checkAXPermissions()) {
-      CGEventTapEnable(screen->m_eventTapPort, true);
-      LOG_INFO("quartz event tap was disabled by timeout, re-enabling");
+    // Re-enable the *existing* tap in place (no CGEventTapCreate here, so no
+    // second tap and nothing to leak). This runs on the event-tap thread, so
+    // do NOT call checkAXPermissions(): its failure path calls disable(),
+    // which joins m_eventTapThread -- i.e. this thread -- and would throw
+    // resource_deadlock_would_occur inside a C callback. Post Quit instead;
+    // the app teardown calls disable() on the main thread.
+    if (AXIsProcessTrusted()) {
+      if (screen->m_eventTapPort != nullptr) {
+        CGEventTapEnable(screen->m_eventTapPort, true);
+        LOG_INFO("quartz event tap was disabled by timeout, re-enabling");
+      }
+    } else {
+      LOG_CRIT("process is not trusted anymore, quitting");
+      screen->getEvents()->addEvent(Event(EventTypes::Quit, nullptr, new ExitEventData(s_exitFailed)));
     }
     break;
   case kCGEventTapDisabledByUserInput:
