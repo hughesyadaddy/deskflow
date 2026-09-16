@@ -90,3 +90,11 @@ if(WIN32)
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
   )
 endif()
+
+create_test(
+  NAME CoordinatorTests
+  DEPENDS coordination
+  SOURCE CoordinatorTests.cpp
+  LIBS base arch mt
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+)

@@ -40,6 +40,10 @@ const int kWedgeProbeTimeoutMs = 1000;
 const int kWedgeProbeEveryTicks = 9;
 const int kWedgeStrikesToRestart = 2;
 const int kVersionProbeEveryTicks = 15;
+//! How long a key forward may wait for a peer whose reachability is still
+//! Unknown (first send only). Well inside the OS input-hook budget
+//! (Windows LowLevelHooksTimeout 300 ms; macOS event-tap timeout).
+const int kKeyForwardGraceMs = 50;
 
 double monotonicSeconds()
 {
@@ -59,32 +63,6 @@ RelayKeyEvent relayEventFromMessage(const Message &message)
   return event;
 }
 
-std::string peerMeshAddress(const std::string &hostName, const FleetState &fleet, const PeerList &peers)
-{
-  auto matchConfigured = [&](const std::string &name) -> std::string {
-    for (const auto &peer : fleet.peers) {
-      if (namesEqual(peer.name, name)) {
-        return peer.lan.empty() ? peer.ip : peer.lan;
-      }
-    }
-    for (const auto &peer : peers) {
-      if (namesEqual(peer.name, name)) {
-        return peer.lan.empty() ? peer.ip : peer.lan;
-      }
-    }
-    return {};
-  };
-
-  if (const auto direct = matchConfigured(hostName); !direct.empty()) {
-    return direct;
-  }
-  if (!fleet.server.empty() && (namesEqual(hostName, fleet.server) || namesEqual(hostName, fleet.cursorScreen) ||
-                                namesEqual(hostName, fleet.cursorHost))) {
-    return matchConfigured(fleet.server);
-  }
-  return {};
-}
-
 } // namespace
 
 Coordinator::Coordinator(CoordinatorConfig config)
@@ -102,6 +80,21 @@ Coordinator::Coordinator(CoordinatorConfig config)
         onMessage(message, reply);
       }
   );
+  // The blocking connects live on the lanes' own threads; sendTo/query
+  // keep their one-connect-per-line wire behavior.
+  const auto transport = [mesh = m_mesh.get()](const std::string &host, const std::string &line, std::string *reply) {
+    if (reply != nullptr) {
+      *reply = mesh->query(host, line);
+      return !reply->empty();
+    }
+    return mesh->sendTo(host, line);
+  };
+  for (const auto &peer : m_config.peers) {
+    if (namesEqual(peer.name, m_config.selfName) || m_outboxes.contains(peer.name)) {
+      continue;
+    }
+    m_outboxes.emplace(peer.name, std::make_unique<PeerOutbox>(peer.ip, peer.lan, transport, monotonicSeconds));
+  }
   m_inputMonitor = createLocalInputMonitor();
   m_keyboardRelay = createKeyboardRelayMonitor();
 }
@@ -130,10 +123,16 @@ bool Coordinator::start()
   }
   g_rescueCoordinator = this;
   setFleetRescueHandler(&fleetRescueThunk);
+  for (auto &[name, outbox] : m_outboxes) {
+    outbox->start();
+  }
   m_inputMonitor->start([this] { onGenuineInput(); });
   m_startedAt = monotonicSeconds();
   m_workerStop = false;
   m_worker = std::thread([this] { workerLoop(); });
+  // Settle every lane's reachability early so the first key forward does
+  // not have to wait for it (and version mismatches surface at once).
+  probePeerMeshVersions();
   LOG_INFO(
       "coordination: started as \"%s\" with %d peer(s)", m_config.selfName.c_str(),
       static_cast<int>(m_config.peers.size())
@@ -159,6 +158,9 @@ void Coordinator::stop()
   }
   m_inputMonitor->stop();
   m_keyboardRelay->stop();
+  for (auto &[name, outbox] : m_outboxes) {
+    outbox->stop(); // before the mesh: lanes send through it
+  }
   m_mesh->stop();
 }
 
@@ -260,24 +262,41 @@ std::vector<FleetPeer> Coordinator::buildFleetPeersLocked()
   return peers;
 }
 
-void Coordinator::sendLineToPeers(const std::string &line, const PeerList &peers)
+void Coordinator::sendLineToPeers(const std::string &line)
 {
-  for (const auto &peer : peers) {
-    if (namesEqual(peer.name, m_config.selfName)) {
-      continue;
-    }
-    m_mesh->sendTo(peer.ip, line);
-    if (peer.lan != peer.ip) {
-      m_mesh->sendTo(peer.lan, line);
+  for (auto &[name, outbox] : m_outboxes) {
+    outbox->post(line);
+  }
+}
+
+PeerOutbox *Coordinator::outboxByName(const std::string &name) const
+{
+  for (const auto &[peerName, outbox] : m_outboxes) {
+    if (namesEqual(peerName, name)) {
+      return outbox.get();
     }
   }
+  return nullptr;
+}
+
+PeerOutbox *Coordinator::outboxForHostLocked(const std::string &hostName) const
+{
+  if (auto *direct = outboxByName(hostName); direct != nullptr) {
+    return direct;
+  }
+  const auto &fleet = m_fleetState;
+  if (!fleet.server.empty() && (namesEqual(hostName, fleet.server) || namesEqual(hostName, fleet.cursorScreen) ||
+                                namesEqual(hostName, fleet.cursorHost))) {
+    return outboxByName(fleet.server);
+  }
+  return nullptr;
 }
 
 bool Coordinator::mergeAndBroadcastFleetFragment(const FleetFragment &fragment, bool sendEvenIfUnchanged)
 {
   IEventQueue *events = nullptr;
   FleetMergeResult merge;
-  bool sendMesh = false;
+  std::string line;
   {
     std::scoped_lock lock{m_mutex};
     if (m_election.role() != Role::Server) {
@@ -288,22 +307,18 @@ bool Coordinator::mergeAndBroadcastFleetFragment(const FleetFragment &fragment, 
     }
     events = m_events;
     merge = applyServerFragment(m_fleetState, fragment);
-    sendMesh = sendEvenIfUnchanged || merge.changed;
-    if (sendMesh) {
-      // Hand the send to the worker thread: callers include the server
-      // event loop (screen switch), and each sleeping peer costs a 700 ms
-      // connect timeout that would stall the input pipeline. A newer
-      // pending line simply replaces an unsent older one -- the latest
-      // snapshot supersedes it and the heartbeat rebroadcast converges
-      // any client that missed an intermediate fragment.
-      m_pendingFleetLine = protocol::encodeFleet(fragment, m_config.token);
+    if (sendEvenIfUnchanged || merge.changed) {
+      line = protocol::encodeFleet(fragment, m_config.token);
     }
   }
 
   postFleetStateEvents(events, merge);
 
-  if (sendMesh) {
-    m_workerWake.notify_all();
+  if (!line.empty()) {
+    // Callers include the server event loop (screen switch): posting is
+    // non-blocking, and the heartbeat rebroadcast converges any client
+    // that misses an intermediate fragment.
+    sendLineToPeers(line);
   }
   return merge.changed;
 }
@@ -626,7 +641,7 @@ bool Coordinator::sendKeyForward(
     }
   }
 
-  std::string destination;
+  PeerOutbox *destination = nullptr;
   std::string line;
   bool logFirst = false;
   {
@@ -645,28 +660,39 @@ bool Coordinator::sendKeyForward(
       return false;
     }
 
-    destination = peerMeshAddress(decision.forwardHost, m_fleetState, m_config.peers);
+    destination = outboxForHostLocked(decision.forwardHost);
+    if (destination == nullptr) {
+      // Fall back to whichever configured peer we are following.
+      const std::string serverAddress = m_election.serverAddress();
+      for (const auto &peer : m_config.peers) {
+        if (peer.hasAddress(serverAddress)) {
+          destination = outboxByName(peer.name);
+          break;
+        }
+      }
+    }
     line = protocol::encodeKey(
         m_config.selfName, phase, static_cast<uint16_t>(id), static_cast<uint16_t>(mask), button, lang, m_config.token
     );
-    if (destination.empty()) {
-      destination = m_election.serverAddress();
-    }
 
     if (!m_loggedKeyForward) {
       m_loggedKeyForward = true;
       logFirst = true;
     }
   }
-  if (destination.empty()) {
+  if (destination == nullptr) {
     return false;
   }
+  const std::string address = destination->preferredAddress();
   if (logFirst) {
-    LOG_INFO("coordination: forwarding keyboard to %s", destination.c_str());
+    LOG_INFO("coordination: forwarding keyboard to %s", address.c_str());
   } else {
-    LOG_DEBUG("coordination: forwarding keyboard to %s", destination.c_str());
+    LOG_DEBUG("coordination: forwarding keyboard to %s", address.c_str());
   }
-  return m_mesh->sendTo(destination, line);
+  // Runs inside the OS keyboard hook: enqueue and return. True (swallow
+  // the key) only while the peer is known reachable; in backoff the key
+  // stays local instead of being lost.
+  return destination->forward(line, kKeyForwardGraceMs);
 }
 
 void Coordinator::requestLocalCoreRestart()
@@ -682,18 +708,17 @@ void Coordinator::requestFleetRescue()
 {
   LOG_INFO("coordination: fleet keyboard rescue -- restarting every peer");
   std::string line;
-  PeerList peers;
   {
     std::scoped_lock lock{m_mutex};
     if (m_quit) {
       return;
     }
     line = protocol::encodeRescue(m_config.token);
-    peers = m_config.peers;
   }
-  // Peers first: this process is about to tear its own core down, and the
-  // sends are blocking connects.
-  sendLineToPeers(line, peers);
+  // Peers first: the lanes deliver to reachable peers within milliseconds,
+  // well before the local restart IPC lands, and this may run inside the
+  // keyboard hook (5x Esc) so nothing here may block.
+  sendLineToPeers(line);
   requestLocalCoreRestart();
 }
 
@@ -741,9 +766,8 @@ void Coordinator::promoteSelf(const char *reason)
       return; // already primary; heartbeats keep claiming
     }
     LOG_INFO("coordination: promoting to server (%s)", reason);
-    // The claim broadcast does blocking connects to every peer; hand it
-    // to the worker so this thread (often the input monitor's event-tap
-    // thread, which macOS disables when stalled) returns immediately.
+    // Hand the claim to the worker: it owns the heartbeat clock, and this
+    // thread is often the input monitor's event-tap thread.
     m_broadcastPending = true;
   }
   decide(Role::Server, {});
@@ -826,42 +850,34 @@ void Coordinator::broadcastClaim()
     }
     line = protocol::encodeClaim(m_config.selfName, selfIp, selfLan, m_election.nextClaimSeq(), m_config.token);
   }
-  sendLineToPeers(line, m_config.peers);
+  sendLineToPeers(line);
 }
 
 void Coordinator::workerLoop()
 {
+  // Nothing in this loop performs peer I/O directly: every send is posted
+  // to a PeerOutbox, so a sleeping peer can never stretch the 1 s tick.
   double lastHeartbeatAt = 0.0;
   int tick = 0;
 
   while (true) {
     bool broadcastNow = false;
-    std::string fleetLine;
-    PeerList fleetPeers;
     {
       std::unique_lock lock{m_mutex};
       m_workerWake.wait_for(lock, std::chrono::duration<double>(kWorkerTickS), [this] {
-        return m_workerStop || m_broadcastPending || !m_pendingFleetLine.empty();
+        return m_workerStop || m_broadcastPending;
       });
       if (m_workerStop) {
         return;
       }
       broadcastNow = m_broadcastPending;
       m_broadcastPending = false;
-      if (!m_pendingFleetLine.empty()) {
-        fleetLine = std::move(m_pendingFleetLine);
-        m_pendingFleetLine.clear();
-        fleetPeers = m_config.peers;
-      }
     }
     ++tick;
     const double now = monotonicSeconds();
     if (broadcastNow) {
       broadcastClaim();
       lastHeartbeatAt = now;
-    }
-    if (!fleetLine.empty()) {
-      sendLineToPeers(fleetLine, fleetPeers);
     }
 
     Role role;
@@ -880,16 +896,14 @@ void Coordinator::workerLoop()
         // Only when we authored the snapshot: after a takeover the state
         // may still carry the previous server until our first publish.
         std::string line;
-        PeerList peers;
         {
           std::scoped_lock lock{m_mutex};
           if (namesEqual(m_fleetState.server, m_config.selfName) && !m_fleetState.screens.empty()) {
             line = protocol::encodeFleet(m_fleetState, m_config.token);
-            peers = m_config.peers;
           }
         }
         if (!line.empty()) {
-          sendLineToPeers(line, peers);
+          sendLineToPeers(line);
         }
       }
       if (tick % kWedgeProbeEveryTicks == 0) {
@@ -933,26 +947,17 @@ void Coordinator::workerLoop()
 void Coordinator::probePeerMeshVersions()
 {
   const std::string hello = protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token);
-  PeerList peers;
-  {
-    std::scoped_lock lock{m_mutex};
-    peers = m_config.peers;
-  }
-  for (const auto &peer : peers) {
-    if (namesEqual(peer.name, m_config.selfName)) {
-      continue;
-    }
-    const std::string host = peer.lan.empty() ? peer.ip : peer.lan;
-    const auto replyLine = m_mesh->query(host, hello);
-    if (replyLine.empty()) {
-      continue;
-    }
-    const Message reply = protocol::decode(replyLine);
-    if (reply.type != Message::Type::Hello || reply.meshVersion < kMeshProtocolVersion) {
-      noteVersionMismatch(peer.name);
-    } else {
-      clearVersionMismatch(peer.name);
-    }
+  for (auto &[name, outbox] : m_outboxes) {
+    // The reply handler runs on the lane thread; unreachable peers never
+    // reply and keep whatever mismatch state they had.
+    outbox->post(hello, [this, peerName = name](const std::string &replyLine) {
+      const Message reply = protocol::decode(replyLine);
+      if (reply.type != Message::Type::Hello || reply.meshVersion < kMeshProtocolVersion) {
+        noteVersionMismatch(peerName);
+      } else {
+        clearVersionMismatch(peerName);
+      }
+    });
   }
 }
 
@@ -982,15 +987,23 @@ void Coordinator::discoverOnce()
   // a status object which we parse here.)
   const std::string line = protocol::encodeStatus(m_config.token);
   for (const auto &peer : m_config.peers) {
-    if (namesEqual(peer.name, m_config.selfName)) {
-      continue;
+    auto *outbox = outboxByName(peer.name);
+    if (outbox == nullptr || !outbox->idle()) {
+      continue; // self, or the previous query is still in flight
     }
-    const auto replyLine = m_mesh->query(peer.lan.empty() ? peer.ip : peer.lan, line);
-    if (replyLine.empty()) {
-      continue;
-    }
-    const auto reply = protocol::decodeStatusReply(replyLine);
-    if (reply.valid && reply.role == Role::Server) {
+    outbox->post(line, [this, peer](const std::string &replyLine) {
+      const auto reply = protocol::decodeStatusReply(replyLine);
+      if (!reply.valid || reply.role != Role::Server) {
+        return;
+      }
+      {
+        // Replies arrive on lane threads: only the first server found
+        // (or an inbound claim) may move us out of Init.
+        std::scoped_lock lock{m_mutex};
+        if (m_quit || m_election.role() != Role::Init) {
+          return;
+        }
+      }
       LOG_INFO("coordination: discovered active server \"%s\"", peer.name.c_str());
       Message claim;
       claim.type = Message::Type::Claim;
@@ -998,8 +1011,7 @@ void Coordinator::discoverOnce()
       claim.ip = peer.ip;
       claim.lan = peer.lan;
       followSender(claim);
-      return;
-    }
+    });
   }
 }
 
