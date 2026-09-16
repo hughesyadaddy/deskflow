@@ -485,6 +485,52 @@ def test_main_missing_env(tmp_path, capsys):
     assert rc == 2 and "missing" in capsys.readouterr().err
 
 
+def test_main_env_defaults_to_fleet_env_file(tmp_path, capsys, monkeypatch):
+    # The controllers export FLEET_ENV_FILE; fleet-health must read the same variable (FLEET_ENV still works).
+    env_file = write_env(tmp_path)
+    monkeypatch.setenv("FLEET_ENV_FILE", str(env_file))
+    monkeypatch.delenv("FLEET_ENV", raising=False)
+    rc = fh.main(["--host", "all", "--check", "sign", "--json"], runner=FakeRunner(mac_ok_table()))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and out["ok"] is True and out["results"][0]["host"] == "macbookpro"
+
+    monkeypatch.setenv("FLEET_ENV_FILE", str(tmp_path / "absent.env"))
+    rc = fh.main(["--check", "sign"], runner=FakeRunner(mac_ok_table()))
+    assert rc == 2 and "absent.env" in capsys.readouterr().err
+
+
+def test_main_json_shape_is_ok_plus_results(tmp_path, capsys):
+    # The shape fleet-deploy.sh / .ps1 --self-test fold per host: {ok, results:[{host,check,status,detail}]}.
+    env_file = write_env(tmp_path)
+    rc = fh.main(["--json", "--env", str(env_file)], runner=FakeRunner(mac_ok_table()))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and set(out) == {"ok", "results"}
+    assert all(set(r) == {"host", "check", "status", "detail"} for r in out["results"])
+    assert {r["check"] for r in out["results"]} >= {"sign", "tcc", "mesh"}
+    assert "hosts" not in out
+
+
+def test_local_id_honours_fleet_local_id(monkeypatch):
+    monkeypatch.setattr(fh.socket, "gethostname", lambda: "Stranger.local")
+    monkeypatch.delenv("FLEET_LOCAL_ID", raising=False)
+    assert fh.local_id() == "stranger"
+    monkeypatch.setenv("FLEET_LOCAL_ID", "MacBookPro")
+    assert fh.local_id() == "macbookpro"
+
+
+def test_subprocess_runner_replaces_undecodable_powershell_bytes(monkeypatch):
+    # fleet-health.ps1 output over ssh can contain 0x83 (not UTF-8); the runner must not raise.
+    import subprocess
+
+    def fake_run(argv, **kw):
+        assert kw.get("errors") == "replace"
+        return subprocess.CompletedProcess(argv, 0, b"[]\x83".decode("utf-8", errors=kw["errors"]), "")
+
+    monkeypatch.setattr(fh.subprocess, "run", fake_run)
+    rc, out, _ = fh.subprocess_runner(fh.Host("tiny11", "tiny11", "alexh", "windows", "tiny11"), "quser")
+    assert rc == 0 and out.startswith("[]")
+
+
 def test_format_table_columns():
     text = fh.format_table([fh.Result("h", "sign", "PASS", "fine"), fh.Result("hackintosh", "mesh", "FAIL", "x")])
     lines = text.splitlines()

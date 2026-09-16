@@ -29,6 +29,7 @@ MOUSER_ROOT="${FLEET_MOUSER_ROOT:-$HOME/Desktop/Mouser}"
 MOUSER_ROOT="${MOUSER_ROOT/#\~/$HOME}"
 MOUSER_FORK_URL="${FLEET_MOUSER_FORK_URL:-https://github.com/hughesyadaddy/Mouser.git}"
 BRANCH="${FLEET_BRANCH:-main}"
+MOUSER_BRANCH="${FLEET_MOUSER_BRANCH:-$BRANCH}"
 DEPLOY_DESKFLOW="${FLEET_DEPLOY_DESKFLOW:-1}"
 DEPLOY_MOUSER="${FLEET_DEPLOY_MOUSER:-1}"
 RECONFIGURE="${FLEET_RECONFIGURE:-0}"
@@ -79,12 +80,22 @@ cmake_cache_value() {
 }
 
 git_pull_deskflow() {
+  # FLEET_SKIP_GIT_PULL=1: the controller already synced this checkout.
   [[ "${FLEET_SKIP_GIT_PULL:-0}" == "1" ]] && return 0
-  echo "== [$HOST_TAG] deskflow pull ($BRANCH) =="
   cd "$DESKFLOW_ROOT"
-  git fetch origin
-  git checkout "$BRANCH"
-  git pull --ff-only origin "$BRANCH"
+  local ref="${FLEET_DESKFLOW_REF:-}"
+  if [[ "$ref" == "HEAD" ]]; then
+    echo "== [$HOST_TAG] deskflow: building checked-out HEAD =="
+  elif [[ -n "$ref" ]]; then
+    echo "== [$HOST_TAG] deskflow checkout --detach $ref =="
+    git fetch origin
+    git checkout --detach "$ref"
+  else
+    echo "== [$HOST_TAG] deskflow pull ($BRANCH) =="
+    git fetch origin
+    git checkout "$BRANCH"
+    git pull --ff-only origin "$BRANCH"
+  fi
   git log -1 --oneline
 }
 
@@ -141,14 +152,26 @@ deploy_mouser() {
   cd "$MOUSER_ROOT"
   [[ -d .git ]] || fail "$MOUSER_ROOT is not a git checkout"
 
+  # FLEET_SKIP_GIT_PULL=1: the controller (fleet-deploy.sh/.ps1) already synced
+  # Mouser — branch fast-forward, --ref detach or --rollback — so nothing here
+  # may move the checkout.
   if [[ "${FLEET_SKIP_GIT_PULL:-0}" != "1" ]]; then
-    echo "== [$HOST_TAG] Mouser pull (fork/$BRANCH) =="
+    local ref="${FLEET_MOUSER_REF:-}"
     if ! git remote get-url fork >/dev/null 2>&1; then
       git remote add fork "$MOUSER_FORK_URL"
     fi
-    git fetch fork
-    git checkout "$BRANCH"
-    git pull --ff-only fork "$BRANCH"
+    if [[ "$ref" == "HEAD" ]]; then
+      echo "== [$HOST_TAG] Mouser: building checked-out HEAD =="
+    elif [[ -n "$ref" ]]; then
+      echo "== [$HOST_TAG] Mouser checkout --detach $ref =="
+      git fetch fork
+      git checkout --detach "$ref"
+    else
+      echo "== [$HOST_TAG] Mouser pull (fork/$MOUSER_BRANCH) =="
+      git fetch fork
+      git checkout "$MOUSER_BRANCH"
+      git pull --ff-only fork "$MOUSER_BRANCH"
+    fi
     git log -1 --oneline
   fi
 

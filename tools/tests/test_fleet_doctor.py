@@ -78,7 +78,8 @@ def mac_responses(hid, python="3.14", console=LOCAL_USER):
         (hid, "CMakeCache.txt"): (0, CMAKE_CACHE),
         (hid, "security find-identity"): (0, f'  1) {MAC_ID} "Apple Development: Alex (TEAM)"\n     1 valid identities found\n'),
         (hid, "stat -f %Su /dev/console"): (0, console + "\n"),
-        (hid, "osascript"): (0, "2\n"),
+        (hid, "osascript"): (0, "2\n"),                       # Terminal: 2 windows
+        (hid, 'tell application "System Events"'): (0, "0\n"),  # no AXDialog open
         (hid, "python3 --version"): (0, f"Python {python}.1\n"),
         (hid, "cmake --version"): (0, "cmake version 3.31.2\n"),
         (hid, "test -d '/opt/Qt/6.8.3/macos'"): (0, ""),
@@ -132,15 +133,20 @@ def healthy():
     return runner
 
 
-def run(fd, runner, fleet_env, *argv):
+# The seat under test is hackintosh: locality is derived from the hostname
+# (this_id), NOT from FLEET_SSH_hackintosh=local in FLEET_ENV above.
+THIS_ID = "hackintosh"
+
+
+def run(fd, runner, fleet_env, *argv, this_id=THIS_ID):
     runner.unreachable_exc = fd.HostUnreachable
     out = io.StringIO()
-    code = fd.main(list(argv), runner=runner, env_path=fleet_env, local_user=LOCAL_USER, out=out)
+    code = fd.main(list(argv), runner=runner, env_path=fleet_env, local_user=LOCAL_USER, out=out, this_id=this_id)
     return code, out.getvalue()
 
 
-def run_json(fd, runner, fleet_env, *argv):
-    code, text = run(fd, runner, fleet_env, "--json", *argv)
+def run_json(fd, runner, fleet_env, *argv, this_id=THIS_ID):
+    code, text = run(fd, runner, fleet_env, "--json", *argv, this_id=this_id)
     return code, json.loads(text)
 
 
@@ -237,6 +243,26 @@ def test_env_failures(fleet_doctor, healthy, fleet_env, host, needle, resp, expe
     assert len(fails) == 1 and expect in fails[0]["detail"], fails
 
 
+@pytest.mark.parametrize("dotenv,expect_ok", [
+    (f"DESKFLOW_CODESIGN_ID={MAC_ID}\n", True),
+    (f"  DESKFLOW_CODESIGN_ID = {MAC_ID}\n", True),
+    (f"export DESKFLOW_CODESIGN_ID={MAC_ID}\n", True),
+    ("DESKFLOW_CODESIGN_ID=\n", False),
+    # The old `\s*=\s*\S+` regex spanned the newline and read QT_PREFIX as the value.
+    ("DESKFLOW_CODESIGN_ID=\nQT_PREFIX=/opt/Qt\n", False),
+    ("DESKFLOW_CODESIGN_ID=   \n\nQT_PREFIX=/opt/Qt\n", False),
+    ('DESKFLOW_CODESIGN_ID=""\n', False),
+    ("DESKFLOW_CODESIGN_ID= # fill me in\n", False),
+    ("# DESKFLOW_CODESIGN_ID=abc\n", False),
+])
+def test_env_key_regex_does_not_span_lines(fleet_doctor, healthy, fleet_env, dotenv, expect_ok):
+    assert fleet_doctor.env_key_has_value(dotenv, "DESKFLOW_CODESIGN_ID") is expect_ok
+    healthy.set("hackintosh", 'deskflow/.env{q}', 0, dotenv)
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "env")
+    lacks = [r for r in rows(payload, host="hackintosh", check="env") if "lacks DESKFLOW_CODESIGN_ID" in r["detail"]]
+    assert bool(lacks) is (not expect_ok), payload
+
+
 def test_env_secret_not_echoed(fleet_doctor, healthy, fleet_env):
     healthy.set("hackintosh", 'scripts/fleet.env{q}', 0, "FLEET_KEYCHAIN_PASSWORD_hackintosh=hunter2\n")
     code, text = run(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "env")
@@ -300,6 +326,17 @@ def test_signing_failures(fleet_doctor, healthy, fleet_env, host, needle, resp, 
     assert len(fails) == 1 and expect in fails[0]["detail"], fails
 
 
+def test_signing_strict_off_fails_and_prints_the_flip(fleet_doctor, healthy, fleet_env):
+    healthy.set("hackintosh", "CMakeCache.txt", 0, "APPLE_CODESIGN_DEV:STRING=ABC\nFLEET_STRICT_SIGNING:BOOL=OFF\n")
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "signing")
+    assert code == 1
+    fails = rows(payload, host="hackintosh", check="signing", status="fail")
+    assert len(fails) == 1
+    assert fails[0]["detail"] == fleet_doctor.STRICT_SIGNING_FLIP
+    assert "-DFLEET_STRICT_SIGNING=ON" in fails[0]["detail"]
+    assert "CMakeLists.txt default stays OFF" in fails[0]["detail"]
+
+
 def test_signing_no_cmakecache_is_not_a_failure(fleet_doctor, healthy, fleet_env):
     healthy.set("macbookpro", "CMakeCache.txt", 1, "")
     code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "macbookpro", "--check", "signing")
@@ -331,6 +368,38 @@ def test_session_failures(fleet_doctor, healthy, fleet_env, host, needle, resp, 
     assert code == 1
     fails = rows(payload, host=host, check="session", status="fail")
     assert len(fails) == 1 and expect in fails[0]["detail"], fails
+
+
+def test_session_probes_system_events_like_fleet_gui_exec(fleet_doctor, healthy, fleet_env):
+    # Same osascript as tools/fleet-gui-exec.py's AXDialog precondition, with its human step.
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "session")
+    assert code == 0
+    probes = [c for _, c in healthy.calls if "System Events" in c]
+    assert probes == ["osascript -e '" + fleet_doctor.OSA_COUNT_MODAL_DIALOGS + "'"]
+    assert any("System Events Automation granted" in r["detail"] for r in rows(payload, check="session"))
+
+    healthy.set("hackintosh", 'tell application "System Events"', 1, "", "Not authorized to send Apple events to System Events. (-1743)")
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "session")
+    assert code == 1
+    fails = rows(payload, host="hackintosh", check="session", status="fail")
+    assert len(fails) == 1
+    assert "System Events Automation probe failed" in fails[0]["detail"]
+    assert "Human step:" in fails[0]["detail"] and "Privacy & Security" in fails[0]["detail"]
+
+    healthy.set("hackintosh", 'tell application "System Events"', 0, "1\n")
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "session")
+    assert code == 1
+    fails = rows(payload, host="hackintosh", check="session", status="fail")
+    assert len(fails) == 1 and "1 modal dialog(s) open" in fails[0]["detail"] and "dismiss the dialog" in fails[0]["detail"]
+
+
+def test_session_terminal_failure_names_the_human_step(fleet_doctor, healthy, fleet_env):
+    healthy.set("macbookpro", "osascript", 1, "", "Not authorized to send Apple events to Terminal. (-1743)")
+    healthy.set("macbookpro", 'tell application "System Events"', 0, "0\n")
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "macbookpro", "--check", "session")
+    assert code == 1
+    fails = rows(payload, host="macbookpro", check="session", status="fail")
+    assert len(fails) == 1 and "Human step:" in fails[0]["detail"] and "control Terminal" in fails[0]["detail"]
 
 
 def test_session_uses_fleet_ssh_user_override(fleet_doctor, healthy, tmp_path):
@@ -463,13 +532,90 @@ def test_tilde_expands_per_host_not_locally(fleet_doctor):
 
 
 def test_load_hosts_defaults(fleet_doctor, fleet_env):
-    hosts = fleet_doctor.load_hosts(fleet_doctor.parse_env_file(fleet_env), "me")
+    hosts = fleet_doctor.load_hosts(fleet_doctor.parse_env_file(fleet_env), "me", this_id="hackintosh")
     by_id = {h.id: h for h in hosts}
     assert by_id["hackintosh"].is_local and by_id["hackintosh"].user == "me"
     assert by_id["macbookpro"].ssh_dest == "me@macbookpro"
     assert by_id["tiny11"].is_windows and by_id["tiny11"].ssh_dest == "alexh@tiny11"
     assert by_id["tiny11"].deskflow_path == "C:/Users/alexh/Desktop/deskflow"
     assert by_id["macbookpro"].mouser_path.endswith("/Desktop/Mouser")
+
+
+# ----------------------------------------------------------------------------- locality (hostname, not FLEET_SSH_x=local)
+
+
+def test_locality_comes_from_hostname_not_fleet_ssh_local(fleet_doctor, fleet_env):
+    # fleet.env says FLEET_SSH_hackintosh=local, but this seat is macbookpro:
+    # hackintosh must be an ssh target and macbookpro the local one.
+    hosts = fleet_doctor.load_hosts(fleet_doctor.parse_env_file(fleet_env), "me", this_id="MacBookPro")
+    by_id = {h.id: h for h in hosts}
+    assert by_id["macbookpro"].is_local
+    assert not by_id["hackintosh"].is_local
+    assert by_id["hackintosh"].ssh_dest == "me@hackintosh"   # "local" never becomes an ssh target
+
+
+def test_locality_defaults_to_socket_hostname(fleet_doctor, fleet_env, monkeypatch):
+    monkeypatch.delenv("FLEET_LOCAL_ID", raising=False)
+    monkeypatch.setattr(fleet_doctor.socket, "gethostname", lambda: "Tiny11.lan")
+    hosts = fleet_doctor.load_hosts(fleet_doctor.parse_env_file(fleet_env), "me")
+    by_id = {h.id: h for h in hosts}
+    assert by_id["tiny11"].is_local and not by_id["hackintosh"].is_local
+
+
+def test_locality_honours_fleet_local_id_env(fleet_doctor, fleet_env, monkeypatch):
+    monkeypatch.setattr(fleet_doctor.socket, "gethostname", lambda: "stranger")
+    monkeypatch.setenv("FLEET_LOCAL_ID", "MacBookPro")
+    hosts = fleet_doctor.load_hosts(fleet_doctor.parse_env_file(fleet_env), "me")
+    assert [h.id for h in hosts if h.is_local] == ["macbookpro"]
+
+
+def test_host_local_uses_hostname_seat(fleet_doctor, healthy, fleet_env):
+    healthy.responses.update(mac_responses("macbookpro", python="3.13"))
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "local", "--check", "toolchain",
+                             this_id="macbookpro")
+    assert code == 0
+    assert payload["hosts"] == ["macbookpro"]
+    assert {c for c, _ in healthy.calls} == {"macbookpro"}
+
+
+def test_fleet_addr_overrides_bare_ssh_target(fleet_doctor, tmp_path):
+    env = tmp_path / "fleet.env"
+    env.write_text(FLEET_ENV + "FLEET_ADDR_macbookpro=192.168.1.11\nFLEET_ADDR_tiny11=192.168.1.12\n"
+                   "FLEET_SSH_tiny11=tiny11.tailnet.ts.net\n")
+    hosts = fleet_doctor.load_hosts(fleet_doctor.parse_env_file(str(env)), "me", this_id="hackintosh")
+    by_id = {h.id: h for h in hosts}
+    assert by_id["macbookpro"].ssh_dest == "me@192.168.1.11"          # bare id -> IP override
+    assert by_id["tiny11"].ssh_dest == "alexh@tiny11.tailnet.ts.net"  # explicit ssh target wins
+
+
+# ----------------------------------------------------------------------------- env file resolution
+
+
+def test_env_path_honours_fleet_env_file(fleet_doctor, healthy, tmp_path, monkeypatch):
+    env = tmp_path / "elsewhere.env"
+    env.write_text(FLEET_ENV)
+    monkeypatch.setenv("FLEET_ENV_FILE", str(env))
+    out = io.StringIO()
+    healthy.unreachable_exc = fleet_doctor.HostUnreachable
+    code = fleet_doctor.main(["--host", "hackintosh", "--check", "toolchain", "--json"], runner=healthy,
+                             local_user=LOCAL_USER, out=out, this_id="hackintosh")
+    assert code == 0
+    assert json.loads(out.getvalue())["hosts"] == ["hackintosh"]
+
+
+# ----------------------------------------------------------------------------- powershell bytes
+
+
+def test_default_runner_replaces_undecodable_powershell_bytes(fleet_doctor, monkeypatch):
+    # PowerShell over ssh can emit 0x83 (not valid UTF-8); the probe must not raise UnicodeDecodeError.
+    def fake_run(argv, **kw):
+        assert kw.get("errors") == "replace", "subprocess.run must decode with errors='replace'"
+        return subprocess.CompletedProcess(argv, 0, b"ok \x83 done".decode("utf-8", errors=kw["errors"]), "")
+
+    monkeypatch.setattr(fleet_doctor.subprocess, "run", fake_run)
+    win = fleet_doctor.Host("tiny11", "tiny11", "alexh", "windows", "C:/d", "C:/m")
+    rc, out, _ = fleet_doctor.default_runner(win, "quser")
+    assert rc == 0 and out.startswith("ok ") and out.endswith(" done")
 
 
 def test_default_runner_wraps_windows_ssh_and_detects_255(fleet_doctor, monkeypatch):

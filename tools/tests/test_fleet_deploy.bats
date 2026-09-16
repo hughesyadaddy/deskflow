@@ -239,6 +239,74 @@ have_real_flock() { command -v flock >/dev/null 2>&1; }
   [[ "$output" == *"macbookpro   | mouser   | beef00000000"* ]]
 }
 
+# --- Mouser sync (the per-OS scripts run with FLEET_SKIP_GIT_PULL=1) ---------
+
+@test "normal branch deploy fast-forwards Mouser from fork on remote Macs (remote added if missing)" {
+  run_deploy --host hackintosh
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *'FLEET_SKIP_GIT_PULL=1'* ]]
+  [[ "$cmd" == *'FLEET_MOUSER_BRANCH="main"'* ]]
+  [[ "$cmd" == *'git -C "$HOME/Desktop/Mouser" remote get-url fork >/dev/null 2>&1 || git -C "$HOME/Desktop/Mouser" remote add fork "https://github.com/hughesyadaddy/Mouser.git"'* ]]
+  [[ "$cmd" == *'git -C "$HOME/Desktop/Mouser" fetch fork && git -C "$HOME/Desktop/Mouser" checkout "main" && git -C "$HOME/Desktop/Mouser" pull --ff-only fork "main"'* ]]
+  # Mouser sync happens before the per-OS script runs
+  [[ "${cmd%%bash scripts/fleet-deploy-macos.sh*}" == *'pull --ff-only fork "main"'* ]]
+}
+
+@test "normal branch deploy fast-forwards Mouser from fork on the local seat" {
+  run_deploy --host macbookpro
+  [ "$status" -eq 0 ]
+  grep -q "git -C $WORK/mouser fetch fork" "$LOG/git.log"
+  grep -q "git -C $WORK/mouser checkout main" "$LOG/git.log"
+  grep -q "git -C $WORK/mouser pull --ff-only fork main" "$LOG/git.log"
+  grep -q 'fleet-deploy-macos.sh' "$LOG/local-cmd.log"
+}
+
+@test "normal branch deploy syncs Mouser on Windows seats inside the powershell command" {
+  run_deploy --host tiny11
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *"\$env:FLEET_MOUSER_BRANCH='main'"* ]]
+  [[ "$cmd" == *"if (Test-Path 'C:/Users/alexh/Desktop/Mouser/.git') { git -C 'C:/Users/alexh/Desktop/Mouser' remote get-url fork; if (\$LASTEXITCODE) { git -C 'C:/Users/alexh/Desktop/Mouser' remote add fork 'https://github.com/hughesyadaddy/Mouser.git'"* ]]
+  [[ "$cmd" == *"git -C 'C:/Users/alexh/Desktop/Mouser' fetch fork; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git -C 'C:/Users/alexh/Desktop/Mouser' checkout 'main'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git -C 'C:/Users/alexh/Desktop/Mouser' pull --ff-only fork 'main'"* ]]
+  [[ "${cmd%%fleet-deploy-windows.ps1*}" == *"pull --ff-only fork 'main'"* ]]
+}
+
+@test "FLEET_MOUSER_BRANCH overrides the Mouser branch; --mouser-only/--deskflow-only gate the sync" {
+  echo 'FLEET_MOUSER_BRANCH=mouser-dev' >> "$REPO/scripts/fleet.env"
+  run_deploy --host hackintosh
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *'FLEET_MOUSER_BRANCH="mouser-dev"'* ]]
+  [[ "$cmd" == *'checkout "mouser-dev" && git -C "$HOME/Desktop/Mouser" pull --ff-only fork "mouser-dev"'* ]]
+  [[ "$cmd" == *'git checkout "main" && git pull --ff-only origin "main"'* ]]
+  rm "$LOG/ssh.log"
+  run_deploy --host hackintosh --deskflow-only
+  [ "$status" -eq 0 ]
+  ! grep -q 'fetch fork' "$LOG/ssh.log"
+  rm "$LOG/ssh.log"
+  run_deploy --host tiny11 --deskflow-only
+  [ "$status" -eq 0 ]
+  ! grep -q 'fetch fork' "$LOG/ssh.log"
+}
+
+@test "--ref HEAD leaves Mouser untouched; --ref X detaches Mouser at X" {
+  run_deploy --host hackintosh --ref HEAD
+  [ "$status" -eq 0 ]
+  ! grep -q 'fetch fork' "$LOG/ssh.log"
+  rm "$LOG/ssh.log"
+  run_deploy --host hackintosh --ref v1.2.3
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *'git -C "$HOME/Desktop/Mouser" fetch fork && git -C "$HOME/Desktop/Mouser" checkout --detach "v1.2.3"'* ]]
+  [[ "$cmd" != *'pull --ff-only fork'* ]]
+  rm "$LOG/ssh.log"
+  run_deploy --host tiny11 --ref v1.2.3
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *"git -C 'C:/Users/alexh/Desktop/Mouser' checkout --detach 'v1.2.3'"* ]]
+}
+
 # --- last-good / rollback ----------------------------------------------------
 
 @test "last-good.json records {host:{app:{commit,ts}}} after a healthy deploy" {
@@ -355,6 +423,93 @@ EOF
   jq -e '.ok == false' "$WORK/st.json" >/dev/null
   jq -e '[.hosts[] | select(.id=="macbookpro") | .result] | all(. == "unhealthy")' "$WORK/st.json" >/dev/null
   jq -e '.hosts[] | select(.id=="macbookpro" and .app=="deskflow") | .tcc == "denied"' "$WORK/st.json" >/dev/null
+}
+
+# Real tools/fleet-health --json shape: {ok, results:[{host,check,status,detail}]}.
+write_real_health() { # $1 = exit code, stdin = JSON
+  local rc="$1" json
+  json="$(cat)"
+  cat > "$REPO/tools/fleet-health" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$LOG/health.log"
+case "\$*" in
+  *"--check all"*) cat <<'JSON'
+$json
+JSON
+    exit $rc ;;
+esac
+exit 0
+EOF
+  chmod +x "$REPO/tools/fleet-health"
+}
+
+REAL_HEALTH_OK='{"ok": true, "results": [
+  {"host":"hackintosh","check":"sign","status":"PASS","detail":"12 Mach-Os signed by Apple Development* team ABCDE12345"},
+  {"host":"hackintosh","check":"no-adhoc","status":"PASS","detail":"12 Mach-Os, none ad-hoc"},
+  {"host":"hackintosh","check":"identifiers","status":"PASS","detail":"12 identifiers stable/allowlisted"},
+  {"host":"hackintosh","check":"tcc","status":"PASS","detail":"4 rows cert-based; AX+ListenEvent granted; --check-permissions ok"},
+  {"host":"hackintosh","check":"session","status":"PASS","detail":"io.github.hughesyadaddy.mouser loaded; Deskflow GUI running"},
+  {"host":"hackintosh","check":"mesh","status":"PASS","detail":"hackintosh -> macbookpro (macbookpro:24800) ok"},
+  {"host":"hackintosh","check":"mesh","status":"PASS","detail":"hackintosh -> tiny11 (tiny11:24800) ok"},
+  {"host":"macbookpro","check":"sign","status":"PASS","detail":"12 Mach-Os signed by Apple Development* team ABCDE12345"},
+  {"host":"macbookpro","check":"tcc","status":"PASS","detail":"4 rows cert-based"},
+  {"host":"macbookpro","check":"mesh","status":"PASS","detail":"macbookpro -> hackintosh (hackintosh:24800) ok"},
+  {"host":"macbookpro","check":"mesh","status":"PASS","detail":"macbookpro -> tiny11 (tiny11:24800) ok"},
+  {"host":"tiny11","check":"sign","status":"SKIP","detail":"macOS-only check"},
+  {"host":"tiny11","check":"tcc","status":"SKIP","detail":"macOS-only check"},
+  {"host":"tiny11","check":"authenticode","status":"PASS","detail":"3 files signed by thumbprint 0123"},
+  {"host":"tiny11","check":"session","status":"PASS","detail":"alexh Active"},
+  {"host":"tiny11","check":"mesh","status":"PASS","detail":"tiny11 -> hackintosh ok"}
+]}'
+
+@test "--self-test folds fleet-health's real {ok,results:[{host,check,status,detail}]} shape per host" {
+  printf '%s' "$REAL_HEALTH_OK" | write_real_health 0
+  run_deploy --self-test --json "$WORK/st.json"
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true' "$WORK/st.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="hackintosh" and .app=="deskflow") | .signedBy == "12 Mach-Os signed by Apple Development* team ABCDE12345" and .tcc == "PASS" and .mesh == "PASS"' "$WORK/st.json" >/dev/null
+  # Windows: `sign` is SKIP, so signed-by falls back to the authenticode detail
+  jq -e '.hosts[] | select(.id=="tiny11" and .app=="mouser") | .signedBy == "3 files signed by thumbprint 0123" and .tcc == "SKIP" and .mesh == "PASS" and .result == "ok"' "$WORK/st.json" >/dev/null
+  jq -e '[.hosts[] | .result] | all(. == "ok")' "$WORK/st.json" >/dev/null
+  [[ "$output" == *"| 12 Mach-Os signed by App | PASS   | PASS   | ok"* ]]  # signed-by column is 24 chars wide
+}
+
+@test "--self-test marks a host unhealthy when any of its real results is FAIL (one mesh leg is enough)" {
+  printf '%s' "$REAL_HEALTH_OK" | jq -c '
+    .ok = false
+    | .results |= map(if .host == "macbookpro" and .check == "tcc" then .status = "FAIL" | .detail = "kTCCServiceAccessibility: no deskflow client with auth_value=2" else . end)
+    | .results |= map(if .host == "hackintosh" and .detail == "hackintosh -> tiny11 (tiny11:24800) ok" then .status = "FAIL" | .detail = "hackintosh -> tiny11 (tiny11:24800) rc=1" else . end)' \
+    | write_real_health 1
+  run_deploy --self-test --json "$WORK/st.json"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' "$WORK/st.json" >/dev/null
+  jq -e '[.hosts[] | select(.id=="macbookpro") | .result] | all(. == "unhealthy")' "$WORK/st.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="macbookpro" and .app=="deskflow") | .tcc == "FAIL"' "$WORK/st.json" >/dev/null
+  # first mesh leg PASS, second FAIL -> mesh column is FAIL and the host is unhealthy
+  jq -e '.hosts[] | select(.id=="hackintosh" and .app=="deskflow") | .mesh == "FAIL" and .result == "unhealthy"' "$WORK/st.json" >/dev/null
+  jq -e '[.hosts[] | select(.id=="tiny11") | .result] | all(. == "ok")' "$WORK/st.json" >/dev/null
+}
+
+@test "fleet-health is always invoked with --env pointing at the controller's fleet.env" {
+  printf '%s' "$REAL_HEALTH_OK" | write_real_health 0
+  run_deploy --self-test
+  [ "$status" -eq 0 ]
+  # per-host gate (3 hosts) + the fleet-wide --check all
+  [ "$(wc -l < "$LOG/health.log" | tr -d ' ')" -eq 4 ]
+  [ "$(grep -c -- "--env $REPO/scripts/fleet.env" "$LOG/health.log")" -eq 4 ]
+  grep -q -- "--host tiny11 --env" "$LOG/health.log"
+  grep -q -- "--check all --host all --json --env" "$LOG/health.log"
+}
+
+@test "FLEET_ENV_FILE is honoured by the controller and forwarded to fleet-health" {
+  mv "$REPO/scripts/fleet.env" "$WORK/custom.env"
+  printf '%s' "$REAL_HEALTH_OK" | write_real_health 0
+  FLEET_ENV_FILE="$WORK/custom.env" run_deploy --self-test
+  [ "$status" -eq 0 ]
+  [ "$(grep -c -- "--env $WORK/custom.env" "$LOG/health.log")" -eq 4 ]
+  run_deploy --dry-run
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Missing"* ]]
 }
 
 @test "--self-test without tools/fleet-health cannot pass" {

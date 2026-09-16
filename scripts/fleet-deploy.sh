@@ -31,9 +31,12 @@
 # The local seat is the FLEET_HOSTS entry matching `hostname -s`
 # (case-insensitive) or FLEET_LOCAL_ID; FLEET_SSH_<id>=local is ignored.
 # Contract with the per-OS scripts: FLEET_SKIP_GIT_PULL=1 is always exported
-# (this controller performs the git sync), FLEET_DESKFLOW_REF / FLEET_MOUSER_REF
-# carry the exact commit for --ref / --rollback. No keychain password is ever
-# passed; signing runs in the GUI session on each seat.
+# (this controller performs the git sync for BOTH deskflow and Mouser —
+# FLEET_MOUSER_BRANCH, default FLEET_BRANCH, from remote `fork`),
+# FLEET_DESKFLOW_REF / FLEET_MOUSER_REF carry the exact commit for --ref /
+# --rollback. tools/fleet-health is always given --env "$ENV_FILE"
+# (FLEET_ENV_FILE). No keychain password is ever passed; signing runs in the
+# GUI session on each seat.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -81,7 +84,7 @@ while [[ $# -gt 0 ]]; do
     --mouser-only) set_app mouser; shift ;;
     --reconfigure) OPT_RECONFIGURE=1; shift ;;
     --pull-only) PULL_ONLY=1; shift ;;
-    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -300,15 +303,26 @@ sh_git_sync() { # path ref -> POSIX sh fragment
     printf 'cd "%s" && git fetch origin && git checkout --detach "%s"' "$path" "$ref"
   fi
 }
-sh_mouser_sync() { # path ref -> fragment (empty when nothing to do)
-  local path ref="$2"; path="$(sh_path "$1")"
-  [[ -n "$ref" && "$ref" != "HEAD" ]] || return 0
-  printf ' && if [ -d "%s/.git" ]; then git -C "%s" fetch fork && git -C "%s" checkout --detach "%s"; fi' \
-    "$path" "$path" "$path" "$ref"
+sh_mouser_sync() { # path ref -> fragment (empty only for HEAD)
+  # The per-OS scripts always run with FLEET_SKIP_GIT_PULL=1, so this
+  # controller is the ONLY place Mouser is synced: empty ref = fast-forward
+  # FLEET_MOUSER_BRANCH (default FLEET_BRANCH) from `fork`, other refs detach.
+  local path ref="$2" branch="${FLEET_MOUSER_BRANCH:-$FLEET_BRANCH}"; path="$(sh_path "$1")"
+  [[ "$DEPLOY_MOUSER" == 1 ]] || return 0
+  [[ "$ref" != "HEAD" ]] || return 0
+  local add_remote
+  add_remote="git -C \"${path}\" remote get-url fork >/dev/null 2>&1 || git -C \"${path}\" remote add fork \"${FLEET_MOUSER_FORK_URL:-https://github.com/hughesyadaddy/Mouser.git}\""
+  if [[ -z "$ref" ]]; then
+    printf ' && if [ -d "%s/.git" ]; then %s && git -C "%s" fetch fork && git -C "%s" checkout "%s" && git -C "%s" pull --ff-only fork "%s"; fi' \
+      "$path" "$add_remote" "$path" "$path" "$branch" "$path" "$branch"
+  else
+    printf ' && if [ -d "%s/.git" ]; then %s && git -C "%s" fetch fork && git -C "%s" checkout --detach "%s"; fi' \
+      "$path" "$add_remote" "$path" "$path" "$ref"
+  fi
 }
 sh_exports() { # deskflow_path mouser_path dref mref
-  printf 'export FLEET_BRANCH="%s" FLEET_DEPLOY_DESKFLOW="%s" FLEET_DEPLOY_MOUSER="%s" FLEET_RECONFIGURE="%s" FLEET_DESKFLOW_ROOT="%s" FLEET_MOUSER_ROOT="%s" FLEET_SKIP_GIT_PULL=1 FLEET_DESKFLOW_REF="%s" FLEET_MOUSER_REF="%s"' \
-    "$FLEET_BRANCH" "$DEPLOY_DESKFLOW" "$DEPLOY_MOUSER" "$RECONFIGURE" "$(sh_path "$1")" "$(sh_path "$2")" "$3" "$4"
+  printf 'export FLEET_BRANCH="%s" FLEET_MOUSER_BRANCH="%s" FLEET_DEPLOY_DESKFLOW="%s" FLEET_DEPLOY_MOUSER="%s" FLEET_RECONFIGURE="%s" FLEET_DESKFLOW_ROOT="%s" FLEET_MOUSER_ROOT="%s" FLEET_SKIP_GIT_PULL=1 FLEET_DESKFLOW_REF="%s" FLEET_MOUSER_REF="%s"' \
+    "$FLEET_BRANCH" "${FLEET_MOUSER_BRANCH:-$FLEET_BRANCH}" "$DEPLOY_DESKFLOW" "$DEPLOY_MOUSER" "$RECONFIGURE" "$(sh_path "$1")" "$(sh_path "$2")" "$3" "$4"
 }
 ps_git_sync() { # path ref -> PowerShell fragment
   local path="$1" ref="$2"
@@ -319,6 +333,19 @@ ps_git_sync() { # path ref -> PowerShell fragment
     printf ''
   else
     printf "git fetch origin; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git checkout --detach '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " "$ref"
+  fi
+}
+ps_mouser_sync() { # path ref -> PowerShell fragment (empty only for HEAD / mouser disabled)
+  local path="$1" ref="$2" branch="${FLEET_MOUSER_BRANCH:-$FLEET_BRANCH}"
+  local url="${FLEET_MOUSER_FORK_URL:-https://github.com/hughesyadaddy/Mouser.git}" g
+  [[ "$DEPLOY_MOUSER" == 1 && "$ref" != "HEAD" ]] || return 0
+  g="git -C '${path}'"
+  printf "if (Test-Path '%s/.git') { %s remote get-url fork; if (\$LASTEXITCODE) { %s remote add fork '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE } }; %s fetch fork; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " \
+    "$path" "$g" "$g" "$url" "$g"
+  if [[ -z "$ref" ]]; then
+    printf "%s checkout '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; %s pull --ff-only fork '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE } }; " "$g" "$branch" "$g" "$branch"
+  else
+    printf "%s checkout --detach '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE } }; " "$g" "$ref"
   fi
 }
 
@@ -363,10 +390,10 @@ deploy_host() { # index dref mref
     else
       local ps
       ps="\$ErrorActionPreference='Stop'; "
-      ps+="\$env:FLEET_BRANCH='${FLEET_BRANCH}'; \$env:FLEET_DEPLOY_DESKFLOW='${DEPLOY_DESKFLOW}'; \$env:FLEET_DEPLOY_MOUSER='${DEPLOY_MOUSER}'; "
+      ps+="\$env:FLEET_BRANCH='${FLEET_BRANCH}'; \$env:FLEET_MOUSER_BRANCH='${FLEET_MOUSER_BRANCH:-$FLEET_BRANCH}'; \$env:FLEET_DEPLOY_DESKFLOW='${DEPLOY_DESKFLOW}'; \$env:FLEET_DEPLOY_MOUSER='${DEPLOY_MOUSER}'; "
       ps+="\$env:FLEET_DESKFLOW_ROOT='${dpath}'; \$env:FLEET_MOUSER_ROOT='${mpath}'; \$env:FLEET_SKIP_GIT_PULL='1'; "
       ps+="\$env:FLEET_DESKFLOW_REF='${dref}'; \$env:FLEET_MOUSER_REF='${mref}'; "
-      ps+="Set-Location '${dpath}'; $(ps_git_sync "$dpath" "$dref")"
+      ps+="Set-Location '${dpath}'; $(ps_git_sync "$dpath" "$dref")$(ps_mouser_sync "$mpath" "$mref")"
       ps+="& '${dpath}/scripts/fleet-deploy-windows.ps1'; exit \$LASTEXITCODE"
       cmd="powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"$ps\""
     fi
@@ -402,8 +429,28 @@ head_commit() { # index path -> sha or "unknown"
 
 health_host() { # id -> exit code of tools/fleet-health --host id (0 when absent)
   [[ -x "$HEALTH" ]] || return 0
-  "$HEALTH" --host "$1"
+  "$HEALTH" --host "$1" --env "$ENV_FILE"
 }
+
+# Fold fleet-health's real JSON ({ok, results:[{host,check,status,detail}]})
+# into one row per host: signedBy = detail of `sign` (Windows: `authenticode`),
+# tcc/mesh = status of those checks (any FAIL leg fails mesh), ok = no FAIL for
+# that host. The legacy {hosts:[{id,signedBy,tcc,mesh,ok}]} shape is still accepted.
+HEALTH_FOLD_JQ='
+  def fold($h):
+    [.results[] | select(.host == $h)] as $rs
+    | if ($rs | length) == 0 then {}
+      else {
+        signedBy: (($rs | map(select((.check == "sign" or .check == "authenticode") and .status != "SKIP")) | .[0].detail) // "-"),
+        tcc: (($rs | map(select(.check == "tcc")) | .[0].status) // "-"),
+        mesh: (($rs | map(select(.check == "mesh")) | if length == 0 then null elif any(.status == "FAIL") then "FAIL" else .[0].status end) // "-"),
+        ok: ($rs | all(.status != "FAIL"))
+      } end;
+  (if (.results? // null) != null then fold($h)
+   elif (.hosts? // null) != null then ((.hosts | map(select((.id // .host) == $h)) | .[0]) // {})
+   else (.[$h] // {}) end)
+  | [(.signedBy // .signed_by // "-"), (.tcc // "-"), (.mesh // "-"), (if has("ok") then (.ok|tostring) else "-" end)]
+  | map(tostring) | join("\t")'
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -465,13 +512,10 @@ done
 if [[ "$SELF_TEST" == 1 ]]; then
   if [[ -x "$HEALTH" ]]; then
     hj=""
-    if hj="$("$HEALTH" --check all --host all --json)"; then :; else ALL_OK=0; warn "fleet-health --check all reported failures"; fi
+    if hj="$("$HEALTH" --check all --host all --json --env "$ENV_FILE")"; then :; else ALL_OK=0; warn "fleet-health --check all reported failures"; fi
     if [[ -n "$hj" ]] && printf '%s' "$hj" | jq -e . >/dev/null 2>&1; then
       for r in "${!R_ID[@]}"; do
-        line="$(printf '%s' "$hj" | jq -r --arg h "${R_ID[$r]}" '
-          (if (.hosts? // null) != null then ((.hosts | map(select((.id // .host) == $h)) | .[0]) // {}) else (.[$h] // {}) end)
-          | [(.signedBy // .signed_by // "-"), (.tcc // "-"), (.mesh // "-"), (if has("ok") then (.ok|tostring) else "-" end)]
-          | map(tostring) | join("\t")')"
+        line="$(printf '%s' "$hj" | jq -r --arg h "${R_ID[$r]}" "$HEALTH_FOLD_JQ")"
         IFS=$'\t' read -r s t m ok <<<"$line"
         R_SIGNED[r]="$s"; R_TCC[r]="$t"; R_MESH[r]="$m"
         if [[ "$ok" == "false" ]]; then ALL_OK=0; [[ "${R_RESULT[$r]}" == ok ]] && R_RESULT[r]="unhealthy"; fi

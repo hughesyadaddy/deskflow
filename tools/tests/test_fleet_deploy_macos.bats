@@ -331,3 +331,35 @@ script_lacks() {
   log_lacks "git fetch fork"
   log_lacks "build_macos_gui_session.py"
 }
+
+@test "FLEET_SKIP_GIT_PULL=1 moves neither checkout (the controller already synced both)" {
+  write_env "ABCDEF0123456789"
+  FLEET_SKIP_GIT_PULL=1 FLEET_MOUSER_REF=v9 FLEET_DESKFLOW_REF=v9 run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_lacks "git fetch"
+  log_lacks "git checkout"
+  log_lacks "git pull"
+  log_has "python3 scripts/build_macos_gui_session.py"
+}
+
+@test "standalone run honours FLEET_MOUSER_BRANCH and FLEET_*_REF (detach, HEAD = no sync)" {
+  write_env "ABCDEF0123456789"
+  FLEET_MOUSER_BRANCH=mouser-dev run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_has "git checkout main"
+  log_has "git checkout mouser-dev"
+  log_has "git pull --ff-only fork mouser-dev"
+  log_lacks "git pull --ff-only fork main"
+  : > "$SHIM_LOG"
+  FLEET_DESKFLOW_REF=abc123 FLEET_MOUSER_REF=def456 run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_has "git checkout --detach abc123"
+  log_has "git checkout --detach def456"
+  log_lacks "git pull"
+  : > "$SHIM_LOG"
+  FLEET_DESKFLOW_REF=HEAD FLEET_MOUSER_REF=HEAD run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_lacks "git fetch"
+  log_lacks "git checkout"
+  log_has "python3 scripts/build_macos_gui_session.py"
+}

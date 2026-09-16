@@ -5,9 +5,12 @@
                        [--check env|repo|signing|session|toolchain|noise|all]
                        [--fix] [--json]
 
-Reads scripts/fleet.env (KEY=VALUE, `~` expanded) for FLEET_HOSTS,
-FLEET_SSH_<id> (`local` or an ssh target), FLEET_SSH_USER_<id>, FLEET_BRANCH
-and FLEET_{DESKFLOW,MOUSER}_PATH_{macos,windows}. Every probe is a shell
+Reads scripts/fleet.env (KEY=VALUE, `~` expanded; override with --env or
+FLEET_ENV_FILE) for FLEET_HOSTS, FLEET_SSH_<id>, FLEET_ADDR_<id>,
+FLEET_SSH_USER_<id>, FLEET_BRANCH and FLEET_{DESKFLOW,MOUSER}_PATH_{macos,windows}.
+The local seat is the FLEET_HOSTS entry matching this machine's hostname
+(case-insensitive) or FLEET_LOCAL_ID — `FLEET_SSH_<id>=local` never defines
+locality (same rule as fleet-deploy and fleet-health). Every probe is a shell
 command run locally or over `ssh user@target '<cmd>'` (Windows targets get
 `powershell -NoProfile -Command "<cmd>"`).
 
@@ -22,6 +25,7 @@ import getpass
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -33,6 +37,18 @@ WINDOWS_HOST_IDS = {"tiny11"}
 NOISE_HOST_IDS = {"hackintosh"}
 DEFAULT_WINDOWS_USER = "alexh"
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+# Human step printed when a seat's build tree was configured without strict signing.
+STRICT_SIGNING_FLIP = (
+    "CMakeCache FLEET_STRICT_SIGNING=OFF — flip it: "
+    "cmake -S . -B build -DFLEET_STRICT_SIGNING=ON -DAPPLE_CODESIGN_DEV=$DESKFLOW_CODESIGN_ID "
+    "(or FLEET_RECONFIGURE=1 fleet-deploy); the CMakeLists.txt default stays OFF until the human flips it"
+)
+# osascript probes shared with tools/fleet-gui-exec.py's preconditions.
+OSA_COUNT_TERMINAL_WINDOWS = 'tell application "Terminal" to count windows'
+OSA_COUNT_MODAL_DIALOGS = (
+    'tell application "System Events" to count (windows of '
+    '(first process whose frontmost is true) whose subrole is "AXDialog")'
+)
 
 RunResult = Tuple[int, str, str]
 Runner = Callable[["Host", str], RunResult]
@@ -133,10 +149,29 @@ def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def load_hosts(cfg: Dict[str, str], local_user: str) -> List[Host]:
+def local_id() -> str:
+    """This seat's id: FLEET_LOCAL_ID, else the short hostname (lowercased)."""
+    override = os.environ.get("FLEET_LOCAL_ID", "").strip()
+    if override:
+        return override.lower()
+    return socket.gethostname().split(".")[0].lower()
+
+
+def load_hosts(cfg: Dict[str, str], local_user: str, this_id: Optional[str] = None) -> List[Host]:
+    """Build the host list. Locality comes from the hostname (or FLEET_LOCAL_ID),
+    never from `FLEET_SSH_<id>=local` — a copied fleet.env must not make a
+    remote seat look local. FLEET_ADDR_<id> overrides the ssh address."""
+    this_id = (this_id or local_id()).lower()
     hosts: List[Host] = []
     for hid in cfg.get("FLEET_HOSTS", "").split():
-        target = cfg.get(f"FLEET_SSH_{hid}", hid)
+        if hid.lower() == this_id:
+            target = "local"
+        else:
+            ssh = cfg.get(f"FLEET_SSH_{hid}", "")
+            if not ssh or ssh == "local" or ssh.lower() == hid.lower():
+                # bare id: FLEET_ADDR_<id> (IP) substitutes when DNS lacks the name
+                ssh = cfg.get(f"FLEET_ADDR_{hid}", "") or hid
+            target = ssh
         host_os = cfg.get(f"FLEET_OS_{hid}", "windows" if hid in WINDOWS_HOST_IDS else "macos")
         default_user = DEFAULT_WINDOWS_USER if host_os == "windows" else local_user
         user = cfg.get(f"FLEET_SSH_USER_{hid}", default_user)
@@ -169,7 +204,10 @@ def default_runner(host: Host, cmd: str) -> RunResult:
         remote = f'powershell -NoProfile -Command "{cmd}"' if host.is_windows else cmd
         argv = ["ssh", *SSH_OPTS, host.ssh_dest, remote]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        # PowerShell over ssh emits OEM/UTF-16 fragments (e.g. byte 0x83) that
+        # are not valid UTF-8; never let that crash a probe.
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                              encoding="utf-8", errors="replace")
     except FileNotFoundError as exc:
         raise HostUnreachable(f"{argv[0]} not found: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -244,13 +282,24 @@ class Probe:
 # --------------------------------------------------------------------------- checks
 
 
+def env_key_has_value(text: str, key: str) -> bool:
+    """True when `KEY=<non-empty>` appears on ONE line of `text`.
+
+    `\\s` would match the newline after `KEY=` and read the next line's key
+    as the value, passing an empty assignment; only horizontal whitespace is
+    allowed around `=`.
+    """
+    pat = rf"^[ \t]*(?:export[ \t]+)?{re.escape(key)}[ \t]*=[ \t]*(?![\"']{{2}}[ \t]*$)(?!#)\S+"
+    return re.search(pat, text, re.M) is not None
+
+
 def check_env(p: Probe, rep: Report) -> None:
     h = p.host
     dotenv = p.read_file(join(h, h.deskflow_path, ".env"))
     key = "DESKFLOW_SIGN_THUMBPRINT" if h.is_windows else "DESKFLOW_CODESIGN_ID"
     if dotenv is None:
         rep.add(h.id, "env", False, ".env missing in deskflow repo")
-    elif not re.search(rf"^\s*{key}\s*=\s*\S+", dotenv, re.M):
+    elif not env_key_has_value(dotenv, key):
         rep.add(h.id, "env", False, f".env lacks {key}")
     else:
         rep.add(h.id, "env", True, f".env has {key}")
@@ -327,7 +376,8 @@ def check_signing(p: Probe, rep: Report) -> None:
         adhoc = re.search(r"^APPLE_CODESIGN_DEV:STRING=-\s*$", cache, re.M) is not None
         rep.add(h.id, "signing", not adhoc, "CMakeCache APPLE_CODESIGN_DEV=- (ad-hoc)" if adhoc else "CMakeCache APPLE_CODESIGN_DEV not ad-hoc")
         lax = re.search(r"^FLEET_STRICT_SIGNING:BOOL=OFF\s*$", cache, re.M) is not None
-        rep.add(h.id, "signing", not lax, "CMakeCache FLEET_STRICT_SIGNING=OFF" if lax else "CMakeCache FLEET_STRICT_SIGNING not OFF")
+        rep.add(h.id, "signing", not lax,
+                STRICT_SIGNING_FLIP if lax else "CMakeCache FLEET_STRICT_SIGNING not OFF")
 
     ident = dotenv.get("DESKFLOW_CODESIGN_ID", "")
     if not ident:
@@ -351,8 +401,26 @@ def check_session(p: Probe, rep: Report) -> None:
     rc, out, _ = p.sh("stat -f %Su /dev/console")
     console = out.strip() if rc == 0 else ""
     rep.add(h.id, "session", console == h.user, f"console user {console or '?'}" + ("" if console == h.user else f", expected {h.user}"))
-    rc, _, err = p.sh("osascript -e 'tell application \"Terminal\" to count windows'")
-    rep.add(h.id, "session", rc == 0, "Terminal Automation granted" if rc == 0 else f"Terminal Automation probe failed: {err.strip()[:80] or 'rc ' + str(rc)}")
+    rc, _, err = p.sh(f"osascript -e '{OSA_COUNT_TERMINAL_WINDOWS}'")
+    rep.add(h.id, "session", rc == 0, "Terminal Automation granted" if rc == 0 else
+            f"Terminal Automation probe failed: {err.strip()[:80] or 'rc ' + str(rc)}. "
+            "Human step: run tools/fleet-gui-exec.py once from a local Terminal on the Mac and click OK on the "
+            "'wants access to control Terminal' prompt, or enable it under System Settings > Privacy & Security > Automation")
+    # tools/fleet-gui-exec.py also asks System Events for the AXDialog count before
+    # every routed build; without that grant every GUI-session build aborts.
+    rc, out, err = p.sh(f"osascript -e '{OSA_COUNT_MODAL_DIALOGS}'")
+    if rc != 0:
+        rep.add(h.id, "session", False,
+                f"System Events Automation probe failed: {err.strip()[:80] or 'rc ' + str(rc)}. "
+                "Human step: grant this terminal (sshd-remote/Terminal) Accessibility and Automation access to "
+                "System Events under System Settings > Privacy & Security")
+    else:
+        try:
+            dialogs = int(out.strip() or "0")
+        except ValueError:
+            dialogs = 0
+        rep.add(h.id, "session", dialogs == 0, "System Events Automation granted; no modal dialogs" if dialogs == 0 else
+                f"{dialogs} modal dialog(s) open on the console. Human step: dismiss the dialog on the Mac's screen, then retry")
 
 
 def check_toolchain(p: Probe, rep: Report, pinned: Dict[str, str]) -> None:
@@ -461,15 +529,16 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     ap.add_argument("--check", default="all", help="env|repo|signing|session|toolchain|noise|all, comma-separable (default: all)")
     ap.add_argument("--fix", action="store_true", help="bootout loaded com.cursor.worker.* (noise check only)")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
-    ap.add_argument("--env", default=None, help=argparse.SUPPRESS)  # override scripts/fleet.env path
+    ap.add_argument("--env", default=None, help="path to fleet.env (default: $FLEET_ENV_FILE, else scripts/fleet.env)")
     return ap.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None, runner: Optional[Runner] = None, env_path: Optional[str] = None,
-         local_user: Optional[str] = None, out=None) -> int:
+         local_user: Optional[str] = None, out=None, this_id: Optional[str] = None) -> int:
     args = parse_args(argv)
     out = out or sys.stdout
-    env_path = args.env or env_path or os.path.join(repo_root(), "scripts", "fleet.env")
+    env_path = (args.env or env_path or os.environ.get("FLEET_ENV_FILE")
+                or os.path.join(repo_root(), "scripts", "fleet.env"))
     cfg = parse_env_file(env_path)
     if not cfg.get("FLEET_HOSTS"):
         print(f"fleet-doctor: no FLEET_HOSTS in {env_path}", file=sys.stderr)
@@ -479,7 +548,7 @@ def main(argv: Optional[List[str]] = None, runner: Optional[Runner] = None, env_
     if bad:
         print(f"fleet-doctor: unknown check(s): {', '.join(bad)}", file=sys.stderr)
         return 2
-    hosts = select_hosts(load_hosts(cfg, local_user or getpass.getuser()), args.host)
+    hosts = select_hosts(load_hosts(cfg, local_user or getpass.getuser(), this_id), args.host)
     if not hosts:
         print(f"fleet-doctor: no host matches --host {args.host}", file=sys.stderr)
         return 2
