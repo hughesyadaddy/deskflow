@@ -189,7 +189,7 @@ TCPSocket::JobResult SecureSocket::doWrite()
     // (the old shared static buffer was raced by every SecureSocket in the
     // process and only ever grew) and capped at one pass, so a queued
     // multi-MiB clipboard is never copied whole.
-    bufferSize = static_cast<int>(std::min(m_outputBuffer.getSize(), kMaxWritePassSize));
+    bufferSize = static_cast<int>((std::min)(m_outputBuffer.getSize(), kMaxWritePassSize));
     if (bufferSize != 0) {
       if (m_writeBuffer.size() < static_cast<std::size_t>(bufferSize)) {
         m_writeBuffer.resize(bufferSize);

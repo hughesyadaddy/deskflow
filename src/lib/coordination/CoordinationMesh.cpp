@@ -693,7 +693,7 @@ void PeerOutbox::pump(double now)
           m_deliveredKeys.insert(job.ticket);
         }
       } else {
-        m_backoffS = m_backoffS <= 0.0 ? kBackoffMinS : std::min(m_backoffS * 2.0, kBackoffMaxS);
+        m_backoffS = m_backoffS <= 0.0 ? kBackoffMinS : (std::min)(m_backoffS * 2.0, kBackoffMaxS);
         m_state = State::Backoff;
         m_nextAttemptAt = m_clock() + m_backoffS;
         if (!otherAddressLocked(host).empty()) {

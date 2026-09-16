@@ -411,7 +411,7 @@ TCPSocket::JobResult TCPSocket::doWrite()
   // would consolidate every chunk into one allocation the size of the
   // backlog on each pass.  If the head chunk already holds a decent run
   // use it as-is (no copy); otherwise consolidate up to one pass worth.
-  bufferSize = std::min(m_outputBuffer.getSize(), kMaxWritePassSize);
+  bufferSize = (std::min)(m_outputBuffer.getSize(), kMaxWritePassSize);
   if (const uint32_t contiguous = m_outputBuffer.getContiguousSize();
       contiguous >= kMaxWritePassSize / 2 && contiguous < bufferSize) {
     bufferSize = contiguous;

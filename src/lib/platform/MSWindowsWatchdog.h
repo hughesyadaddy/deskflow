@@ -84,7 +84,7 @@ constexpr int nextRestartDelayMs(int exitCode, int consecutiveFastExits, long lo
     // Shift is bounded well below 31 by kMaxConsecutiveFastExits, but clamp
     // anyway so a raised threshold can never overflow the int.
     const int step = std::clamp(consecutiveFastExits - 1, 0, 20);
-    return std::min(kBaseBackoffMs << step, kMaxBackoffMs);
+    return (std::min)(kBaseBackoffMs << step, kMaxBackoffMs);
   }
   return 0;
 }

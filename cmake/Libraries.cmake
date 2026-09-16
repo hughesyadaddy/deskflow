@@ -16,6 +16,7 @@ macro(configure_libs)
       /D_WINDOWS
       /D_CRT_SECURE_NO_WARNINGS
       /D_XKEYCHECK_H
+      /DNOMINMAX
     )
   endif()
 

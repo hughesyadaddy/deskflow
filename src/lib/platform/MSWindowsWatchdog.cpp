@@ -604,7 +604,7 @@ MSWindowsWatchdog::ProcessState MSWindowsWatchdog::handleStartError(const std::s
 
   // Exponential backoff so a crash loop on one node does not hammer the mesh.
   if (m_startFailures > 1) {
-    const int delaySeconds = std::min(1 << (m_startFailures - 2), 30);
+    const int delaySeconds = (std::min)(1 << (m_startFailures - 2), 30);
     m_nextStartTime = Arch::time() + delaySeconds;
     LOG_WARN("start failed %d times, delaying start %ds", m_startFailures, delaySeconds);
     LOG_DEBUG("start delay, seconds=%d, time=%f", delaySeconds, m_nextStartTime.value());
