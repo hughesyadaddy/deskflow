@@ -47,11 +47,26 @@ function Invoke-Native {
 }
 
 function Sync-DeskflowRepo {
-  Write-Host "== [$hostName] deskflow pull ($Branch) =="
   Set-Location $DeskflowRoot
-  Invoke-Git fetch origin
-  Invoke-Git checkout $Branch
-  Invoke-Git pull --ff-only origin $Branch
+  if ($env:FLEET_SKIP_GIT_PULL -eq '1') {
+    # The controller already synced this checkout (branch, --ref or --rollback).
+    Write-Host "== [$hostName] deskflow sync skipped (FLEET_SKIP_GIT_PULL=1) =="
+    Invoke-Git log -1 --oneline
+    return
+  }
+  $ref = $env:FLEET_DESKFLOW_REF
+  if ($ref -and $ref -ne 'HEAD') {
+    Write-Host "== [$hostName] deskflow checkout --detach $ref =="
+    Invoke-Git fetch origin
+    Invoke-Git checkout --detach $ref
+  } elseif (-not $ref) {
+    Write-Host "== [$hostName] deskflow pull ($Branch) =="
+    Invoke-Git fetch origin
+    Invoke-Git checkout $Branch
+    Invoke-Git pull --ff-only origin $Branch
+  } else {
+    Write-Host "== [$hostName] deskflow: building checked-out HEAD =="
+  }
   Invoke-Git log -1 --oneline
 }
 
@@ -66,10 +81,15 @@ function Deploy-Deskflow {
 }
 
 function Sync-MouserRepo {
-  Write-Host "== [$hostName] Mouser pull (fork/$MouserBranch) =="
   Set-Location $MouserRoot
   if (-not (Test-Path (Join-Path $MouserRoot '.git'))) {
     throw "Mouser at $MouserRoot is not a git clone; bootstrap it first (scripts\sync-desktop-repos-tiny11.ps1)."
+  }
+  if ($env:FLEET_SKIP_GIT_PULL -eq '1') {
+    # The controller already synced this checkout (branch, --ref or --rollback).
+    Write-Host "== [$hostName] Mouser sync skipped (FLEET_SKIP_GIT_PULL=1) =="
+    Invoke-Git log -1 --oneline
+    return
   }
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
@@ -82,9 +102,19 @@ function Sync-MouserRepo {
     Write-Host "adding Mouser remote 'fork' -> $MouserRemoteUrl"
     Invoke-Git remote add fork $MouserRemoteUrl
   }
-  Invoke-Git fetch fork
-  Invoke-Git checkout $MouserBranch
-  Invoke-Git pull --ff-only fork $MouserBranch
+  $ref = $env:FLEET_MOUSER_REF
+  if ($ref -and $ref -ne 'HEAD') {
+    Write-Host "== [$hostName] Mouser checkout --detach $ref =="
+    Invoke-Git fetch fork
+    Invoke-Git checkout --detach $ref
+  } elseif (-not $ref) {
+    Write-Host "== [$hostName] Mouser pull (fork/$MouserBranch) =="
+    Invoke-Git fetch fork
+    Invoke-Git checkout $MouserBranch
+    Invoke-Git pull --ff-only fork $MouserBranch
+  } else {
+    Write-Host "== [$hostName] Mouser: building checked-out HEAD =="
+  }
   Invoke-Git log -1 --oneline
 }
 

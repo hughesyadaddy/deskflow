@@ -84,4 +84,29 @@ else
   tail -30 "$b.log"
 fi
 
+# --- Case 4: a real identity makes MacCodesign.cmake sign each first-party
+# binary with an explicit, stable --identifier (tools/fleet-health.identifiers)
+# while the bundle call keeps its Info.plist CFBundleIdentifier.
+b="$base-ident"
+rc=$(run_configure "$b" -DFLEET_STRICT_SIGNING=ON -DAPPLE_CODESIGN_DEV=FAKEIDENT)
+if [[ "$rc" -eq 0 ]]; then
+  gen="$(cat "$b"/CMakeFiles/codesign-dev.dir/build.make 2>/dev/null || grep -h codesign "$b/build.ninja" 2>/dev/null)"
+  for ident in org.deskflow.deskflow-core org.deskflow.deskflow-vhid-bridge org.deskflow.deskflow; do
+    if grep -qE -- "--identifier ${ident} .*Contents/MacOS/" <<<"$gen" \
+       && grep -qF "$ident" "$REPO_ROOT/tools/fleet-health.identifiers"; then
+      pass "codesign-dev signs a Contents/MacOS binary with --identifier $ident (allowlisted)"
+    else
+      fail "codesign-dev lacks '--identifier $ident' on a Contents/MacOS binary, or it is not allowlisted"
+    fi
+  done
+  if grep -E -- "--sign FAKEIDENT [^ ]*Deskflow\.app\$" <<<"$gen" | grep -q -- "--identifier"; then
+    fail "bundle codesign call must not pass --identifier (Info.plist id wins)"
+  else
+    pass "bundle codesign call carries no --identifier"
+  fi
+else
+  fail "identity configure failed (exit $rc); see tail:"
+  tail -30 "$b.log"
+fi
+
 exit $fail

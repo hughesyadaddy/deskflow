@@ -84,6 +84,10 @@ def parse_env_file(path: Path) -> Dict[str, str]:
 
 
 def local_id() -> str:
+    """This seat's id: FLEET_LOCAL_ID, else the short hostname (same rule as fleet-deploy/-doctor)."""
+    override = os.environ.get("FLEET_LOCAL_ID", "").strip()
+    if override:
+        return override.lower()
     return socket.gethostname().split(".")[0].lower()
 
 
@@ -155,7 +159,10 @@ def subprocess_runner(host: Host, cmd: str) -> Tuple[int, str, str]:
             cmd,
         ]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+        # PowerShell over ssh emits OEM/UTF-16 fragments (e.g. byte 0x83) that
+        # are not valid UTF-8; decode leniently instead of raising.
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=600,
+                              encoding="utf-8", errors="replace")
     except FileNotFoundError as exc:
         return 127, "", str(exc)
     except subprocess.TimeoutExpired:
@@ -596,8 +603,10 @@ def main(argv: Optional[Sequence[str]] = None, runner: Runner = subprocess_runne
     ap.add_argument("--host", default="all", help="all | local | <id> (default: all)")
     ap.add_argument("--check", default="all", choices=ALL_CHECKS + ("all",))
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
-    ap.add_argument("--env", default=os.environ.get("FLEET_ENV", str(DEFAULT_ENV_FILE)),
-                    help="path to fleet.env")
+    # FLEET_ENV_FILE is the controller's (fleet-deploy.sh/.ps1, fleet-doctor) name
+    # for the same override; FLEET_ENV is kept for older callers.
+    ap.add_argument("--env", default=os.environ.get("FLEET_ENV_FILE") or os.environ.get("FLEET_ENV")
+                    or str(DEFAULT_ENV_FILE), help="path to fleet.env (default: $FLEET_ENV_FILE, else scripts/fleet.env)")
     args = ap.parse_args(argv)
 
     env_path = Path(args.env).expanduser()

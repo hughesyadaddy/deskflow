@@ -161,16 +161,57 @@ function Get-ShGitSync {
   if ($Ref -eq 'HEAD') { return "cd `"$p`"" }
   return "cd `"$p`" && git fetch origin && git checkout --detach `"$Ref`""
 }
+$script:MouserForkUrl = 'https://github.com/hughesyadaddy/Mouser.git'
 function Get-ShMouserSync {
-  param([string]$Path, [string]$Ref)
-  if (-not $Ref -or $Ref -eq 'HEAD') { return '' }
+  # The per-OS scripts always run with FLEET_SKIP_GIT_PULL=1, so the controller
+  # is the ONLY place Mouser is synced: empty ref = fast-forward MouserBranch
+  # from `fork` (remote added when missing), other refs detach, HEAD = nothing.
+  param([string]$Path, [string]$Ref, $Opt = $null)
+  if ($Ref -eq 'HEAD') { return '' }
+  if ($Opt -and $Opt.DeployMouser -ne 1) { return '' }
   $p = ConvertTo-ShPath $Path
-  return " && if [ -d `"$p/.git`" ]; then git -C `"$p`" fetch fork && git -C `"$p`" checkout --detach `"$Ref`"; fi"
+  $add = "git -C `"$p`" remote get-url fork >/dev/null 2>&1 || git -C `"$p`" remote add fork `"$script:MouserForkUrl`""
+  if (-not $Ref) {
+    $b = if ($Opt -and $Opt.MouserBranch) { $Opt.MouserBranch } elseif ($Opt) { $Opt.Branch } else { 'main' }
+    return " && if [ -d `"$p/.git`" ]; then $add && git -C `"$p`" fetch fork && git -C `"$p`" checkout `"$b`" && git -C `"$p`" pull --ff-only fork `"$b`"; fi"
+  }
+  return " && if [ -d `"$p/.git`" ]; then $add && git -C `"$p`" fetch fork && git -C `"$p`" checkout --detach `"$Ref`"; fi"
 }
 function Get-ShExports {
   param($Opt, [string]$DeskflowPath, [string]$MouserPath, [string]$DRef, [string]$MRef)
   $d = ConvertTo-ShPath $DeskflowPath; $m = ConvertTo-ShPath $MouserPath
-  return "export FLEET_BRANCH=`"$($Opt.Branch)`" FLEET_DEPLOY_DESKFLOW=`"$($Opt.DeployDeskflow)`" FLEET_DEPLOY_MOUSER=`"$($Opt.DeployMouser)`" FLEET_RECONFIGURE=`"$($Opt.Reconfigure)`" FLEET_DESKFLOW_ROOT=`"$d`" FLEET_MOUSER_ROOT=`"$m`" FLEET_SKIP_GIT_PULL=1 FLEET_DESKFLOW_REF=`"$DRef`" FLEET_MOUSER_REF=`"$MRef`""
+  $mb = if ($Opt.MouserBranch) { $Opt.MouserBranch } else { $Opt.Branch }
+  return "export FLEET_BRANCH=`"$($Opt.Branch)`" FLEET_MOUSER_BRANCH=`"$mb`" FLEET_DEPLOY_DESKFLOW=`"$($Opt.DeployDeskflow)`" FLEET_DEPLOY_MOUSER=`"$($Opt.DeployMouser)`" FLEET_RECONFIGURE=`"$($Opt.Reconfigure)`" FLEET_DESKFLOW_ROOT=`"$d`" FLEET_MOUSER_ROOT=`"$m`" FLEET_SKIP_GIT_PULL=1 FLEET_DESKFLOW_REF=`"$DRef`" FLEET_MOUSER_REF=`"$MRef`""
+}
+function Get-PsMouserSync {
+  # PowerShell fragment for a Windows seat (remote via powershell.exe -Command).
+  param([string]$Path, [string]$Ref, $Opt)
+  if ($Ref -eq 'HEAD' -or $Opt.DeployMouser -ne 1) { return '' }
+  $g = "git -C '$Path'"
+  $chk = 'if ($LASTEXITCODE) { exit $LASTEXITCODE }'
+  $s = "if (Test-Path '$Path/.git') { $g remote get-url fork; if (`$LASTEXITCODE) { $g remote add fork '$script:MouserForkUrl'; $chk }; $g fetch fork; $chk; "
+  if (-not $Ref) {
+    $b = if ($Opt.MouserBranch) { $Opt.MouserBranch } else { $Opt.Branch }
+    return $s + "$g checkout '$b'; $chk; $g pull --ff-only fork '$b'; $chk }; "
+  }
+  return $s + "$g checkout --detach '$Ref'; $chk }; "
+}
+function Get-MouserSteps {
+  # [exe, args...] steps for THIS Windows seat's Mouser checkout (run via Invoke-Native).
+  param([string]$Path, [string]$Ref, $Opt)
+  $steps = @()
+  if ($Ref -eq 'HEAD' -or $Opt.DeployMouser -ne 1) { return $steps }
+  if (-not (Test-Path (Join-Path $Path '.git'))) { return $steps }
+  $r = Invoke-Native 'git' @('remote', 'get-url', 'fork') $Path
+  if ($r.Code -ne 0) { $steps += , @('git', 'remote', 'add', 'fork', $script:MouserForkUrl) }
+  $steps += , @('git', 'fetch', 'fork')
+  if (-not $Ref) {
+    $b = if ($Opt.MouserBranch) { $Opt.MouserBranch } else { $Opt.Branch }
+    $steps += , @('git', 'checkout', $b); $steps += , @('git', 'pull', '--ff-only', 'fork', $b)
+  } else {
+    $steps += , @('git', 'checkout', '--detach', $Ref)
+  }
+  return $steps
 }
 function Get-CmdGitSync {
   # cmd.exe fragment for Windows seats (local via cmd, remote via ssh's default shell).
@@ -182,7 +223,7 @@ function Get-CmdGitSync {
 function Get-MacRemoteCommand {
   param($Opt, $Entry, [string]$DRef, [string]$MRef)
   $prelude = 'set -euo pipefail; if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"; elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; else export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"; fi; '
-  $sync = (Get-ShGitSync $Entry.deskflowPath $DRef $Opt.Branch) + (Get-ShMouserSync $Entry.mouserPath $MRef)
+  $sync = (Get-ShGitSync $Entry.deskflowPath $DRef $Opt.Branch) + (Get-ShMouserSync $Entry.mouserPath $MRef $Opt)
   if ($Opt.PullOnly) { return "$prelude$sync && git log -1 --oneline" }
   return "$prelude$(Get-ShExports $Opt $Entry.deskflowPath $Entry.mouserPath $DRef $MRef); $sync && bash scripts/fleet-deploy-macos.sh"
 }
@@ -190,10 +231,12 @@ function Get-WinRemoteCommand {
   param($Opt, $Entry, [string]$DRef, [string]$MRef)
   $d = $Entry.deskflowPath; $m = $Entry.mouserPath
   if ($Opt.PullOnly) { return "cd /d `"$d`" && $(Get-CmdGitSync $DRef $Opt.Branch)git log -1 --oneline" }
-  $ps = "`$ErrorActionPreference='Stop'; `$env:FLEET_BRANCH='$($Opt.Branch)'; `$env:FLEET_DEPLOY_DESKFLOW='$($Opt.DeployDeskflow)'; `$env:FLEET_DEPLOY_MOUSER='$($Opt.DeployMouser)'; " +
+  $mb = if ($Opt.MouserBranch) { $Opt.MouserBranch } else { $Opt.Branch }
+  $ps = "`$ErrorActionPreference='Stop'; `$env:FLEET_BRANCH='$($Opt.Branch)'; `$env:FLEET_MOUSER_BRANCH='$mb'; `$env:FLEET_DEPLOY_DESKFLOW='$($Opt.DeployDeskflow)'; `$env:FLEET_DEPLOY_MOUSER='$($Opt.DeployMouser)'; " +
         "`$env:FLEET_DESKFLOW_ROOT='$d'; `$env:FLEET_MOUSER_ROOT='$m'; `$env:FLEET_SKIP_GIT_PULL='1'; `$env:FLEET_DESKFLOW_REF='$DRef'; `$env:FLEET_MOUSER_REF='$MRef'; Set-Location '$d'; "
   if (-not $DRef) { $ps += "git fetch origin; if (`$LASTEXITCODE) { exit `$LASTEXITCODE }; git checkout '$($Opt.Branch)'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE }; git pull --ff-only origin '$($Opt.Branch)'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE }; " }
   elseif ($DRef -ne 'HEAD') { $ps += "git fetch origin; if (`$LASTEXITCODE) { exit `$LASTEXITCODE }; git checkout --detach '$DRef'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE }; " }
+  $ps += Get-PsMouserSync $m $MRef $Opt
   $ps += "& '$d/scripts/fleet-deploy-windows.ps1'; exit `$LASTEXITCODE"
   return "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"$ps`""
 }
@@ -213,11 +256,27 @@ function Get-LocalWinSteps {
 function Invoke-LocalWinDeploy {
   param($Opt, $Entry, [string]$DRef, [string]$MRef)
   $saved = @{}
-  $vars = @{ FLEET_BRANCH = $Opt.Branch; FLEET_DEPLOY_DESKFLOW = "$($Opt.DeployDeskflow)"; FLEET_DEPLOY_MOUSER = "$($Opt.DeployMouser)"; FLEET_RECONFIGURE = "$($Opt.Reconfigure)"
+  $mb = if ($Opt.MouserBranch) { $Opt.MouserBranch } else { $Opt.Branch }
+  $vars = @{ FLEET_BRANCH = $Opt.Branch; FLEET_MOUSER_BRANCH = $mb; FLEET_DEPLOY_DESKFLOW = "$($Opt.DeployDeskflow)"; FLEET_DEPLOY_MOUSER = "$($Opt.DeployMouser)"; FLEET_RECONFIGURE = "$($Opt.Reconfigure)"
               FLEET_DESKFLOW_ROOT = $Entry.deskflowPath; FLEET_MOUSER_ROOT = $Entry.mouserPath; FLEET_SKIP_GIT_PULL = '1'; FLEET_DESKFLOW_REF = $DRef; FLEET_MOUSER_REF = $MRef }
   foreach ($k in $vars.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $vars[$k]) }
   try {
-    foreach ($step in Get-LocalWinSteps $Opt $Entry $DRef $MRef) {
+    # Deskflow sync first (in the deskflow root), then Mouser (in its own
+    # checkout), then the per-OS script; PullOnly stops after the syncs.
+    $deskflowSteps = @(Get-LocalWinSteps $Opt $Entry $DRef $MRef)
+    $runScript = @($deskflowSteps | Where-Object { $_[0] -eq 'powershell.exe' })
+    $syncSteps = @($deskflowSteps | Where-Object { $_[0] -ne 'powershell.exe' })
+    foreach ($step in $syncSteps) {
+      $r = Invoke-Native $step[0] @($step | Select-Object -Skip 1) $Entry.deskflowPath
+      Write-Host $r.Output
+      if ($r.Code -ne 0) { return $r.Code }
+    }
+    foreach ($step in Get-MouserSteps $Entry.mouserPath $MRef $Opt) {
+      $r = Invoke-Native $step[0] @($step | Select-Object -Skip 1) $Entry.mouserPath
+      Write-Host $r.Output
+      if ($r.Code -ne 0) { return $r.Code }
+    }
+    foreach ($step in $runScript) {
       $r = Invoke-Native $step[0] @($step | Select-Object -Skip 1) $Entry.deskflowPath
       Write-Host $r.Output
       if ($r.Code -ne 0) { return $r.Code }
@@ -241,13 +300,66 @@ function Get-HeadCommit {
   if ($lines.Count -eq 0) { return 'unknown' }
   return $lines[-1].Trim()
 }
+$script:HealthEnvFile = ''
+function Get-FleetPython {
+  # tools\fleet-health is a python3 script (no .py suffix); tools\fleet-health.ps1
+  # is only the per-seat collector it calls on Windows. Prefer `python`, then `py -3`.
+  foreach ($c in 'python', 'python3') { if (Get-Command $c -ErrorAction SilentlyContinue) { return @($c) } }
+  if (Get-Command 'py' -ErrorAction SilentlyContinue) { return @('py', '-3') }
+  return $null
+}
 function Invoke-FleetHealth {
-  # Returns the exit code of tools\fleet-health.ps1, or -1 when it is not installed. Output lands in $script:HealthJson.
+  # Runs the fleet checker `python tools/fleet-health <args> --env <fleet.env>`.
+  # Returns its exit code, or -1 when the tool (or python) is not installed.
+  # stdout (JSON with --json) lands in $script:HealthJson.
   param([string[]]$HealthArgs)
-  $ps1 = Join-Path $script:FleetRoot 'tools\fleet-health.ps1'
-  if (-not (Test-Path $ps1)) { return -1 }
-  $script:HealthJson = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ps1 @HealthArgs 2>&1 | Out-String)
+  $tool = Join-Path $script:FleetRoot 'tools\fleet-health'
+  if (-not (Test-Path $tool)) { return -1 }
+  $py = Get-FleetPython
+  if (-not $py) { Write-Warning 'python not found: cannot run tools/fleet-health'; return -1 }
+  $argv = @($py | Select-Object -Skip 1) + @($tool) + $HealthArgs
+  if ($script:HealthEnvFile -and ($HealthArgs -notcontains '--env')) { $argv += @('--env', $script:HealthEnvFile) }
+  # stderr is left on the console on purpose: redirecting it under
+  # $ErrorActionPreference='Stop' turns python warnings into terminating errors.
+  $script:HealthJson = (& $py[0] @argv | Out-String)
   return $LASTEXITCODE
+}
+function ConvertFrom-FleetHealthJson {
+  # Folds fleet-health's real shape {ok, results:[{host,check,status,detail}]}
+  # into per-host {signedBy,tcc,mesh,ok}: signedBy = detail of `sign` (Windows:
+  # `authenticode`; SKIP rows ignored), tcc/mesh = status of those checks (any
+  # FAIL mesh leg fails mesh), ok = no FAIL for the host. The legacy
+  # {hosts:[{id,signedBy,tcc,mesh,ok}]} shape is passed through.
+  param([string]$Json)
+  $hj = $null
+  try { $hj = $Json | ConvertFrom-Json } catch { return @{} }
+  if ($null -eq $hj) { return @{} }
+  $byHost = @{}
+  if ($hj.PSObject.Properties['results']) {
+    foreach ($r in @($hj.results)) {
+      $h = [string]$r.host
+      if (-not $byHost.ContainsKey($h)) { $byHost[$h] = @{ signedBy = '-'; tcc = '-'; mesh = '-'; ok = $true } }
+      $st = [string]$r.status
+      switch ([string]$r.check) {
+        { $_ -in 'sign', 'authenticode' } { if ($byHost[$h].signedBy -eq '-' -and $st -ne 'SKIP') { $byHost[$h].signedBy = [string]$r.detail } }
+        'tcc' { if ($byHost[$h].tcc -eq '-') { $byHost[$h].tcc = $st } }
+        'mesh' { if ($byHost[$h].mesh -eq '-' -or $st -eq 'FAIL') { $byHost[$h].mesh = $st } }
+      }
+      if ($st -eq 'FAIL') { $byHost[$h].ok = $false }
+    }
+    return $byHost
+  }
+  $entries = @()
+  if ($hj.PSObject.Properties['hosts']) { $entries = @($hj.hosts) }
+  else { foreach ($p in $hj.PSObject.Properties) { $e = $p.Value; if ($e -is [psobject]) { $e | Add-Member -NotePropertyName id -NotePropertyValue $p.Name -Force; $entries += $e } } }
+  foreach ($e in $entries) {
+    $h = if ($e.PSObject.Properties['id']) { [string]$e.id } elseif ($e.PSObject.Properties['host']) { [string]$e.host } else { continue }
+    $row = @{ signedBy = '-'; tcc = '-'; mesh = '-' }
+    foreach ($k in 'signedBy', 'tcc', 'mesh') { if ($e.PSObject.Properties[$k]) { $row[$k] = [string]$e.$k } }
+    if ($e.PSObject.Properties['ok']) { $row.ok = [bool]$e.ok }
+    $byHost[$h] = $row
+  }
+  return $byHost
 }
 function Invoke-HostDeploy {
   param($Opt, $Entry, [string]$DRef, [string]$MRef)
@@ -321,7 +433,9 @@ function Invoke-FleetDeploy {
   $stateDir = Join-Path $root 'tools\state'
   $lastGood = Join-Path $stateDir 'last-good.json'
   $map = Read-FleetEnv $envFile
+  $script:HealthEnvFile = $envFile
   $opt.Branch = $map['FLEET_BRANCH']
+  $opt.MouserBranch = Get-EnvValue $map 'FLEET_MOUSER_BRANCH' $opt.Branch
   if ($null -eq $opt.DeployDeskflow) { $opt.DeployDeskflow = [int](Get-EnvValue $map 'FLEET_DEPLOY_DESKFLOW' 1) }
   if ($null -eq $opt.DeployMouser) { $opt.DeployMouser = [int](Get-EnvValue $map 'FLEET_DEPLOY_MOUSER' 1) }
   if ($null -eq $opt.Reconfigure) { $opt.Reconfigure = [int](Get-EnvValue $map 'FLEET_RECONFIGURE' 0) }
@@ -376,20 +490,15 @@ function Invoke-FleetDeploy {
 
     if ($opt.SelfTest) {
       $hc = Invoke-FleetHealth @('--check', 'all', '--host', 'all', '--json')
-      if ($hc -eq -1) { Write-Warning 'tools\fleet-health.ps1 not found - self-test cannot verify health'; $allOk = $false }
+      if ($hc -eq -1) { Write-Warning 'tools\fleet-health (python) not runnable - self-test cannot verify health'; $allOk = $false }
       else {
         if ($hc -ne 0) { $allOk = $false; Write-Warning 'fleet-health --check all reported failures' }
-        $hj = $null
-        try { $hj = $script:HealthJson | ConvertFrom-Json } catch { $hj = $null }
-        if ($hj) {
-          foreach ($row in $rows) {
-            $h = $null
-            if ($hj.PSObject.Properties['hosts']) { $h = $hj.hosts | Where-Object { ($_.id -eq $row.id) -or ($_.PSObject.Properties['host'] -and $_.host -eq $row.id) } | Select-Object -First 1 }
-            elseif ($hj.PSObject.Properties[$row.id]) { $h = $hj.($row.id) }
-            if ($null -eq $h) { continue }
-            foreach ($k in 'signedBy', 'tcc', 'mesh') { if ($h.PSObject.Properties[$k]) { $row[$k] = [string]$h.$k } }
-            if ($h.PSObject.Properties['ok'] -and -not $h.ok) { $allOk = $false; if ($row.result -eq 'ok') { $row.result = 'unhealthy' } }
-          }
+        $byHost = ConvertFrom-FleetHealthJson $script:HealthJson
+        foreach ($row in $rows) {
+          if (-not $byHost.ContainsKey($row.id)) { continue }
+          $h = $byHost[$row.id]
+          foreach ($k in 'signedBy', 'tcc', 'mesh') { $row[$k] = [string]$h[$k] }
+          if ($h.ContainsKey('ok') -and -not $h.ok) { $allOk = $false; if ($row.result -eq 'ok') { $row.result = 'unhealthy' } }
         }
       }
     }

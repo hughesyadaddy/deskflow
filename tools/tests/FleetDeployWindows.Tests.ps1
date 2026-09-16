@@ -85,6 +85,62 @@ Describe 'fleet-deploy-windows.ps1 structure' {
     $sync | Should -Not -Match '\|\| true'
   }
 
+  # NOTE: pwsh is absent on the authoring seat; these cases are written but unrun there.
+  It 'skips both syncs when FLEET_SKIP_GIT_PULL=1 (the controller already checked out --ref/--rollback)' {
+    foreach ($fn in 'Sync-DeskflowRepo', 'Sync-MouserRepo') {
+      $body = $script:Functions[$fn].Extent.Text
+      # The guard must come before any fetch/checkout/pull in the function body.
+      $guard = $body.IndexOf("`$env:FLEET_SKIP_GIT_PULL -eq '1'")
+      $guard | Should -BeGreaterThan 0
+      $guard | Should -BeLessThan $body.IndexOf('Invoke-Git fetch')
+      $guard | Should -BeLessThan $body.IndexOf('Invoke-Git checkout')
+      $body.Substring($guard, $body.IndexOf('Invoke-Git fetch') - $guard) | Should -Match 'return'
+    }
+  }
+
+  It 'detaches at FLEET_DESKFLOW_REF / FLEET_MOUSER_REF instead of re-checking out $Branch' {
+    $d = $script:Functions['Sync-DeskflowRepo'].Extent.Text
+    $d | Should -Match '\$env:FLEET_DESKFLOW_REF'
+    $d | Should -Match 'Invoke-Git checkout --detach \$ref'
+    $d | Should -Match "-ne 'HEAD'"
+    $m = $script:Functions['Sync-MouserRepo'].Extent.Text
+    $m | Should -Match '\$env:FLEET_MOUSER_REF'
+    $m | Should -Match 'Invoke-Git checkout --detach \$ref'
+    $m | Should -Match "-ne 'HEAD'"
+  }
+
+  It 'Sync-DeskflowRepo / Sync-MouserRepo honour the env contract with a fake git (lifted from the AST)' {
+    $calls = [System.Collections.ArrayList]::new()
+    function global:git { [void]$calls.Add(($args -join ' ')); $global:LASTEXITCODE = 0 }
+    try {
+      $hostName = 'TESTBOX'; $Branch = 'main'; $MouserBranch = 'main'; $MouserRemoteUrl = 'https://example/fork.git'
+      $DeskflowRoot = Join-Path $TestDrive 'deskflow'; $MouserRoot = Join-Path $TestDrive 'Mouser'
+      New-Item -ItemType Directory -Path (Join-Path $MouserRoot '.git') -Force | Out-Null
+      New-Item -ItemType Directory -Path $DeskflowRoot -Force | Out-Null
+      Invoke-Expression $script:Functions['Sync-DeskflowRepo'].Extent.Text
+      Invoke-Expression $script:Functions['Sync-MouserRepo'].Extent.Text
+
+      $env:FLEET_SKIP_GIT_PULL = '1'; $env:FLEET_DESKFLOW_REF = 'v9'; $env:FLEET_MOUSER_REF = 'v9'
+      $calls.Clear(); Sync-DeskflowRepo; Sync-MouserRepo
+      @($calls | Where-Object { $_ -match '^(fetch|checkout|pull)' }).Count | Should -Be 0
+
+      $env:FLEET_SKIP_GIT_PULL = '0'; $env:FLEET_DESKFLOW_REF = 'abc123'; $env:FLEET_MOUSER_REF = 'def456'
+      $calls.Clear(); Sync-DeskflowRepo; Sync-MouserRepo
+      $calls | Should -Contain 'checkout --detach abc123'
+      $calls | Should -Contain 'checkout --detach def456'
+      @($calls | Where-Object { $_ -like 'pull*' }).Count | Should -Be 0
+
+      $env:FLEET_DESKFLOW_REF = ''; $env:FLEET_MOUSER_REF = ''
+      $calls.Clear(); Sync-DeskflowRepo; Sync-MouserRepo
+      $calls | Should -Contain 'checkout main'
+      $calls | Should -Contain 'pull --ff-only origin main'
+      $calls | Should -Contain 'pull --ff-only fork main'
+    } finally {
+      Remove-Item Function:\global:git -ErrorAction SilentlyContinue
+      foreach ($k in 'FLEET_SKIP_GIT_PULL', 'FLEET_DESKFLOW_REF', 'FLEET_MOUSER_REF') { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
+    }
+  }
+
   It 'checks $LASTEXITCODE after the Deskflow build/install' {
     $script:Functions['Deploy-Deskflow'].Extent.Text | Should -Match 'build-windows\.ps1[^\n]*-Install[\s\S]*if \(\$LASTEXITCODE -ne 0\)[^\n]*throw'
   }

@@ -31,6 +31,13 @@ endif()
 
 function(configure_mac_codesign target)
   set_property(GLOBAL APPEND PROPERTY _MAC_CODESIGN_DEPENDS $<TARGET_FILE:${target}>)
+  # Stable code identifier per target. Without --identifier codesign derives
+  # one from the file name (plus an LC_UUID-style suffix for bare Mach-Os,
+  # e.g. deskflow-core-5555), which changes per build and breaks both TCC
+  # grants and `tools/fleet-health --check identifiers`. Keep in sync with
+  # tools/fleet-health.identifiers.
+  string(TOLOWER "${target}" _mac_codesign_id_tail)
+  set_property(GLOBAL APPEND PROPERTY _MAC_CODESIGN_IDENTIFIERS "org.deskflow.${_mac_codesign_id_tail}")
 
   get_property(deferred GLOBAL PROPERTY _MAC_CODESIGN_DEFERRED)
 
@@ -43,19 +50,26 @@ endfunction()
 
 function(_finalize_mac_codesign)
   get_property(depends GLOBAL PROPERTY _MAC_CODESIGN_DEPENDS)
+  get_property(identifiers GLOBAL PROPERTY _MAC_CODESIGN_IDENTIFIERS)
 
   set(stamp_file "${CMAKE_BINARY_DIR}/CMakeFiles/codesign-dev.stamp")
 
   # Use a stamp file because codesign modifies the binaries it signs.
   # Nested executables are signed before the bundle: the x86_64 linker
   # does not ad-hoc sign its output (unlike arm64), and signing a bundle
-  # fails on unsigned subcomponents.
+  # fails on unsigned subcomponents. Each nested binary gets its explicit
+  # org.deskflow.<target> identifier; the bundle itself keeps the
+  # CFBundleIdentifier from its Info.plist (no --identifier on that call).
   set(_codesign_cmds)
+  set(_i 0)
   foreach(_bin IN LISTS depends)
+    list(GET identifiers ${_i} _ident)
+    math(EXPR _i "${_i} + 1")
     list(APPEND _codesign_cmds
       COMMAND /usr/bin/codesign
               --force
               --options runtime
+              --identifier "${_ident}"
               --entitlements "${CMAKE_SOURCE_DIR}/src/apps/res/entitlements-dev.plist"
               --sign "${APPLE_CODESIGN_DEV}"
               "${_bin}"

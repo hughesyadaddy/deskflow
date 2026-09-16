@@ -201,9 +201,113 @@ Describe 'self-test' {
     @($script:NativeLog | Where-Object { $_.Args -like 'pull*' }).Count | Should -Be 0
   }
 
-  It 'cannot pass without tools/fleet-health.ps1' {
+  It 'cannot pass without tools/fleet-health (python)' {
     $rc = Invoke-FleetDeploy @('--self-test') | Select-Object -Last 1
     $rc | Should -Be 1
+  }
+
+  # NOTE: pwsh is absent on the authoring seat; these cases are written but unrun there.
+  It 'folds the real fleet-health shape {ok,results:[{host,check,status,detail}]} per host' {
+    $real = @'
+{"ok": false, "results": [
+ {"host":"hackintosh","check":"sign","status":"PASS","detail":"12 Mach-Os signed by Apple Development* team ABCDE12345"},
+ {"host":"hackintosh","check":"tcc","status":"PASS","detail":"4 rows cert-based"},
+ {"host":"hackintosh","check":"mesh","status":"PASS","detail":"hackintosh -> macbookpro ok"},
+ {"host":"hackintosh","check":"mesh","status":"FAIL","detail":"hackintosh -> tiny11 rc=1"},
+ {"host":"macbookpro","check":"sign","status":"PASS","detail":"12 Mach-Os signed"},
+ {"host":"macbookpro","check":"tcc","status":"FAIL","detail":"kTCCServiceAccessibility: no deskflow client with auth_value=2"},
+ {"host":"macbookpro","check":"mesh","status":"PASS","detail":"macbookpro -> hackintosh ok"},
+ {"host":"tiny11","check":"sign","status":"SKIP","detail":"macOS-only check"},
+ {"host":"tiny11","check":"tcc","status":"SKIP","detail":"macOS-only check"},
+ {"host":"tiny11","check":"authenticode","status":"PASS","detail":"3 files signed by thumbprint 0123"},
+ {"host":"tiny11","check":"mesh","status":"PASS","detail":"tiny11 -> hackintosh ok"}
+]}
+'@
+    $by = ConvertFrom-FleetHealthJson $real
+    $by['hackintosh'].signedBy | Should -Be '12 Mach-Os signed by Apple Development* team ABCDE12345'
+    $by['hackintosh'].tcc | Should -Be 'PASS'
+    $by['hackintosh'].mesh | Should -Be 'FAIL'      # one failing leg fails mesh
+    $by['hackintosh'].ok | Should -BeFalse
+    $by['macbookpro'].tcc | Should -Be 'FAIL'
+    $by['macbookpro'].ok | Should -BeFalse
+    $by['tiny11'].signedBy | Should -Be '3 files signed by thumbprint 0123'   # sign is SKIP on Windows
+    $by['tiny11'].tcc | Should -Be 'SKIP'
+    $by['tiny11'].ok | Should -BeTrue
+
+    Mock Invoke-FleetHealth { if ($HealthArgs -contains '--check') { $script:HealthJson = $real; return 1 }; return 0 }
+    $rc = Invoke-FleetDeploy @('--self-test', '--json', (Join-Path $TestDrive 'st2.json')) | Select-Object -Last 1
+    $rc | Should -Be 1
+    $r = Get-Content (Join-Path $TestDrive 'st2.json') -Raw | ConvertFrom-Json
+    $r.ok | Should -BeFalse
+    ($r.hosts | Where-Object { $_.id -eq 'hackintosh' -and $_.app -eq 'deskflow' }).mesh | Should -Be 'FAIL'
+    @($r.hosts | Where-Object id -eq 'macbookpro' | ForEach-Object { $_.result } | Sort-Object -Unique) | Should -Be @('unhealthy')
+    @($r.hosts | Where-Object id -eq 'tiny11' | ForEach-Object { $_.result } | Sort-Object -Unique) | Should -Be @('ok')
+  }
+
+  It 'runs python tools/fleet-health (not the fleet-health.ps1 collector) with --env <fleet.env>' {
+    # The seam itself is mocked elsewhere; assert on its definition: the fleet
+    # checker is the python script, invoked through Get-FleetPython, and the
+    # controller's fleet.env is forwarded as --env.
+    $def = (Get-Command Invoke-FleetHealth).Definition
+    $def | Should -Match "Join-Path \`$script:FleetRoot 'tools\\fleet-health'"
+    $def | Should -Not -Match 'fleet-health\.ps1'
+    $def | Should -Match 'Get-FleetPython'
+    $def | Should -Match "'--env', \`$script:HealthEnvFile"
+    $rc = Invoke-FleetDeploy @('--dry-run') | Select-Object -Last 1
+    $script:HealthEnvFile | Should -Be (Join-Path $script:Repo 'scripts\fleet.env')
+  }
+}
+
+Describe 'Mouser sync (the per-OS scripts run with FLEET_SKIP_GIT_PULL=1)' {
+  It 'fast-forwards Mouser from fork on remote Macs on a normal branch deploy, before the per-OS script' {
+    $rc = Invoke-FleetDeploy @('--host', 'hackintosh') | Select-Object -Last 1
+    $rc | Should -Be 0
+    $cmd = ($script:SshLog | Where-Object { $_.Command -notlike '*rev-parse*' } | Select-Object -First 1).Command
+    $cmd | Should -Match 'FLEET_SKIP_GIT_PULL=1'
+    $cmd | Should -Match 'FLEET_MOUSER_BRANCH="main"'
+    $cmd | Should -Match 'remote get-url fork >/dev/null 2>&1 \|\| git -C "\$HOME/Desktop/Mouser" remote add fork "https://github.com/hughesyadaddy/Mouser.git"'
+    $cmd | Should -Match 'git -C "\$HOME/Desktop/Mouser" fetch fork && git -C "\$HOME/Desktop/Mouser" checkout "main" && git -C "\$HOME/Desktop/Mouser" pull --ff-only fork "main"'
+    $cmd.IndexOf('pull --ff-only fork "main"') | Should -BeLessThan $cmd.IndexOf('bash scripts/fleet-deploy-macos.sh')
+  }
+
+  It 'syncs Mouser inside the powershell command for remote Windows seats' {
+    $opt = ConvertTo-FleetOptions @(); $opt.Branch = 'main'; $opt.MouserBranch = 'main'; $opt.DeployDeskflow = 1; $opt.DeployMouser = 1; $opt.Reconfigure = 0
+    $e = [pscustomobject]@{ id = 'winbox'; os = 'windows'; target = 'alexh@winbox'; deskflowPath = 'C:/d'; mouserPath = 'C:/m' }
+    $cmd = Get-WinRemoteCommand $opt $e '' ''
+    $cmd | Should -Match "\`$env:FLEET_MOUSER_BRANCH='main'"
+    $cmd | Should -Match "if \(Test-Path 'C:/m/.git'\) \{ git -C 'C:/m' remote get-url fork; if \(\`$LASTEXITCODE\) \{ git -C 'C:/m' remote add fork 'https://github.com/hughesyadaddy/Mouser.git'"
+    $cmd | Should -Match "git -C 'C:/m' fetch fork; if \(\`$LASTEXITCODE\) \{ exit \`$LASTEXITCODE \}; git -C 'C:/m' checkout 'main'; if \(\`$LASTEXITCODE\) \{ exit \`$LASTEXITCODE \}; git -C 'C:/m' pull --ff-only fork 'main'"
+    $cmd.IndexOf("pull --ff-only fork 'main'") | Should -BeLessThan $cmd.IndexOf('fleet-deploy-windows.ps1')
+    (Get-WinRemoteCommand $opt $e 'HEAD' 'HEAD') | Should -Not -Match 'fetch fork'
+    (Get-WinRemoteCommand $opt $e 'v1' 'v1') | Should -Match "git -C 'C:/m' checkout --detach 'v1'"
+    $opt.DeployMouser = 0
+    (Get-WinRemoteCommand $opt $e '' '') | Should -Not -Match 'fetch fork'
+  }
+
+  It 'honours FLEET_MOUSER_BRANCH and detaches Mouser for --ref X' {
+    $opt = ConvertTo-FleetOptions @(); $opt.Branch = 'main'; $opt.MouserBranch = 'mouser-dev'; $opt.DeployDeskflow = 1; $opt.DeployMouser = 1; $opt.Reconfigure = 0
+    (Get-ShMouserSync '~/Desktop/Mouser' '' $opt) | Should -Match 'checkout "mouser-dev" && git -C "\$HOME/Desktop/Mouser" pull --ff-only fork "mouser-dev"'
+    (Get-ShMouserSync '~/Desktop/Mouser' 'v1.2.3' $opt) | Should -Match 'fetch fork && git -C "\$HOME/Desktop/Mouser" checkout --detach "v1.2.3"'
+    (Get-ShMouserSync '~/Desktop/Mouser' 'v1.2.3' $opt) | Should -Not -Match 'pull --ff-only'
+    (Get-ShMouserSync '~/Desktop/Mouser' 'HEAD' $opt) | Should -Be ''
+    (Get-ShExports $opt '~/d' '~/m' '' '') | Should -Match 'FLEET_MOUSER_BRANCH="mouser-dev"'
+  }
+
+  It 'syncs the local Windows seat''s Mouser checkout via git -C steps' {
+    $m = Join-Path $TestDrive 'Mouser'
+    New-Item -ItemType Directory -Path (Join-Path $m '.git') -Force | Out-Null
+    $opt = ConvertTo-FleetOptions @(); $opt.Branch = 'main'; $opt.MouserBranch = 'main'; $opt.DeployDeskflow = 1; $opt.DeployMouser = 1; $opt.Reconfigure = 0
+    Mock Invoke-Native {
+      $script:NativeLog += [pscustomobject]@{ Exe = $Exe; Args = ($ArgList -join ' '); Dir = $WorkingDirectory }
+      if (($ArgList -join ' ') -eq 'remote get-url fork') { return @{ Code = 2; Output = '' } }
+      return @{ Code = 0; Output = '' }
+    }
+    $steps = @(Get-MouserSteps $m '' $opt)
+    @($steps | ForEach-Object { $_ -join ' ' }) | Should -Be @(
+      'git remote add fork https://github.com/hughesyadaddy/Mouser.git', 'git fetch fork', 'git checkout main', 'git pull --ff-only fork main')
+    @(Get-MouserSteps $m 'v1' $opt | ForEach-Object { $_ -join ' ' }) | Should -Contain 'git checkout --detach v1'
+    @(Get-MouserSteps $m 'HEAD' $opt).Count | Should -Be 0
+    @(Get-MouserSteps (Join-Path $TestDrive 'nope') '' $opt).Count | Should -Be 0
   }
 }
 
