@@ -161,7 +161,8 @@ void TCPSocket::write(const void *buffer, uint32_t n)
     // single write cannot be skipped; drop the queue, shut the output side
     // and tell the owner, which treats it as a write failure / disconnect.
     const uint64_t queued = static_cast<uint64_t>(m_outputBuffer.getSize()) + n;
-    if (queued > m_maxOutputBufferSize) {
+    const bool stalled = (std::chrono::steady_clock::now() - m_lastProgress) > kOutputStallTimeout;
+    if (queued > m_maxOutputBufferSize && stalled) {
       LOG_WARN(
           "socket %08X output buffer full (%llu > %u bytes), dropping queued output", m_socket,
           static_cast<unsigned long long>(queued), m_maxOutputBufferSize
@@ -407,7 +408,7 @@ TCPSocket::JobResult TCPSocket::doWrite()
   // use it as-is (no copy); otherwise consolidate up to one pass worth.
   bufferSize = std::min(m_outputBuffer.getSize(), kMaxWritePassSize);
   if (const uint32_t contiguous = m_outputBuffer.getContiguousSize();
-      contiguous >= StreamBuffer::chunkSize() && contiguous < bufferSize) {
+      contiguous >= kMaxWritePassSize / 2 && contiguous < bufferSize) {
     bufferSize = contiguous;
   }
   const void *buffer = m_outputBuffer.peek(bufferSize);
@@ -489,6 +490,7 @@ void TCPSocket::sendEvent(EventTypes type)
 void TCPSocket::discardWrittenData(int bytesWrote)
 {
   m_outputBuffer.pop(bytesWrote);
+  m_lastProgress = std::chrono::steady_clock::now();
   if (m_outputBuffer.getSize() == 0) {
     sendEvent(EventTypes::StreamOutputFlushed);
     m_flushed = true;
@@ -499,6 +501,7 @@ void TCPSocket::discardWrittenData(int bytesWrote)
 void TCPSocket::onConnected()
 {
   m_connected = true;
+  m_lastProgress = std::chrono::steady_clock::now();
   m_readable = true;
   m_writable = true;
 }

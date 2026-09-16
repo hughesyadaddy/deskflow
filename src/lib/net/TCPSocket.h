@@ -15,6 +15,7 @@
 #include "net/IDataSocket.h"
 
 #include <atomic>
+#include <chrono>
 
 class Mutex;
 class Thread;
@@ -77,6 +78,14 @@ public:
   span per pass, so a large queued transfer is never copied whole.
   */
   static constexpr uint32_t kMaxWritePassSize = 64 * 1024;
+
+  /*!
+  The output cap only trips when the peer has made no progress for this
+  long.  A legitimate burst (a 10 MB clipboard is posted as 20 chunks at
+  once while the kernel absorbs ~128 KiB) may exceed the cap for a moment;
+  only a stalled peer exceeds it for seconds.
+  */
+  static constexpr std::chrono::seconds kOutputStallTimeout{10};
 
   //! Set the process-wide default output cap used by new sockets.
   static void setDefaultMaxOutputBufferSize(uint32_t bytes);
@@ -187,6 +196,7 @@ private:
   bool m_connected;
   bool m_outputOverflowed = false;
   uint32_t m_maxOutputBufferSize;
+  std::chrono::steady_clock::time_point m_lastProgress = std::chrono::steady_clock::now();
   static std::atomic<uint32_t> s_defaultMaxOutputBufferSize;
   Mutex m_mutex;
   ArchSocket m_socket;
