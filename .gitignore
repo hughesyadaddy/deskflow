@@ -22,8 +22,8 @@ deskflow-config.toml
 .vscode
 .DS_Store
 *.code-workspace
+# per-seat secrets/config (canonical template is env.example, tracked)
 .env*
-!.env.example
 /scripts/*.egg-info
 /*.user
 *.ui.autosave
@@ -46,11 +46,19 @@ CMakeFiles/*
 # vscode folder
 /.vscode
 
-# scripts folder (upstream python tooling); keep build/install scripts tracked
+# scripts folder (upstream python tooling); keep build/install scripts tracked.
+# /scripts/fleet.env (per-seat, may hold host names/users) stays ignored; only
+# the example template is tracked.
 /scripts/*
 !/scripts/*.ps1
 !/scripts/*.sh
 !/scripts/fleet.env.example
+
+# fleet tooling state (tools/ and harness/ themselves are tracked)
+/tools/state/
+/harness/runs/
+/harness/soak/
+/harness/.hackintosh.lock
 
 # Ai helperfilers
 **/[cC]laude.[mM][dD]
