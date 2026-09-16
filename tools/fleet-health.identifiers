@@ -10,6 +10,7 @@
 org.deskflow.deskflow
 org.deskflow.deskflow-core
 org.deskflow.deskflow-vhid-bridge
+org.deskflow.deskflow-prio
 io.github.hughesyadaddy.deskflow
 io.github.hughesyadaddy.mouser
 # Bundled Qt frameworks carry their own stable identifiers.

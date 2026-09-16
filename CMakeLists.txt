@@ -235,9 +235,17 @@ if(BUILD_OSX_BUNDLE AND BUILD_INSTALLER)
   else()
     set(MAC_FINAL_CODESIGN_ID "${APPLE_CODESIGN_DEV}")
   endif()
+  # --preserve-metadata keeps what cmake/MacCodesign.cmake stamped on each
+  # nested binary: the explicit org.deskflow.* --identifier (a plain --deep
+  # re-sign replaces it with a filename+UUID id, which fails fleet-health
+  # `identifiers` and resets TCC), the entitlements and the hardened-runtime
+  # flag. --options runtime is repeated so a bundle that was never signed
+  # with it (ad-hoc dev path) still ends up hardened.
   install(CODE "
     execute_process(COMMAND
       /usr/bin/codesign --force --deep
+      --preserve-metadata=identifier,entitlements,flags,runtime
+      --options runtime
       \"--sign=${MAC_FINAL_CODESIGN_ID}\"
       \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_PROPER_NAME}.app\"
       RESULT_VARIABLE _final_codesign_rc

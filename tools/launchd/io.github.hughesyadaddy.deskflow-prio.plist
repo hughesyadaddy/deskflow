@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  deskflow-prio: every 30 s, promote every running deskflow-core to the
+  foreground task role and raise its threads' precedence (importance 16).
+  See src/apps/deskflow-prio/deskflow-prio.c for why renice/ProcessType are
+  not enough. task_for_pid needs root, hence a LaunchDaemon (system domain).
+
+  The binary is the one shipped inside the app bundle, signed with the
+  org.deskflow.deskflow-prio identifier by the normal build, so it is covered
+  by fleet-health `sign`/`no-adhoc`/`identifiers`. This replaces the old
+  out-of-tree /usr/local/bin/deskflow-prio + deskflow-prio-apply.sh pair.
+
+  Install (root; scripts/install-macos.sh is expected to do this):
+
+    sudo install -m 644 -o root -g wheel \
+      tools/launchd/io.github.hughesyadaddy.deskflow-prio.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist
+
+  Uninstall:
+
+    sudo launchctl bootout system/io.github.hughesyadaddy.deskflow-prio
+    sudo rm /Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.hughesyadaddy.deskflow-prio</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/Deskflow.app/Contents/MacOS/deskflow-prio</string>
+    <string>--name</string>
+    <string>deskflow-core</string>
+    <string>16</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/deskflow-prio.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/deskflow-prio.log</string>
+</dict>
+</plist>
