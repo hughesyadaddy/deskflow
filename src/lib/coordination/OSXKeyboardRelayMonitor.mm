@@ -16,6 +16,7 @@
 #import <IOKit/hidsystem/ev_keymap.h>
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 
 namespace deskflow::coordination {
@@ -64,13 +65,20 @@ public:
   void stop() override
   {
     m_running = false;
-    if (m_runLoop != nullptr) {
-      CFRunLoopStop(m_runLoop);
+    {
+      // m_runLoop is written by the monitor thread under the same mutex, so
+      // this either sees nullptr (not captured yet, or tap creation failed;
+      // the thread will observe m_running == false and exit on its own) or a
+      // RETAINED loop that stays valid even if the thread has already exited.
+      std::lock_guard<std::mutex> lock(m_runLoopMutex);
+      if (m_runLoop != nullptr) {
+        CFRunLoopStop(m_runLoop);
+      }
     }
     if (m_thread.joinable()) {
       m_thread.join();
     }
-    m_runLoop = nullptr;
+    releaseRunLoop();
   }
 
   bool running() const override
@@ -285,9 +293,19 @@ private:
       return;
     }
 
-    m_runLoop = CFRunLoopGetCurrent();
+    // Retain the run loop (same fix as OSXScreen, 843d0743b): the loop is
+    // owned by this thread and freed on thread exit. stop() sets m_running
+    // first, so this thread can finish its 250ms slice and exit BEFORE stop()
+    // reaches CFRunLoopStop -- without the retain that would trap on a freed
+    // loop (SIGTRAP in __CFCheckCFInfoPACSignature). stop() releases it after
+    // join; the destructor covers the never-started/failed-tap paths.
+    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+    {
+      std::lock_guard<std::mutex> lock(m_runLoopMutex);
+      m_runLoop = (CFRunLoopRef)CFRetain(runLoop);
+    }
     CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_tap, 0);
-    CFRunLoopAddSource(m_runLoop, source, kCFRunLoopCommonModes);
+    CFRunLoopAddSource(runLoop, source, kCFRunLoopCommonModes);
     CGEventTapEnable(m_tap, true);
     m_active = true;
     LOG_DEBUG("coordination: keyboard relay monitor started");
@@ -297,12 +315,24 @@ private:
     }
 
     m_active = false;
+    // Every CF object created per start (tap + source) is released here so
+    // repeated start/stop (auto-mode epoch flips) cannot accumulate them.
     CGEventTapEnable(m_tap, false);
-    CFRunLoopRemoveSource(m_runLoop, source, kCFRunLoopCommonModes);
+    CFRunLoopRemoveSource(runLoop, source, kCFRunLoopCommonModes);
     CFRelease(source);
     CFRelease(m_tap);
     m_tap = nullptr;
     LOG_DEBUG("coordination: keyboard relay monitor stopped");
+  }
+
+  //! Drop the retained run loop. Only call with the monitor thread joined.
+  void releaseRunLoop()
+  {
+    std::lock_guard<std::mutex> lock(m_runLoopMutex);
+    if (m_runLoop != nullptr) {
+      CFRelease(m_runLoop);
+      m_runLoop = nullptr;
+    }
   }
 
   RelayPassThroughQuery m_passThrough;
@@ -313,7 +343,8 @@ private:
   CFMachPortRef m_tap = nullptr;
   KeyboardRelayForwardLedger m_ledger; //!< tap-thread only
   bool m_capsLockOn = false;
-  CFRunLoopRef m_runLoop = nullptr;
+  std::mutex m_runLoopMutex;         //!< guards m_runLoop between stop() and the monitor thread
+  CFRunLoopRef m_runLoop = nullptr; //!< retained; released by stop() after join
 };
 
 } // namespace
