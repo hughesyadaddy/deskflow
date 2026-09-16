@@ -119,6 +119,17 @@ create_test(
 )
 target_include_directories(AutoModeRunnerTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-core")
 
+# deskflow-vhid-bridge pure logic (caps decision table, motion chunking,
+# calibration math) is header-only in BridgeCalibration.h; the bridge itself
+# is macOS-only but the logic is portable, so this test builds everywhere.
+create_test(
+  NAME BridgeCalibrationTests
+  DEPENDS base
+  SOURCE apps/deskflow-vhid-bridge/BridgeCalibrationTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/apps/deskflow-vhid-bridge"
+)
+target_include_directories(BridgeCalibrationTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-vhid-bridge")
+
 #make sure to use CI only plugin on Unix
 if (UNIX AND NOT APPLE)
   set(qPA_Platform "QT_QPA_PLATFORM=minimal")

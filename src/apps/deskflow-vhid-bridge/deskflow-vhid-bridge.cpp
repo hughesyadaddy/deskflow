@@ -4,7 +4,14 @@
 //
 // Usage: deskflow-vhid-bridge <server_hosts> <client_screen_name>
 //          [port [width height [scale_factor]]]
-//          [--size=WxH] [--scale=S] [--coord-port=N]
+//          [--size=WxH] [--scale=S] [--scale-fixed] [--calibrate] [--coord-port=N]
+//
+// Pointer scale: by default the bridge self-calibrates (slam to a corner, emit
+// a known delta, read the cursor back -> counts per point) and then runs every
+// absolute move closed-loop against the real cursor position. --scale=S is only
+// a seed unless --scale-fixed is also passed, which disables calibration and
+// closed-loop correction and uses backing_scale x S verbatim (the pre-2026-09
+// behaviour). --calibrate is accepted for explicitness; it is the default.
 //
 // When --coord-port is set, the bridge polls the local coordination mesh on
 // 127.0.0.1:N before each reconnect pass and refreshes server candidates from
@@ -18,19 +25,22 @@
 // Scope: TLS-disabled protocol only (the KVM runs inside Tailscale). It handles
 // the handshake, keep-alives, screen-info query, and mouse/key data messages;
 // non-input messages (clipboard, options, file transfer) are acknowledged or
-// ignored. Mouse position is relayed as relative motion (the operator watches
-// the screen and self-corrects), so OS pointer acceleration is irrelevant.
+// ignored. Mouse position is relayed as relative motion; the bridge disables
+// OS pointer acceleration on its virtual device, calibrates counts-per-point,
+// and corrects each absolute move against the real cursor (see above).
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
@@ -49,11 +59,33 @@
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/hid/IOHIDEventServiceKeys.h>
+#include <IOKit/hid/IOHIDKeys.h>
+#include <IOKit/hid/IOHIDProperties.h>
+#include <IOKit/hid/IOHIDUsageTables.h>
 #include <IOKit/hidsystem/IOHIDLib.h>
 #include <IOKit/hidsystem/IOHIDParameter.h>
 
 #include <pqrs/karabiner/driverkit/virtual_hid_device_driver.hpp>
 #include <pqrs/karabiner/driverkit/virtual_hid_device_service.hpp>
+
+#include "BridgeCalibration.h"
+
+// IOHIDEventSystemClient — the modern (per-service) HID property API. It is
+// exported by IOKit.framework but has no public header; these are the
+// signatures Karabiner-Elements and Apple's own hidutil use. Unlike the legacy
+// IOHIDSystem kIOHIDParamConnectType user client it does NOT require an
+// exclusive event-system connection, which is exactly what fails at the
+// LoginWindow session on macOS 26 (kr=-536870195 == kIOReturnExclusiveAccess).
+extern "C"
+{
+  typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+  typedef struct __IOHIDServiceClient *IOHIDServiceClientRef;
+  IOHIDEventSystemClientRef IOHIDEventSystemClientCreateSimpleClient(CFAllocatorRef allocator);
+  CFArrayRef IOHIDEventSystemClientCopyServices(IOHIDEventSystemClientRef client);
+  CFTypeRef IOHIDServiceClientCopyProperty(IOHIDServiceClientRef service, CFStringRef key);
+  Boolean IOHIDServiceClientSetProperty(IOHIDServiceClientRef service, CFStringRef key, CFTypeRef property);
+}
 
 namespace {
 
@@ -68,37 +100,142 @@ void log_line(const std::string &message)
   ::write(STDERR_FILENO, line.data(), line.size());
 }
 
+std::string hex_str(unsigned v)
+{
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%04x", v);
+  return buf;
+}
+
+// Karabiner DriverKit virtual device identity (parameters.hpp / DriverKit sources).
+constexpr int kKarabinerVendorId = 0x16c0;
+constexpr int kKarabinerPointingProductId = 0x27da;
+constexpr int kKarabinerKeyboardProductId = 0x27db;
+
+struct CFReleaser
+{
+  void operator()(const void *ref) const
+  {
+    if (ref)
+      CFRelease(ref);
+  }
+};
+template <typename T> using cf_ptr = std::unique_ptr<std::remove_pointer_t<T>, CFReleaser>;
+
+std::optional<int> service_int_property(IOHIDServiceClientRef service, CFStringRef key)
+{
+  cf_ptr<CFTypeRef> value(IOHIDServiceClientCopyProperty(service, key));
+  if (!value || CFGetTypeID(value.get()) != CFNumberGetTypeID())
+    return std::nullopt;
+  int out = 0;
+  if (!CFNumberGetValue(static_cast<CFNumberRef>(value.get()), kCFNumberIntType, &out))
+    return std::nullopt;
+  return out;
+}
+
+// Finds the Karabiner virtual HID service with the given product id (or any
+// Karabiner service matching usage page/usage when the product id is absent).
+// Returns the service and the owning client, which must outlive the service.
+struct HidServiceHandle
+{
+  cf_ptr<IOHIDEventSystemClientRef> client;
+  cf_ptr<CFArrayRef> services;
+  IOHIDServiceClientRef service = nullptr; // borrowed from `services`
+};
+
+HidServiceHandle
+find_karabiner_service(int product_id, int usage_page, int usage, const char *what, bool verbose = true)
+{
+  HidServiceHandle h;
+  h.client.reset(IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault));
+  if (!h.client) {
+    if (verbose)
+      log_line(std::string("hid: IOHIDEventSystemClientCreateSimpleClient failed (") + what + ")");
+    return h;
+  }
+  h.services.reset(IOHIDEventSystemClientCopyServices(h.client.get()));
+  if (!h.services) {
+    if (verbose)
+      log_line(std::string("hid: IOHIDEventSystemClientCopyServices returned null (") + what + ")");
+    return h;
+  }
+  const CFIndex n = CFArrayGetCount(h.services.get());
+  for (CFIndex i = 0; i < n; ++i) {
+    auto service = static_cast<IOHIDServiceClientRef>(const_cast<void *>(CFArrayGetValueAtIndex(h.services.get(), i)));
+    const auto vendor = service_int_property(service, CFSTR(kIOHIDVendorIDKey));
+    if (!vendor || *vendor != kKarabinerVendorId)
+      continue;
+    const auto product = service_int_property(service, CFSTR(kIOHIDProductIDKey));
+    const auto page = service_int_property(service, CFSTR(kIOHIDPrimaryUsagePageKey));
+    const auto use = service_int_property(service, CFSTR(kIOHIDPrimaryUsageKey));
+    const bool product_ok = product && *product == product_id;
+    const bool usage_ok = page && use && *page == usage_page && *use == usage;
+    if (product_ok || usage_ok) {
+      log_line(
+          std::string("hid: found Karabiner ") + what + " service (product=0x" +
+          hex_str(static_cast<unsigned>(product.value_or(0))) + " page=" + std::to_string(page.value_or(0)) +
+          " usage=" + std::to_string(use.value_or(0)) + ") among " + std::to_string(n) + " services"
+      );
+      h.service = service;
+      return h;
+    }
+  }
+  if (verbose) {
+    log_line(
+        std::string("hid: no Karabiner ") + what + " service among " + std::to_string(n) +
+        " HID services (vendor 0x16c0 not present yet?)"
+    );
+  }
+  return h;
+}
+
 // We inject RELATIVE pointer motion; under macOS pointer acceleration a delta does
 // not map 1:1 to a screen point, so the cursor drifts from the host's absolute
-// position and can't reach the last strip to the far edge. Force linear (no-accel)
-// so 1 delta == 1 point. The bridge runs as root at the login window, where the
-// per-user mouse pref doesn't apply, so we set it directly on IOHIDSystem.
+// position. Force linear (no-accel) on the VIRTUAL POINTING SERVICE itself via
+// the per-service property API (value -1 == acceleration off, the same thing
+// `hidutil property --set '{"HIDPointerAcceleration":-1}'` does).
 //
-// The legacy IOHID acceleration API is deprecated and can BLOCK in some contexts,
-// so the caller runs this on a detached thread — if it ever hangs, the bridge still
-// works (just without the accel tweak), never a dead cursor.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-void disable_pointer_acceleration()
+// The legacy IOHIDSystem kIOHIDParamConnectType route this replaced failed on
+// every LoginWindow run on macOS 26 (only the first-ever run got the exclusive
+// connection) -- so acceleration was silently live while the bridge multiplied
+// deltas by 8 and chopped them into int8 reports: fast, nonlinear cursor.
+//
+// Returns true when both keys were accepted. Runs on a detached thread so a
+// hung HID call can never block the bridge; calibration + closed-loop
+// correction cover the case where this fails.
+bool disable_pointer_acceleration()
 {
-  io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOHIDSystem"));
-  if (!service) {
-    log_line("accel: IOHIDSystem not found");
-    return;
+  HidServiceHandle h =
+      find_karabiner_service(kKarabinerPointingProductId, kHIDPage_GenericDesktop, kHIDUsage_GD_Mouse, "pointing");
+  if (!h.service) {
+    log_line("accel: FAILED — virtual pointing service not found; relying on calibration + closed loop");
+    return false;
   }
-  io_connect_t connect = 0;
-  kern_return_t kr = IOServiceOpen(service, mach_task_self(), kIOHIDParamConnectType, &connect);
-  IOObjectRelease(service);
-  if (kr != KERN_SUCCESS) {
-    log_line("accel: IOServiceOpen failed kr=" + std::to_string(kr));
-    return;
-  }
-  IOReturn rm = IOHIDSetAccelerationWithKey(connect, CFSTR(kIOHIDMouseAccelerationType), -1.0);
-  IOReturn rp = IOHIDSetAccelerationWithKey(connect, CFSTR(kIOHIDPointerAccelerationKey), -1.0);
-  IOServiceClose(connect);
-  log_line("accel: disabled mouse_r=" + std::to_string(rm) + " pointer_r=" + std::to_string(rp) + " (0=ok)");
+  int minus_one = -1;
+  cf_ptr<CFNumberRef> value(CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &minus_one));
+  const Boolean rm = IOHIDServiceClientSetProperty(h.service, CFSTR(kIOHIDMouseAccelerationType), value.get());
+  const Boolean rp = IOHIDServiceClientSetProperty(h.service, CFSTR(kIOHIDPointerAccelerationKey), value.get());
+  const auto readback = service_int_property(h.service, CFSTR(kIOHIDPointerAccelerationKey));
+  log_line(
+      std::string("accel: ") + ((rm && rp) ? "DISABLED" : "FAILED") +
+      " on virtual pointing service (HIDMouseAcceleration=" + (rm ? "ok" : "rejected") + " HIDPointerAcceleration=" +
+      (rp ? "ok" : "rejected") + " readback=" + (readback ? std::to_string(*readback) : std::string("n/a")) + ")"
+  );
+  return rm && rp;
 }
-#pragma clang diagnostic pop
+
+// Reads the cursor's current position in points. Works at the login window
+// because the bridge already reaches WindowServer (CGMainDisplayID succeeds).
+std::optional<CGPoint> read_cursor_position()
+{
+  cf_ptr<CGEventRef> event(CGEventCreate(nullptr));
+  if (!event)
+    return std::nullopt;
+  CGPoint p = CGEventGetLocation(event.get());
+  if (!std::isfinite(p.x) || !std::isfinite(p.y))
+    return std::nullopt;
+  return p;
+}
 
 // ---------------------------------------------------------------------------
 // Deskflow/Barrier protocol constants (verified against deskflow ProtocolTypes).
@@ -712,31 +849,94 @@ bool keyid_is_letter(uint16_t key_id)
   return (key_id >= 'A' && key_id <= 'Z') || (key_id >= 'a' && key_id <= 'z');
 }
 
-// Live Caps Lock state of THIS machine, read from IOHIDSystem.
+// Live Caps Lock state of THIS machine.
 /*!
 The bridge injects raw HID reports, and macOS composes caps+shift as
-LOWERCASE. Blindly adding shift for an uppercase KeyID therefore inverts
-every letter whenever caps happens to be on at the login window -- the
-bridge cannot see the keyboard LED, so it must ask the HID system. Returns
-false when the state cannot be read (the historical assumption).
+LOWERCASE, so the shift decision for letters depends on the target's caps
+state -- and a relayed caps press must only emit a toggle edge when the
+target's lock state differs from what the server wants. Three sources, in
+order:
+  1. IOHIDServiceClient "HIDCapsLockState" on the Karabiner virtual keyboard
+     (modern per-service API; needs no exclusive connection).
+  2. A fresh legacy IOHIDSystem kIOHIDParamConnectType open +
+     IOHIDGetModifierLockState. Fails with kIOReturnExclusiveAccess on every
+     LoginWindow run after the first on macOS 26, but is cheap to try.
+  3. CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & AlphaShift --
+     WindowServer's view, reachable from the bridge at the login window.
+state is nullopt only when none of them can answer.
 */
-bool target_caps_lock_on()
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+std::optional<bool> caps_state_legacy_iohidsystem()
 {
   io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass));
-  if (service == IO_OBJECT_NULL) {
-    return false;
-  }
+  if (service == IO_OBJECT_NULL)
+    return std::nullopt;
   io_connect_t connect = MACH_PORT_NULL;
-  bool state = false;
+  std::optional<bool> state;
   if (IOServiceOpen(service, mach_task_self(), kIOHIDParamConnectType, &connect) == KERN_SUCCESS) {
     bool value = false;
-    if (IOHIDGetModifierLockState(connect, kIOHIDCapsLockState, &value) == KERN_SUCCESS) {
+    if (IOHIDGetModifierLockState(connect, kIOHIDCapsLockState, &value) == KERN_SUCCESS)
       state = value;
-    }
     IOServiceClose(connect);
   }
   IOObjectRelease(service);
   return state;
+}
+#pragma clang diagnostic pop
+
+std::optional<bool> caps_state_virtual_keyboard_service()
+{
+  // Cached: the virtual keyboard outlives the bridge process, and this is
+  // consulted on every relayed letter. Re-resolved only while unresolved.
+  static HidServiceHandle h;
+  static bool logged_miss = false;
+  if (!h.service) {
+    h = find_karabiner_service(
+        kKarabinerKeyboardProductId, kHIDPage_GenericDesktop, kHIDUsage_GD_Keyboard, "keyboard", !logged_miss
+    );
+    logged_miss = true;
+  }
+  if (!h.service)
+    return std::nullopt;
+  cf_ptr<CFTypeRef> value(IOHIDServiceClientCopyProperty(h.service, CFSTR(kIOHIDServiceCapsLockStateKey)));
+  if (!value)
+    return std::nullopt;
+  if (CFGetTypeID(value.get()) == CFBooleanGetTypeID())
+    return CFBooleanGetValue(static_cast<CFBooleanRef>(value.get()));
+  if (CFGetTypeID(value.get()) == CFNumberGetTypeID()) {
+    int v = 0;
+    if (CFNumberGetValue(static_cast<CFNumberRef>(value.get()), kCFNumberIntType, &v))
+      return v != 0;
+  }
+  return std::nullopt;
+}
+
+std::optional<bool> caps_state_cg_flags()
+{
+  const CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+  // CG has no "unknown"; 0 is a legitimate answer, so only distrust it when
+  // WindowServer is unreachable altogether (the cursor read fails too).
+  if (flags == 0 && !read_cursor_position())
+    return std::nullopt;
+  return (flags & kCGEventFlagMaskAlphaShift) != 0;
+}
+
+struct CapsTruth
+{
+  std::optional<bool> state;
+  const char *source = "none";
+};
+
+CapsTruth target_caps_lock_state()
+{
+  if (auto s = caps_state_virtual_keyboard_service())
+    return {s, "vkbd-service"};
+  if (auto s = caps_state_legacy_iohidsystem())
+    return {s, "iohidsystem"};
+  if (auto s = caps_state_cg_flags())
+    return {s, "cg-flags"};
+  return {};
 }
 
 // Modifier KeyIDs map to a single HID modifier bit; non-modifier keys return 0.
@@ -766,19 +966,13 @@ uint8_t modifier_keyid_to_bit(uint16_t key_id)
   }
 }
 
-uint8_t mask_to_modifier_bits(uint32_t mask)
-{
-  uint8_t bits = 0;
-  if (mask & proto::kMaskShift)
-    bits |= static_cast<uint8_t>(hr::modifier::left_shift);
-  if (mask & proto::kMaskControl)
-    bits |= static_cast<uint8_t>(hr::modifier::left_control);
-  if (mask & proto::kMaskAlt)
-    bits |= static_cast<uint8_t>(hr::modifier::left_option);
-  if (mask & (proto::kMaskMeta | proto::kMaskSuper))
-    bits |= static_cast<uint8_t>(hr::modifier::left_command);
-  return bits;
-}
+// Deskflow mask -> HID modifier byte lives in BridgeCalibration.h (pure, unit
+// tested). Its SDK-free constants must equal hr::modifier's values:
+static_assert(bridge_logic::kHidLeftShift == static_cast<uint8_t>(hr::modifier::left_shift));
+static_assert(bridge_logic::kHidLeftControl == static_cast<uint8_t>(hr::modifier::left_control));
+static_assert(bridge_logic::kHidLeftOption == static_cast<uint8_t>(hr::modifier::left_option));
+static_assert(bridge_logic::kHidLeftCommand == static_cast<uint8_t>(hr::modifier::left_command));
+static_assert(bridge_logic::kMaskShift == proto::kMaskShift && bridge_logic::kMaskSuper == proto::kMaskSuper);
 
 // ---------------------------------------------------------------------------
 // Bridge — owns input state and translates one host connection.
@@ -786,26 +980,78 @@ uint8_t mask_to_modifier_bits(uint32_t mask)
 class Bridge
 {
 public:
-  Bridge(VirtualHidSink &sink, std::string client_name, int16_t fallback_w, int16_t fallback_h, double scale_factor)
+  Bridge(
+      VirtualHidSink &sink, std::string client_name, int16_t fallback_w, int16_t fallback_h, double scale_factor,
+      bool scale_fixed
+  )
       : sink_(sink),
         client_name_(std::move(client_name)),
         screen_w_(fallback_w),
         screen_h_(fallback_h),
-        scale_factor_(scale_factor)
+        scale_factor_(scale_factor),
+        scale_fixed_(scale_fixed)
   {
     // query_main_display overwrites these if the live display is readable; if it
     // isn't (can happen at the login window), the caller-supplied fallback — the
     // machine's real size from config — is kept instead of a wrong hardcoded guess.
-    // It also reports the display's backing scale, from which we derive the motion
-    // scale so the bridge auto-adapts to ANY display (this machine's, whichever is
-    // at the login screen) rather than a hardcoded value — 1x->4, 2x->8, 3x->12.
+    // It also reports the display's backing scale, from which we derive the SEED
+    // motion scale (1x->4, 2x->8, 3x->12). Unless --scale-fixed, calibrate()
+    // replaces the seed with a measured counts-per-point.
     double backing_scale = 2.0;
     query_main_display(screen_w_, screen_h_, backing_scale);
     motion_scale_ = backing_scale * scale_factor_;
     log_line(
-        "motion scale " + std::to_string(motion_scale_) + " (backing " + std::to_string(backing_scale) + " x factor " +
-        std::to_string(scale_factor_) + ")"
+        std::string(scale_fixed_ ? "motion scale FIXED " : "motion scale seed ") + std::to_string(motion_scale_) +
+        " (backing " + std::to_string(backing_scale) + " x factor " + std::to_string(scale_factor_) + ")"
     );
+  }
+
+  // Self-calibration: slam the cursor to the top-left corner (OS clamps it
+  // there), emit a known delta in <=8-count reports, read the cursor back and
+  // derive counts_per_point. Runs at startup and, if that attempt could not
+  // read the cursor (WindowServer not up yet), again after the next Enter's
+  // corner slam. Returns true once calibrated.
+  bool calibrate()
+  {
+    if (scale_fixed_ || calibrated_)
+      return calibrated_;
+    if (++calibration_attempts_ > kMaxCalibrationAttempts) {
+      return false;
+    }
+    constexpr int kSlam = 1 << 15;
+    emit_slam(-kSlam, -kSlam);
+    std::this_thread::sleep_for(milliseconds(150));
+    const auto p0 = read_cursor_position();
+    if (!p0) {
+      log_line("calibrate: cursor unreadable (WindowServer not up?) — keeping seed scale, will retry on Enter");
+      return false;
+    }
+    constexpr int kProbeX = 400, kProbeY = 300; // counts
+    emit_counts(kProbeX, kProbeY);
+    std::this_thread::sleep_for(milliseconds(150));
+    const auto p1 = read_cursor_position();
+    if (!p1) {
+      log_line("calibrate: cursor unreadable after probe — keeping seed scale");
+      return false;
+    }
+    const auto sx = bridge_logic::counts_per_point(kProbeX, p1->x - p0->x);
+    const auto sy = bridge_logic::counts_per_point(kProbeY, p1->y - p0->y);
+    const auto scale = bridge_logic::combine_axis_scales(sx, sy);
+    log_line(
+        "calibrate: probe +" + std::to_string(kProbeX) + "," + std::to_string(kProbeY) + " counts moved cursor from (" +
+        std::to_string(static_cast<int>(p0->x)) + "," + std::to_string(static_cast<int>(p0->y)) + ") to (" +
+        std::to_string(static_cast<int>(p1->x)) + "," + std::to_string(static_cast<int>(p1->y)) + ") -> x " +
+        (sx ? std::to_string(*sx) : std::string("n/a")) + " y " + (sy ? std::to_string(*sy) : std::string("n/a")) +
+        " counts/point"
+    );
+    if (!scale) {
+      log_line("calibrate: measurement unusable — keeping seed scale " + std::to_string(motion_scale_));
+      return false;
+    }
+    motion_scale_ = *scale;
+    calibrated_ = true;
+    log_line("calibrate: motion scale set to " + std::to_string(motion_scale_) + " counts/point (closed loop active)");
+    return true;
   }
 
   // Runs one connection to completion (returns on disconnect/error/close).
@@ -820,6 +1066,7 @@ public:
         break;
       if (!dispatch(socket, *message))
         break;
+      warn_stuck_keys();
     }
     release_all();
   }
@@ -831,7 +1078,43 @@ private:
   {
     std::optional<uint16_t> usage; // none for pure modifier keys
     uint8_t modifier_bits = 0;
+    uint16_t key_id = 0;
+    Clock::time_point since{};
+    bool warned = false;
   };
+
+  static constexpr int kMaxCalibrationAttempts = 5;
+  static constexpr auto kStuckKeyWarning = std::chrono::seconds(10);
+
+  // Logs a WARNING (once per entry) for any key held longer than
+  // kStuckKeyWarning: a missed key-up or a latched entry shows up here
+  // instead of only as "everything types wrong until Leave".
+  void warn_stuck_keys()
+  {
+    if (held_keys_.empty())
+      return;
+    const auto now = Clock::now();
+    bool any = false;
+    std::string summary;
+    for (auto &[button, held] : held_keys_) {
+      if (now - held.since < kStuckKeyWarning)
+        continue;
+      if (!held.warned) {
+        held.warned = true;
+        any = true;
+      }
+      summary += " {btn=" + std::to_string(button) + " id=0x" + to_hex(held.key_id) + " usage=0x" +
+                 to_hex(held.usage.value_or(0)) + " mods=0x" + to_hex(held.modifier_bits) +
+                 " held=" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(now - held.since).count()) +
+                 "s}";
+    }
+    if (any) {
+      log_line(
+          "WARNING: " + std::to_string(held_keys_.size()) + " key(s) in held_keys_, some > 10s:" + summary +
+          " (Leave/close will release)"
+      );
+    }
+  }
 
   bool handshake(FramedSocket &socket)
   {
@@ -968,7 +1251,16 @@ private:
     constexpr int kSlamDistance = 1 << 15; // exceeds any display dimension
     int corner_x = (2 * x < screen_w_) ? 0 : screen_w_;
     int corner_y = (2 * y < screen_h_) ? 0 : screen_h_;
-    emit_relative_raw(corner_x == 0 ? -kSlamDistance : kSlamDistance, corner_y == 0 ? -kSlamDistance : kSlamDistance);
+    emit_slam(corner_x == 0 ? -kSlamDistance : kSlamDistance, corner_y == 0 ? -kSlamDistance : kSlamDistance);
+    if (!calibrated_ && !scale_fixed_) {
+      // Startup calibration could not read the cursor; retry now that the
+      // host is driving us (WindowServer is certainly up by this point).
+      // calibrate() slams to the top-left corner itself, so re-slam after.
+      if (calibrate()) {
+        emit_slam(corner_x == 0 ? -kSlamDistance : kSlamDistance, corner_y == 0 ? -kSlamDistance : kSlamDistance);
+      }
+    }
+    frac_x_ = frac_y_ = 0.0;
     emit_relative(x - corner_x, y - corner_y);
     last_abs_x_ = x;
     last_abs_y_ = y;
@@ -1001,8 +1293,38 @@ private:
     std::optional<int16_t> y = r.i16();
     if (!r.ok() || !x || !y)
       return true;
-    if (have_last_abs_)
-      emit_relative(static_cast<int>(*x) - last_abs_x_, static_cast<int>(*y) - last_abs_y_);
+    if (have_last_abs_) {
+      int dx = static_cast<int>(*x) - last_abs_x_;
+      int dy = static_cast<int>(*y) - last_abs_y_;
+      // Closed loop: the previous move's reports have landed by now, so the
+      // difference between where the host wanted the cursor and where it
+      // actually is (in points) is carried into this delta -- bounded, so a
+      // bad read can never turn into a sweep. Skipped under --scale-fixed.
+      if (calibrated_ && !closed_loop_disabled_) {
+        if (const auto here = read_cursor_position()) {
+          const int rx = bridge_logic::bounded_residual(last_abs_x_, static_cast<int>(std::lround(here->x)));
+          const int ry = bridge_logic::bounded_residual(last_abs_y_, static_cast<int>(std::lround(here->y)));
+          dx += rx;
+          dy += ry;
+          // A residual pinned at the bound move after move means the readback
+          // and the host disagree about coordinates (not a scale error) --
+          // keep correcting and we would drift 48 points per move. Give up.
+          const bool saturated =
+              std::abs(rx) >= bridge_logic::kMaxResidualPoints || std::abs(ry) >= bridge_logic::kMaxResidualPoints;
+          saturated_residuals_ = saturated ? saturated_residuals_ + 1 : 0;
+          if (saturated_residuals_ >= 20) {
+            closed_loop_disabled_ = true;
+            log_line(
+                "WARNING: closed-loop residual saturated for 20 moves (cursor at " +
+                std::to_string(static_cast<int>(here->x)) + "," + std::to_string(static_cast<int>(here->y)) +
+                " vs host " + std::to_string(last_abs_x_) + "," + std::to_string(last_abs_y_) +
+                ") — disabling closed loop, keeping calibrated scale"
+            );
+          }
+        }
+      }
+      emit_relative(dx, dy);
+    }
     last_abs_x_ = *x;
     last_abs_y_ = *y;
     have_last_abs_ = true;
@@ -1087,21 +1409,34 @@ private:
     int16_t key_id = 0, mask = 0, button = 0;
     if (!parse_key(body, key_id, mask, button))
       return true;
-    if (static_cast<uint16_t>(key_id) == 0xEF1B) { // Escape
+    const auto id16 = static_cast<uint16_t>(key_id);
+    const auto mask32 = static_cast<uint32_t>(static_cast<uint16_t>(mask));
+    if (id16 == 0xEF1B) { // Escape
       note_escape_down();
     }
+    // Caps Lock is an EDGE, never a held key. A relayed Caps Down used to be
+    // stored in held_keys_ with the mask's modifiers, so Shift held at caps
+    // time latched onto it until Leave, and a second caps Down overwrote the
+    // same button with an identical entry -> no HID edge -> no toggle. Also
+    // handle a mask-only event (id 0 with the caps bit): same sync logic.
+    if (id16 == bridge_logic::kKeyIdCapsLock || (id16 == 0 && (mask32 & bridge_logic::kMaskCapsLock))) {
+      sync_caps_lock(id16, mask32, button);
+      return true;
+    }
     HeldKey entry;
-    uint8_t modifier_bit = modifier_keyid_to_bit(static_cast<uint16_t>(key_id));
+    entry.key_id = id16;
+    entry.since = Clock::now();
+    uint8_t modifier_bit = modifier_keyid_to_bit(id16);
     if (modifier_bit != 0) {
       entry.modifier_bits = modifier_bit;
     } else {
-      std::optional<uint16_t> usage = translate_key(static_cast<uint16_t>(key_id));
+      std::optional<uint16_t> usage = translate_key(id16);
       if (!usage) {
-        log_line("unmapped key id 0x" + to_hex(static_cast<uint16_t>(key_id)));
+        log_line("unmapped key id 0x" + to_hex(id16));
         return true;
       }
       entry.usage = usage;
-      entry.modifier_bits = mask_to_modifier_bits(static_cast<uint32_t>(static_cast<uint16_t>(mask)));
+      entry.modifier_bits = bridge_logic::key_down_modifier_bits(id16, mask32);
       // The KeyID already names the character the server wants typed; a
       // shifted character must carry shift even when the protocol mask
       // lacks it (caps-lock-composed uppercase, relay-normalized masks).
@@ -1111,10 +1446,18 @@ private:
       // needs NO shift and a lowercase letter needs one. Ignoring this made
       // every relayed letter come out inverted whenever caps was on at the
       // login window (where the user cannot see or fix it).
-      const auto id16 = static_cast<uint16_t>(key_id);
+      //
+      // For letters the KeyID + caps truth decide shift OUTRIGHT (the mask's
+      // shift bit is dropped): the log showed 'K' relayed with Shift while
+      // caps was on, which macOS composes as lowercase. Non-letters keep the
+      // mask's shift (shift+arrow selection etc.) and only ever gain it.
       bool wantShift = keyid_requires_shift(id16);
-      if (keyid_is_letter(id16) && target_caps_lock_on()) {
-        wantShift = !wantShift;
+      if (keyid_is_letter(id16)) {
+        const CapsTruth truth = target_caps_lock_state();
+        if (truth.state.value_or(false)) {
+          wantShift = !wantShift;
+        }
+        entry.modifier_bits &= static_cast<uint8_t>(~static_cast<uint8_t>(hr::modifier::left_shift));
       }
       if (wantShift) {
         entry.modifier_bits |= static_cast<uint8_t>(hr::modifier::left_shift);
@@ -1122,12 +1465,41 @@ private:
     }
     held_keys_[button] = entry;
     log_line(
-        "key down id=0x" + to_hex(static_cast<uint16_t>(key_id)) + " mask=0x" + to_hex(static_cast<uint16_t>(mask)) +
+        "key down id=0x" + to_hex(id16) + " mask=0x" + to_hex(static_cast<uint16_t>(mask)) +
         " btn=" + std::to_string(button) + " -> usage=0x" + to_hex(entry.usage.value_or(0)) + " mods=0x" +
-        to_hex(entry.modifier_bits)
+        to_hex(entry.modifier_bits) + " held=" + std::to_string(held_keys_.size())
     );
     emit_keyboard();
     return true;
+  }
+
+  // Caps Lock: compare the server's desired lock state (the mask's caps bit)
+  // with this machine's truth and emit ONE press+release edge (usage 0x39,
+  // no modifiers, the currently held keys untouched) only when they differ.
+  // When the truth is unreadable, emit the edge unconditionally -- one edge
+  // per press is the best approximation of a real keyboard.
+  void sync_caps_lock(uint16_t key_id, uint32_t mask, int16_t button)
+  {
+    const bool desired = bridge_logic::desired_caps_from_mask(mask);
+    const CapsTruth truth = target_caps_lock_state();
+    const bool emit = bridge_logic::caps_edge_needed(truth.state, desired);
+    log_line(
+        "caps " + std::string(key_id == 0 ? "mask-only" : "down") + " id=0x" + to_hex(key_id) + " mask=0x" +
+        to_hex(static_cast<uint16_t>(mask)) + " btn=" + std::to_string(button) +
+        " desired=" + (desired ? "on" : "off") + " truth=" + (truth.state ? (*truth.state ? "on" : "off") : "unknown") +
+        " (" + truth.source + ") -> " + (emit ? "EDGE" : "skip")
+    );
+    if (!emit)
+      return;
+    // Edge = held report + caps, then the held report without it. Modifiers of
+    // the held keys stay as they are; the caps usage itself carries none.
+    uint8_t modifiers = 0;
+    std::set<uint16_t> keys;
+    collect_held(modifiers, keys);
+    std::set<uint16_t> with_caps = keys;
+    with_caps.insert(bridge_logic::kUsageCapsLock);
+    sink_.post_keyboard(modifiers, with_caps);
+    sink_.post_keyboard(modifiers, keys);
   }
 
   bool on_key_up(const std::vector<uint8_t> &body)
@@ -1135,7 +1507,19 @@ private:
     int16_t key_id = 0, mask = 0, button = 0;
     if (!parse_key(body, key_id, mask, button))
       return true;
-    held_keys_.erase(button);
+    const auto id16 = static_cast<uint16_t>(key_id);
+    auto it = held_keys_.find(button);
+    const bool was_held = it != held_keys_.end();
+    const uint16_t usage = was_held ? it->second.usage.value_or(0) : 0;
+    if (was_held)
+      held_keys_.erase(it);
+    log_line(
+        "key up id=0x" + to_hex(id16) + " mask=0x" + to_hex(static_cast<uint16_t>(mask)) +
+        " btn=" + std::to_string(button) + " -> usage=0x" + to_hex(usage) + (was_held ? "" : " (not held)") +
+        " held=" + std::to_string(held_keys_.size())
+    );
+    if (id16 == bridge_logic::kKeyIdCapsLock)
+      return true; // edge already emitted on the down
     emit_keyboard();
     return true;
   }
@@ -1170,41 +1554,57 @@ private:
     return std::nullopt;
   }
 
-  void emit_keyboard()
+  void collect_held(uint8_t &modifiers, std::set<uint16_t> &keys) const
   {
-    uint8_t modifiers = 0;
-    std::set<uint16_t> keys;
     for (const auto &[button, held] : held_keys_) {
       modifiers |= held.modifier_bits;
       if (held.usage)
         keys.insert(*held.usage);
     }
+  }
+
+  void emit_keyboard()
+  {
+    uint8_t modifiers = 0;
+    std::set<uint16_t> keys;
+    collect_held(modifiers, keys);
     sink_.post_keyboard(modifiers, keys);
   }
 
-  // Karabiner's pointer is RELATIVE-only (no absolute mode), and with OS pointer
-  // acceleration disabled the device's fixed resolution makes one delta cover far
-  // less than one screen point (~1/8 on these Retina displays). Scale host-space
-  // deltas up by motion_scale_ so they map 1:1 onto the screen. motion_scale_ is
-  // derived per-display from the backing scale (see the constructor), so the bridge
-  // auto-adapts to whichever machine is at the login screen. emit_relative_raw is
-  // the unscaled stepper, used for the corner slam (which only needs to be "big
-  // enough" to hit the edge, so it must NOT be scaled again).
+  // Karabiner's pointer is RELATIVE-only (no absolute mode); one HID count is
+  // a fixed fraction of a screen point (~1/8 on 2x Retina with acceleration
+  // off). Host-space deltas are scaled by motion_scale_ (counts per point:
+  // measured by calibrate(), or backing x --scale under --scale-fixed) with a
+  // fractional carry so rounding never accumulates.
+  //
+  // emit_counts is the unscaled stepper. Every report carries at most
+  // bridge_logic::kMaxChunk (8) counts per axis so motion stays inside the
+  // linear part of any acceleration curve the OS still applies (the accel
+  // disable is best-effort at the login window). The corner slam is the one
+  // exception: it only needs to overshoot the edge, and acceleration can
+  // only help it, so it uses full 127-count reports (4096 x fewer reports).
 
-  void emit_relative_raw(int dx, int dy)
+  void emit_counts(int dx, int dy)
   {
-    while (dx != 0 || dy != 0) {
-      int8_t step_x = clamp_to_i8(dx);
-      int8_t step_y = clamp_to_i8(dy);
-      sink_.post_pointing(mouse_buttons_, step_x, step_y, 0, 0);
-      dx -= step_x;
-      dy -= step_y;
-    }
+    for (const bridge_logic::Step s : bridge_logic::chunk_delta_xy(dx, dy))
+      sink_.post_pointing(mouse_buttons_, s.dx, s.dy, 0, 0);
+  }
+
+  void emit_slam(int dx, int dy)
+  {
+    for (const bridge_logic::Step s : bridge_logic::chunk_delta_xy(dx, dy, 127))
+      sink_.post_pointing(mouse_buttons_, s.dx, s.dy, 0, 0);
   }
 
   void emit_relative(int dx, int dy)
   {
-    emit_relative_raw(static_cast<int>(dx * motion_scale_), static_cast<int>(dy * motion_scale_));
+    const double fx = dx * motion_scale_ + frac_x_;
+    const double fy = dy * motion_scale_ + frac_y_;
+    const int cx = static_cast<int>(std::lround(fx));
+    const int cy = static_cast<int>(std::lround(fy));
+    frac_x_ = fx - cx;
+    frac_y_ = fy - cy;
+    emit_counts(cx, cy);
   }
 
   int escape_taps_ = 0;
@@ -1256,8 +1656,15 @@ private:
   bool have_last_abs_ = false;
   int16_t screen_w_ = 1920;
   int16_t screen_h_ = 1080;
-  double scale_factor_ = 4.0; // sensitivity knob (counts/point = backing x this); from arg
-  double motion_scale_ = 8.0; // host-point -> HID-count scale; set per-display in ctor
+  double scale_factor_ = 4.0; // seed knob (counts/point = backing x this); from arg
+  bool scale_fixed_ = false;  // --scale-fixed: no calibration, no closed loop
+  double motion_scale_ = 8.0; // host-point -> HID-count scale (seed, then calibrated)
+  double frac_x_ = 0.0;       // sub-count carry so rounding never accumulates
+  double frac_y_ = 0.0;
+  bool calibrated_ = false;
+  int calibration_attempts_ = 0;
+  bool closed_loop_disabled_ = false;
+  int saturated_residuals_ = 0;
 
 public:
   static std::atomic<bool> g_stop;
@@ -1276,6 +1683,7 @@ int main(int argc, char **argv)
   std::optional<int16_t> flag_w, flag_h;
   std::optional<double> flag_scale;
   std::optional<uint16_t> flag_coord_port;
+  bool scale_fixed = false, calibrate = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg.rfind("--size=", 0) == 0) {
@@ -1302,15 +1710,24 @@ int main(int argc, char **argv)
         return 2;
       }
       flag_coord_port = static_cast<uint16_t>(parsed);
+    } else if (arg == "--scale-fixed") {
+      scale_fixed = true;
+    } else if (arg == "--calibrate") {
+      calibrate = true; // the default; accepted so plists can say so explicitly
     } else {
       positional.push_back(arg);
     }
+  }
+  if (scale_fixed && calibrate) {
+    log_line("--scale-fixed and --calibrate are mutually exclusive");
+    return 2;
   }
 
   if (positional.size() < 2) {
     log_line(
         "usage: deskflow-vhid-bridge <server_hosts> <client_screen_name> "
-        "[port [width height [scale_factor]]] [--size=WxH] [--scale=S] [--coord-port=N]"
+        "[port [width height [scale_factor]]] [--size=WxH] [--scale=S] [--scale-fixed] [--calibrate] "
+        "[--coord-port=N]"
     );
     return 2;
   }
@@ -1383,11 +1800,6 @@ int main(int argc, char **argv)
   sigaction(SIGINT, &sa, nullptr);
   signal(SIGPIPE, SIG_IGN);
 
-  // Disable acceleration so motion is LINEAR (no drift); the resulting fixed
-  // count->point scale is then corrected by kMotionScale below. Detached so a hung
-  // legacy-HID call can never block the bridge.
-  std::thread(disable_pointer_acceleration).detach();
-
   VirtualHidSink sink;
   sink.start();
   if (!sink.wait_ready(milliseconds(10000))) {
@@ -1401,7 +1813,26 @@ int main(int argc, char **argv)
     log_line("virtual HID ready; server candidates: " + hosts + " port " + std::to_string(port));
   }
 
-  Bridge bridge(sink, client_name, fallback_w, fallback_h, scale_factor);
+  // Disable acceleration on the virtual pointing service (it exists only now
+  // that the sink is ready) so motion is LINEAR. On its own thread so a hung
+  // HID call can never block the bridge; we give it a moment to land before
+  // calibrating so the measurement reflects the accel-off state.
+  {
+    std::promise<void> done;
+    std::future<void> done_f = done.get_future();
+    std::thread([p = std::move(done)]() mutable {
+      disable_pointer_acceleration();
+      p.set_value();
+    }).detach();
+    if (done_f.wait_for(std::chrono::seconds(2)) != std::future_status::ready)
+      log_line("accel: disable still pending after 2s — continuing without waiting");
+  }
+
+  Bridge bridge(sink, client_name, fallback_w, fallback_h, scale_factor, scale_fixed);
+  if (!scale_fixed) {
+    std::this_thread::sleep_for(milliseconds(250)); // let the accel property settle
+    bridge.calibrate();
+  }
   const uint16_t coord_port = flag_coord_port.value_or(0);
   // Cycle the candidate list; back off only after a full pass with no server
   // accepting, so a role flip to any peer is picked up within one pass.
