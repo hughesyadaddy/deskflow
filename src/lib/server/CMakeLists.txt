@@ -35,7 +35,6 @@ add_library(server STATIC
   TopologyLink.h
   InputFilter.cpp
   InputFilter.h
-  MouserBridge.cpp
   MouserBridge.h
   VirtualHostTracker.cpp
   VirtualHostTracker.h

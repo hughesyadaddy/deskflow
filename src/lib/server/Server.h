@@ -32,11 +32,11 @@
 #include <vector>
 
 class BaseClientProxy;
-class MouserBridge;
 class EventQueueTimer;
 class PrimaryClient;
 class InputFilter;
 namespace deskflow {
+class MouserLink;
 class Screen;
 }
 class IEventQueue;
@@ -480,10 +480,11 @@ private:
   // state saved when screen saver activates
   BaseClientProxy *m_activeSaver = nullptr;
 
-  // Mouser bridge (fork extension): loopback listener fed by the local
-  // Mouser, the cached device-connect line, and which remote client
-  // currently hosts the virtual device.
-  std::unique_ptr<MouserBridge> m_mouserBridge;
+  // Mouser bridge (fork extension): the process-lifetime link to the local
+  // Mouser (not owned here; a Server only borrows it for its epoch), the
+  // cached device-connect line, and which remote client currently hosts
+  // the virtual device.
+  deskflow::MouserLink *m_mouserLink = nullptr;
   VirtualHostTracker m_mouserVirtualHostTracker;
 
   BaseClientProxy *m_switchScreen = nullptr;

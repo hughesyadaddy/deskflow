@@ -28,6 +28,8 @@ create_test(
   SOURCE ServerTests.cpp
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/server"
 )
+# A Server borrows the process-wide MouserLink; keep the test from dialing a real Mouser.
+set_tests_properties(ServerTests PROPERTIES ENVIRONMENT "DESKFLOW_MOUSER_LINK=off")
 
 create_test(
   NAME VirtualHostTrackerTests

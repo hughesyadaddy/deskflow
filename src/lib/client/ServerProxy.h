@@ -17,7 +17,9 @@
 #include "client/HidConsumer.h"
 
 class Client;
-class MouserClient;
+namespace deskflow {
+class MouserLink;
+}
 class ClientInfo;
 class EventQueueTimer;
 class IClipboard;
@@ -108,8 +110,8 @@ private:
 private:
   using MessageParser = ConnectionResult (ServerProxy::*)(const uint8_t *);
 
-  //! Lazily create the loopback Mouser client; null when sharing/HID delivery is off.
-  MouserClient *mouserDeliveryOrNull();
+  //! The process-lifetime Mouser link; null when HID delivery is off.
+  deskflow::MouserLink *mouserDeliveryOrNull();
   void stopMouserHidDelivery();
 
   Client *m_client = nullptr;
@@ -136,6 +138,6 @@ private:
   std::string m_serverLayout = "";
   bool m_isUserNotifiedAboutLayoutSyncError = false;
   deskflow::KeyboardLayoutManager m_layoutManager;
-  // Mouser integration (fork extension); created lazily on first DMSR/HIDR.
-  std::unique_ptr<MouserClient> m_mouserClient;
+  // Mouser integration (fork extension): borrowed on first DMSR/HIDR, never owned.
+  deskflow::MouserLink *m_mouserLink = nullptr;
 };

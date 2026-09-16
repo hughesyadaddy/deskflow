@@ -15,6 +15,7 @@
 #include "deskflow/AppUtil.h"
 #include "deskflow/DeskflowException.h"
 #include "deskflow/IPlatformScreen.h"
+#include "deskflow/MouserLink.h"
 #include "deskflow/OptionTypes.h"
 #include "deskflow/PacketStreamFilter.h"
 #include "deskflow/ProtocolTypes.h"
@@ -422,8 +423,11 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
 
 Server::~Server()
 {
-  if (m_mouserBridge) {
-    m_mouserBridge->stop();
+  if (m_mouserLink != nullptr) {
+    // The link outlives us (it belongs to the process): just stop feeding
+    // this Server. Mouser keeps its session; the next Server re-registers.
+    m_mouserLink->setInboundHandler({});
+    m_mouserLink = nullptr;
     setMouserBridgeActive(false);
     m_events->removeHandler(EventTypes::ServerMouserBridgeLine, this);
   }
@@ -841,22 +845,23 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
 
 void Server::initMouserBridge()
 {
-  if (!Settings::value(Settings::Server::MouserBridgeEnabled).toBool()) {
-    setMouserBridgeActive(false);
-    return;
-  }
-  const int port = Settings::value(Settings::Server::MouserBridgePort).toInt();
-  const std::string token = Settings::value(Settings::Server::MouserBridgeToken).toString().toStdString();
-  auto bridge = std::make_unique<MouserBridge>(m_events, this, port, token);
-  if (!bridge->start()) {
-    setMouserBridgeActive(false);
-    return;
-  }
-  m_mouserBridge = std::move(bridge);
-  setMouserBridgeActive(true);
+  // One process-lifetime link (docs/mouser-bridge.md): Mouser owns the
+  // listener; we announce our role and route its lines onto this event
+  // loop. The legacy 19796 listener only comes up inside the link when
+  // Mouser has not been upgraded (no token file) and the conf enables it.
+  auto &link = deskflow::MouserLink::shared();
+  m_mouserLink = &link;
   m_events->addHandler(EventTypes::ServerMouserBridgeLine, this, [this](const auto &e) { handleMouserBridgeLine(e); });
+  link.setInboundHandler([this](const std::string &line) {
+    m_events->addEvent(Event(EventTypes::ServerMouserBridgeLine, this, new MouserBridgeLineData(line)));
+  });
+  link.setRole(deskflow::MouserLink::Role::Server);
+  setMouserBridgeActive(
+      link.mode() == deskflow::MouserLink::Mode::Lego || Settings::value(Settings::Server::MouserBridgeEnabled).toBool()
+  );
+  LOG_INFO("mouser bridge: using process link (%s mode)", deskflow::MouserLink::modeName(link.mode()));
   // Seed the focus state so Mouser knows it starts local.
-  m_mouserBridge->notifyFocus(getName(m_active), m_active == m_primaryClient);
+  link.notifyFocus(getName(m_active), m_active == m_primaryClient);
 }
 
 void Server::sendMouserLine(BaseClientProxy *client, const std::string &line)
@@ -906,7 +911,7 @@ void Server::virtualHostOnFocusChange(
 )
 {
   tracker.onFocusChange(
-      dst, m_primaryClient,
+      dst, m_primaryClient, getName(dst),
       [this](BaseClientProxy *client, const std::string &payload) { sendMouserLine(client, payload); }, connectPayload
   );
 }
@@ -951,16 +956,18 @@ void Server::handleMouserBridgeLine(const Event &event)
 
 void Server::updateMouserVirtualHost(BaseClientProxy *dst)
 {
-  if (!m_mouserBridge) {
+  if (m_mouserLink == nullptr) {
     return;
   }
+  // A focus notice on both hops (local Mouser and the remote host), never
+  // a device connect/disconnect: the HID session survives the switch.
   virtualHostOnFocusChange(m_mouserVirtualHostTracker, dst);
-  m_mouserBridge->notifyFocus(getName(dst), dst == m_primaryClient);
+  m_mouserLink->notifyFocus(getName(dst), dst == m_primaryClient);
 }
 
 void Server::syncMouserVirtualHostForFleetCursor(const std::string &cursorScreen)
 {
-  if (!m_mouserBridge || cursorScreen.empty()) {
+  if (m_mouserLink == nullptr || cursorScreen.empty()) {
     return;
   }
   const auto index = m_clients.find(cursorScreen);
