@@ -120,7 +120,7 @@ tools/fleet-health --check all --host all
 ssh tiny11 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\alexh\Desktop\deskflow\scripts\deskflow-ctl.ps1 assert-single'
 ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl assert-single'
 # signatures + TCC + bridge
-tools/fleet-health --check sign,identifiers,tcc,instances,bridge --host all
+tools/fleet-health --check all --host all
 # no key held anywhere (Windows) — rerun 1a and expect all down=False
 ```
 

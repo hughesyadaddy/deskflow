@@ -287,8 +287,13 @@ def bridge_status_cmd(port: int = BRIDGE_PORT) -> str:
 def parse_bridge_status(output: str) -> Tuple[bool, str]:
     """(pass, detail) for a bridge status reply.
 
-    PASS iff a JSON object in the output has attached == true and
-    peer == "deskflow-core". Anything else names what was wrong.
+    PASS iff a JSON object in the output has peer == "deskflow-core" —
+    that proves the proto-2 link is wired up. attached == false is the
+    correct steady state on a seat that has not yet received a device
+    connect over the link (e.g. before the physical device's host has
+    published one); it is reported in the detail, not treated as a
+    failure. Anything else (wrong/missing peer, no reply, unparseable)
+    names what was wrong.
     """
     text = output.strip()
     if not text:
@@ -309,18 +314,15 @@ def parse_bridge_status(output: str) -> Tuple[bool, str]:
         return False, f"unparseable bridge reply: {text[:120]}"
     attached = payload.get("attached")
     peer = payload.get("peer")
-    problems = []
-    if attached is not True:
-        problems.append(f"attached={json.dumps(attached)} (want true)")
     if peer != BRIDGE_PEER:
-        problems.append(f"peer={json.dumps(peer)} (want {BRIDGE_PEER!r})")
-    if problems:
-        return False, "; ".join(problems)
+        return False, f"peer={json.dumps(peer)} (want {BRIDGE_PEER!r})"
     extra = ""
     for key in ("session", "proto", "ver"):
         if key in payload:
             extra += f" {key}={payload[key]}"
-    return True, f"attached to {BRIDGE_PEER}{extra}"
+    if attached is True:
+        return True, f"attached to {BRIDGE_PEER}{extra}"
+    return True, f"linked to {BRIDGE_PEER}, not yet attached (no device connect observed){extra}"
 
 
 def ctl_assert_single_cmd(root: str = MAC_DESKFLOW_ROOT) -> str:

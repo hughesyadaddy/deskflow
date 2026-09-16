@@ -1810,6 +1810,17 @@ bool OSXScreen::HotKeyItem::operator<(const HotKeyItem &x) const
 CGEventRef
 OSXScreen::handleCGInputEventSecondary(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
+  // Secondary/client screens install this callback instead of handleCGInputEvent, so
+  // without this call sanitizeInjectedKeys()'s freshness check never sees a hardware
+  // flags-changed event on a client Mac and treats every held modifier as stale,
+  // releasing it out from under the user. Must run before the early return below.
+  {
+    OSXScreen *screen = (OSXScreen *)refcon;
+    if (type == kCGEventFlagsChanged) {
+      screen->m_keyState->noteHardwareModifierFlags(CGEventGetFlags(event), OSXKeyState::monotonicSeconds());
+    }
+  }
+
   // this fix is really screwing with the correct show/hide behavior. it
   // should be tested better before reintroducing.
   return event;

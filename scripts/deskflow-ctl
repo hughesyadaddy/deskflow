@@ -101,7 +101,12 @@ agent_loaded() { launchctl print "$DOMAIN/$1" >/dev/null 2>&1; }
 
 agent_pid() {
   # Prints the pid launchd reports for a label, or nothing when not running.
-  launchctl print "$DOMAIN/$1" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }'
+  # `launchctl print` exits non-zero when the label isn't loaded; under
+  # `set -euo pipefail` that failure propagates through the pipe and — for
+  # callers that assign this via `x="$(agent_pid ...)"` — aborts the whole
+  # script instead of yielding an empty string. `|| true` on the producer
+  # keeps this a plain "no pid" result in every case.
+  launchctl print "$DOMAIN/$1" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }' || true # fleet:allow launchctl exits non-zero when the label isn't loaded; empty output is the intended "no pid" result
 }
 
 render_agent() {

@@ -464,8 +464,11 @@ def test_parse_bridge_status():
     assert not ok and "no reply" in detail
     ok, detail = fh.parse_bridge_status("garbage\n")
     assert not ok and "unparseable" in detail
+    # attached=false with the right peer is the correct steady state before any
+    # device-connect has been observed over the link -- the link itself is what
+    # proves the bridge is wired up, so this is a PASS with a note, not a FAIL.
     ok, detail = fh.parse_bridge_status('{"attached":false,"peer":"deskflow-core"}')
-    assert not ok and "attached=false" in detail
+    assert ok and "not yet attached" in detail
     ok, detail = fh.parse_bridge_status('{"attached":true,"peer":"mouser-gui"}')
     assert not ok and 'peer="mouser-gui"' in detail
     ok, detail = fh.parse_bridge_status('{"attached":true}')
@@ -481,11 +484,16 @@ def test_bridge_mac_pass_and_fail():
     assert results[0].status == "PASS" and "deskflow-core" in results[0].detail
     assert ("macbookpro", fh.bridge_status_cmd()) in runner.calls
 
-    # Mouser up but the core never attached (legacy/off mode): FAIL, named.
+    # Linked but idle (no device-connect observed yet): PASS, noted as not-yet-attached.
     t = mac_ok_table()
+    t[("macbookpro", fh.bridge_status_cmd())] = (0, '{"t":"status","attached":false,"peer":"deskflow-core"}\n', "")
+    results, _ = run_checks([mac()], t, ["bridge"])
+    assert results[0].status == "PASS" and "not yet attached" in results[0].detail
+
+    # Mouser up but no peer at all (legacy/off mode): FAIL, named.
     t[("macbookpro", fh.bridge_status_cmd())] = (0, '{"t":"status","attached":false,"peer":null}\n', "")
     results, _ = run_checks([mac()], t, ["bridge"])
-    assert results[0].status == "FAIL" and "attached=false" in results[0].detail
+    assert results[0].status == "FAIL" and "peer=null" in results[0].detail
 
     # Nothing listening on 19795: nc exits 1 with no output.
     t[("macbookpro", fh.bridge_status_cmd())] = (1, "", "")
