@@ -49,6 +49,7 @@ private:
   void setConfigFile(const QString &configFile);
   void applyWatchdogCommand() const;
   void clearWatchdogCommand();
+  void restartWatchdogProcess() const;
   void clearSettings();
 
   static void showConsole();

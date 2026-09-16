@@ -1168,15 +1168,22 @@ void MSWindowsKeyState::noteInjectedModifier(WORD vk, bool held)
     return;
   }
   if (held) {
-    m_injectedModifierVks.insert(vk);
+    // Down AND repeat land here: a repeat refreshes the stamp so a chord the
+    // server keeps holding stays inside the audit's grace window.
+    m_injectedModifiers[vk] = GetTickCount64();
   } else {
-    m_injectedModifierVks.erase(vk);
+    m_injectedModifiers.erase(vk);
   }
 }
 
 int MSWindowsKeyState::modifierVkIndex(WORD vk)
 {
-  static const WORD kTracked[] = {VK_LWIN, VK_RWIN, VK_LMENU, VK_RMENU, VK_LCONTROL, VK_RCONTROL};
+  // Indices 0-5 are the contract shared with the desk-side audit table
+  // (deskSanitizeStaleModifiers). Shift is tracked here (6-7) only so that
+  // sanitizeInjectedKeys() can tell an injected Shift from a physical one;
+  // the audit table deliberately has no Shift row, so those bits are ignored
+  // there by construction.
+  static const WORD kTracked[] = {VK_LWIN, VK_RWIN, VK_LMENU, VK_RMENU, VK_LCONTROL, VK_RCONTROL, VK_LSHIFT, VK_RSHIFT};
   for (int i = 0; i < static_cast<int>(sizeof(kTracked) / sizeof(kTracked[0])); ++i) {
     if (kTracked[i] == vk) {
       return i;
@@ -1185,15 +1192,108 @@ int MSWindowsKeyState::modifierVkIndex(WORD vk)
   return -1;
 }
 
-uint32_t MSWindowsKeyState::injectedModifierBits() const
+uint32_t MSWindowsKeyState::injectedModifierBits(const InjectedModifierMap &ledger, ULONGLONG nowMs)
 {
   uint32_t bits = 0;
-  for (const WORD vk : m_injectedModifierVks) {
+  for (const auto &[vk, stampMs] : ledger) {
+    if (nowMs - stampMs > kInjectedModifierGraceMs) {
+      continue; // no UP for too long: stop vouching for it
+    }
     if (const int index = modifierVkIndex(vk); index >= 0) {
       bits |= (1u << index);
     }
   }
   return bits;
+}
+
+uint32_t MSWindowsKeyState::injectedModifierBits() const
+{
+  return injectedModifierBits(m_injectedModifiers, GetTickCount64());
+}
+
+std::vector<WORD> MSWindowsKeyState::injectedKeyCandidates(const InjectedModifierMap &ledger)
+{
+  // Shift is always a candidate here even though the periodic audit never
+  // touches it: this runs only at boundaries (enter/leave/enable/desk
+  // switch/wake) where the server holds nothing on this screen, so a Shift
+  // still down is the classic "everything types in capitals" strand. The
+  // false positive -- a human physically holding Shift at this exact
+  // instant -- self-corrects on their next press.
+  std::map<WORD, bool> candidates; // ordered => deterministic release order
+  for (const auto &[vk, stampMs] : ledger) {
+    candidates[vk] = true;
+  }
+  candidates[VK_LSHIFT] = true;
+  candidates[VK_RSHIFT] = true;
+
+  std::vector<WORD> result;
+  for (const auto &[vk, unused] : candidates) {
+    result.push_back(vk);
+  }
+  return result;
+}
+
+std::vector<WORD> MSWindowsKeyState::injectedKeysToRelease(
+    const InjectedModifierMap &ledger, const std::function<bool(WORD)> &isPhysicallyDown
+)
+{
+  std::vector<WORD> release;
+  for (const WORD vk : injectedKeyCandidates(ledger)) {
+    if (isPhysicallyDown(vk)) {
+      release.push_back(vk);
+    }
+  }
+  return release;
+}
+
+void MSWindowsKeyState::sanitizeInjectedKeys()
+{
+  // No pre-filter on this thread: GetAsyncKeyState answers for the desktop
+  // THIS thread is bound to, which on LogonUI / secure desktop is not the
+  // input desktop -- exactly the case that strands keys. The desk thread
+  // probes each candidate, injects the UP, and trims the list to what it
+  // actually released.
+  std::vector<WORD> vks = injectedKeyCandidates(m_injectedModifiers);
+  m_desks->releaseHeldKeys(vks);
+  for (const WORD vk : vks) {
+    const bool wasInjected = m_injectedModifiers.erase(vk) != 0;
+    LOG_INFO("released stale %s key vk=0x%02x", wasInjected ? "injected" : "held", vk);
+  }
+}
+
+void MSWindowsKeyState::setToggleState(KeyModifierMask bit, bool on)
+{
+  WORD vk;
+  switch (bit) {
+  case KeyModifierCapsLock:
+    vk = VK_CAPITAL;
+    break;
+  case KeyModifierNumLock:
+    vk = VK_NUMLOCK;
+    break;
+  case KeyModifierScrollLock:
+    vk = VK_SCROLL;
+    break;
+  default:
+    return;
+  }
+
+  // Toggle bit, the same read pollActiveModifiers() uses.
+  const bool current = (GetKeyState(vk) & 0x01) != 0;
+  if (current == on) {
+    return;
+  }
+
+  // There is no Windows API to set a toggle directly; the only way is to
+  // press the key. Inject through the desk so it lands on the input desktop.
+  const WORD scanCode = static_cast<WORD>(MapVirtualKey(vk, MAPVK_VK_TO_VSC));
+  const DWORD extended = (vk == VK_NUMLOCK) ? KEYEVENTF_EXTENDEDKEY : 0;
+  const bool downOk = m_desks->fakeKeyEvent(vk, scanCode, extended, false);
+  const bool upOk = m_desks->fakeKeyEvent(vk, scanCode, extended | KEYEVENTF_KEYUP, false);
+  LOG_INFO(
+      "toggle vk=0x%02x %s -> %s (%s)", vk, current ? "on" : "off", on ? "on" : "off",
+      (downOk && upOk) ? "pressed" : "injection dropped"
+  );
 }
 
 void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)

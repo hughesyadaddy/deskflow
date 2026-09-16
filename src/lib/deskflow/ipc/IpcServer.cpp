@@ -7,6 +7,7 @@
 #include "IpcServer.h"
 
 #include "base/Log.h"
+#include "common/Constants.h"
 #include "common/VersionInfo.h"
 
 #include <QLocalServer>
@@ -206,14 +207,37 @@ void IpcServer::requestLocalCoreRestart()
     broadcastCommandIfClients(QStringLiteral("restartCore"));
     return;
   }
-  // NEVER stop the core here. Nothing guarantees a respawn: on Windows the
-  // daemon watchdog only relaunches on a session change or a login-screen
-  // transition, so with no GUI running this turned the rescue into a kill
-  // switch -- the machine went dead and had to be restarted by hand. A
-  // rescue that cannot restart must do nothing rather than destroy the
-  // thing it was meant to rescue.
-  LOG_ERR("keyboard rescue: 5x Esc — no GUI IPC client to restart the core; "
-          "ignoring (stopping it here would leave this machine dead)");
+#if defined(Q_OS_WIN)
+  // No GUI, but on Windows the daemon watchdog owns this process: ask it to
+  // relaunch us (DaemonIpcServer "restartCore" -> MSWindowsWatchdog::
+  // requestRestart). The daemon does the stop AND the start, so unlike the
+  // old stop-and-pray path there is always something left to respawn.
+  // Short blocking waits are fine: this runs on the IPC owning thread and a
+  // rescue is a once-in-a-blue-moon event.
+  QLocalSocket daemon;
+  daemon.connectToServer(QString::fromLatin1(kDaemonIpcName));
+  if (daemon.waitForConnected(500)) {
+    LOG_INFO("keyboard rescue: 5x Esc — no GUI IPC client; asking the daemon to relaunch the core");
+    daemon.write("restartCore\n");
+    daemon.flush();
+    daemon.waitForBytesWritten(500);
+    daemon.disconnectFromServer();
+    return;
+  }
+  LOG_ERR(
+      "keyboard rescue: 5x Esc — no GUI IPC client and the daemon is unreachable (%s); ignoring",
+      daemon.errorString().toUtf8().constData()
+  );
+#else
+  // NEVER stop the core here. Nothing guarantees a respawn, so with no GUI
+  // running this would turn the rescue into a kill switch -- the machine
+  // went dead and had to be restarted by hand. A rescue that cannot restart
+  // must do nothing rather than destroy the thing it was meant to rescue.
+  LOG_ERR(
+      "keyboard rescue: 5x Esc — no GUI IPC client to restart the core; "
+      "ignoring (stopping it here would leave this machine dead)"
+  );
+#endif
 }
 
 void IpcServer::writeToClientSocket(QLocalSocket *&clientSocket, const QString &message) const

@@ -111,6 +111,30 @@ public:
     // Default implementation does nothing
   }
 
+  //! Force a toggle modifier (Caps/Num/Scroll Lock) to a known state
+  /*!
+  \p bit is exactly one of KeyModifierCapsLock / KeyModifierNumLock /
+  KeyModifierScrollLock. Platforms that can only flip a toggle by pressing
+  the key compare the OS state with \p on and press+release when they differ.
+  Default implementation does nothing.
+  */
+  virtual void setToggleState(KeyModifierMask /*bit*/, bool /*on*/)
+  {
+    // Default implementation does nothing
+  }
+
+  //! Release keys this client injected that the OS still reports held
+  /*!
+  Backstop for a lost release: at a boundary where the server cannot be
+  holding anything here (enter/leave/enable/desk switch/wake) any injected
+  key still physically down is stale and is released. Default implementation
+  does nothing.
+  */
+  virtual void sanitizeInjectedKeys()
+  {
+    // Default implementation does nothing
+  }
+
   //! Fake ctrl+alt+del
   /*!
   Synthesize a press of ctrl+alt+del.  Return true if processing is

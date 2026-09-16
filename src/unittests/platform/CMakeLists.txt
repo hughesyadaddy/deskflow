@@ -18,6 +18,14 @@ if (WIN32)
     SOURCE MSWindowsClipboardTests.cpp
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
   )
+  # Pure decision logic only (static functions); no live desks/key state.
+  create_test(
+    NAME MSWindowsKeyStateTests
+    DEPENDS platform
+    LIBS base arch
+    SOURCE MSWindowsKeyStateTests.cpp
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
+  )
 elseif(APPLE)
   create_test(
     NAME OSXClipboardTests

@@ -254,11 +254,16 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
     return;
   }
   m_desks->sanitizeStaleModifiers(m_keyState != nullptr ? m_keyState->injectedModifierBits() : 0);
-  // The releases just changed the OS modifier state behind KeyState's back.
-  // Without a resync the shadow still says (e.g.) Ctrl is held, and
-  // KeyMap::keysForModifierState then emits NO modifier press for a key that
-  // needs it -- relayed capitals arrive lowercase for the rest of the epoch.
   if (m_keyState != nullptr) {
+    // Second sweep from the other direction: the audit above skips what the
+    // ledger says WE hold, but at this boundary the server holds nothing, so
+    // any ledger entry (and any Shift) still physically down is stale too.
+    m_keyState->sanitizeInjectedKeys();
+    // The releases just changed the OS modifier state behind KeyState's back.
+    // Without a resync the shadow still says (e.g.) Ctrl is held, and
+    // KeyMap::keysForModifierState then emits NO modifier press for a key
+    // that needs it -- relayed capitals arrive lowercase for the rest of the
+    // epoch.
     m_keyState->updateKeyState();
   }
 }
@@ -331,6 +336,9 @@ void MSWindowsScreen::leave()
     // how a stuck Win outlived the visit. Shift is excluded by the audit
     // table, so local capitals are unaffected.
     m_desks->sanitizeStaleModifiers(0);
+    // ...and the ledger's own view, Shift included (the audit table has no
+    // Shift row; a Shift stranded by a lost UP is the "all capitals" bug).
+    m_keyState->sanitizeInjectedKeys();
   }
 
   if (m_isPrimary) {
@@ -1007,6 +1015,12 @@ bool MSWindowsScreen::onEvent(HWND, UINT msg, WPARAM wParam, LPARAM lParam, LRES
     case PBT_APMRESUMEAUTOMATIC:
     case PBT_APMRESUMECRITICAL:
     case PBT_APMRESUMESUSPEND:
+      if (!m_isPrimary && m_keyState != nullptr) {
+        // Sleep interrupts any chord mid-hold and the UP never arrives
+        // (the server has long since moved on); waking with a modifier
+        // still injected is a stuck key until something releases it.
+        m_keyState->sanitizeInjectedKeys();
+      }
       m_events->addEvent(
           Event(EventTypes::ScreenResume, getEventTarget(), nullptr, Event::EventFlags::DeliverImmediately)
       );
@@ -1652,6 +1666,18 @@ void MSWindowsScreen::updateKeysCB(const void *)
   // update layouts if necessary
   if (m_keyState->didGroupsChange()) {
     PlatformScreen::updateKeyMap();
+  }
+
+  if (!isPrimary()) {
+    // updateKeyState() below zeroes m_syntheticKeys/m_serverKeys WITHOUT
+    // releasing anything, so every key the server was holding through us
+    // (a chord mid-lock, a modifier during a UAC/LogonUI desk switch) stays
+    // physically down and the server's later UP is dropped by
+    // KeyState::fakeKeyUp as "not ours". Release them first -- this runs on
+    // the desk thread, so the UPs are injected inline on the current input
+    // desktop before the OS is polled -- then sweep anything still held.
+    m_keyState->fakeAllKeysUp();
+    m_keyState->sanitizeInjectedKeys();
   }
 
   // now update the keyboard state

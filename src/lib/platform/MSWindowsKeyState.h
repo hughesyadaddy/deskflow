@@ -9,7 +9,8 @@
 
 #include "deskflow/KeyState.h"
 
-#include <set>
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -28,13 +29,51 @@ This class maps KeyIDs to keystrokes.
 class MSWindowsKeyState : public KeyState
 {
 public:
+  //! Injected-modifier ledger: VK -> tick (ms) of the most recent injected
+  //! DOWN (or repeat) that has not been followed by an injected UP.
+  using InjectedModifierMap = std::map<WORD, ULONGLONG>;
+
+  //! How long an injected DOWN vouches for a physically held modifier.
+  /*!
+  The 1 s audit skips modifiers in the ledger so a chord the server is
+  deliberately holding is not released under it. But a DOWN whose UP never
+  arrives (server gone mid-chord, epoch restart, desk switch dropping the
+  UP) would otherwise be protected forever -- the ledger would defend the
+  very stranded key the audit exists to release. After this grace the audit
+  stops trusting the entry. Repeats refresh the stamp, so a held modifier
+  that the server keeps repeating stays protected; a modifier held longer
+  than this WITHOUT repeats (e.g. a macOS server, which sends none for
+  modifiers) may be released early by the audit -- a known trade-off.
+  */
+  static constexpr ULONGLONG kInjectedModifierGraceMs = 2000;
+
   //! Bitfield of modifier VKs this client has injected DOWN and not released.
   /*!
   Derived only from injection outcomes, never from the OS -- reading the OS
   back would let a stuck modifier certify itself as intended. Bit order
-  matches the table in MSWindowsDesks' stale-modifier audit.
+  matches the table in MSWindowsDesks' stale-modifier audit. Entries older
+  than kInjectedModifierGraceMs are excluded (see there).
   */
   uint32_t injectedModifierBits() const;
+
+  //! Pure form of injectedModifierBits() for unit tests: bits of \p ledger
+  //! entries stamped within the grace window of \p nowMs.
+  static uint32_t injectedModifierBits(const InjectedModifierMap &ledger, ULONGLONG nowMs);
+
+  //! Candidate VKs for sanitizeInjectedKeys(): every VK in \p ledger plus
+  //! VK_LSHIFT/VK_RSHIFT, ascending. The desk thread probes and releases
+  //! these (it is the only thread bound to the input desktop).
+  static std::vector<WORD> injectedKeyCandidates(const InjectedModifierMap &ledger);
+
+  //! Pure decision logic for sanitizeInjectedKeys(): the VKs to release.
+  /*!
+  injectedKeyCandidates() filtered to those \p isPhysicallyDown(vk) reports
+  held. \p isPhysicallyDown stands in for GetAsyncKeyState so the decision
+  is testable without Win32 input state; at runtime the desk thread applies
+  the same filter (deskReleaseHeldKeys) on the input desktop.
+  */
+  static std::vector<WORD>
+  injectedKeysToRelease(const InjectedModifierMap &ledger, const std::function<bool(WORD)> &isPhysicallyDown);
 
   //! Index of \p vk in the tracked-modifier table, or -1.
   static int modifierVkIndex(WORD vk);
@@ -148,6 +187,8 @@ public:
   KeyModifierMask pollActiveModifiers() const override;
   int32_t pollActiveGroup() const override;
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
+  void setToggleState(KeyModifierMask bit, bool on) override;
+  void sanitizeInjectedKeys() override;
 
   // KeyState overrides
   void onKey(KeyButton button, bool down, KeyModifierMask newState) override;
@@ -181,8 +222,7 @@ protected:
 
 private:
   void noteInjectedModifier(WORD vk, bool held);
-  std::set<WORD> m_injectedModifierVks;
-
+  InjectedModifierMap m_injectedModifiers;
 
   using GroupList = std::vector<HKL>;
 
