@@ -14,8 +14,13 @@ Stdlib only (ctypes is used for libproc on macOS).
 JSONL layout: the first line is a header
   {"header": true, "metric": "phys_footprint"|"private_bytes",
    "scenario_source": "observed", "sampler_sha": ..., "seat": ..., "proc": ...,
-   "interval": 60}
-followed by one sample object per line.
+   "interval": 60, "restart_source": ...}
+followed by one sample object per line. `restart_source` says whether
+restart_count comes from launchd (`runs =`) or is null, in which case restarts
+are detected only from (exe, pid, start_time) tuple changes.
+
+On macOS a verdict is INVALID when any post-warm-up sample's metric_source is
+not proc_pid_rusage (the top(1) RSS fallback measures something else).
 
 Report exit codes: 0 pass, 1 fail (criteria), 2 verdict invalid.
 """
@@ -131,14 +136,20 @@ _PS_RE = re.compile(
 
 
 def parse_ps(text: str, exe: str) -> list[tuple[int, str, str]]:
-    """Parse `ps -axo pid=,lstart=,args=` output; return (pid, start, args)."""
+    """Parse `ps -axo pid=,lstart=,args=` output; return (pid, start, args).
+
+    The exe match is case-insensitive: APFS is case-insensitive by default,
+    so `.../MacOS/deskflow` and `.../MacOS/Deskflow` are the same binary.
+    """
     out = []
+    exe_l = exe.lower()
     for line in text.splitlines():
         m = _PS_RE.match(line)
         if not m:
             continue
         pid, lstart, args = int(m.group(1)), m.group(2), m.group(3)
-        if args == exe or args.startswith(exe + " "):
+        args_l = args.lower()
+        if args_l == exe_l or args_l.startswith(exe_l + " "):
             try:
                 st = _dt.datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y")
                 start = st.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -252,11 +263,63 @@ def mac_fds(pid: int) -> int | None:
     return max(len(lines) - 1, 0) if lines else None
 
 
-def mac_restart_count(label: str) -> int | None:
-    uid = os.getuid()
-    text = run(["launchctl", "print", f"gui/{uid}/{label}"])
-    m = re.search(r"^\s*runs\s*=\s*(\d+)", text, re.M)
+_LAUNCHCTL_RUNS_RE = re.compile(r"^\s*runs\s*=\s*(\d+)", re.M)
+_LAUNCHCTL_PROGRAM_RE = re.compile(r"^\s*program\s*=\s*(\S.*?)\s*$", re.M)
+
+
+def _launchctl_runs(text: str) -> int | None:
+    m = _LAUNCHCTL_RUNS_RE.search(text)
     return int(m.group(1)) if m else None
+
+
+def launchctl_labels(text: str) -> list[str]:
+    """Labels from the `services = { ... }` block of `launchctl print gui/UID`.
+
+    Each row is `<pid|->\t<status>\t<label>`; dynamic app labels look like
+    `application.io.github.hughesyadaddy.deskflow.406638075.406638081`.
+    """
+    labels: list[str] = []
+    in_services = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not in_services:
+            if re.match(r"^services\s*=\s*\{", s):
+                in_services = True
+            continue
+        if s.startswith("}"):
+            break
+        parts = s.split()
+        if len(parts) >= 3:
+            labels.append(parts[-1])
+    return labels
+
+
+def mac_restart_count(label: str, exe: str | None = None) -> int | None:
+    """`runs =` of the launchd job for `label`.
+
+    GUI apps launched by LaunchServices get a dynamic label
+    (`application.<bundle-id>.<n>.<m>`), so the static label misses. In that
+    case fall back to every gui/UID service whose label contains the label's
+    last component and whose `program =` is `exe` (case-insensitive). Returns
+    None when nothing matches; the header's `restart_source` then records that
+    restarts are detected only from (exe, pid, start_time) tuple changes.
+    """
+    uid = os.getuid()
+    runs = _launchctl_runs(run(["launchctl", "print", f"gui/{uid}/{label}"]))
+    if runs is not None or not exe:
+        return runs
+    needle = proc_from_label(label)
+    exe_l = exe.lower()
+    for cand in launchctl_labels(run(["launchctl", "print", f"gui/{uid}"])):
+        if cand == label or needle not in cand.lower():
+            continue
+        text = run(["launchctl", "print", f"gui/{uid}/{cand}"])
+        m = _LAUNCHCTL_PROGRAM_RE.search(text)
+        if m and m.group(1).lower() == exe_l:
+            runs = _launchctl_runs(text)
+            if runs is not None:
+                return runs
+    return None
 
 
 def _newest_log(paths: list[Path]) -> Path | None:
@@ -277,18 +340,106 @@ def _tail_text(path: Path, nbytes: int = 256 * 1024) -> str:
         return ""
 
 
-def derive_scenario(proc: str, home: Path | None = None, log_path: str | None = None) -> str:
-    """Derive the observed scenario from the app's newest log line.
+MESH_PORT = 24851
 
-    mouser        -> device-connected | device-absent
-    deskflow-core -> server | client
+
+def mesh_token(home: Path | None = None) -> str | None:
+    """coordination/token from Deskflow.conf (mirrors harness_mesh_token in
+    harness/run-scenario.sh): DESKFLOW_MESH_TOKEN env, else the first of
+    $DESKFLOW_SETTINGS, ~/Library/Deskflow/Deskflow.conf,
+    $XDG_CONFIG_HOME/Deskflow/Deskflow.conf, /Library/Deskflow/Deskflow.conf.
+    """
+    env_tok = os.environ.get("DESKFLOW_MESH_TOKEN")
+    if env_tok:
+        return env_tok
+    home = home or Path.home()
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or (home / ".config"))
+    candidates = [
+        Path(os.environ["DESKFLOW_SETTINGS"]) if os.environ.get("DESKFLOW_SETTINGS") else None,
+        home / "Library/Deskflow/Deskflow.conf",
+        xdg / "Deskflow/Deskflow.conf",
+        Path("/Library/Deskflow/Deskflow.conf"),
+    ]
+    for conf in candidates:
+        if conf is None or not conf.is_file():
+            continue
+        section = None
+        try:
+            for raw in conf.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1].strip().lower()
+                    continue
+                if section == "coordination" and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k.strip() == "token":
+                        return v.strip() or None
+        except OSError:
+            pass
+        return None
+    return None
+
+
+def mesh_status(host: str = "127.0.0.1", port: int = MESH_PORT, token: str | None = None,
+                timeout: float = 2.0) -> dict | None:
+    """Send `{"t":"status"}` (plus token) to the coordinator; return the reply."""
+    msg = {"t": "status"}
+    if token:
+        msg["token"] = token
+    try:
+        with socket.create_connection((host, port), timeout) as s:
+            s.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode())
+            s.settimeout(timeout)
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        reply = json.loads(buf.decode("utf-8", "replace").strip() or "null")
+        return reply if isinstance(reply, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def role_from_status(status: dict | None) -> str | None:
+    """Map a coordinator status reply's role to server | client (else None)."""
+    if not isinstance(status, dict):
+        return None
+    role = status.get("role")
+    if role is None and isinstance(status.get("self"), dict):
+        role = status["self"].get("role")
+    if not isinstance(role, str):
+        return None
+    role = role.strip().lower()
+    if role in ("server", "primary"):
+        return "server"
+    if role in ("client", "secondary"):
+        return "client"
+    return None
+
+
+def derive_scenario(proc: str, home: Path | None = None, log_path: str | None = None,
+                    status_fn=None) -> str:
+    """Derive the observed scenario.
+
+    mouser        -> device-connected | device-absent (newest log line)
+    deskflow-core -> server | client from the coordinator status socket
+                     (127.0.0.1:24851, `{"t":"status"}` with the Deskflow.conf
+                     token); the newest log line is only a fallback
     otherwise     -> unknown
 
     ``log_path`` overrides the default log lookup for the process.
+    ``status_fn`` overrides the status query (tests); it returns a dict or None.
     """
     home = home or Path.home()
     text = ""
     override = Path(log_path) if log_path and log_path != "-" else None
+    if proc in ("deskflow-core", "deskflow", "deskflow-daemon"):
+        query = status_fn or (lambda: mesh_status(token=mesh_token(home)))
+        role = role_from_status(query())
+        if role:
+            return role
     if proc == "mouser":
         log = override or _newest_log(
             [home / "Library/Logs/Mouser/mouser.log"]
@@ -344,7 +495,7 @@ def mac_collect(label: str, exe: str, proc: str, scenario_log: str | None = None
             rec["metric_source"] = "top-mem-fallback"
         rec["fds"] = mac_fds(pid)
     rec["scenario"] = derive_scenario(proc, log_path=scenario_log)
-    rec["restart_count"] = mac_restart_count(label)
+    rec["restart_count"] = mac_restart_count(label, exe)
     return rec
 
 
@@ -421,8 +572,27 @@ def metric_name() -> str:
     return "private_bytes" if IS_WIN else "phys_footprint"
 
 
-def make_header(proc: str, interval: int, seat: str | None = None) -> dict:
-    return {
+RESTART_SOURCE_LAUNCHD = "launchctl-runs+tuple-change"
+RESTART_SOURCE_TUPLE_ONLY = (
+    "tuple-change only: restart_count is null (no launchd job matched the label "
+    "or the exe's program); restarts are detected solely from (exe, pid, "
+    "start_time) tuple changes between consecutive samples, so a sampling gap "
+    "that spans a restart can hide it"
+)
+
+
+def restart_source(label: str, exe: str) -> str:
+    """Header note on where restart evidence comes from for this target."""
+    if IS_WIN:
+        return "service-control-manager-7036+tuple-change"
+    if mac_restart_count(label, exe) is None:
+        return RESTART_SOURCE_TUPLE_ONLY
+    return RESTART_SOURCE_LAUNCHD
+
+
+def make_header(proc: str, interval: int, seat: str | None = None,
+                restart_src: str | None = None) -> dict:
+    hdr = {
         "header": True,
         "metric": metric_name(),
         "scenario_source": "observed",
@@ -431,6 +601,9 @@ def make_header(proc: str, interval: int, seat: str | None = None) -> dict:
         "proc": proc,
         "interval": int(interval),
     }
+    if restart_src is not None:
+        hdr["restart_source"] = restart_src
+    return hdr
 
 
 def ensure_header(path: Path, header: dict) -> None:
@@ -509,8 +682,8 @@ def cmd_sample(a: argparse.Namespace) -> int:
         raw = sys.stdin.read() if a.probe_json == "-" else Path(a.probe_json).read_text()
         probe = json.loads(raw or "{}")
 
-    for out, p in zip(outs, procs):
-        ensure_header(out, make_header(p, a.interval, seat))
+    for out, p, label, exe in zip(outs, procs, a.label, a.exe):
+        ensure_header(out, make_header(p, a.interval, seat, restart_source(label, exe)))
 
     while True:
         for label, exe, proc, out, slog in zip(a.label, a.exe, procs, outs, logs):
@@ -656,6 +829,32 @@ def validate(header: dict | None, samples: list[dict], problems: list[str],
     return fails
 
 
+# macOS only: the Windows probe has a single collector (Get-Process).
+REQUIRED_METRIC_SOURCE = {"phys_footprint": "proc_pid_rusage"}
+
+
+def metric_source_problems(metric: str, body: list[dict]) -> list[str]:
+    """Body samples whose metric_source is not the authoritative collector.
+
+    On macOS phys_footprint must come from proc_pid_rusage; a top(1) RSS
+    fallback (or a missing source) measures something else and the verdict
+    built on it is INVALID rather than merely noisy.
+    """
+    want = REQUIRED_METRIC_SOURCE.get(metric)
+    if want is None:
+        return []
+    bad: dict[str, int] = {}
+    first: dict[str, str] = {}
+    for s in body:
+        src = s.get("metric_source")
+        if src != want:
+            key = str(src)
+            bad[key] = bad.get(key, 0) + 1
+            first.setdefault(key, s.get("ts", "?"))
+    return [f"{n} body sample(s) with metric_source={src!r} != {want!r} (first at {first[src]})"
+            for src, n in sorted(bad.items())]
+
+
 def analyze(header: dict | None, samples: list[dict], window_h: float | None,
             accelerated: bool, scenario: str | None) -> dict:
     metric = (header or {}).get("metric") or "phys_footprint"
@@ -713,6 +912,7 @@ def analyze(header: dict | None, samples: list[dict], window_h: float | None,
     body = [s for s in samples if s["_t"] >= t0 + warm]
     res["warmup_excluded"] = len(samples) - len(body)
     res["analyzed"] = len(body)
+    res["metric_source_problems"] = metric_source_problems(metric, body)
 
     xs = [s["_t"] / 3600 for s in body]
     ys = [metric_value(s, metric) for s in body]
@@ -772,6 +972,7 @@ def cmd_report(a: argparse.Namespace) -> int:
         invalid = ["no samples in window"]
     if res.get("slope_mb_h") is None and not invalid:
         invalid = ["too few samples after warm-up exclusion to compute a slope"]
+    invalid += res.get("metric_source_problems") or []
 
     fails: list[str] = []
     if not invalid:

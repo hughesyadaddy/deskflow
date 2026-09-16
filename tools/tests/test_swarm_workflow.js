@@ -50,6 +50,50 @@ test('assertDisjoint passes on the real registry', () => {
   assert.equal(mod.assertDisjoint(registry.hotspots), true)
 })
 
+// Registry rows that are known to disagree with their driver header. Each
+// entry is an expected failure with the JSON edit that would fix it; the
+// assertion below still checks the row and reports when it starts passing so
+// the entry can be deleted. Empty today: D6 -> epoch-flip, M6 -> window-toggle
+// were repointed in the registry and mouse-absent-reconnect now declares
+// `# proc: mouser` (M2).
+const EXPECTED_REGISTRY_DRIVER_MISMATCHES = {
+  // 'D6-osxscreen-polling': 'TODO(registry): set "scenario" to an automated deskflow-core row',
+}
+
+test('every registry hotspot points at a driver whose # proc: matches and is not manual', () => {
+  const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'))
+  const header = (driver, key) => {
+    const m = driver.match(new RegExp(`^# ${key}:[ \\t]*(.*)$`, 'm'))
+    return m ? m[1].trim() : ''
+  }
+  const problems = []
+  const fixed = []
+  for (const h of registry.hotspots) {
+    const driverPath = path.join(root, 'harness', 'scenarios', `${h.scenario}.sh`)
+    const errs = []
+    if (!fs.existsSync(driverPath)) {
+      errs.push(`scenario ${h.scenario} has no driver at harness/scenarios/${h.scenario}.sh`)
+    } else {
+      const driver = fs.readFileSync(driverPath, 'utf8')
+      const proc = header(driver, 'proc')
+      const automation = header(driver, 'automation')
+      if (proc !== h.proc) errs.push(`registry proc ${h.proc} != driver '# proc: ${proc}' (${h.scenario}.sh)`)
+      if (automation === 'manual') errs.push(`driver ${h.scenario}.sh is '# automation: manual'; the swarm cannot run it (exit 4)`)
+      if (!['full', 'partial'].includes(automation) && automation !== 'manual') errs.push(`driver ${h.scenario}.sh has no valid '# automation:' header`)
+    }
+    const expected = EXPECTED_REGISTRY_DRIVER_MISMATCHES[h.id]
+    if (errs.length && expected) {
+      console.log(`  # expected failure ${h.id}: ${errs.join('; ')} -- ${expected}`)
+    } else if (errs.length) {
+      problems.push(`${h.id}: ${errs.join('; ')}`)
+    } else if (expected) {
+      fixed.push(h.id)
+    }
+  }
+  assert.deepEqual(problems, [], `registry/driver mismatches:\n  ${problems.join('\n  ')}`)
+  assert.deepEqual(fixed, [], `these rows now pass; remove them from EXPECTED_REGISTRY_DRIVER_MISMATCHES: ${fixed.join(', ')}`)
+})
+
 test('assertDisjoint throws on an overlapping fixture', () => {
   const fixture = [
     { id: 'A', repo: 'deskflow', files: ['src/a.cpp', 'src/shared.h'] },

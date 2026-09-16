@@ -49,18 +49,28 @@ scenario_teardown() { :; }
 EOF
 }
 
-# write_stub <report-exit-code>: fleet-soak stub. `sample --once` emits a
-# JSON line whose phys_footprint grows 1 MiB per call and appends to --out.
+# write_stub <report-exit-code>: fleet-soak stub. `sample --once` mirrors the
+# real sampler: it prints nothing on stdout, requires --exe, writes a header
+# line if --out is empty and appends one realistic JSONL record whose
+# phys_footprint_mb grows 1.5 MB per call and mach_ports by 1.
 write_stub() {
   cat >"$FLEET_SOAK_BIN" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >>"$STUB_LOG"
 case "\$1" in
   sample)
-    out=""; while [ \$# -gt 0 ]; do [ "\$1" = --out ] && out="\$2"; shift; done
+    out=""; exe=""; label=""
+    while [ \$# -gt 0 ]; do
+      case "\$1" in --out) out="\$2"; shift ;; --exe) exe="\$2"; shift ;; --label) label="\$2"; shift ;; esac
+      shift
+    done
+    [ -n "\$exe" ] || { echo "fleet-soak: error: the following arguments are required: --exe" >&2; exit 2; }
+    [ -n "\$out" ] || { echo "fleet-soak: --out or --start-soak required" >&2; exit 2; }
     n=\$(grep -c '^sample' "$STUB_LOG")
-    line="{\"ts\":\$n,\"phys_footprint\":\$((100*1048576 + n*1048576)),\"ports\":\$((50 + n))}"
-    echo "\$line"; [ -n "\$out" ] && echo "\$line" >>"\$out"; exit 0 ;;
+    [ -s "\$out" ] || echo '{"header":true,"metric":"phys_footprint","scenario_source":"observed","sampler_sha":"stub","seat":"test","proc":"'"\$label"'","interval":60}' >>"\$out"
+    mb=\$(python3 -c "print(round(100.25 + \$n * 1.5, 3))")
+    echo '{"ts":"2026-09-16T12:00:'"\$(printf %02d \$((n % 60)))"'Z","pid":4242,"start_time":"2026-09-16T10:00:00-0400","exe":"'"\$exe"'","phys_footprint_mb":'"\$mb"',"metric_source":"proc_pid_rusage","rss_mb":'"\$mb"',"compressed_mb":1.0,"mach_ports":'"\$((300 + n))"',"threads":12,"fds":60,"scenario":"server","restart_count":null,"heartbeat":true}' >>"\$out"
+    exit 0 ;;
   report) exit $1 ;;
 esac
 exit 99
@@ -116,7 +126,7 @@ EOF
 }
 
 @test "manual row without FLEET_OPERATOR exits 4 and runs nothing" {
-  export HARNESS_SCENARIOS_DIR="$TMP/scenarios"
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=macbookpro
   run "$RUN" manual-row --seat macbookpro --iters 3
   [ "$status" -eq 4 ]
   [[ "$output" == *FLEET_OPERATOR=1* ]]
@@ -125,6 +135,7 @@ EOF
 }
 
 @test "shipped manual rows exit 4 without FLEET_OPERATOR" {
+  export FLEET_HOSTNAME=hackintosh
   for row in bt-sleep-wake lock-unlock login-bridge; do
     run "$RUN" "$row" --seat hackintosh --iters 1
     [ "$status" -eq 4 ] || { echo "$row: exit $status"; false; }
@@ -144,35 +155,90 @@ EOF
 }
 
 @test "manual row runs with FLEET_OPERATOR=1" {
-  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_OPERATOR=1
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_OPERATOR=1 FLEET_HOSTNAME=macbookpro
   run "$RUN" manual-row --seat macbookpro --iters 2
   [ "$status" -eq 0 ]
   grep -q 'manual iter 2' "$TMP/driver.log"
 }
 
 @test "full row runs setup, N iterations, teardown with the stubbed sampler" {
-  export HARNESS_SCENARIOS_DIR="$TMP/scenarios"
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=macbookpro
   run "$RUN" trivial --seat macbookpro --iters 3
   [ "$status" -eq 0 ]
   [ "$(cat "$TMP/driver.log")" = $'setup\niter 1\niter 2\niter 3\nteardown' ]
-  # sampler: before + after (interval sampler may or may not have fired)
-  [ "$(grep -c '^sample --once --label deskflow-core --out' "$STUB_LOG")" -ge 2 ]
+  # sampler: before + after (interval sampler may or may not have fired), with --exe
+  [ "$(grep -c '^sample --once --label deskflow-core --exe /Applications/Deskflow.app/Contents/MacOS/deskflow-core --out' "$STUB_LOG")" -ge 2 ]
   # out file: header + samples
   out="$HARNESS_RUNS_DIR/trivial.jsonl"
   grep -q '"header":true' "$out"
   grep -q '"scenario_source":"scripted"' "$out"
-  grep -q '"phys_footprint"' "$out"
-  # log under runs/logs/<proc>/<row>-<ts>.log
-  ls "$HARNESS_RUNS_DIR/logs/deskflow-core/" | grep -Eq '^trivial-[0-9T]+Z\.log$'
-  # deltas and run id printed
-  [[ "$output" == *"run-id: trivial-"* ]]
-  [[ "$output" == *"deltaMB: +"* ]]
+  grep -q '"run_id":"trivial-' "$out"
+  grep -q '"phys_footprint_mb"' "$out"
+  # log under runs/logs/<proc>/<run_id>.log carrying the same run-id:/deltaMB: lines
+  run_id="$(sed -n 's/^run-id: //p' <<<"$output")"
+  [[ "$run_id" == trivial-*Z ]]
+  log="$HARNESS_RUNS_DIR/logs/deskflow-core/$run_id.log"
+  [ -f "$log" ]
+  grep -q "^run-id: $run_id\$" "$log"
+  grep -Eq '^deltaMB: [+-][0-9]+\.[0-9]{2}$' "$log"
+  # deltas: the stub grows 1.5 MB per call and the value is already MB, so
+  # before/after differ by 1.5 x (calls between them) -- numeric, never n/a
+  delta="$(sed -n 's/^deltaMB: //p' <<<"$output")"
+  [[ "$delta" =~ ^\+[0-9]+\.[0-9]{2}$ ]] || { echo "bad deltaMB '$delta'"; false; }
+  python3 -c 'import sys; d=float(sys.argv[1]); assert d >= 1.5 and abs(d/1.5 - round(d/1.5)) < 1e-6, d' "$delta"
+  [ "$delta" = "$(sed -n 's/^deltaMB: //p' "$log")" ]
   [[ "$output" == *"Δ phys_footprint"* ]]
-  [[ "$output" == *"Δ ports"* ]]
+  ports="$(sed -n 's/^deltaPorts: //p' <<<"$output")"
+  [[ "$ports" =~ ^[0-9]+$ ]] && [ "$ports" -ge 1 ]
+}
+
+@test "--exe comes from the built-in map, then '# exe:' header, then HARNESS_EXE_<PROC>" {
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=macbookpro
+  run "$RUN" trivial --seat macbookpro --iters 1
+  [ "$status" -eq 0 ]
+  grep -q -- '--exe /Applications/Deskflow.app/Contents/MacOS/deskflow-core ' "$STUB_LOG"
+  { echo '# exe: /opt/custom/deskflow-core'; cat "$TMP/scenarios/trivial.sh"; } >"$TMP/scenarios/trivial2.sh"
+  mv "$TMP/scenarios/trivial2.sh" "$TMP/scenarios/trivial.sh"
+  : >"$STUB_LOG"
+  run "$RUN" trivial --seat macbookpro --iters 1
+  [ "$status" -eq 0 ]
+  grep -q -- '--exe /opt/custom/deskflow-core ' "$STUB_LOG"
+  : >"$STUB_LOG"
+  HARNESS_EXE_DESKFLOW_CORE=/env/deskflow-core run "$RUN" trivial --seat macbookpro --iters 1
+  [ "$status" -eq 0 ]
+  grep -q -- '--exe /env/deskflow-core ' "$STUB_LOG"
+  ! grep -q -- '--exe /opt/custom' "$STUB_LOG"
+  HARNESS_EXE_DESKFLOW_CORE=relative/path run "$RUN" trivial --seat macbookpro --iters 1
+  [ "$status" -eq 2 ]
+}
+
+@test "sampler failure yields deltaMB n/a instead of a bogus number" {
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=macbookpro
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$FLEET_SOAK_BIN"
+  run "$RUN" trivial --seat macbookpro --iters 1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"deltaMB: n/a"* ]]
+  [[ "$output" == *"fleet-soak sample --once failed (before)"* ]]
+}
+
+@test "--seat must match the host unless --smoke" {
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=macbookpro
+  run "$RUN" trivial --seat hackintosh --iters 1
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"does not match this host"* ]]
+  [ ! -f "$TMP/driver.log" ]
+  [ ! -f "$STUB_LOG" ]
+  run "$RUN" trivial --seat hackintosh --iters 1 --smoke
+  [ "$status" -eq 0 ]
+  grep -q 'iter 1' "$TMP/driver.log"
+  # --print-proc never needs a seat
+  unset FLEET_HOSTNAME
+  run "$RUN" trivial --print-proc
+  [ "$status" -eq 0 ] && [ "$output" = deskflow-core ]
 }
 
 @test "iteration failure exits 1 and still runs teardown" {
-  export HARNESS_SCENARIOS_DIR="$TMP/scenarios"
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=macbookpro
   run "$RUN" failing --seat macbookpro --iters 5
   [ "$status" -eq 1 ]
   [ "$(grep -c teardown "$TMP/driver.log")" -eq 1 ]
@@ -218,12 +284,64 @@ EOF
   ! grep -q '^report' "$STUB_LOG"
 }
 
-@test "gate is not applied when the seat is hackintosh but the host is not" {
+@test "seat=hackintosh from another host is refused before the gate (bypass closed)" {
   export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=macbookpro
   write_stub 2
   run "$RUN" trivial --seat hackintosh --iters 1
+  [ "$status" -eq 2 ]
+  [ ! -f "$STUB_LOG" ]
+  [ ! -f "$TMP/driver.log" ]
+}
+
+@test "seat=hackintosh --smoke from another host holds the lock and skips the gate" {
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=macbookpro
+  if command -v flock >/dev/null 2>&1; then skip "flock present; mkdir fallback not exercised"; fi
+  write_stub 2
+  cat >"$TMP/scenarios/locky.sh" <<'EOF'
+# proc: deskflow-core
+# automation: full
+# seat: hackintosh
+# description: asserts the lock dir is held during the run
+scenario_setup() { :; }
+scenario_iter() { [ -d "$HARNESS_LOCK_FILE.d" ] && grep -q "^$$ " "$HARNESS_LOCK_FILE.d/owner"; }
+scenario_teardown() { :; }
+EOF
+  run "$RUN" locky --seat hackintosh --iters 1 --smoke
   [ "$status" -eq 0 ]
+  [[ "$output" == *"baseline gate skipped"* ]]
   ! grep -q '^report' "$STUB_LOG"
+  [ ! -d "$HARNESS_LOCK_FILE.d" ]
+}
+
+@test "stale mkdir lock (dead owner pid) is reclaimed instead of hanging" {
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=hackintosh FLEET_NO_BASELINE_GATE=1
+  if command -v flock >/dev/null 2>&1; then skip "flock present; mkdir fallback not exercised"; fi
+  mkdir "$HARNESS_LOCK_FILE.d"
+  ( : ) & dead=$!; wait "$dead"   # a pid that has certainly exited
+  echo "$dead trivial-stale" >"$HARNESS_LOCK_FILE.d/owner"
+  start=$(date +%s)
+  run "$RUN" trivial --seat hackintosh --iters 1
+  end=$(date +%s)
+  [ "$status" -eq 0 ]
+  [ $((end - start)) -lt 5 ]
+  [[ "$output" == *"reclaiming stale lock"* ]]
+  [ ! -d "$HARNESS_LOCK_FILE.d" ]
+}
+
+@test "live mkdir lock (owner pid alive) is waited on, not reclaimed" {
+  export HARNESS_SCENARIOS_DIR="$TMP/scenarios" FLEET_HOSTNAME=hackintosh FLEET_NO_BASELINE_GATE=1
+  if command -v flock >/dev/null 2>&1; then skip "flock present; mkdir fallback not exercised"; fi
+  mkdir "$HARNESS_LOCK_FILE.d"
+  sleep 30 & holder=$!
+  echo "$holder trivial-live" >"$HARNESS_LOCK_FILE.d/owner"
+  ( sleep 2; kill "$holder" 2>/dev/null; rm -rf "$HARNESS_LOCK_FILE.d" ) &
+  start=$(date +%s)
+  run "$RUN" trivial --seat hackintosh --iters 1
+  end=$(date +%s)
+  [ "$status" -eq 0 ]
+  [ $((end - start)) -ge 2 ]
+  [[ "$output" == *"waiting for"* ]]
+  [[ "$output" != *"reclaiming stale lock"* ]]
 }
 
 @test "hackintosh lock serializes: a held mkdir lock blocks until released" {

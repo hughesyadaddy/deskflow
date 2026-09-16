@@ -336,8 +336,9 @@ def mocked_mac(fs, monkeypatch):
     monkeypatch.setattr(fs, "mac_top", lambda pid: {"rss_mb": 130.0, "compressed_mb": 4.0,
                                                     "mach_ports": 311, "threads": 14})
     monkeypatch.setattr(fs, "mac_fds", lambda pid: 77)
-    monkeypatch.setattr(fs, "mac_restart_count", lambda label: 3)
-    monkeypatch.setattr(fs, "derive_scenario", lambda proc, home=None, log_path=None: "device-connected")
+    monkeypatch.setattr(fs, "mac_restart_count", lambda label, exe=None: 3)
+    monkeypatch.setattr(fs, "derive_scenario",
+                        lambda proc, home=None, log_path=None, status_fn=None: "device-connected")
     return fs
 
 
@@ -352,7 +353,7 @@ def test_sample_header_macos(mocked_mac, tmp_path):
     hdr = json.loads(lines[0])
     assert hdr == {"header": True, "metric": "phys_footprint", "scenario_source": "observed",
                    "sampler_sha": "abc123", "seat": "hackintosh", "proc": "mouser",
-                   "interval": 60}
+                   "interval": 60, "restart_source": fs.RESTART_SOURCE_LAUNCHD}
     rec = json.loads(lines[1])
     assert rec["pid"] == 4242
     assert rec["phys_footprint_mb"] == 123.0
@@ -489,11 +490,173 @@ def test_derive_scenario_from_logs(fs, tmp_path):
     dlog = home / "deskflow.log"
     dlog.write_text("INFO: coordination: starting client epoch towards 1.2.3.4\n"
                     "INFO: coordination: starting server epoch\n")
-    assert fs.derive_scenario("deskflow-core", home) == "server"
-    assert fs.derive_scenario("deskflow-core", home, log_path=str(mlog)) == "unknown"
-    assert fs.derive_scenario("something-else", home) == "unknown"
+    # no coordinator reachable (status_fn -> None): the log is the fallback
+    down = lambda: None  # noqa: E731
+    assert fs.derive_scenario("deskflow-core", home, status_fn=down) == "server"
+    assert fs.derive_scenario("deskflow-core", home, log_path=str(mlog), status_fn=down) == "unknown"
+    assert fs.derive_scenario("something-else", home, status_fn=down) == "unknown"
     (home / "Library/Logs").mkdir(exist_ok=True)
-    assert fs.derive_scenario("deskflow-core", tmp_path / "empty") == "unknown"
+    assert fs.derive_scenario("deskflow-core", tmp_path / "empty", status_fn=down) == "unknown"
+
+
+def test_derive_scenario_deskflow_core_from_status_socket(fs, tmp_path):
+    """deskflow-core's role comes from the coordinator status reply, not the log."""
+    home = tmp_path
+    (home / "deskflow.log").write_text("INFO: coordination: starting server epoch\n")
+    calls = []
+
+    def status(reply):
+        def fn():
+            calls.append(1)
+            return reply
+        return fn
+
+    assert fs.derive_scenario("deskflow-core", home, status_fn=status({"t": "status", "role": "client",
+                                                                       "name": "hackintosh"})) == "client"
+    assert fs.derive_scenario("deskflow-core", home, status_fn=status({"role": "server"})) == "server"
+    assert fs.derive_scenario("deskflow-core", home, status_fn=status({"role": "SERVER"})) == "server"
+    # `init` (election not settled) and garbage fall through to the log fallback
+    assert fs.derive_scenario("deskflow-core", home, status_fn=status({"role": "init"})) == "server"
+    assert fs.derive_scenario("deskflow-core", tmp_path / "empty", status_fn=status({"role": "init"})) == "unknown"
+    assert fs.derive_scenario("deskflow-core", tmp_path / "empty", status_fn=status(["nope"])) == "unknown"
+    assert fs.derive_scenario("deskflow-core", tmp_path / "empty", status_fn=status(None)) == "unknown"
+    assert len(calls) == 7
+    # mouser never touches the socket
+    assert fs.derive_scenario("mouser", tmp_path / "empty", status_fn=status({"role": "server"})) == "unknown"
+    assert len(calls) == 7
+
+
+def test_mesh_status_round_trip_with_token(fs, tmp_path, monkeypatch):
+    """mesh_status sends {"t":"status","token":...}\\n and parses the newline reply."""
+    import socket as _socket
+    import threading
+
+    conf = tmp_path / "Library/Deskflow/Deskflow.conf"
+    conf.parent.mkdir(parents=True)
+    conf.write_text("[core]\nname=hackintosh\n[coordination]\nport=24851\ntoken=s3cret\n[gui]\nx=1\n")
+    monkeypatch.delenv("DESKFLOW_MESH_TOKEN", raising=False)
+    monkeypatch.delenv("DESKFLOW_SETTINGS", raising=False)
+    assert fs.mesh_token(tmp_path) == "s3cret"
+    assert fs.mesh_token(tmp_path / "nowhere") is None
+    monkeypatch.setenv("DESKFLOW_MESH_TOKEN", "env-tok")
+    assert fs.mesh_token(tmp_path) == "env-tok"
+
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    got = {}
+
+    def serve():
+        c, _ = srv.accept()
+        data = b""
+        while not data.endswith(b"\n"):
+            data += c.recv(4096)
+        got["req"] = json.loads(data.decode())
+        c.sendall(b'{"t":"status","role":"server","name":"hackintosh","seq":3}\n')
+        c.close()
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    reply = fs.mesh_status("127.0.0.1", port, token="s3cret")
+    th.join(3)
+    srv.close()
+    assert got["req"] == {"t": "status", "token": "s3cret"}
+    assert reply["role"] == "server"
+    assert fs.role_from_status(reply) == "server"
+    # closed port -> None (no exception)
+    dead = _socket.socket(); dead.bind(("127.0.0.1", 0)); dead_port = dead.getsockname()[1]; dead.close()
+    assert fs.mesh_status("127.0.0.1", dead_port, timeout=0.5) is None
+
+
+def test_parse_ps_is_case_insensitive(fs):
+    text = " 2676 Wed Sep 16 12:12:33 2026     /Applications/Deskflow.app/Contents/MacOS/Deskflow\n"
+    assert fs.parse_ps(text, "/Applications/Deskflow.app/Contents/MacOS/deskflow")[0][0] == 2676
+    assert fs.parse_ps(text, "/Applications/Deskflow.app/Contents/MacOS/Deskflow")[0][0] == 2676
+    assert fs.parse_ps(text, "/Applications/Deskflow.app/Contents/MacOS/deskflow-core") == []
+
+
+LAUNCHCTL_GUI = """\
+com.apple.xpc.launchd.user.domain.501.100005.Aqua = {
+\ttype = user
+\tservices = {
+\t\t    2698      - \tapplication.io.github.hughesyadaddy.mouser.406643559.406643564
+\t\t    2676      - \tapplication.io.github.hughesyadaddy.deskflow.406638075.406638081
+\t\t       -      0 \tcom.apple.somethingelse
+\t}
+\tendpoints = {
+\t\t"foo" = { port = 1 }
+\t}
+}
+"""
+
+
+def test_launchctl_labels_parses_services_block(fs):
+    assert fs.launchctl_labels(LAUNCHCTL_GUI) == [
+        "application.io.github.hughesyadaddy.mouser.406643559.406643564",
+        "application.io.github.hughesyadaddy.deskflow.406638075.406638081",
+        "com.apple.somethingelse",
+    ]
+    assert fs.launchctl_labels("") == []
+
+
+def test_restart_count_falls_back_to_dynamic_label_by_exe(fs, monkeypatch):
+    dyn = "application.io.github.hughesyadaddy.deskflow.406638075.406638081"
+    printed = []
+
+    def fake_run(cmd, timeout=20):
+        printed.append(cmd)
+        target = cmd[-1]
+        if target == "gui/501":
+            return LAUNCHCTL_GUI
+        if target == f"gui/501/{dyn}":
+            return ("\tprogram = /Applications/Deskflow.app/Contents/MacOS/Deskflow\n"
+                    "\targuments = {\n\t\t/Applications/Deskflow.app/Contents/MacOS/Deskflow\n\t}\n"
+                    "\truns = 4\n")
+        if target.endswith(".mouser.406643559.406643564"):
+            return "\tprogram = /Applications/Mouser.app/Contents/MacOS/Mouser\n\truns = 9\n"
+        return ""  # static label: "Could not find service" goes to stderr
+
+    monkeypatch.setattr(fs, "run", fake_run)
+    monkeypatch.setattr(fs.os, "getuid", lambda: 501)
+    # static label misses, exe (lower-case as in the old plist) matches the dynamic job
+    assert fs.mac_restart_count("io.github.hughesyadaddy.deskflow",
+                                "/Applications/Deskflow.app/Contents/MacOS/deskflow") == 4
+    assert any(c[-1] == "gui/501" for c in printed)
+    # only labels containing the proc name are printed (mouser's job is skipped)
+    assert not any(c[-1].endswith("406643564") for c in printed)
+    # nothing matches -> None (and restart_source says tuple-change only)
+    assert fs.mac_restart_count("deskflow-core", "/Applications/Deskflow.app/Contents/MacOS/deskflow-core") is None
+    assert fs.restart_source("deskflow-core", "/Applications/Deskflow.app/Contents/MacOS/deskflow-core") \
+        == fs.RESTART_SOURCE_TUPLE_ONLY
+    assert "tuple" in fs.RESTART_SOURCE_TUPLE_ONLY and "null" in fs.RESTART_SOURCE_TUPLE_ONLY
+    # no exe -> no fallback scan
+    printed.clear()
+    assert fs.mac_restart_count("io.github.hughesyadaddy.deskflow") is None
+    assert printed == [["launchctl", "print", "gui/501/io.github.hughesyadaddy.deskflow"]]
+
+
+def test_report_invalid_when_body_metric_source_is_not_rusage(fs, tmp_path, capsys):
+    s = series(6, 0.0)
+    # one post-warm-up sample from the top(1) fallback poisons the verdict
+    s[200]["metric_source"] = "top-mem-fallback"
+    p = write_jsonl(tmp_path / "src.jsonl", header(), s)
+    code, res = report(fs, p, "--slope-max", "1", capsys=capsys)
+    assert code == 2
+    assert res["verdict"] == "INVALID"
+    assert any("metric_source='top-mem-fallback' != 'proc_pid_rusage'" in i for i in res["invalid"])
+    # ... also with --validate, and a missing source counts too
+    s[200]["metric_source"] = "proc_pid_rusage"
+    del s[300]["metric_source"]
+    p = write_jsonl(tmp_path / "src2.jsonl", header(), s)
+    code, res = report(fs, p, "--validate", "--min-hours", "1", capsys=capsys)
+    assert code == 2 and any("metric_source='None'" in i for i in res["invalid"])
+    # warm-up samples are not body samples: a fallback there is tolerated
+    s[300]["metric_source"] = "proc_pid_rusage"
+    s[5]["metric_source"] = "top-mem-fallback"
+    p = write_jsonl(tmp_path / "src3.jsonl", header(), s)
+    code, res = report(fs, p, "--slope-max", "1", capsys=capsys)
+    assert code == 0 and res["metric_source_problems"] == []
 
 
 def test_proc_from_label(fs):

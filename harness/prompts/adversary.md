@@ -30,7 +30,7 @@ reproduced the leak before the fix and its absence after, on the seat.
 3. **Independent rerun, BEFORE.** On the seat, on `origin/{{baseBranch}}`:
 
    ```
-   ssh {{hackintoshSsh}} 'git -C <repo> fetch && git checkout origin/{{baseBranch}} && harness/run-scenario.sh {{scenario}} --iters 1000'
+   ssh {{hackintoshSsh}} 'git -C <repo> fetch && git checkout origin/{{baseBranch}} && harness/run-scenario.sh {{scenario}} --seat hackintosh --iters 1000'
    ```
 
    The leak must reproduce (slope above `--slope-max` in
