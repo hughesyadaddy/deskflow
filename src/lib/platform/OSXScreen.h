@@ -159,6 +159,22 @@ private:
 
   bool checkAXPermissions();
 
+  // clipboard polling: cheap NSPasteboard changeCount gate in front of the
+  // heavy PasteboardSynchronize path. Pure helper so the gating rule is unit
+  // testable without AppKit: returns true (and updates `last`) only when the
+  // change count moved since the previous tick.
+  static bool clipboardChangeCountAdvanced(long &last, long current)
+  {
+    if (current == last) {
+      return false;
+    }
+    last = current;
+    return true;
+  }
+  void clipboardPollTick();
+  void armClipboardTimer();
+  double clipboardPollInterval() const;
+
   // global hotkey operating mode
   static bool isGlobalHotKeyOperatingModeAvailable();
   static void setGlobalHotKeysEnabled(bool enabled);
@@ -262,7 +278,12 @@ private:
   // clipboard stuff
   bool m_ownClipboard;
   EventQueueTimer *m_clipboardTimer;
+  // interval the live m_clipboardTimer was armed with (0 = none)
+  double m_clipboardTimerInterval = 0.0;
+  // last NSPasteboard changeCount observed; -1 forces a sync on first tick
+  long m_lastPasteboardChangeCount = -1;
 
+  // low-rate watchdog: quits if accessibility trust is revoked at runtime
   EventQueueTimer *m_axTimer;
 
   // window object that gets user input events when the server
