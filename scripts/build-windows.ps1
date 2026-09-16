@@ -81,4 +81,13 @@ Write-Host "Build OK -> $build"
 if ($Install) {
   & (Join-Path $PSScriptRoot 'install-windows.ps1')
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # Post-install signing gate. install-windows.ps1 signs (elevated, before the
+  # service starts) via scripts/sign-windows.ps1; here we re-run sign-windows.ps1
+  # in verify mode over the Deskflow install root so an unsigned or wrong-cert
+  # binary fails the build/deploy instead of shipping silently. Verify-only
+  # because the installed images are now in use by the running service/GUI.
+  $installRoot = if ($env:DESKFLOW_INSTALL_DIR) { $env:DESKFLOW_INSTALL_DIR } else { Join-Path ${env:ProgramFiles} 'Deskflow' }
+  & (Join-Path $PSScriptRoot 'sign-windows.ps1') -Root $installRoot -VerifyOnly
+  Write-Host "Install signed OK -> $installRoot"
 }
