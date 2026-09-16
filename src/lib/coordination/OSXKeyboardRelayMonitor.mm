@@ -45,7 +45,7 @@ public:
   bool start(RelayPassThroughQuery passThrough, KeyForwardSend send) override
   {
     if (m_thread.joinable()) {
-      if (m_active) {
+      if (m_running) {
         return true;
       }
       // Thread finished without a live tap (permission/transient failure):
@@ -290,6 +290,7 @@ private:
         CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, tapCallback, this);
     if (m_tap == nullptr) {
       LOG_WARN("coordination: keyboard relay tap unavailable (input monitoring permission?)");
+      m_running = false;
       return;
     }
 

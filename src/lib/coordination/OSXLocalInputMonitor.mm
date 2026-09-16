@@ -35,7 +35,7 @@ public:
   bool start(Callback onGenuineInput) override
   {
     if (m_thread.joinable()) {
-      if (m_active) {
+      if (m_running) {
         return true;
       }
       // Thread finished without a live tap (permission/transient failure):
@@ -98,6 +98,7 @@ private:
     );
     if (m_tap == nullptr) {
       LOG_WARN("coordination: could not create input event tap (missing input monitoring permission?)");
+      m_running = false;
       return;
     }
 

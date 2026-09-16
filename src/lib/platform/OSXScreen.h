@@ -44,6 +44,19 @@ class Mutex;
 class OSXScreen : public PlatformScreen
 {
 public:
+  // clipboard polling: cheap NSPasteboard changeCount gate in front of the
+  // heavy PasteboardSynchronize path. Pure helper so the gating rule is unit
+  // testable without AppKit: returns true (and updates `last`) only when the
+  // change count moved since the previous tick.
+  static bool clipboardChangeCountAdvanced(long &last, long current)
+  {
+    if (current == last) {
+      return false;
+    }
+    last = current;
+    return true;
+  }
+
   OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync = false);
 
   virtual ~OSXScreen();
@@ -159,18 +172,6 @@ private:
 
   bool checkAXPermissions();
 
-  // clipboard polling: cheap NSPasteboard changeCount gate in front of the
-  // heavy PasteboardSynchronize path. Pure helper so the gating rule is unit
-  // testable without AppKit: returns true (and updates `last`) only when the
-  // change count moved since the previous tick.
-  static bool clipboardChangeCountAdvanced(long &last, long current)
-  {
-    if (current == last) {
-      return false;
-    }
-    last = current;
-    return true;
-  }
   void clipboardPollTick();
   void armClipboardTimer();
   double clipboardPollInterval() const;
