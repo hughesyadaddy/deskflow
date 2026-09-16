@@ -176,8 +176,16 @@ void TCPSocketTests::writePastCap_raisesBackpressureAndDropsQueue()
   QVERIFY(!socket->outputOverflowed());
   QCOMPARE(events.count(EventTypes::StreamOutputError), 0);
 
-  // one more byte: backpressure
+  // a burst past the cap while the peer is still within the stall window is
+  // buffered, not dropped: a 10 MB clipboard is posted as 20 chunks at once
   const uint8_t one = 0x01;
+  socket->write(&one, 1);
+  QVERIFY(!socket->outputOverflowed());
+  QCOMPARE(socket->outputBufferSize(), cap + 1);
+  QCOMPARE(events.count(EventTypes::StreamOutputError), 0);
+
+  // once the peer has made no progress for the stall timeout: backpressure
+  socket->setOutputStallTimeout(std::chrono::milliseconds(0));
   socket->write(&one, 1);
   QVERIFY(socket->outputOverflowed());
   QCOMPARE(events.count(EventTypes::StreamOutputError), 1);

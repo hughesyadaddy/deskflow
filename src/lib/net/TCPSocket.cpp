@@ -161,7 +161,7 @@ void TCPSocket::write(const void *buffer, uint32_t n)
     // single write cannot be skipped; drop the queue, shut the output side
     // and tell the owner, which treats it as a write failure / disconnect.
     const uint64_t queued = static_cast<uint64_t>(m_outputBuffer.getSize()) + n;
-    const bool stalled = (std::chrono::steady_clock::now() - m_lastProgress) > kOutputStallTimeout;
+    const bool stalled = (std::chrono::steady_clock::now() - m_lastProgress) > m_outputStallTimeout;
     if (queued > m_maxOutputBufferSize && stalled) {
       LOG_WARN(
           "socket %08X output buffer full (%llu > %u bytes), dropping queued output", m_socket,
@@ -196,6 +196,11 @@ void TCPSocket::setDefaultMaxOutputBufferSize(uint32_t bytes)
 uint32_t TCPSocket::defaultMaxOutputBufferSize()
 {
   return s_defaultMaxOutputBufferSize.load();
+}
+
+void TCPSocket::setOutputStallTimeout(std::chrono::milliseconds timeout)
+{
+  m_outputStallTimeout = timeout;
 }
 
 void TCPSocket::setMaxOutputBufferSize(uint32_t bytes)

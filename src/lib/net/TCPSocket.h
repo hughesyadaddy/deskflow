@@ -87,6 +87,9 @@ public:
   */
   static constexpr std::chrono::seconds kOutputStallTimeout{10};
 
+  //! Override the stall timeout for this socket (tests, tuning).
+  void setOutputStallTimeout(std::chrono::milliseconds timeout);
+
   //! Set the process-wide default output cap used by new sockets.
   static void setDefaultMaxOutputBufferSize(uint32_t bytes);
   static uint32_t defaultMaxOutputBufferSize();
@@ -197,6 +200,7 @@ private:
   bool m_outputOverflowed = false;
   uint32_t m_maxOutputBufferSize;
   std::chrono::steady_clock::time_point m_lastProgress = std::chrono::steady_clock::now();
+  std::chrono::milliseconds m_outputStallTimeout = kOutputStallTimeout;
   static std::atomic<uint32_t> s_defaultMaxOutputBufferSize;
   Mutex m_mutex;
   ArchSocket m_socket;
