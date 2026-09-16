@@ -7,6 +7,8 @@
 
 #include "server/PrimaryClient.h"
 
+#include "deskflow/IPlatformScreen.h"
+
 #include "base/Log.h"
 #include "deskflow/Screen.h"
 //
