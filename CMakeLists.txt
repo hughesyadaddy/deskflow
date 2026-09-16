@@ -162,7 +162,7 @@ endif()
 # identity is a configure-time error instead of a silent ad-hoc fallback.
 # Default OFF for now; Phase 3 of the fleet memory program flips it to ON.
 option(FLEET_STRICT_SIGNING
-  "Fail configure when APPLE_CODESIGN_DEV is empty or '-' (ad-hoc) on macOS" OFF)
+  "Fail configure when APPLE_CODESIGN_DEV is empty or '-' (ad-hoc) on macOS" ON)
 
 if(APPLE AND BUILD_OSX_BUNDLE)
   if("${APPLE_CODESIGN_DEV}" STREQUAL "" OR "${APPLE_CODESIGN_DEV}" STREQUAL "-")
