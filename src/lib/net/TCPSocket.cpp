@@ -17,17 +17,19 @@
 #include "net/SocketMultiplexer.h"
 #include "net/TSocketMultiplexerMethodJob.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
-
-static const std::size_t s_maxInputBufferSize = 1024 * 1024;
 
 //
 // TCPSocket
 //
 
+std::atomic<uint32_t> TCPSocket::s_defaultMaxOutputBufferSize{TCPSocket::kDefaultMaxOutputBufferSize};
+
 TCPSocket::TCPSocket(IEventQueue *events, SocketMultiplexer *socketMultiplexer, IArchNetwork::AddressFamily family)
     : IDataSocket(events),
+      m_maxOutputBufferSize(s_defaultMaxOutputBufferSize.load()),
       m_events(events),
       m_flushed(&m_mutex, true),
       m_socketMultiplexer(socketMultiplexer)
@@ -45,6 +47,7 @@ TCPSocket::TCPSocket(IEventQueue *events, SocketMultiplexer *socketMultiplexer, 
 
 TCPSocket::TCPSocket(IEventQueue *events, SocketMultiplexer *socketMultiplexer, ArchSocket socket)
     : IDataSocket(events),
+      m_maxOutputBufferSize(s_defaultMaxOutputBufferSize.load()),
       m_socket(socket),
       m_events(events),
       m_flushed(&m_mutex, true),
@@ -152,18 +155,70 @@ void TCPSocket::write(const void *buffer, uint32_t n)
       return;
     }
 
-    // copy data to the output buffer
-    wasEmpty = (m_outputBuffer.getSize() == 0);
-    m_outputBuffer.write(buffer, n);
+    // backpressure: the peer is not draining.  Buffering further only grows
+    // without bound (a stalled client used to pin the whole clipboard plus
+    // every mouse move queued behind it).  The stream is packet framed so a
+    // single write cannot be skipped; drop the queue, shut the output side
+    // and tell the owner, which treats it as a write failure / disconnect.
+    const uint64_t queued = static_cast<uint64_t>(m_outputBuffer.getSize()) + n;
+    if (queued > m_maxOutputBufferSize) {
+      LOG_WARN(
+          "socket %08X output buffer full (%llu > %u bytes), dropping queued output", m_socket,
+          static_cast<unsigned long long>(queued), m_maxOutputBufferSize
+      );
+      m_outputOverflowed = true;
+      onOutputShutdown();
+      sendEvent(EventTypes::StreamOutputError);
+      // job depends on m_writable: fall through to setJob below
+      wasEmpty = true;
+    } else {
+      // copy data to the output buffer
+      wasEmpty = (m_outputBuffer.getSize() == 0);
+      m_outputBuffer.write(buffer, n);
 
-    // there's data to write
-    m_flushed = false;
+      // there's data to write
+      m_flushed = false;
+    }
   }
 
   // make sure we're waiting to write
   if (wasEmpty) {
     setJob(newJob());
   }
+}
+
+void TCPSocket::setDefaultMaxOutputBufferSize(uint32_t bytes)
+{
+  s_defaultMaxOutputBufferSize.store(bytes);
+}
+
+uint32_t TCPSocket::defaultMaxOutputBufferSize()
+{
+  return s_defaultMaxOutputBufferSize.load();
+}
+
+void TCPSocket::setMaxOutputBufferSize(uint32_t bytes)
+{
+  Lock lock(&m_mutex);
+  m_maxOutputBufferSize = bytes;
+}
+
+uint32_t TCPSocket::maxOutputBufferSize() const
+{
+  Lock lock(&m_mutex);
+  return m_maxOutputBufferSize;
+}
+
+uint32_t TCPSocket::outputBufferSize() const
+{
+  Lock lock(&m_mutex);
+  return m_outputBuffer.getSize();
+}
+
+bool TCPSocket::outputOverflowed() const
+{
+  Lock lock(&m_mutex);
+  return m_outputOverflowed;
 }
 
 void TCPSocket::flush()
@@ -313,7 +368,7 @@ TCPSocket::JobResult TCPSocket::doRead()
     do {
       m_inputBuffer.write(buffer, static_cast<uint32_t>(bytesRead));
 
-      if (m_inputBuffer.getSize() > s_maxInputBufferSize) {
+      if (m_inputBuffer.getSize() > kMaxInputBufferSize) {
         break;
       }
 
@@ -346,7 +401,15 @@ TCPSocket::JobResult TCPSocket::doWrite()
   uint32_t bufferSize = 0;
   int bytesWrote = 0;
 
-  bufferSize = m_outputBuffer.getSize();
+  // hand the kernel a bounded contiguous span: peeking the whole queue
+  // would consolidate every chunk into one allocation the size of the
+  // backlog on each pass.  If the head chunk already holds a decent run
+  // use it as-is (no copy); otherwise consolidate up to one pass worth.
+  bufferSize = std::min(m_outputBuffer.getSize(), kMaxWritePassSize);
+  if (const uint32_t contiguous = m_outputBuffer.getContiguousSize();
+      contiguous >= StreamBuffer::chunkSize() && contiguous < bufferSize) {
+    bufferSize = contiguous;
+  }
   const void *buffer = m_outputBuffer.peek(bufferSize);
   bytesWrote = (uint32_t)ARCH->writeSocket(m_socket, buffer, bufferSize);
 

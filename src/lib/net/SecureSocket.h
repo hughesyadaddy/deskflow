@@ -10,8 +10,10 @@
 #include "net/SecurityLevel.h"
 #include "net/TCPSocket.h"
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 class Event;
 class IEventQueue;
@@ -95,5 +97,10 @@ private:
   std::unique_ptr<Ssl> m_ssl;
   bool m_secureReady = false;
   bool m_fatal = false;
+  // staging copy for SSL_write; bounded by TCPSocket::kMaxWritePassSize and
+  // released whenever the output buffer drains.
+  std::vector<uint8_t> m_writeBuffer;
+  bool m_writeRetry = false;
+  int m_writeRetrySize = 0;
   SecurityLevel m_securityLevel = SecurityLevel::Encrypted;
 };

@@ -88,6 +88,27 @@ create_test(
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/server"
 )
 
+# Hotspot D3-socket-buffers (harness/registry.json): tests live beside the
+# library path they cover, under lib/<lib>/.
+if(WIN32)
+  set(socket_extra_libs version)
+endif()
+
+create_test(
+  NAME StreamBufferTests
+  DEPENDS io
+  SOURCE lib/io/StreamBufferTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/io"
+)
+
+create_test(
+  NAME TCPSocketTests
+  DEPENDS net
+  LIBS base arch mt io ${socket_extra_libs}
+  SOURCE lib/net/TCPSocketTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/net"
+)
+
 #make sure to use CI only plugin on Unix
 if (UNIX AND NOT APPLE)
   set(qPA_Platform "QT_QPA_PLATFORM=minimal")
