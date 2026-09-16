@@ -40,6 +40,7 @@
 #ifdef _WIN32
 #include <algorithm>
 #endif
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -291,11 +292,7 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
   for (auto &clipboard : m_clipboards) {
     clipboard.m_clipboardOwner = primaryName;
     clipboard.m_clipboardSeqNum = m_seqNum;
-    if (clipboard.m_clipboard.open(0)) {
-      clipboard.m_clipboard.empty();
-      clipboard.m_clipboard.close();
-    }
-    clipboard.m_clipboardData = clipboard.m_clipboard.marshall();
+    clearClipboard(clipboard);
   }
 
   // install event handlers
@@ -760,8 +757,9 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     if (m_enableClipboard) {
       // send the clipboard data to new active screen
       for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-        // Hackity hackity hack
-        if (m_clipboards[id].m_clipboard.marshall().size() > (m_maximumClipboardSize * 1024)) {
+        // size check uses the cached fingerprint; a screen switch must not
+        // re-marshal (and so copy) every clipboard just to measure it.
+        if (m_clipboards[id].m_fingerprint.m_size > (m_maximumClipboardSize * 1024)) {
           continue;
         }
         m_active->setClipboard(id, &m_clipboards[id].m_clipboard);
@@ -1714,11 +1712,7 @@ void Server::handleClipboardGrabbed(const Event &event, BaseClientProxy *grabber
   clipboard.m_clipboardSeqNum = info->m_sequenceNumber;
 
   // clear the clipboard data (since it's not known at this point)
-  if (clipboard.m_clipboard.open(0)) {
-    clipboard.m_clipboard.empty();
-    clipboard.m_clipboard.close();
-  }
-  clipboard.m_clipboardData = clipboard.m_clipboard.marshall();
+  clearClipboard(clipboard);
 
   // tell all other screens to take ownership of clipboard.  tell the
   // grabber that it's clipboard isn't dirty.
@@ -1964,6 +1958,69 @@ void Server::handleLockCursorToScreenEvent(const Event &event)
   }
 }
 
+namespace {
+std::atomic<uint64_t> s_clipboardScanCount{0};
+
+void fnv1aAppend(uint64_t &hash, const void *bytes, size_t length)
+{
+  const auto *p = static_cast<const unsigned char *>(bytes);
+  for (size_t i = 0; i < length; ++i) {
+    hash ^= p[i];
+    hash *= 0x100000001b3ULL;
+  }
+}
+} // namespace
+
+Server::ClipboardFingerprint Server::fingerprintClipboard(const IClipboard &clipboard)
+{
+  s_clipboardScanCount.fetch_add(1, std::memory_order_relaxed);
+
+  // mirrors IClipboard::marshall(): 4-byte format count, then per present
+  // format a 4-byte id, a 4-byte length and the payload.  hashing the same
+  // sequence keeps the fingerprint stable across a marshall/unmarshall trip.
+  ClipboardFingerprint fp;
+  if (!clipboard.open(0)) {
+    return fp;
+  }
+
+  uint64_t hash = 0xcbf29ce484222325ULL;
+  uint32_t numFormats = 0;
+  fp.m_size = 4;
+  for (uint32_t format = 0; format != static_cast<uint32_t>(IClipboard::Format::TotalFormats); ++format) {
+    const auto f = static_cast<IClipboard::Format>(format);
+    if (!clipboard.has(f)) {
+      continue;
+    }
+    ++numFormats;
+    // one transient copy of one format at a time; never the whole buffer
+    const std::string payload = clipboard.get(f);
+    const auto length = static_cast<uint32_t>(payload.size());
+    fp.m_size += 4 + 4 + payload.size();
+    fnv1aAppend(hash, &format, sizeof(format));
+    fnv1aAppend(hash, &length, sizeof(length));
+    fnv1aAppend(hash, payload.data(), payload.size());
+  }
+  fnv1aAppend(hash, &numFormats, sizeof(numFormats));
+  clipboard.close();
+
+  fp.m_hash = hash;
+  return fp;
+}
+
+uint64_t Server::clipboardScanCountForTests()
+{
+  return s_clipboardScanCount.load(std::memory_order_relaxed);
+}
+
+void Server::clearClipboard(ClipboardInfo &clipboard)
+{
+  if (clipboard.m_clipboard.open(0)) {
+    clipboard.m_clipboard.empty();
+    clipboard.m_clipboard.close();
+  }
+  clipboard.m_fingerprint = fingerprintClipboard(clipboard.m_clipboard);
+}
+
 void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum)
 {
   ClipboardInfo &clipboard = m_clipboards[id];
@@ -1977,24 +2034,26 @@ void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, u
   // should be the expected client
   assert(sender == m_clients.find(clipboard.m_clipboardOwner)->second);
 
-  // get data
+  // get data straight into the single server-side copy, then fingerprint it
+  // in place.  the fingerprint always mirrors m_clipboard so the size check
+  // in switchScreen() stays correct even when we bail out below.
   sender->getClipboard(id, &clipboard.m_clipboard);
+  const ClipboardFingerprint previous = clipboard.m_fingerprint;
+  clipboard.m_fingerprint = fingerprintClipboard(clipboard.m_clipboard);
 
-  std::string data = clipboard.m_clipboard.marshall();
-  if (data.size() > m_maximumClipboardSize * 1024) {
+  if (clipboard.m_fingerprint.m_size > m_maximumClipboardSize * 1024) {
     LOG_WARN("not sending clipboard data, exceeds limit: %i KB", m_maximumClipboardSize);
     return;
   }
 
   // ignore if data hasn't changed
-  if (data == clipboard.m_clipboardData) {
+  if (clipboard.m_fingerprint == previous) {
     LOG_DEBUG("ignored screen \"%s\" update of clipboard %d (unchanged)", clipboard.m_clipboardOwner.c_str(), id);
     return;
   }
 
   // got new data
   LOG_INFO("screen \"%s\" updated clipboard %d", clipboard.m_clipboardOwner.c_str(), id);
-  clipboard.m_clipboardData = data;
 
   // tell all clients except the sender that the clipboard is dirty
   for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {

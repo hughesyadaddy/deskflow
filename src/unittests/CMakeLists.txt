@@ -67,6 +67,19 @@ add_subdirectory(net)
 add_subdirectory(platform)
 add_subdirectory(server)
 
+# Hotspot D4-server-clipboard-copies (harness/registry.json) owns this file;
+# it lives outside server/ so the registry's file ownership stays disjoint.
+if(WIN32)
+  set(server_clipboard_extra_libs version app mt net)
+endif()
+create_test(
+  NAME ServerClipboardTests
+  DEPENDS server
+  LIBS base arch app ${server_clipboard_extra_libs}
+  SOURCE lib/server/ServerClipboardTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/server"
+)
+
 #make sure to use CI only plugin on Unix
 if (UNIX AND NOT APPLE)
   set(qPA_Platform "QT_QPA_PLATFORM=minimal")

@@ -48,12 +48,14 @@ class ClientListener;
 This class implements the top-level server algorithms for deskflow.
 */
 class ServerTests;
+class ServerClipboardTests;
 
 class Server
 {
   using ServerConfig = deskflow::server::Config;
 
   friend class ServerTests;
+  friend class ServerClipboardTests;
 
 public:
   //! Lock cursor to screen data
@@ -419,17 +421,47 @@ private:
   void forceLeaveClient(const BaseClientProxy *client);
 
 private:
+  //! Cheap identity of a clipboard's contents
+  /*!
+  \c m_size is exactly what \c IClipboard::marshall() would produce for the
+  clipboard and \c m_hash is a 64-bit FNV-1a over the same content, so size
+  limits and change detection never need the marshalled buffer itself.
+  */
+  struct ClipboardFingerprint
+  {
+    size_t m_size = 0;
+    uint64_t m_hash = 0;
+
+    bool operator==(const ClipboardFingerprint &) const = default;
+  };
+
   class ClipboardInfo
   {
   public:
     ClipboardInfo() = default;
 
   public:
+    // the single server-side copy of the clipboard.  the marshalled form is
+    // never cached here; proxies marshal on send and the fingerprint below
+    // answers size/equality questions.
     Clipboard m_clipboard;
-    std::string m_clipboardData;
+    ClipboardFingerprint m_fingerprint;
     std::string m_clipboardOwner;
     uint32_t m_clipboardSeqNum = 0;
   };
+
+  //! Compute the fingerprint of \p clipboard without marshalling it
+  /*!
+  Walks the formats one at a time so the transient footprint is one format,
+  not the whole marshalled buffer.
+  */
+  static ClipboardFingerprint fingerprintClipboard(const IClipboard &clipboard);
+
+  //! Test hook: number of \c fingerprintClipboard calls so far
+  static uint64_t clipboardScanCountForTests();
+
+  // resets the server-side copy of clipboard \p id to empty
+  void clearClipboard(ClipboardInfo &clipboard);
   // Order suggested by clang
 
   // the Primary Screen Client
