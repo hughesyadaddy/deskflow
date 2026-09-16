@@ -1,0 +1,33 @@
+name: PR harness check
+
+on:
+  pull_request:
+    branches: [fleet/memory-program]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-pr:
+    name: run-id, deltaMB and citations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Citations are checked at the PR head commit.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Write PR body to file
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+
+      - name: harness/check-pr.sh
+        run: |
+          chmod +x harness/check-pr.sh
+          harness/check-pr.sh "${{ github.event.pull_request.number }}" \
+            --body-file "$RUNNER_TEMP/pr-body.md" \
+            --repo "${GITHUB_REPOSITORY##*/}"
