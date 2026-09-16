@@ -118,7 +118,7 @@
         "src/lib/platform/OSXScreen.mm",
         "src/lib/platform/OSXScreen.h"
       ],
-      "scenario": "lock-unlock",
+      "scenario": "epoch-flip",
       "proc": "deskflow-core",
       "seat": "hackintosh",
       "budgetMB": 20,
@@ -165,7 +165,8 @@
         "line": 3266,
         "token": "_wait_reconnect"
       },
-      "fixClass": "root-cause"
+      "fixClass": "root-cause",
+      "scenarioNote": "driver is partial-automation and measures deskflow-core switching; the Mouser process is sampled via proc=mouser"
     },
     {
       "id": "M3-status-item-and-icons",
@@ -233,7 +234,7 @@
         "core/engine.py",
         "tests/test_engine_threads.py"
       ],
-      "scenario": "bt-sleep-wake",
+      "scenario": "window-toggle",
       "proc": "mouser",
       "seat": "hackintosh",
       "budgetMB": 30,
