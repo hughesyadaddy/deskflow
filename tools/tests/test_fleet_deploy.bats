@@ -1,0 +1,408 @@
+#!/usr/bin/env bats
+# scripts/fleet-deploy.sh controller tests. No real hosts: ssh, hostname, git
+# and bash are PATH shims that log what they were asked to do.
+#
+# Run:  tools/tests/bats/bin/bats tools/tests/test_fleet_deploy.bats
+
+setup() {
+  REPO_SRC="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
+  WORK="$(mktemp -d "${BATS_TMPDIR:-/tmp}/fleet-deploy.XXXXXX")"
+  REPO="$WORK/repo"
+  SHIM="$WORK/shim"
+  LOG="$WORK/log"
+  mkdir -p "$REPO/scripts" "$REPO/tools" "$SHIM" "$LOG" "$WORK/mouser/.git"
+  cp "$REPO_SRC/scripts/fleet-deploy.sh" "$REPO/scripts/fleet-deploy.sh"
+  : > "$REPO/scripts/fleet-deploy-macos.sh"
+  SCRIPT="$REPO/scripts/fleet-deploy.sh"
+
+  cat > "$REPO/scripts/fleet.env" <<EOF
+FLEET_BRANCH=main
+FLEET_HOSTS="hackintosh macbookpro tiny11"
+# "local" here must NOT make hackintosh local — the seat is macbookpro.
+FLEET_SSH_hackintosh=local
+FLEET_SSH_macbookpro=macbookpro
+FLEET_SSH_tiny11=tiny11
+FLEET_SSH_USER_hackintosh=alex
+FLEET_SSH_USER_tiny11=alexh
+FLEET_DEPLOY_DESKFLOW=1
+FLEET_DEPLOY_MOUSER=1
+FLEET_DESKFLOW_PATH_macos=$REPO
+FLEET_MOUSER_PATH_macos=$WORK/mouser
+FLEET_DESKFLOW_PATH_windows=C:/Users/alexh/Desktop/deskflow
+FLEET_MOUSER_PATH_windows=C:/Users/alexh/Desktop/Mouser
+EOF
+
+  # --- shims -------------------------------------------------------------
+  cat > "$SHIM/hostname" <<'EOF'
+#!/bin/sh
+echo "${SHIM_HOSTNAME:-MacBookPro}"
+EOF
+  cat > "$SHIM/ssh" <<'EOF'
+#!/bin/sh
+# drop options
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -t|-T|-q) shift ;;
+    *) break ;;
+  esac
+done
+target="$1"; shift
+printf '%s\t%s\n' "$target" "$*" >> "$SHIM_LOG/ssh.log"
+case " ${SHIM_SSH_DOWN:-} " in *" $target "*) exit 255 ;; esac
+case " ${SHIM_SSH_FAIL:-} " in *" $target "*) exit 7 ;; esac
+case "$*" in *rev-parse*) echo "cafe0000$(printf '%s' "$target" | cksum | cut -c1-8)" ;; esac
+exit 0
+EOF
+  cat > "$SHIM/git" <<'EOF'
+#!/bin/sh
+printf 'git %s\n' "$*" >> "$SHIM_LOG/git.log"
+case "$*" in *rev-parse*) echo "beef000000000000000000000000000000000001" ;; esac
+exit 0
+EOF
+  cat > "$SHIM/bash" <<'EOF'
+#!/bin/sh
+# Record any inner `bash -c '<cmd>'` and `bash <script>` invocations, then run
+# the -c command through the real bash so the git/ssh shims see it.
+printf 'bash %s\n' "$*" >> "$SHIM_LOG/bash.log"
+if [ "$1" = "-euo" ] && [ "$3" = "-c" ]; then
+  printf '%s\n' "$4" >> "$SHIM_LOG/local-cmd.log"
+  exec "$REAL_BASH" -euo pipefail -c "$4"
+fi
+exit 0
+EOF
+  chmod +x "$SHIM"/*
+  export REAL_BASH="$BASH"
+  export SHIM_LOG="$LOG"
+  export PATH="$SHIM:$PATH"
+  unset FLEET_LOCAL_ID SHIM_SSH_DOWN SHIM_SSH_FAIL
+}
+
+teardown() {
+  rm -rf "$WORK"
+}
+
+run_deploy() { run "$REAL_BASH" "$SCRIPT" "$@"; }
+
+have_real_flock() { command -v flock >/dev/null 2>&1; }
+
+# --- dry-run / planning ------------------------------------------------------
+
+@test "dry-run --json - has the {hosts:[{id,target,order,role}]} shape" {
+  run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hosts | length == 3' >/dev/null
+  echo "$output" | jq -e 'all(.hosts[]; has("id") and has("target") and has("order") and has("role"))' >/dev/null
+  echo "$output" | jq -e '[.hosts[].order] == [1,2,3]' >/dev/null
+}
+
+@test "LOCAL_ID comes from hostname (case-insensitive), not FLEET_SSH_x=local" {
+  run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hosts[] | select(.id=="macbookpro") | .target == "local"' >/dev/null
+  echo "$output" | jq -e '.hosts[] | select(.id=="hackintosh") | .target == "alex@hackintosh"' >/dev/null
+  echo "$output" | jq -e '.hosts[] | select(.id=="tiny11") | .target == "alexh@tiny11"' >/dev/null
+}
+
+@test "three distinct targets" {
+  run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hosts | map(.target) | unique | length == 3' >/dev/null
+}
+
+@test "server is last (default hackintosh)" {
+  run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hosts | last | .id == "hackintosh" and .role == "server"' >/dev/null
+  echo "$output" | jq -e '[.hosts[] | select(.role=="client")] | length == 2' >/dev/null
+}
+
+@test "FLEET_ROLE_<id>=server moves the server to the end" {
+  echo 'FLEET_ROLE_macbookpro=server' >> "$REPO/scripts/fleet.env"
+  run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hosts | last | .id == "macbookpro" and .role == "server"' >/dev/null
+  echo "$output" | jq -e '.hosts[0].id == "hackintosh" and .hosts[0].role == "client"' >/dev/null
+}
+
+@test "hostname matching no FLEET_HOSTS entry is an error" {
+  SHIM_HOSTNAME=stranger run_deploy --dry-run --json -
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no FLEET_HOSTS entry matches"* ]]
+}
+
+@test "FLEET_LOCAL_ID overrides the hostname" {
+  SHIM_HOSTNAME=stranger FLEET_LOCAL_ID=Hackintosh run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hosts[] | select(.id=="hackintosh") | .target == "local"' >/dev/null
+}
+
+@test "--host filters the plan and rejects unknown ids" {
+  run_deploy --dry-run --json - --host tiny11
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hosts | length == 1 and .[0].id == "tiny11"' >/dev/null
+  run_deploy --dry-run --host nope
+  [ "$status" -ne 0 ]
+}
+
+@test "dry-run runs nothing" {
+  run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+  [ ! -e "$LOG/ssh.log" ]
+  [ ! -e "$LOG/bash.log" ]
+  [ ! -e "$REPO/tools/state/deploy.lock.d" ]
+}
+
+# --- full deploy -------------------------------------------------------------
+
+@test "every host targeted once: local deployed once, never over ssh, server last" {
+  run_deploy --json "$WORK/report.json"
+  [ "$status" -eq 0 ]
+  # local seat ran the macOS script exactly once and was never an ssh target
+  [ "$(grep -c 'fleet-deploy-macos.sh' "$LOG/local-cmd.log")" -eq 1 ]
+  ! grep -q 'macbookpro' "$LOG/ssh.log"
+  # deploy commands (not the rev-parse queries): tiny11 then hackintosh
+  deploys="$(grep -v 'rev-parse' "$LOG/ssh.log" | cut -f1 | tr '\n' ' ')"
+  [ "$deploys" = "alexh@tiny11 alex@hackintosh " ]
+  # the local deploy happened before the server's remote deploy
+  grep -q 'fleet-deploy-windows.ps1' "$LOG/ssh.log"
+  grep -q 'fleet-deploy-macos.sh' "$LOG/ssh.log"
+  jq -e '.ok == true and (.hosts | length == 6)' "$WORK/report.json" >/dev/null
+  jq -e '[.hosts[] | select(.result != "ok")] | length == 0' "$WORK/report.json" >/dev/null
+}
+
+@test "remote macOS command exports the env, pulls the branch, and carries no keychain password" {
+  run_deploy --host hackintosh
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *'export FLEET_BRANCH="main"'* ]]
+  [[ "$cmd" == *'FLEET_DEPLOY_DESKFLOW="1"'* ]]
+  [[ "$cmd" == *'FLEET_DEPLOY_MOUSER="1"'* ]]
+  [[ "$cmd" == *'FLEET_RECONFIGURE="0"'* ]]
+  [[ "$cmd" == *'FLEET_DESKFLOW_ROOT='* ]]
+  [[ "$cmd" == *'FLEET_MOUSER_ROOT='* ]]
+  [[ "$cmd" == *'git fetch origin && git checkout "main" && git pull --ff-only origin "main" && bash scripts/fleet-deploy-macos.sh'* ]]
+  ! grep -qi 'KEYCHAIN' "$LOG/ssh.log"
+}
+
+@test "remote Windows command goes through powershell and propagates \$LASTEXITCODE" {
+  run_deploy --host tiny11
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command'* ]]
+  [[ "$cmd" == *'fleet-deploy-windows.ps1'* ]]
+  [[ "$cmd" == *'exit $LASTEXITCODE'* ]]
+}
+
+@test "ssh exit 255 is reported as unreachable and fails the run" {
+  SHIM_SSH_DOWN="alex@hackintosh" run_deploy --json "$WORK/r.json"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unreachable(ssh 255)"* ]]
+  jq -e '.ok == false' "$WORK/r.json" >/dev/null
+  jq -e '[.hosts[] | select(.id=="hackintosh") | .result] | all(. == "unreachable(ssh 255)")' "$WORK/r.json" >/dev/null
+  jq -e '[.hosts[] | select(.id=="tiny11") | .result] | all(. == "ok")' "$WORK/r.json" >/dev/null
+}
+
+@test "a non-255 remote failure is reported with its exit code" {
+  SHIM_SSH_FAIL="alexh@tiny11" run_deploy --host tiny11
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"fail(7)"* ]]
+}
+
+@test "--deskflow-only / --mouser-only / --app flip the deploy flags" {
+  run_deploy --host hackintosh --deskflow-only
+  [ "$status" -eq 0 ]
+  grep -q 'FLEET_DEPLOY_MOUSER="0"' "$LOG/ssh.log"
+  rm "$LOG/ssh.log"
+  run_deploy --host hackintosh --app mouser
+  [ "$status" -eq 0 ]
+  grep -q 'FLEET_DEPLOY_DESKFLOW="0"' "$LOG/ssh.log"
+  run_deploy --host hackintosh --app nope
+  [ "$status" -ne 0 ]
+}
+
+@test "--pull-only syncs git without running the deploy scripts" {
+  run_deploy --pull-only
+  [ "$status" -eq 0 ]
+  ! grep -q 'fleet-deploy-macos.sh' "$LOG/ssh.log"
+  ! grep -q 'fleet-deploy-windows.ps1' "$LOG/ssh.log"
+  grep -q 'git pull --ff-only origin' "$LOG/ssh.log"
+  ! grep -q 'fleet-deploy-macos.sh' "$LOG/local-cmd.log"
+  [ ! -e "$REPO/tools/state/last-good.json" ]
+}
+
+@test "the per-host table has the seven columns" {
+  run_deploy
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"host         | app      | commit       | signed-by                | tcc    | mesh   | result"* ]]
+  [[ "$output" == *"tiny11       | deskflow | cafe0000"* ]]
+  [[ "$output" == *"macbookpro   | mouser   | beef00000000"* ]]
+}
+
+# --- last-good / rollback ----------------------------------------------------
+
+@test "last-good.json records {host:{app:{commit,ts}}} after a healthy deploy" {
+  run_deploy
+  [ "$status" -eq 0 ]
+  f="$REPO/tools/state/last-good.json"
+  [ -f "$f" ]
+  jq -e '.macbookpro.deskflow.commit == "beef000000000000000000000000000000000001"' "$f" >/dev/null
+  jq -e '.macbookpro.mouser.commit == "beef000000000000000000000000000000000001"' "$f" >/dev/null
+  jq -e '.hackintosh.deskflow.commit | startswith("cafe0000")' "$f" >/dev/null
+  jq -e '.tiny11.deskflow.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")' "$f" >/dev/null
+  jq -e 'keys | length == 3' "$f" >/dev/null
+}
+
+@test "last-good is only recorded when tools/fleet-health --host passes" {
+  cat > "$REPO/tools/fleet-health" <<'EOF'
+#!/bin/sh
+case "$*" in *"--host tiny11"*) exit 3 ;; esac
+exit 0
+EOF
+  chmod +x "$REPO/tools/fleet-health"
+  run_deploy --json "$WORK/r.json"
+  [ "$status" -ne 0 ]
+  f="$REPO/tools/state/last-good.json"
+  jq -e '.macbookpro.deskflow.commit != null and .hackintosh.deskflow.commit != null' "$f" >/dev/null
+  jq -e '.tiny11 == null' "$f" >/dev/null
+  jq -e '[.hosts[] | select(.id=="tiny11") | .result] | all(. == "unhealthy")' "$WORK/r.json" >/dev/null
+}
+
+@test "--rollback checks out the commits recorded in last-good.json" {
+  mkdir -p "$REPO/tools/state"
+  cat > "$REPO/tools/state/last-good.json" <<'EOF'
+{"hackintosh":{"deskflow":{"commit":"d15ea5e0000000000000000000000000deadbeef","ts":"2026-09-16T00:00:00Z"},
+               "mouser":{"commit":"a11ce0000000000000000000000000000000c0de","ts":"2026-09-16T00:00:00Z"}},
+ "macbookpro":{"deskflow":{"commit":"0ddba11000000000000000000000000000000001","ts":"2026-09-16T00:00:00Z"}}}
+EOF
+  run_deploy --rollback --host hackintosh
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *'git checkout --detach "d15ea5e0000000000000000000000000deadbeef"'* ]]
+  [[ "$cmd" == *'git -C "$HOME/Desktop/Mouser" fetch fork && git -C "$HOME/Desktop/Mouser" checkout --detach "a11ce0000000000000000000000000000000c0de"'* ]]
+  [[ "$cmd" == *'FLEET_DESKFLOW_REF="d15ea5e0000000000000000000000000deadbeef"'* ]]
+  [[ "$cmd" == *'FLEET_SKIP_GIT_PULL=1'* ]]
+  [[ "$cmd" != *'git pull --ff-only origin'* ]]
+  [[ "$cmd" == *'bash scripts/fleet-deploy-macos.sh'* ]]
+}
+
+@test "--rollback --app deskflow only needs the deskflow entry and rolls back the local seat" {
+  mkdir -p "$REPO/tools/state"
+  echo '{"macbookpro":{"deskflow":{"commit":"0ddba11000000000000000000000000000000001","ts":"x"}}}' > "$REPO/tools/state/last-good.json"
+  run_deploy --rollback --host macbookpro --app deskflow
+  [ "$status" -eq 0 ]
+  grep -q 'git checkout --detach 0ddba11000000000000000000000000000000001' "$LOG/git.log"
+  grep -q 'fleet-deploy-macos.sh' "$LOG/local-cmd.log"
+}
+
+@test "--rollback refuses without last-good for the host/app" {
+  run_deploy --rollback --host hackintosh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"last-good.json does not exist"* ]]
+  mkdir -p "$REPO/tools/state"
+  echo '{"macbookpro":{"deskflow":{"commit":"abc","ts":"x"}}}' > "$REPO/tools/state/last-good.json"
+  run_deploy --rollback --host hackintosh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no last-good commit for hackintosh/deskflow"* ]]
+  [ ! -e "$LOG/ssh.log" ]
+}
+
+# --- --ref / --self-test -----------------------------------------------------
+
+@test "--ref HEAD rebuilds what is checked out without pulling; other refs detach" {
+  run_deploy --host hackintosh --ref HEAD
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" != *'git fetch'* ]]
+  [[ "$cmd" == *'FLEET_DESKFLOW_REF="HEAD"'* ]]
+  rm "$LOG/ssh.log"
+  run_deploy --host tiny11 --ref v1.2.3
+  [ "$status" -eq 0 ]
+  cmd="$(grep -v rev-parse "$LOG/ssh.log" | head -n1 | cut -f2-)"
+  [[ "$cmd" == *"git checkout --detach 'v1.2.3'"* ]]
+}
+
+@test "--self-test writes {ok,hosts:[{id,target,app,commit,signedBy,tcc,mesh,result}]} from fleet-health" {
+  cat > "$REPO/tools/fleet-health" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *"--check all"*) echo '{"hosts":[{"id":"hackintosh","signedBy":"Apple Development: Alex","tcc":"ok","mesh":"ok","ok":true},{"id":"macbookpro","signedBy":"Apple Development: Alex","tcc":"ok","mesh":"ok","ok":true},{"id":"tiny11","signedBy":"thumb","tcc":"n/a","mesh":"ok","ok":true}]}' ;;
+esac
+exit 0
+EOF
+  chmod +x "$REPO/tools/fleet-health"
+  run_deploy --self-test --json "$WORK/st.json"
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true' "$WORK/st.json" >/dev/null
+  jq -e 'all(.hosts[]; has("id") and has("target") and has("app") and has("commit") and has("signedBy") and has("tcc") and has("mesh") and has("result"))' "$WORK/st.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="hackintosh" and .app=="deskflow") | .signedBy == "Apple Development: Alex" and .tcc == "ok" and .mesh == "ok"' "$WORK/st.json" >/dev/null
+  # --self-test implies --ref HEAD: no pulls anywhere
+  ! grep -q 'git pull' "$LOG/ssh.log"
+  ! grep -q 'git pull' "$LOG/git.log"
+}
+
+@test "--self-test exits non-zero when fleet-health marks a host unhealthy" {
+  cat > "$REPO/tools/fleet-health" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *"--check all"*) echo '{"hosts":[{"id":"hackintosh","ok":true},{"id":"macbookpro","ok":false,"tcc":"denied"},{"id":"tiny11","ok":true}]}'; exit 1 ;;
+esac
+exit 0
+EOF
+  chmod +x "$REPO/tools/fleet-health"
+  run_deploy --self-test --json "$WORK/st.json"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' "$WORK/st.json" >/dev/null
+  jq -e '[.hosts[] | select(.id=="macbookpro") | .result] | all(. == "unhealthy")' "$WORK/st.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="macbookpro" and .app=="deskflow") | .tcc == "denied"' "$WORK/st.json" >/dev/null
+}
+
+@test "--self-test without tools/fleet-health cannot pass" {
+  run_deploy --self-test --json "$WORK/st.json"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' "$WORK/st.json" >/dev/null
+}
+
+# --- lock --------------------------------------------------------------------
+
+@test "refuses to run while the mkdir lock is held by a live process" {
+  if have_real_flock; then skip "flock present: mkdir fallback not exercised on this platform"; fi
+  mkdir -p "$REPO/tools/state/deploy.lock.d"
+  echo "$$" > "$REPO/tools/state/deploy.lock.d/pid"
+  run_deploy
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"deploy lock held"* ]]
+  [ ! -e "$LOG/ssh.log" ]
+  [ -d "$REPO/tools/state/deploy.lock.d" ]
+}
+
+@test "reclaims a stale mkdir lock whose pid is dead, and releases its own on exit" {
+  if have_real_flock; then skip "flock present: mkdir fallback not exercised on this platform"; fi
+  mkdir -p "$REPO/tools/state/deploy.lock.d"
+  echo "2147483000" > "$REPO/tools/state/deploy.lock.d/pid"
+  run_deploy --dry-run
+  [ "$status" -eq 0 ]
+  run_deploy
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reclaiming stale deploy lock"* ]]
+  [ ! -e "$REPO/tools/state/deploy.lock.d" ]
+}
+
+@test "refuses to run when flock(1) reports the lock held" {
+  cat > "$SHIM/flock" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+  chmod +x "$SHIM/flock"
+  run_deploy
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"deploy lock held"* ]]
+  [ ! -e "$LOG/ssh.log" ]
+}
+
+@test "dry-run never touches the lock" {
+  mkdir -p "$REPO/tools/state/deploy.lock.d"
+  echo "$$" > "$REPO/tools/state/deploy.lock.d/pid"
+  run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+}

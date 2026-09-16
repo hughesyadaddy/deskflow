@@ -1,179 +1,512 @@
 #!/usr/bin/env bash
-# Fleet redeploy orchestrator — run from hackintosh.
-# Pulls main on each machine and runs signed local build/install.
+# Fleet deploy controller — symmetric: run it from ANY seat.
+# Every host in FLEET_HOSTS is targeted exactly once; the seat you are on is
+# deployed locally, every other seat over SSH. Clients deploy first, the
+# server (FLEET_ROLE_<id>=server, default hackintosh) last.
 #
 # Setup:
 #   cp scripts/fleet.env.example scripts/fleet.env
 #   bash scripts/fleet-setup-ssh.sh          # passwordless SSH
-#   # Edit fleet.env: keychain passwords for remote Mac signing
 #   bash scripts/fleet-deploy.sh
 #
-# Options:
-#   --pull-only       git pull only, no build
-#   --deskflow-only   skip Mouser
-#   --mouser-only     skip Deskflow
-#   --host NAME       deploy one host (hackintosh|macbookpro|tiny11)
+# Usage:
+#   fleet-deploy [--dry-run] [--json PATH|-] [--self-test] [--ref REF]
+#                [--rollback] [--host ID] [--app deskflow|mouser]
+#                [--deskflow-only] [--mouser-only] [--reconfigure] [--pull-only]
+#
+#   --dry-run         plan only; with --json prints {hosts:[{id,target,order,role}]}
+#   --json PATH|-     write the JSON report to PATH (or stdout with -)
+#   --self-test       rebuild+install current HEAD everywhere, then
+#                     tools/fleet-health --check all --host all --json;
+#                     exit 0 only if every host is ok
+#   --ref REF         deploy REF instead of FLEET_BRANCH (HEAD = build what is
+#                     checked out, no pull)
+#   --rollback        check out the commit recorded in tools/state/last-good.json
+#                     per host/app and redeploy those hosts
+#   --host ID         limit to one host id from FLEET_HOSTS
+#   --app X           deskflow | mouser (same as --deskflow-only / --mouser-only)
 #   --reconfigure     force cmake configure on Macs
+#   --pull-only       git sync only, no build
+#
+# The local seat is the FLEET_HOSTS entry matching `hostname -s`
+# (case-insensitive) or FLEET_LOCAL_ID; FLEET_SSH_<id>=local is ignored.
+# Contract with the per-OS scripts: FLEET_SKIP_GIT_PULL=1 is always exported
+# (this controller performs the git sync), FLEET_DESKFLOW_REF / FLEET_MOUSER_REF
+# carry the exact commit for --ref / --rollback. No keychain password is ever
+# passed; signing runs in the GUI session on each seat.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="${ROOT}/scripts/fleet.env"
-EXAMPLE="${ROOT}/scripts/fleet.env.example"
+ENV_FILE="${FLEET_ENV_FILE:-${ROOT}/scripts/fleet.env}"
+STATE_DIR="${ROOT}/tools/state"
+LAST_GOOD="${STATE_DIR}/last-good.json"
+LOCK_FILE="${STATE_DIR}/deploy.lock"
+LOCK_DIR="${STATE_DIR}/deploy.lock.d"
+HEALTH="${ROOT}/tools/fleet-health"
 
-PULL_ONLY=0
+DRY_RUN=0
+JSON_OUT=""
+SELF_TEST=0
+REF=""
+ROLLBACK=0
 FILTER_HOST=""
-EXTRA_ENV=()
+PULL_ONLY=0
+OPT_DEPLOY_DESKFLOW=""
+OPT_DEPLOY_MOUSER=""
+OPT_RECONFIGURE=""
+
+die() { echo "fleet-deploy: error: $*" >&2; exit 1; }
+warn() { echo "fleet-deploy: warning: $*" >&2; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+now_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+set_app() {
+  case "$1" in
+    deskflow) OPT_DEPLOY_MOUSER=0 ;;
+    mouser) OPT_DEPLOY_DESKFLOW=0 ;;
+    *) die "--app must be deskflow or mouser (got '$1')" ;;
+  esac
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --json) [[ $# -ge 2 ]] || die "--json needs PATH or -"; JSON_OUT="$2"; shift 2 ;;
+    --self-test) SELF_TEST=1; shift ;;
+    --ref) [[ $# -ge 2 ]] || die "--ref needs REF"; REF="$2"; shift 2 ;;
+    --rollback) ROLLBACK=1; shift ;;
+    --host) [[ $# -ge 2 ]] || die "--host needs ID"; FILTER_HOST="$(lower "$2")"; shift 2 ;;
+    --app) [[ $# -ge 2 ]] || die "--app needs deskflow|mouser"; set_app "$2"; shift 2 ;;
+    --deskflow-only) set_app deskflow; shift ;;
+    --mouser-only) set_app mouser; shift ;;
+    --reconfigure) OPT_RECONFIGURE=1; shift ;;
     --pull-only) PULL_ONLY=1; shift ;;
-    --deskflow-only) EXTRA_ENV+=(FLEET_DEPLOY_MOUSER=0); shift ;;
-    --mouser-only) EXTRA_ENV+=(FLEET_DEPLOY_DESKFLOW=0); shift ;;
-    --reconfigure) EXTRA_ENV+=(FLEET_RECONFIGURE=1); shift ;;
-    --host)
-      FILTER_HOST="$2"
-      shift 2
-      ;;
-    -h|--help)
-      sed -n '2,20p' "$0"
-      exit 0
-      ;;
-    *) echo "Unknown option: $1" >&2; exit 1 ;;
+    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+    *) die "unknown option: $1" ;;
   esac
 done
+
+[[ "$SELF_TEST" == 1 && "$ROLLBACK" == 1 ]] && die "--self-test and --rollback are exclusive"
+[[ "$SELF_TEST" == 1 && -z "$REF" ]] && REF="HEAD"
+[[ "$ROLLBACK" == 1 && -n "$REF" ]] && die "--rollback picks its own commits; drop --ref"
+
+command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing $ENV_FILE — copy from fleet.env.example:" >&2
   echo "  cp scripts/fleet.env.example scripts/fleet.env" >&2
   exit 1
 fi
-
-# shellcheck disable=SC1091
+# shellcheck disable=SC1090
 source "$ENV_FILE"
 
 FLEET_BRANCH="${FLEET_BRANCH:-main}"
 FLEET_HOSTS="${FLEET_HOSTS:-hackintosh macbookpro tiny11}"
-LOCAL_ID="$(hostname -s | tr '[:upper:]' '[:lower:]')"
+DEPLOY_DESKFLOW="${OPT_DEPLOY_DESKFLOW:-${FLEET_DEPLOY_DESKFLOW:-1}}"
+DEPLOY_MOUSER="${OPT_DEPLOY_MOUSER:-${FLEET_DEPLOY_MOUSER:-1}}"
+RECONFIGURE="${OPT_RECONFIGURE:-${FLEET_RECONFIGURE:-0}}"
 
-deploy_macos() {
-  local host_id="$1"
-  local ssh_target="$2"
-  local user="${3:-$USER}"
-  local keychain_var="FLEET_KEYCHAIN_PASSWORD_${host_id}"
-  local keychain_pass="${!keychain_var:-}"
-  local deskflow_path="${FLEET_DESKFLOW_PATH_macos:-~/Desktop/deskflow}"
-  local mouser_path="${FLEET_MOUSER_PATH_macos:-~/Desktop/Mouser}"
-  local deploy_df="${FLEET_DEPLOY_DESKFLOW:-1}"
-  local deploy_m="${FLEET_DEPLOY_MOUSER:-1}"
-  local reconf="${FLEET_RECONFIGURE:-0}"
-
-  for kv in ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}; do
-    case "$kv" in
-      FLEET_DEPLOY_MOUSER=*) deploy_m="${kv#*=}" ;;
-      FLEET_DEPLOY_DESKFLOW=*) deploy_df="${kv#*=}" ;;
-      FLEET_RECONFIGURE=*) reconf="${kv#*=}" ;;
-    esac
+# ---------------------------------------------------------------------------
+# Local identity: hostname (or FLEET_LOCAL_ID) must match a FLEET_HOSTS entry.
+# ---------------------------------------------------------------------------
+resolve_local_id() {
+  local hn want id
+  hn="$(hostname -s 2>/dev/null)"
+  hn="$(lower "$hn")"
+  want="$(lower "${FLEET_LOCAL_ID:-$hn}")"
+  for id in $FLEET_HOSTS; do
+    if [[ "$(lower "$id")" == "$want" ]]; then
+      printf '%s' "$id"
+      return 0
+    fi
   done
+  die "no FLEET_HOSTS entry matches this seat (hostname '$hn'; set FLEET_LOCAL_ID to override)"
+}
+LOCAL_ID="$(resolve_local_id)"
 
-  if [[ "$PULL_ONLY" == "1" ]]; then
-    echo ">>> pull: $host_id"
-    if [[ "$ssh_target" == "local" ]]; then
-      cd "${deskflow_path/#\~/$HOME}"
-      git fetch origin && git checkout "$FLEET_BRANCH" && git pull --ff-only origin "$FLEET_BRANCH"
-      git log -1 --oneline
+# ---------------------------------------------------------------------------
+# Host plan. Parallel indexed arrays (bash 3.2 on macOS has no declare -A).
+# ---------------------------------------------------------------------------
+P_ID=(); P_TARGET=(); P_OS=(); P_ROLE=(); P_DESKFLOW=(); P_MOUSER=(); P_USER=(); P_SSH=()
+
+host_os() {
+  local id="$1" var="FLEET_OS_${1}" v
+  v="${!var:-}"
+  if [[ -n "$v" ]]; then printf '%s' "$(lower "$v")"
+  elif [[ "$(lower "$id")" == "tiny11" ]]; then printf 'windows'
+  else printf 'macos'; fi
+}
+
+host_role() {
+  local var="FLEET_ROLE_${1}"
+  printf '%s' "$(lower "${!var:-client}")"
+}
+
+build_plan() {
+  local id os role ssh_var ssh user_var user seen=" " server_id="" clients=() n=0
+  # Server = explicit FLEET_ROLE_<id>=server, else hackintosh when present.
+  for id in $FLEET_HOSTS; do
+    [[ "$(host_role "$id")" == "server" ]] && { server_id="$id"; break; }
+  done
+  if [[ -z "$server_id" ]]; then
+    for id in $FLEET_HOSTS; do
+      [[ "$(lower "$id")" == "hackintosh" ]] && { server_id="$id"; break; }
+    done
+  fi
+  for id in $FLEET_HOSTS; do
+    case "$seen" in *" $(lower "$id") "*) warn "duplicate host '$id' in FLEET_HOSTS ignored"; continue ;; esac
+    seen="${seen}$(lower "$id") "
+    [[ "$id" == "$server_id" ]] && continue
+    clients+=("$id")
+  done
+  local ordered=(${clients[@]+"${clients[@]}"})
+  [[ -n "$server_id" ]] && ordered+=("$server_id")
+
+  for id in ${ordered[@]+"${ordered[@]}"}; do
+    os="$(host_os "$id")"
+    role="client"; [[ "$id" == "$server_id" ]] && role="server"
+    ssh_var="FLEET_SSH_${id}"; ssh="${!ssh_var:-}"
+    [[ -z "$ssh" || "$ssh" == "local" ]] && ssh="$id"   # "local" never defines locality
+    user_var="FLEET_SSH_USER_${id}"; user="${!user_var:-}"
+    if [[ -z "$user" ]]; then
+      if [[ "$os" == "windows" ]]; then user="alexh"; else user="${USER:-$(id -un)}"; fi
+    fi
+    n=$((n + 1))
+    P_ID+=("$id"); P_OS+=("$os"); P_ROLE+=("$role"); P_USER+=("$user"); P_SSH+=("$ssh")
+    if [[ "$id" == "$LOCAL_ID" ]]; then P_TARGET+=("local"); else P_TARGET+=("${user}@${ssh}"); fi
+    if [[ "$os" == "windows" ]]; then
+      P_DESKFLOW+=("${FLEET_DESKFLOW_PATH_windows:-C:/Users/alexh/Desktop/deskflow}")
+      P_MOUSER+=("${FLEET_MOUSER_PATH_windows:-C:/Users/alexh/Desktop/Mouser}")
     else
-      ssh "${user}@${ssh_target}" "cd '${deskflow_path}' && git fetch origin && git checkout '${FLEET_BRANCH}' && git pull --ff-only origin '${FLEET_BRANCH}' && git log -1 --oneline"
+      P_DESKFLOW+=("${FLEET_DESKFLOW_PATH_macos:-~/Desktop/deskflow}")
+      P_MOUSER+=("${FLEET_MOUSER_PATH_macos:-~/Desktop/Mouser}")
     fi
-    return 0
-  fi
-
-  local script="${ROOT}/scripts/fleet-deploy-macos.sh"
-  if [[ "$ssh_target" == "local" ]]; then
-    echo ">>> LOCAL deploy: $host_id"
-    export FLEET_BRANCH="$FLEET_BRANCH"
-    export FLEET_DEPLOY_DESKFLOW="$deploy_df"
-    export FLEET_DEPLOY_MOUSER="$deploy_m"
-    export FLEET_RECONFIGURE="$reconf"
-    export FLEET_DESKFLOW_ROOT="${deskflow_path/#\~/$HOME}"
-    export FLEET_MOUSER_ROOT="${mouser_path/#\~/$HOME}"
-    export FLEET_KEYCHAIN_PASSWORD="$keychain_pass"
-    bash "$script"
-  else
-    echo ">>> SSH deploy: $host_id ($user@$ssh_target)"
-    ssh -t "${user}@${ssh_target}" \
-      "set -euo pipefail; \
-       if [[ -x /opt/homebrew/bin/brew ]]; then eval \"\$(/opt/homebrew/bin/brew shellenv)\"; \
-       elif [[ -x /usr/local/bin/brew ]]; then eval \"\$(/usr/local/bin/brew shellenv)\"; \
-       else export PATH=\"/opt/homebrew/bin:/usr/local/bin:\${PATH}\"; fi; \
-       export FLEET_BRANCH='${FLEET_BRANCH}'; \
-       export FLEET_DEPLOY_DESKFLOW='${deploy_df}'; \
-       export FLEET_DEPLOY_MOUSER='${deploy_m}'; \
-       export FLEET_RECONFIGURE='${reconf}'; \
-       export FLEET_DESKFLOW_ROOT='${deskflow_path}'; \
-       export FLEET_MOUSER_ROOT='${mouser_path}'; \
-       export FLEET_KEYCHAIN_PASSWORD='${keychain_pass}'; \
-       export FLEET_SKIP_GIT_PULL=1; \
-       cd '${deskflow_path}' && \
-       git fetch origin && git checkout '${FLEET_BRANCH}' && git pull --ff-only origin '${FLEET_BRANCH}' && \
-       bash scripts/fleet-deploy-macos.sh"
-  fi
-}
-
-deploy_windows() {
-  local host_id="$1"
-  local ssh_target="$2"
-  local user="${3:-alexh}"
-  local deskflow_path="${FLEET_DESKFLOW_PATH_windows:-C:/Users/alexh/Desktop/deskflow}"
-  local deploy_df="${FLEET_DEPLOY_DESKFLOW:-1}"
-  local deploy_m="${FLEET_DEPLOY_MOUSER:-1}"
-
-  for kv in ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}; do
-    case "$kv" in
-      FLEET_DEPLOY_MOUSER=*) deploy_m="${kv#*=}" ;;
-      FLEET_DEPLOY_DESKFLOW=*) deploy_df="${kv#*=}" ;;
-    esac
   done
+  [[ ${#P_ID[@]} -gt 0 ]] || die "FLEET_HOSTS is empty"
+}
+build_plan
 
-  if [[ "$PULL_ONLY" == "1" ]]; then
-    echo ">>> pull: $host_id"
-    ssh "${user}@${ssh_target}" "cd /d \"${deskflow_path}\" && git fetch origin && git checkout ${FLEET_BRANCH} && git pull --ff-only origin ${FLEET_BRANCH} && git log -1 --oneline"
+if [[ -n "$FILTER_HOST" ]]; then
+  found=0
+  for id in "${P_ID[@]}"; do [[ "$(lower "$id")" == "$FILTER_HOST" ]] && found=1; done
+  [[ "$found" == 1 ]] || die "--host '$FILTER_HOST' is not in FLEET_HOSTS ($FLEET_HOSTS)"
+fi
+
+selected() { # index -> 0 if host is in scope
+  [[ -z "$FILTER_HOST" || "$(lower "${P_ID[$1]}")" == "$FILTER_HOST" ]]
+}
+
+emit_json() { # $1 = json text
+  if [[ -z "$JSON_OUT" ]]; then return 0
+  elif [[ "$JSON_OUT" == "-" ]]; then printf '%s\n' "$1"
+  else mkdir -p "$(dirname "$JSON_OUT")"; printf '%s\n' "$1" > "$JSON_OUT"; fi
+}
+
+plan_json() {
+  local i rows=""
+  for i in "${!P_ID[@]}"; do
+    selected "$i" || continue
+    rows+="$(jq -cn --arg id "${P_ID[$i]}" --arg t "${P_TARGET[$i]}" --argjson o "$((i + 1))" \
+      --arg r "${P_ROLE[$i]}" --arg os "${P_OS[$i]}" \
+      '{id:$id,target:$t,order:$o,role:$r,os:$os}')"$'\n'
+  done
+  printf '%s' "$rows" | jq -cs '{hosts:.}'
+}
+
+if [[ "$DRY_RUN" == 1 ]]; then
+  if [[ -n "$JSON_OUT" ]]; then
+    emit_json "$(plan_json)"
+  else
+    echo "plan (local=${LOCAL_ID}, branch=${FLEET_BRANCH}${REF:+, ref=$REF}):"
+    for i in "${!P_ID[@]}"; do
+      selected "$i" || continue
+      printf '  %d. %-12s %-8s %-7s %s\n' "$((i + 1))" "${P_ID[$i]}" "${P_ROLE[$i]}" "${P_OS[$i]}" "${P_TARGET[$i]}"
+    done
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Per-repo lock: flock(1) when present, otherwise an atomic mkdir on
+# tools/state/deploy.lock.d (macOS ships no flock; PowerShell uses New-Item on
+# the same directory). A dead-pid mkdir lock is reclaimed; anything else refuses.
+# ---------------------------------------------------------------------------
+LOCK_KIND=""
+# shellcheck disable=SC2329  # invoked via trap
+release_lock() {
+  if [[ "$LOCK_KIND" == "mkdir" ]]; then rm -rf "$LOCK_DIR"; fi
+}
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+      die "deploy lock held ($LOCK_FILE) — another fleet-deploy is running; refusing"
+    fi
+    LOCK_KIND="flock"
+    return 0
+  fi
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local pid=""
+    [[ -f "$LOCK_DIR/pid" ]] && pid="$(cat "$LOCK_DIR/pid")"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      warn "reclaiming stale deploy lock left by pid $pid"
+      rm -rf "$LOCK_DIR"
+      mkdir "$LOCK_DIR" 2>/dev/null || die "deploy lock held ($LOCK_DIR); refusing"
+    else
+      die "deploy lock held ($LOCK_DIR${pid:+, pid $pid}) — another fleet-deploy is running; refusing"
+    fi
+  fi
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  LOCK_KIND="mkdir"
+  trap release_lock EXIT
+}
+acquire_lock
+
+# ---------------------------------------------------------------------------
+# last-good.json: {host: {app: {commit, ts}}}
+# ---------------------------------------------------------------------------
+last_good_commit() { # host app
+  [[ -f "$LAST_GOOD" ]] || return 1
+  local c
+  c="$(jq -r --arg h "$1" --arg a "$2" '.[$h][$a].commit // empty' "$LAST_GOOD")"
+  [[ -n "$c" ]] || return 1
+  printf '%s' "$c"
+}
+record_last_good() { # host app commit
+  local tmp
+  mkdir -p "$STATE_DIR"
+  [[ -f "$LAST_GOOD" ]] || printf '{}\n' > "$LAST_GOOD"
+  tmp="$(mktemp "${STATE_DIR}/last-good.XXXXXX")"
+  jq --arg h "$1" --arg a "$2" --arg c "$3" --arg t "$(now_ts)" \
+    '.[$h] = ((.[$h] // {}) + {($a): {commit:$c, ts:$t}})' "$LAST_GOOD" > "$tmp"
+  mv "$tmp" "$LAST_GOOD"
+}
+
+# ---------------------------------------------------------------------------
+# Remote command builders
+# ---------------------------------------------------------------------------
+# Paths reach the remote shell inside double quotes; a leading "~" becomes
+# "$HOME" so it expands there (a single-quoted "~" never does).
+sh_path() { printf '%s' "${1/#\~/\$HOME}"; }
+sh_git_sync() { # path ref -> POSIX sh fragment
+  local path ref="$2"; path="$(sh_path "$1")"
+  if [[ -z "$ref" ]]; then
+    printf 'cd "%s" && git fetch origin && git checkout "%s" && git pull --ff-only origin "%s"' \
+      "$path" "$FLEET_BRANCH" "$FLEET_BRANCH"
+  elif [[ "$ref" == "HEAD" ]]; then
+    printf 'cd "%s"' "$path"
+  else
+    printf 'cd "%s" && git fetch origin && git checkout --detach "%s"' "$path" "$ref"
+  fi
+}
+sh_mouser_sync() { # path ref -> fragment (empty when nothing to do)
+  local path ref="$2"; path="$(sh_path "$1")"
+  [[ -n "$ref" && "$ref" != "HEAD" ]] || return 0
+  printf ' && if [ -d "%s/.git" ]; then git -C "%s" fetch fork && git -C "%s" checkout --detach "%s"; fi' \
+    "$path" "$path" "$path" "$ref"
+}
+sh_exports() { # deskflow_path mouser_path dref mref
+  printf 'export FLEET_BRANCH="%s" FLEET_DEPLOY_DESKFLOW="%s" FLEET_DEPLOY_MOUSER="%s" FLEET_RECONFIGURE="%s" FLEET_DESKFLOW_ROOT="%s" FLEET_MOUSER_ROOT="%s" FLEET_SKIP_GIT_PULL=1 FLEET_DESKFLOW_REF="%s" FLEET_MOUSER_REF="%s"' \
+    "$FLEET_BRANCH" "$DEPLOY_DESKFLOW" "$DEPLOY_MOUSER" "$RECONFIGURE" "$(sh_path "$1")" "$(sh_path "$2")" "$3" "$4"
+}
+ps_git_sync() { # path ref -> PowerShell fragment
+  local path="$1" ref="$2"
+  if [[ -z "$ref" ]]; then
+    printf "git fetch origin; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git checkout '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git pull --ff-only origin '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " \
+      "$FLEET_BRANCH" "$FLEET_BRANCH"
+  elif [[ "$ref" == "HEAD" ]]; then
+    printf ''
+  else
+    printf "git fetch origin; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git checkout --detach '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " "$ref"
+  fi
+}
+
+# run_ssh target cmd -> exit code (255 = unreachable)
+run_ssh() {
+  local rc=0
+  ssh -o BatchMode=yes "$1" "$2" || rc=$?
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Per-host deploy. Sets HOST_RC / HOST_RESULT.
+# ---------------------------------------------------------------------------
+HOST_RC=0
+HOST_RESULT=""
+
+deploy_host() { # index dref mref
+  local i="$1" dref="$2" mref="$3"
+  local id="${P_ID[$i]}" target="${P_TARGET[$i]}" os="${P_OS[$i]}"
+  local dpath="${P_DESKFLOW[$i]}" mpath="${P_MOUSER[$i]}" rc=0 cmd
+  HOST_RC=0; HOST_RESULT="ok"
+
+  if [[ "$target" == "local" ]]; then
+    [[ "$os" == "macos" ]] || die "local seat '$id' is $os — run scripts/fleet-deploy.ps1 there"
+    dpath="${dpath/#\~/$HOME}"; mpath="${mpath/#\~/$HOME}"
+    if [[ "$PULL_ONLY" == 1 ]]; then
+      echo ">>> pull: $id (local)"
+      cmd="$(sh_git_sync "$dpath" "$dref")$(sh_mouser_sync "$mpath" "$mref") && git log -1 --oneline"
+    else
+      echo ">>> LOCAL deploy: $id"
+      cmd="$(sh_exports "$dpath" "$mpath" "$dref" "$mref"); $(sh_git_sync "$dpath" "$dref")$(sh_mouser_sync "$mpath" "$mref") && bash '${ROOT}/scripts/fleet-deploy-macos.sh'"
+    fi
+    bash -euo pipefail -c "$cmd" || rc=$?
+    if [[ "$rc" != 0 ]]; then HOST_RC="$rc"; HOST_RESULT="fail($rc)"; fi
     return 0
   fi
 
-  echo ">>> SSH deploy: $host_id ($user@$ssh_target)"
-  local ps_cmd
-  ps_cmd="\
-\$env:FLEET_BRANCH='${FLEET_BRANCH}'; \
-\$env:FLEET_DEPLOY_DESKFLOW='${deploy_df}'; \
-\$env:FLEET_DEPLOY_MOUSER='${deploy_m}'; \
-\$env:FLEET_DESKFLOW_ROOT='${deskflow_path}'; \
-\$env:FLEET_MOUSER_ROOT='${FLEET_MOUSER_PATH_windows:-C:/Users/alexh/Desktop/Mouser}'; \
-& '${deskflow_path}/scripts/fleet-deploy-windows.ps1'"
+  if [[ "$os" == "windows" ]]; then
+    echo ">>> SSH deploy: $id ($target)"
+    if [[ "$PULL_ONLY" == 1 ]]; then
+      cmd="cd /d \"${dpath}\" && git fetch origin && git checkout ${FLEET_BRANCH} && git pull --ff-only origin ${FLEET_BRANCH} && git log -1 --oneline"
+    else
+      local ps
+      ps="\$ErrorActionPreference='Stop'; "
+      ps+="\$env:FLEET_BRANCH='${FLEET_BRANCH}'; \$env:FLEET_DEPLOY_DESKFLOW='${DEPLOY_DESKFLOW}'; \$env:FLEET_DEPLOY_MOUSER='${DEPLOY_MOUSER}'; "
+      ps+="\$env:FLEET_DESKFLOW_ROOT='${dpath}'; \$env:FLEET_MOUSER_ROOT='${mpath}'; \$env:FLEET_SKIP_GIT_PULL='1'; "
+      ps+="\$env:FLEET_DESKFLOW_REF='${dref}'; \$env:FLEET_MOUSER_REF='${mref}'; "
+      ps+="Set-Location '${dpath}'; $(ps_git_sync "$dpath" "$dref")"
+      ps+="& '${dpath}/scripts/fleet-deploy-windows.ps1'; exit \$LASTEXITCODE"
+      cmd="powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"$ps\""
+    fi
+  else
+    echo ">>> SSH deploy: $id ($target)"
+    local prelude
+    prelude="set -euo pipefail; if [ -x /opt/homebrew/bin/brew ]; then eval \"\$(/opt/homebrew/bin/brew shellenv)\"; elif [ -x /usr/local/bin/brew ]; then eval \"\$(/usr/local/bin/brew shellenv)\"; else export PATH=\"/opt/homebrew/bin:/usr/local/bin:\${PATH}\"; fi; "
+    if [[ "$PULL_ONLY" == 1 ]]; then
+      cmd="${prelude}$(sh_git_sync "$dpath" "$dref")$(sh_mouser_sync "$mpath" "$mref") && git log -1 --oneline"
+    else
+      cmd="${prelude}$(sh_exports "$dpath" "$mpath" "$dref" "$mref"); $(sh_git_sync "$dpath" "$dref")$(sh_mouser_sync "$mpath" "$mref") && bash scripts/fleet-deploy-macos.sh"
+    fi
+  fi
 
-  ssh "${user}@${ssh_target}" "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"$ps_cmd\""
+  run_ssh "$target" "$cmd" || rc=$?
+  if [[ "$rc" == 255 ]]; then HOST_RC=255; HOST_RESULT="unreachable(ssh 255)"
+  elif [[ "$rc" != 0 ]]; then HOST_RC="$rc"; HOST_RESULT="fail($rc)"; fi
+  return 0
 }
 
-for host_id in $FLEET_HOSTS; do
-  [[ -z "$FILTER_HOST" || "$host_id" == "$FILTER_HOST" ]] || continue
-
-  ssh_var="FLEET_SSH_${host_id}"
-  target="${!ssh_var:-}"
-  user_var="FLEET_SSH_USER_${host_id}"
-  user="${!user_var:-}"
-
-  if [[ "$host_id" == "tiny11" ]]; then
-    user="${user:-alexh}"
-    [[ -n "$target" ]] || target="tiny11"
-    deploy_windows "$host_id" "$target" "$user"
+head_commit() { # index path -> sha or "unknown"
+  local i="$1" path="$2" c="" target
+  target="${P_TARGET[$i]}"
+  if [[ "$target" == "local" ]]; then
+    path="${path/#\~/$HOME}"
+    c="$(git -C "$path" rev-parse HEAD 2>/dev/null)" || c=""
   else
-    # Treat current machine as local when host id matches or target is local
-    if [[ "$target" == "local" ]] || [[ "$(echo "$host_id" | tr '[:upper:]' '[:lower:]')" == "$LOCAL_ID" ]]; then
-      target="local"
-    fi
-    [[ -n "$target" ]] || target="$host_id"
-    user="${user:-$USER}"
-    deploy_macos "$host_id" "$target" "$user"
+    c="$(ssh -o BatchMode=yes "$target" "git -C \"$(sh_path "$path")\" rev-parse HEAD" 2>/dev/null)" || c=""
   fi
+  c="$(printf '%s' "$c" | tr -d '\r' | tail -n 1)"
+  printf '%s' "${c:-unknown}"
+}
+
+health_host() { # id -> exit code of tools/fleet-health --host id (0 when absent)
+  [[ -x "$HEALTH" ]] || return 0
+  "$HEALTH" --host "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+R_ID=(); R_APP=(); R_COMMIT=(); R_RESULT=(); R_SIGNED=(); R_TCC=(); R_MESH=(); R_TARGET=()
+ALL_OK=1
+
+add_row() { R_ID+=("$1"); R_TARGET+=("$2"); R_APP+=("$3"); R_COMMIT+=("$4"); R_RESULT+=("$5"); R_SIGNED+=("-"); R_TCC+=("-"); R_MESH+=("-"); }
+
+apps_enabled() {
+  local a=()
+  [[ "$DEPLOY_DESKFLOW" == 1 ]] && a+=(deskflow)
+  [[ "$DEPLOY_MOUSER" == 1 ]] && a+=(mouser)
+  [[ ${#a[@]} -gt 0 ]] || die "nothing to deploy: both FLEET_DEPLOY_DESKFLOW and FLEET_DEPLOY_MOUSER are 0"
+  printf '%s\n' "${a[@]}"
+}
+APPS="$(apps_enabled)"
+
+if [[ "$ROLLBACK" == 1 ]]; then
+  [[ -f "$LAST_GOOD" ]] || die "--rollback: $LAST_GOOD does not exist (no successful deploy recorded yet)"
+fi
+
+for i in "${!P_ID[@]}"; do
+  selected "$i" || continue
+  id="${P_ID[$i]}"
+  dref="$REF"; mref="$REF"
+  if [[ "$ROLLBACK" == 1 ]]; then
+    for app in $APPS; do
+      c="$(last_good_commit "$id" "$app")" || die "--rollback: no last-good commit for $id/$app in $LAST_GOOD"
+      if [[ "$app" == deskflow ]]; then dref="$c"; else mref="$c"; fi
+    done
+    echo ">>> rollback $id: deskflow=${dref:--} mouser=${mref:--}"
+  fi
+
+  deploy_host "$i" "$dref" "$mref"
+  result="$HOST_RESULT"
+  if [[ "$HOST_RC" == 0 && "$PULL_ONLY" == 0 ]]; then
+    if health_host "$id"; then
+      for app in $APPS; do
+        if [[ "$app" == deskflow ]]; then c="$(head_commit "$i" "${P_DESKFLOW[$i]}")"; else c="$(head_commit "$i" "${P_MOUSER[$i]}")"; fi
+        [[ "$c" != unknown ]] && record_last_good "$id" "$app" "$c"
+        add_row "$id" "${P_TARGET[$i]}" "$app" "$c" "$result"
+      done
+      continue
+    fi
+    result="unhealthy"
+  fi
+  [[ "$result" == "ok" ]] || ALL_OK=0
+  for app in $APPS; do
+    c="-"
+    [[ "$HOST_RC" == 0 ]] && { if [[ "$app" == deskflow ]]; then c="$(head_commit "$i" "${P_DESKFLOW[$i]}")"; else c="$(head_commit "$i" "${P_MOUSER[$i]}")"; fi; }
+    add_row "$id" "${P_TARGET[$i]}" "$app" "$c" "$result"
+  done
 done
 
-echo "=== Fleet deploy complete ==="
+# ---------------------------------------------------------------------------
+# Self-test: fleet-wide health, folded into the rows.
+# ---------------------------------------------------------------------------
+if [[ "$SELF_TEST" == 1 ]]; then
+  if [[ -x "$HEALTH" ]]; then
+    hj=""
+    if hj="$("$HEALTH" --check all --host all --json)"; then :; else ALL_OK=0; warn "fleet-health --check all reported failures"; fi
+    if [[ -n "$hj" ]] && printf '%s' "$hj" | jq -e . >/dev/null 2>&1; then
+      for r in "${!R_ID[@]}"; do
+        line="$(printf '%s' "$hj" | jq -r --arg h "${R_ID[$r]}" '
+          (if (.hosts? // null) != null then ((.hosts | map(select((.id // .host) == $h)) | .[0]) // {}) else (.[$h] // {}) end)
+          | [(.signedBy // .signed_by // "-"), (.tcc // "-"), (.mesh // "-"), (if has("ok") then (.ok|tostring) else "-" end)]
+          | map(tostring) | join("\t")')"
+        IFS=$'\t' read -r s t m ok <<<"$line"
+        R_SIGNED[r]="$s"; R_TCC[r]="$t"; R_MESH[r]="$m"
+        if [[ "$ok" == "false" ]]; then ALL_OK=0; [[ "${R_RESULT[$r]}" == ok ]] && R_RESULT[r]="unhealthy"; fi
+      done
+    fi
+  else
+    warn "tools/fleet-health not found — self-test cannot verify health"
+    ALL_OK=0
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+echo
+printf '%-12s | %-8s | %-12s | %-24s | %-6s | %-6s | %s\n' host app commit signed-by tcc mesh result
+printf '%-12s-+-%-8s-+-%-12s-+-%-24s-+-%-6s-+-%-6s-+-%s\n' ------------ -------- ------------ ------------------------ ------ ------ ------
+for r in "${!R_ID[@]}"; do
+  printf '%-12s | %-8s | %-12.12s | %-24.24s | %-6.6s | %-6.6s | %s\n' \
+    "${R_ID[$r]}" "${R_APP[$r]}" "${R_COMMIT[$r]}" "${R_SIGNED[$r]}" "${R_TCC[$r]}" "${R_MESH[$r]}" "${R_RESULT[$r]}"
+done
+
+if [[ -n "$JSON_OUT" ]]; then
+  rows=""
+  for r in "${!R_ID[@]}"; do
+    rows+="$(jq -cn --arg id "${R_ID[$r]}" --arg t "${R_TARGET[$r]}" --arg a "${R_APP[$r]}" --arg c "${R_COMMIT[$r]}" \
+      --arg s "${R_SIGNED[$r]}" --arg tcc "${R_TCC[$r]}" --arg m "${R_MESH[$r]}" --arg res "${R_RESULT[$r]}" \
+      '{id:$id,target:$t,app:$a,commit:$c,signedBy:$s,tcc:$tcc,mesh:$m,result:$res}')"$'\n'
+  done
+  emit_json "$(printf '%s' "$rows" | jq -cs --argjson ok "$([[ "$ALL_OK" == 1 ]] && echo true || echo false)" '{ok:$ok,hosts:.}')"
+fi
+
+if [[ "$ALL_OK" == 1 ]]; then
+  echo "=== Fleet deploy complete ==="
+  exit 0
+fi
+echo "=== Fleet deploy FAILED on at least one host ===" >&2
+exit 1
