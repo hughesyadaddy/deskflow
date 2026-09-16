@@ -17,6 +17,12 @@
 
 #if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
 #include <signal.h>
+#include <unistd.h>
+#endif
+
+#ifdef Q_OS_WIN
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
 #endif
 
 #ifdef Q_OS_LINUX
@@ -30,10 +36,23 @@
 #include <QMutexLocker>
 #include <QRegularExpression>
 
+#include <algorithm>
+
 namespace deskflow::gui {
 
 const int kRetryDelay = 1000;
 const auto kLineSplitRegex = QRegularExpression("\r|\n|\r\n");
+
+#ifdef Q_OS_MACOS
+//! launchd label of the user-domain core agent installed by the macOS installer.
+const auto kLaunchdCoreLabel = QStringLiteral("io.github.hughesyadaddy.deskflow-core");
+const int kLaunchctlTimeoutMs = 3000;
+
+QString launchdCoreTarget()
+{
+  return QStringLiteral("gui/%1/%2").arg(getuid()).arg(kLaunchdCoreLabel);
+}
+#endif
 
 QString CoreProcess::processModeToString(const Settings::ProcessMode mode)
 {
@@ -102,15 +121,23 @@ QString CoreProcess::wrapIpv6(const QString &address)
 // CoreProcess
 //
 
-CoreProcess::CoreProcess(const ServerConfig &serverConfig)
+CoreProcess::CoreProcess(const ServerConfig &serverConfig, const QString &appPathOverride)
     : m_serverConfig(serverConfig),
       m_daemonIpcClient{new ipc::DaemonIpcClient(this)}
 {
-  m_appPath = QStringLiteral("%1/%2").arg(QCoreApplication::applicationDirPath(), kCoreBinName);
-  if (!QFile::exists(m_appPath)) {
-    qFatal("core server binary does not exist");
-    return;
+  if (appPathOverride.isEmpty()) {
+    m_appPath = QStringLiteral("%1/%2").arg(QCoreApplication::applicationDirPath(), kCoreBinName);
+    if (!QFile::exists(m_appPath)) {
+      qFatal("core server binary does not exist");
+      return;
+    }
+  } else {
+    m_appPath = appPathOverride;
   }
+
+  m_retryTimer.setSingleShot(true);
+  m_restartTimer.setSingleShot(true);
+  connect(&m_restartTimer, &QTimer::timeout, this, &CoreProcess::doRestart);
 
   connect(m_daemonIpcClient, &ipc::DaemonIpcClient::connected, this, &CoreProcess::daemonIpcClientConnected);
   connect(
@@ -147,34 +174,30 @@ void CoreProcess::daemonIpcClientConnected()
   m_daemonIpcClient->requestLogPath();
 }
 
-void CoreProcess::checkExistingProcess()
+void CoreProcess::releaseProcess()
 {
-  qInfo("checking existing core");
+  if (!m_process) {
+    return;
+  }
 
-  auto *client = new ipc::CoreIpcClient(this);
-  connect(client, &ipc::CoreIpcClient::connected, this, [client] {
-    qInfo("existing core has matching version, leaving it running");
-    client->deleteLater();
-  });
-  connect(client, &ipc::CoreIpcClient::versionMismatch, this, [client] {
-    qInfo("existing core has mismatched version, asking it to stop");
-    client->sendStop();
-  });
-  connect(client, &ipc::CoreIpcClient::serverShutdown, this, [this, client] {
-    qInfo("existing core stopped successfully");
-    client->deleteLater();
-    setProcessState(ProcessState::RetryPending);
-    m_retryTimer.setSingleShot(true);
-    m_retryTimer.start(kRetryDelay);
-  });
-  connect(client, &ipc::CoreIpcClient::connectionFailed, this, [client] {
-    qCritical("could not contact existing core");
-    client->deleteLater();
-  });
-  client->connectToServer();
+  // Detach before deleting so a late signal from the old object can never be
+  // attributed to a newer process.
+  disconnect(m_process, nullptr, this, nullptr);
+  if (m_process->state() != QProcess::NotRunning) {
+    qWarning("releasing core process that is still running, killing it");
+    m_process->kill();
+  }
+  m_process->deleteLater();
+  m_process = nullptr;
 }
 
-void CoreProcess::onProcessFinished(int exitCode, QProcess::ExitStatus)
+void CoreProcess::scheduleRetry(int delayMs)
+{
+  setProcessState(ProcessState::RetryPending);
+  m_retryTimer.start(delayMs);
+}
+
+void CoreProcess::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
   using enum ProcessState;
   setConnectionState(ConnectionState::Disconnected);
@@ -183,26 +206,124 @@ void CoreProcess::onProcessFinished(int exitCode, QProcess::ExitStatus)
     m_retryTimer.stop();
   }
 
-  if (exitCode != s_exitSuccess) {
+  const auto wasStarted = m_processState == Started;
+  releaseProcess();
+
+  // Another core already owns this machine (a launchd agent, the service's core, or a
+  // second GUI). Never stop or kill it and never retry: retrying would just re-collide,
+  // and stopping it via IPC makes its supervisor respawn it, which ping-pongs forever.
+  if (exitCode == s_exitDuplicate && exitStatus == QProcess::NormalExit) {
+    qWarning("another core owns this machine (exit code %d), leaving it running and not retrying", exitCode);
+    m_consecutiveCrashes = 0;
     setProcessState(Stopped);
-    if (exitCode == s_exitDuplicate) {
-      checkExistingProcess();
+    return;
+  }
+
+  if (exitStatus == QProcess::CrashExit) {
+    if (!wasStarted) {
+      // Stopping/Stopped: we terminated/killed it ourselves; a signal exit is the expected outcome.
+      qDebug("desktop process ended by our stop request");
+      setProcessState(Stopped);
       return;
     }
+
+    m_consecutiveCrashes++;
+    if (m_consecutiveCrashes > kMaxCrashRetries) {
+      qCritical("core process crashed %d times in a row, giving up; use Start to try again", m_consecutiveCrashes);
+      setProcessState(Stopped);
+      Q_EMIT error(Error::CrashLoop);
+      return;
+    }
+
+    const auto delay = std::min(kCrashRetryBaseDelayMs << (m_consecutiveCrashes - 1), kMaxCrashRetryDelayMs);
+    qCritical(
+        "core process crashed (exit code %d), retry %d of %d in %d ms", //
+        exitCode, m_consecutiveCrashes, kMaxCrashRetries, delay
+    );
+    scheduleRetry(delay);
+    return;
+  }
+
+  if (exitCode != s_exitSuccess) {
     qWarning("desktop process exited with code: %d", exitCode);
+    setProcessState(Stopped);
     return;
   }
 
   qDebug("desktop process exited normally");
 
-  if (const auto wasStarted = m_processState == Started; wasStarted) {
+  if (wasStarted) {
     qDebug("desktop process was running, retrying in %d ms", kRetryDelay);
-    setProcessState(RetryPending);
-    m_retryTimer.setSingleShot(true);
-    m_retryTimer.start(kRetryDelay);
+    scheduleRetry(kRetryDelay);
   } else {
     setProcessState(Stopped);
   }
+}
+
+bool CoreProcess::spawnCoreProcess(QProcess *process, const QString &program, const QStringList &args)
+{
+#ifdef Q_OS_LINUX
+  process->setChildProcessModifier([] {
+    // the core process becomes orphaned when the gui process exits abruptly (e.g. with kill -9),
+    // so ensure the os also kills the core when that happens to the gui.
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+  });
+#endif
+
+  process->start(program, args);
+  return process->waitForStarted();
+}
+
+bool CoreProcess::probeExternalSupervisor() const
+{
+#ifdef Q_OS_MACOS
+  QProcess launchctl;
+  launchctl.setProcessChannelMode(QProcess::MergedChannels);
+  launchctl.start(QStringLiteral("/bin/launchctl"), {QStringLiteral("print"), launchdCoreTarget()});
+  if (!launchctl.waitForFinished(kLaunchctlTimeoutMs)) {
+    launchctl.kill();
+    qWarning("launchctl print timed out, assuming no launchd-managed core");
+    return false;
+  }
+  return launchctl.exitStatus() == QProcess::NormalExit && launchctl.exitCode() == 0;
+#else
+  return false;
+#endif
+}
+
+void CoreProcess::kickstartExternalCore() const
+{
+#ifdef Q_OS_MACOS
+  const auto target = launchdCoreTarget();
+  qInfo("restarting launchd-managed core: launchctl kickstart -k %s", qPrintable(target));
+  QProcess launchctl;
+  launchctl.start(QStringLiteral("/bin/launchctl"), {QStringLiteral("kickstart"), QStringLiteral("-k"), target});
+  if (!launchctl.waitForFinished(kLaunchctlTimeoutMs)) {
+    launchctl.kill();
+    qWarning("launchctl kickstart timed out");
+  } else if (launchctl.exitCode() != 0) {
+    qWarning("launchctl kickstart failed with exit code %d", launchctl.exitCode());
+  }
+#endif
+}
+
+bool CoreProcess::isWindowsServiceInstalled() const
+{
+#ifdef Q_OS_WIN
+  SC_HANDLE mgr = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
+  if (!mgr) {
+    return false;
+  }
+  SC_HANDLE service = OpenService(mgr, QString::fromLatin1(kAppName).toStdWString().c_str(), SERVICE_QUERY_STATUS);
+  const bool installed = service != nullptr;
+  if (service) {
+    CloseServiceHandle(service);
+  }
+  CloseServiceHandle(mgr);
+  return installed;
+#else
+  return false;
+#endif
 }
 
 void CoreProcess::applyLogLevel()
@@ -227,19 +348,10 @@ void CoreProcess::startForegroundProcess(const QStringList &args)
   const auto quoted = makeQuotedArgs(m_appPath, args);
   qInfo("running command: %s", qPrintable(quoted));
 
-#ifdef Q_OS_LINUX
-  m_process->setChildProcessModifier([] {
-    // the core process becomes orphaned when the gui process exits abruptly (e.g. with kill -9),
-    // so ensure the os also kills the core when that happens to the gui.
-    prctl(PR_SET_PDEATHSIG, SIGTERM);
-  });
-#endif
-
-  m_process->start(m_appPath, args);
-
-  if (m_process->waitForStarted()) {
+  if (spawnCoreProcess(m_process, m_appPath, args)) {
     setProcessState(Started);
   } else {
+    releaseProcess();
     setProcessState(Stopped);
     Q_EMIT error(Error::StartFailed);
   }
@@ -271,24 +383,37 @@ void CoreProcess::startProcessFromDaemon()
   }
 }
 
-void CoreProcess::stopForegroundProcess() const
+void CoreProcess::stopForegroundProcess()
 {
   if (m_processState != ProcessState::Stopping) {
     qFatal("core process must be in stopping state");
   }
 
   if (!m_process) {
-    qFatal("process not set, cannot stop");
+    qWarning("process not set, nothing to stop");
+    setProcessState(ProcessState::Stopped);
+    return;
   }
 
   qInfo("stopping core desktop process");
 
   if (m_process->state() == QProcess::ProcessState::Running) {
-    qDebug("process is running, closing");
-    m_process->close();
+    // SIGTERM first so the core can tear down its IPC server and virtual devices; only
+    // escalate to SIGKILL when it ignores us. waitForFinished delivers finished() to
+    // onProcessFinished synchronously, which sees Stopping and settles on Stopped.
+    qDebug("process is running, terminating (grace %d ms)", kStopGraceMs);
+    m_process->terminate();
+    if (!m_process->waitForFinished(kStopGraceMs)) {
+      qWarning("core did not exit within %d ms after SIGTERM, killing", kStopGraceMs);
+      m_process->kill();
+      m_process->waitForFinished(1000);
+    }
   } else {
     qDebug("process is not running, skipping terminate");
   }
+
+  releaseProcess();
+  setProcessState(ProcessState::Stopped);
 }
 
 void CoreProcess::stopProcessFromDaemon()
@@ -362,11 +487,36 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
 
   QMutexLocker locker(&m_processMutex);
 
+  // A retry keeps the crash count; anything else (user, restart) is a fresh attempt.
+  if (m_processState != ProcessState::RetryPending) {
+    m_consecutiveCrashes = 0;
+  }
+  if (m_retryTimer.isActive()) {
+    m_retryTimer.stop();
+  }
+
   const auto currentMode = Settings::value(Settings::Core::ProcessMode).value<ProcessMode>();
-  const auto processMode = processModeOption.value_or(currentMode);
+  auto processMode = processModeOption.value_or(currentMode);
   const auto coreMode = QVariant::fromValue(m_mode).toString().toLower();
 
-  qInfo().noquote() << QString("starting %1 process (%2 mode)").arg(coreMode, processModeToString(processMode));
+  // On Windows the service's watchdog owns the core; a second Desktop-mode core would only
+  // collide with it (exit 5) or fight it for the virtual devices.
+  if (processMode == ProcessMode::Desktop && isWindowsServiceInstalled()) {
+    if (!m_serviceModeForcedLogged) {
+      qWarning("the %s service is installed, refusing desktop mode and using service mode", kAppName);
+      m_serviceModeForcedLogged = true;
+    }
+    processMode = ProcessMode::Service;
+  }
+
+  // Probed once per start(): an externally supervised core (launchd) is attached to via IPC only.
+  m_externallySupervised = processMode == ProcessMode::Desktop && probeExternalSupervisor();
+
+  qInfo().noquote() << QString("starting %1 process (%2 mode%3)")
+                           .arg(
+                               coreMode, processModeToString(processMode),
+                               m_externallySupervised ? QStringLiteral(", externally supervised") : QString()
+                           );
 
   setProcessState(ProcessState::Starting);
 
@@ -376,17 +526,12 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
 
   setConnectionState(ConnectionState::Connecting);
 
-  if (processMode == ProcessMode::Desktop) {
+  if (processMode == ProcessMode::Desktop && !m_externallySupervised) {
+    releaseProcess();
     m_process = new QProcess(this);
-    connect(m_process, &QProcess::finished, this, &CoreProcess::onProcessFinished, Qt::UniqueConnection);
-    connect(
-        m_process, &QProcess::readyReadStandardOutput, this, &CoreProcess::onProcessReadyReadStandardOutput,
-        Qt::UniqueConnection
-    );
-    connect(
-        m_process, &QProcess::readyReadStandardError, this, &CoreProcess::onProcessReadyReadStandardError,
-        Qt::UniqueConnection
-    );
+    connect(m_process, &QProcess::finished, this, &CoreProcess::onProcessFinished);
+    connect(m_process, &QProcess::readyReadStandardOutput, this, &CoreProcess::onProcessReadyReadStandardOutput);
+    connect(m_process, &QProcess::readyReadStandardError, this, &CoreProcess::onProcessReadyReadStandardError);
   }
 
   QStringList args = {coreMode};
@@ -431,8 +576,9 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
 
           m_coreIpcClient = new ipc::CoreIpcClient(this);
           connect(m_coreIpcClient, &ipc::CoreIpcClient::commandReceived, this, &CoreProcess::onCoreIpcMessageReceived);
-          connect(m_coreIpcClient, &ipc::CoreIpcClient::connected, this, [] {
+          connect(m_coreIpcClient, &ipc::CoreIpcClient::connected, this, [this] {
             qDebug("connected to core ipc server");
+            m_consecutiveCrashes = 0;
           });
           connect(m_coreIpcClient, &ipc::CoreIpcClient::connectionFailed, this, [] {
             qWarning("failed to establish core ipc connection");
@@ -447,7 +593,10 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
       static_cast<Qt::ConnectionType>(Qt::SingleShotConnection | Qt::QueuedConnection)
   );
 
-  if (processMode == ProcessMode::Desktop) {
+  if (m_externallySupervised) {
+    qInfo("core is supervised by launchd, attaching via ipc without spawning");
+    setProcessState(ProcessState::Started);
+  } else if (processMode == ProcessMode::Desktop) {
     startForegroundProcess(args);
   } else if (processMode == ProcessMode::Service) {
     startProcessFromDaemon();
@@ -465,6 +614,11 @@ void CoreProcess::stop(std::optional<ProcessMode> processModeOption)
 
   qInfo("stopping core process (%s mode)", qPrintable(processModeToString(processMode)));
 
+  m_consecutiveCrashes = 0;
+  if (m_retryTimer.isActive()) {
+    m_retryTimer.stop();
+  }
+
   if (m_coreIpcClient) {
     m_coreIpcClient->disconnectFromServer();
     m_coreIpcClient->deleteLater();
@@ -477,7 +631,10 @@ void CoreProcess::stop(std::optional<ProcessMode> processModeOption)
   } else if (m_processState != ProcessState::Stopped) {
     setProcessState(ProcessState::Stopping);
 
-    if (processMode == ProcessMode::Service) {
+    if (m_externallySupervised) {
+      qInfo("core is supervised by launchd, detaching and leaving it running");
+      setProcessState(ProcessState::Stopped);
+    } else if (processMode == ProcessMode::Service) {
       stopProcessFromDaemon();
     } else if (processMode == ProcessMode::Desktop) {
       stopForegroundProcess();
@@ -522,7 +679,32 @@ void CoreProcess::reloadServerConfig()
 
 void CoreProcess::restart()
 {
+  // Rate-limit: settings churn, the 5x Esc rescue and reloadServerConfig can all fire
+  // restart() in quick succession; one restart per window is enough, later calls coalesce.
+  if (m_lastRestart.isValid() && m_lastRestart.elapsed() < kRestartMinIntervalMs) {
+    const auto remaining = static_cast<int>(kRestartMinIntervalMs - m_lastRestart.elapsed());
+    if (!m_restartTimer.isActive()) {
+      qDebug("restart requested within %d ms of the last one, coalescing (in %d ms)", kRestartMinIntervalMs, remaining);
+      m_restartTimer.start(std::max(remaining, 1));
+    }
+    return;
+  }
+
+  doRestart();
+}
+
+void CoreProcess::doRestart()
+{
   qDebug("restarting core process");
+  m_lastRestart.restart();
+
+  if (m_externallySupervised) {
+    // launchd owns the process: never kill+spawn, ask launchd to bounce it and re-attach.
+    stop();
+    kickstartExternalCore();
+    start();
+    return;
+  }
 
   const auto processMode = Settings::value(Settings::Core::ProcessMode).value<ProcessMode>();
 
