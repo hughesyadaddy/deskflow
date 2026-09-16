@@ -8,6 +8,7 @@
 
 #include "AutoModeRunner.h"
 #include "CoreArgParser.h"
+#include "PermissionCheck.h"
 
 #if defined(Q_OS_WIN)
 // WIN32_LEAN_AND_MEAN: plain windows.h drags in the legacy winsock.h, which
@@ -42,6 +43,7 @@
 #include <QTextStream>
 #include <QThread>
 
+#include <iostream>
 #include <memory>
 
 void qtMessageHandler(QtMsgType type, const QMessageLogContext &context, const QString &message)
@@ -86,6 +88,13 @@ App *createApp(const CoreArgParser &parser, EventQueue &events, const QString &p
 
 int main(int argc, char **argv)
 {
+  // `--check-permissions` must run before Qt/app init so it works from a
+  // headless SSH session (no display, no TCC prompt).
+  if (const int rc = deskflow::core::permissions::run(argc, argv, deskflow::core::permissions::probe, std::cout);
+      rc >= 0) {
+    return rc;
+  }
+
 #if defined(Q_OS_WIN)
   ArchMiscWindows::setInstanceWin32(GetModuleHandle(nullptr));
 #endif

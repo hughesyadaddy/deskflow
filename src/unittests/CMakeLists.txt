@@ -67,6 +67,14 @@ add_subdirectory(net)
 add_subdirectory(platform)
 add_subdirectory(server)
 
+# deskflow-core `--check-permissions` (Qt-free lib defined in src/apps/deskflow-core)
+create_test(
+  NAME PermissionCheckTests
+  DEPENDS ${CMAKE_PROJECT_NAME}-core-permissioncheck
+  SOURCE apps/deskflow-core/PermissionCheckTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/apps/deskflow-core"
+)
+
 #make sure to use CI only plugin on Unix
 if (UNIX AND NOT APPLE)
   set(qPA_Platform "QT_QPA_PLATFORM=minimal")
