@@ -29,6 +29,7 @@
 class IEventQueue;
 
 class CoordinatorFleetPublishTests;
+class CoordinatorTests;
 
 namespace deskflow::coordination {
 
@@ -66,6 +67,7 @@ interrupts the currently running app via the registered callback.
 class Coordinator
 {
   friend class ::CoordinatorFleetPublishTests;
+  friend class ::CoordinatorTests;
 
 public:
   explicit Coordinator(CoordinatorConfig config);
@@ -140,7 +142,11 @@ private:
   void handleFleetMessage(const Message &message);
   void postFleetStateEvents(IEventQueue *events, const FleetMergeResult &merge);
   std::vector<FleetPeer> buildFleetPeersLocked();
-  void sendLineToPeers(const std::string &line, const PeerList &peers);
+  //! Queue \p line on every peer's outbox (never blocks; see PeerOutbox).
+  void sendLineToPeers(const std::string &line);
+  PeerOutbox *outboxByName(const std::string &name) const;
+  //! Resolve a fleet host name (peer, server, or cursor screen) to its outbox.
+  PeerOutbox *outboxForHostLocked(const std::string &hostName) const;
   bool mergeAndBroadcastFleetFragment(const FleetFragment &fragment, bool sendEvenIfUnchanged);
   void handleKeyForwardMessage(const Message &message);
   bool
@@ -161,6 +167,10 @@ private:
 
   CoordinatorConfig m_config;
   std::unique_ptr<CoordinationMesh> m_mesh;
+  //! One outbound lane per configured peer (self excluded), keyed by peer
+  //! name. Declared after m_mesh: the lanes send through it and must be
+  //! destroyed first.
+  std::map<std::string, std::unique_ptr<PeerOutbox>> m_outboxes;
   std::unique_ptr<ILocalInputMonitor> m_inputMonitor;
   std::unique_ptr<IKeyboardRelayMonitor> m_keyboardRelay;
 
@@ -182,10 +192,6 @@ private:
   std::condition_variable m_workerWake;
   bool m_workerStop = false;
   bool m_broadcastPending = false;
-  //! Encoded fleet fragment awaiting broadcast by the worker (guarded by
-  //! m_mutex); set by mergeAndBroadcastFleetFragment so event-loop callers
-  //! never pay per-peer connect timeouts.
-  std::string m_pendingFleetLine;
   double m_startedAt = 0.0;
   int m_wedgeStrikes = 0;
   bool m_loggedKeyForward = false;

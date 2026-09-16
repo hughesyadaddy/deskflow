@@ -23,6 +23,7 @@ using SocketLen = int;
 using SocketLen = socklen_t;
 #endif
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -193,6 +194,10 @@ bool CoordinationMesh::start()
   }
 
   m_running = true;
+  m_handlers.reserve(kHandlerPoolSize);
+  for (int i = 0; i < kHandlerPoolSize; ++i) {
+    m_handlers.emplace_back([this] { handlerLoop(); });
+  }
   m_thread = std::thread([this] { serveLoop(); });
   LOG_INFO("coordination: mesh listening on port %d", m_port);
   return true;
@@ -208,8 +213,10 @@ void CoordinationMesh::stop()
   if (m_thread.joinable()) {
     m_thread.join();
   }
-  // Unblock every in-flight handler, then wait for them to drain so a
-  // handler thread can never touch *this after destruction.
+  // Unblock every in-flight handler (pending fds included: they sit in
+  // m_clientFds too), then join the pool so a handler thread can never
+  // touch *this after destruction. Handlers are time-bounded (2 s read
+  // timeout, sockets shut down here), so the join converges.
   {
     std::scoped_lock lock{m_clientsMutex};
     for (const int fd : m_clientFds) {
@@ -220,13 +227,19 @@ void CoordinationMesh::stop()
 #endif
     }
   }
-  // Handlers are time-bounded (2s read timeout, 700ms probes, sockets
-  // shut down above), so this converges; returning early would let a
-  // detached handler touch *this after destruction.
-  std::unique_lock lock{m_clientsMutex};
-  while (!m_clientsDone.wait_for(lock, std::chrono::seconds(5), [this] { return m_activeClients.load() == 0; })) {
-    LOG_WARN("coordination: still draining %d mesh handler(s) at shutdown", m_activeClients.load());
+  m_pendingReady.notify_all();
+  for (auto &handler : m_handlers) {
+    if (handler.joinable()) {
+      handler.join();
+    }
   }
+  m_handlers.clear();
+  std::scoped_lock lock{m_clientsMutex};
+  for (const int fd : m_pendingFds) {
+    m_clientFds.erase(fd);
+    platformCloseSocket(fd);
+  }
+  m_pendingFds.clear();
 }
 
 bool CoordinationMesh::sendTo(const std::string &host, const std::string &line)
@@ -319,27 +332,42 @@ void CoordinationMesh::serveLoop()
       platformCloseSocket(clientFd);
       break;
     }
-    if (m_activeClients.load() >= kMaxConcurrentClients) {
-      // A stalled or hostile peer set must not starve the mesh; excess
-      // connections are refused rather than queued behind them.
-      platformCloseSocket(clientFd);
-      continue;
-    }
     {
       std::scoped_lock lock{m_clientsMutex};
-      m_clientFds.insert(clientFd);
-    }
-    ++m_activeClients;
-    std::thread([this, clientFd] {
-      handleClient(clientFd);
-      {
-        std::scoped_lock lock{m_clientsMutex};
-        m_clientFds.erase(clientFd);
+      if (m_activeClients.load() + static_cast<int>(m_pendingFds.size()) >= kMaxConcurrentClients) {
+        // A stalled or hostile peer set must not starve the mesh; excess
+        // connections are refused rather than queued behind them.
+        platformCloseSocket(clientFd);
+        continue;
       }
-      platformCloseSocket(clientFd);
-      --m_activeClients;
-      m_clientsDone.notify_all();
-    }).detach();
+      m_clientFds.insert(clientFd);
+      m_pendingFds.push_back(clientFd);
+    }
+    m_pendingReady.notify_one();
+  }
+}
+
+void CoordinationMesh::handlerLoop()
+{
+  while (true) {
+    int clientFd = -1;
+    {
+      std::unique_lock lock{m_clientsMutex};
+      m_pendingReady.wait(lock, [this] { return !m_running || !m_pendingFds.empty(); });
+      if (!m_running) {
+        return; // stop() closes whatever is still pending
+      }
+      clientFd = m_pendingFds.front();
+      m_pendingFds.pop_front();
+      ++m_activeClients;
+    }
+    handleClient(clientFd);
+    {
+      std::scoped_lock lock{m_clientsMutex};
+      m_clientFds.erase(clientFd);
+    }
+    platformCloseSocket(clientFd);
+    --m_activeClients;
   }
 }
 
@@ -386,6 +414,212 @@ void CoordinationMesh::handleClient(int clientFd)
       return; // EOF or timeout: legacy senders are one-shot
     }
     carry.append(buffer, static_cast<size_t>(received));
+  }
+}
+
+//
+// PeerOutbox
+//
+
+PeerOutbox::PeerOutbox(std::string ip, std::string lan, Transport transport, Clock clock)
+    : m_ip(std::move(ip)),
+      m_lan(std::move(lan)),
+      m_transport(std::move(transport)),
+      m_clock(std::move(clock)),
+      m_preferLan(!m_lan.empty())
+{
+  // do nothing
+}
+
+PeerOutbox::~PeerOutbox()
+{
+  stop();
+}
+
+void PeerOutbox::start()
+{
+  std::scoped_lock lock{m_mutex};
+  if (m_thread.joinable()) {
+    return;
+  }
+  m_stop = false;
+  m_thread = std::thread([this] { run(); });
+}
+
+void PeerOutbox::stop()
+{
+  {
+    std::scoped_lock lock{m_mutex};
+    m_stop = true;
+  }
+  m_wake.notify_all();
+  m_jobDone.notify_all();
+  if (m_thread.joinable()) {
+    m_thread.join(); // at most one bounded connect attempt in flight
+  }
+}
+
+void PeerOutbox::post(std::string line, ReplyHandler onReply)
+{
+  {
+    std::scoped_lock lock{m_mutex};
+    m_queue.push_back(Job{std::move(line), std::move(onReply)});
+    ++m_posted;
+    if (m_queue.size() > kMaxQueuedLines) {
+      m_queue.pop_front();
+      ++m_resolved; // dropped counts as resolved for forward() waiters
+    }
+  }
+  m_wake.notify_all();
+}
+
+bool PeerOutbox::forward(std::string line, int graceMs)
+{
+  uint64_t ticket = 0;
+  {
+    std::scoped_lock lock{m_mutex};
+    if (m_state == State::Backoff) {
+      return false;
+    }
+    m_queue.push_back(Job{std::move(line), {}});
+    ticket = ++m_posted;
+    if (m_queue.size() > kMaxQueuedLines) {
+      m_queue.pop_front();
+      ++m_resolved;
+    }
+  }
+  m_wake.notify_all();
+
+  std::unique_lock lock{m_mutex};
+  if (m_state == State::Reachable) {
+    return true;
+  }
+  // Unknown: give the lane thread a short, bounded chance to resolve this
+  // very job. A timeout is reported as "not delivered" (the key stays
+  // local); the attempt itself keeps running and settles the state.
+  m_jobDone.wait_for(lock, std::chrono::milliseconds(graceMs), [&] { return m_resolved >= ticket || m_stop; });
+  return m_resolved >= ticket && m_state == State::Reachable;
+}
+
+PeerOutbox::State PeerOutbox::state() const
+{
+  std::scoped_lock lock{m_mutex};
+  return m_state;
+}
+
+std::string PeerOutbox::preferredAddress() const
+{
+  std::scoped_lock lock{m_mutex};
+  return (m_preferLan && !m_lan.empty()) ? m_lan : m_ip;
+}
+
+double PeerOutbox::nextAttemptAt() const
+{
+  std::scoped_lock lock{m_mutex};
+  return m_nextAttemptAt;
+}
+
+bool PeerOutbox::idle() const
+{
+  std::scoped_lock lock{m_mutex};
+  return m_queue.empty() && !m_inFlight;
+}
+
+std::string PeerOutbox::otherAddressLocked(const std::string &host) const
+{
+  if (m_lan.empty() || m_lan == m_ip) {
+    return {};
+  }
+  return host == m_lan ? m_ip : m_lan;
+}
+
+void PeerOutbox::pump(double now)
+{
+  while (true) {
+    Job job;
+    std::string host;
+    bool alternateOnFailure = false;
+    {
+      std::scoped_lock lock{m_mutex};
+      if (m_queue.empty() || now < m_nextAttemptAt || m_stop) {
+        return;
+      }
+      job = std::move(m_queue.front());
+      m_queue.pop_front();
+      host = (m_preferLan && !m_lan.empty()) ? m_lan : m_ip;
+      // Only a peer we believed reachable (or never tried) earns a second
+      // address on the same attempt; in backoff it is one connect per window.
+      alternateOnFailure = m_state != State::Backoff;
+      m_inFlight = true;
+    }
+
+    std::string reply;
+    std::string *replyOut = job.onReply ? &reply : nullptr;
+    bool ok = m_transport(host, job.line, replyOut);
+    if (!ok && alternateOnFailure) {
+      std::string other;
+      {
+        std::scoped_lock lock{m_mutex};
+        other = m_stop ? std::string{} : otherAddressLocked(host);
+      }
+      if (!other.empty()) {
+        reply.clear();
+        ok = m_transport(other, job.line, replyOut);
+        if (ok) {
+          host = other;
+        }
+      }
+    }
+
+    {
+      std::scoped_lock lock{m_mutex};
+      m_inFlight = false;
+      if (ok) {
+        m_state = State::Reachable;
+        m_backoffS = 0.0;
+        m_nextAttemptAt = 0.0;
+        m_preferLan = !m_lan.empty() && host == m_lan;
+        ++m_resolved;
+      } else {
+        m_backoffS = m_backoffS <= 0.0 ? kBackoffMinS : std::min(m_backoffS * 2.0, kBackoffMaxS);
+        m_state = State::Backoff;
+        m_nextAttemptAt = m_clock() + m_backoffS;
+        if (!otherAddressLocked(host).empty()) {
+          m_preferLan = !m_preferLan; // alternate lan/ip across windows
+        }
+        // Everything behind the failed line is stale by now (>= one
+        // connect timeout old); periodic senders re-post.
+        m_queue.clear();
+        m_resolved = m_posted;
+      }
+    }
+    m_jobDone.notify_all();
+
+    if (!ok) {
+      return;
+    }
+    if (job.onReply) {
+      job.onReply(reply);
+    }
+  }
+}
+
+void PeerOutbox::run()
+{
+  std::unique_lock lock{m_mutex};
+  while (!m_stop) {
+    if (m_queue.empty()) {
+      m_wake.wait(lock);
+      continue;
+    }
+    const double now = m_clock();
+    if (now < m_nextAttemptAt) {
+      m_wake.wait_for(lock, std::chrono::duration<double>(m_nextAttemptAt - now));
+      continue;
+    }
+    lock.unlock();
+    pump(now);
+    lock.lock();
   }
 }
 
