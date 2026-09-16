@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-soak sampler: one sample per process every 60 s.
+
+  Install (edit __REPO__ to the checkout path on this seat, e.g.
+  /Users/alexhughes/Desktop/deskflow):
+
+    sed "s#__REPO__#$PWD#g" tools/launchd/com.fleet.soak.plist \
+      > ~/Library/LaunchAgents/com.fleet.soak.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet.soak.plist
+
+  Uninstall:
+
+    launchctl bootout gui/$(id -u)/com.fleet.soak
+
+  Output goes to __REPO__/harness/soak/<date>/<seat>-<proc>.jsonl with
+  harness/soak/latest pointing at the current day directory (the <date>
+  directory is created once by `fleet-soak sample --start-soak`; --soak keeps
+  appending to latest so a multi-day soak stays in one file per process).
+  The label for deskflow-core is a plain name (it is a child of the GUI app,
+  not a launchd job), so its restart_count is null and restarts are detected
+  from (exe, pid, start_time) tuple changes.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fleet.soak</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>__REPO__/tools/fleet-soak</string>
+    <string>sample</string>
+    <string>--once</string>
+    <string>--interval</string>
+    <string>60</string>
+    <string>--soak</string>
+    <string>__REPO__/harness/soak</string>
+    <string>--label</string>
+    <string>io.github.hughesyadaddy.mouser</string>
+    <string>--exe</string>
+    <string>/Applications/Mouser.app/Contents/MacOS/Mouser</string>
+    <string>--label</string>
+    <string>deskflow-core</string>
+    <string>--exe</string>
+    <string>/Applications/Deskflow.app/Contents/MacOS/deskflow-core</string>
+    <string>--label</string>
+    <string>io.github.hughesyadaddy.deskflow</string>
+    <string>--exe</string>
+    <string>/Applications/Deskflow.app/Contents/MacOS/deskflow</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/com.fleet.soak.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/com.fleet.soak.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
