@@ -46,7 +46,7 @@ done
 
 quit_deskflow() {
   echo "== Stopping Deskflow processes =="
-  osascript -e 'tell application "Deskflow" to quit' 2>/dev/null || true
+  osascript -e 'tell application "Deskflow" to quit' 2>/dev/null || true # fleet:allow app may not be running
 
   local -a patterns=(
     deskflow-core
@@ -58,14 +58,14 @@ quit_deskflow() {
     for pat in "${patterns[@]}"; do
       if pgrep -f "$pat" >/dev/null 2>&1; then
         alive=1
-        pkill -f "$pat" 2>/dev/null || true
+        pkill -f "$pat" 2>/dev/null || true # fleet:allow process may exit between pgrep and pkill
       fi
     done
     [[ "$alive" -eq 0 ]] && break
     sleep 0.5
   done
   for pat in "${patterns[@]}"; do
-    pkill -9 -f "$pat" 2>/dev/null || true
+    pkill -9 -f "$pat" 2>/dev/null || true # fleet:allow nothing left to kill is the goal
   done
 
   # Wait until the GUI singleton lock is released before replacing the bundle.
@@ -102,11 +102,39 @@ restart_mouser() {
   [[ -d "$mouser_app" ]] || return 0
   pgrep -f "Mouser.app/Contents/MacOS/Mouser" >/dev/null 2>&1 || return 0
   echo "== Restarting Mouser (clears stale deskflow bridge state) =="
-  osascript -e 'tell application "Mouser" to quit' 2>/dev/null || true
+  osascript -e 'tell application "Mouser" to quit' 2>/dev/null || true # fleet:allow Mouser may ignore the quit event
   sleep 2
-  pkill -x Mouser 2>/dev/null || true
+  pkill -x Mouser 2>/dev/null || true # fleet:allow already quit cleanly
   sleep 1
   open "$mouser_app"
+}
+
+# Fatal unless the bundle verifies AND deskflow-core carries a real (non ad-hoc)
+# signature: an Authority chain and a TeamIdentifier. An ad-hoc or unsigned
+# install "works" once and then loses its Accessibility / Input Monitoring
+# grants on the next build, so it must never be reported as a success.
+verify_signature() {
+  local app="$1"
+  local core="$app/Contents/MacOS/deskflow-core"
+  if ! codesign --verify --deep --strict "$app"; then
+    echo "error: codesign --verify --deep --strict failed for $app — installed bundle is unsigned or broken" >&2
+    exit 1
+  fi
+  local info
+  if ! info="$(codesign -dv "$core" 2>&1)"; then
+    echo "error: codesign -dv failed for $core" >&2
+    exit 1
+  fi
+  if ! grep -q '^Authority=' <<<"$info"; then
+    echo "error: $core has no Authority= (ad-hoc signature) — set DESKFLOW_CODESIGN_ID to a real identity" >&2
+    exit 1
+  fi
+  if ! grep -Eq '^TeamIdentifier=[A-Z0-9]+$' <<<"$info"; then
+    echo "error: $core has no TeamIdentifier= — not signed with a Developer certificate" >&2
+    exit 1
+  fi
+  echo "== Codesign verify OK =="
+  grep -E '^(Authority|TeamIdentifier)=' <<<"$info"
 }
 
 install_bundle() {
@@ -142,14 +170,9 @@ install_bundle() {
     exit 1
   fi
 
-  xattr -cr "$INSTALL_APP" 2>/dev/null || true
+  xattr -cr "$INSTALL_APP" 2>/dev/null || true # fleet:allow quarantine attrs may simply not exist
 
-  if codesign --verify --deep --strict "$INSTALL_APP" 2>/dev/null; then
-    echo "== Codesign verify OK =="
-    codesign -dv "$INSTALL_APP/Contents/MacOS/deskflow-core" 2>&1 | grep -E 'Authority=|TeamIdentifier=' || true
-  else
-    echo "== Installed unsigned (codesign verify skipped or failed) =="
-  fi
+  verify_signature "$INSTALL_APP"
 
   # libqsvgicon.dylib needs QtSvg.framework; without it tray/menu SVG icons are blank
   # in Release installs while Debug (Homebrew Qt) still works.
