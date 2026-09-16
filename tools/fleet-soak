@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+"""fleet-soak: per-process memory soak sampler and verdict reporter.
+
+Stdlib only (ctypes is used for libproc on macOS).
+
+    fleet-soak sample --label L --exe P (--out F | --soak DIR | --start-soak DIR)
+                      [--once] [--interval 60] [--proc NAME] [--probe-json FILE|-]
+    fleet-soak report --in F [--seat S] [--proc P] [--window H] [--accelerated]
+                      [--scenario X] [--slope-max MB/h] [--cap MB]
+                      [--ports-slope-max n/h] [--max-step pct]
+                      [--max-restarts N] [--min-hours 72]
+                      [--min-completeness 0.95] [--validate] [--json]
+
+JSONL layout: the first line is a header
+  {"header": true, "metric": "phys_footprint"|"private_bytes",
+   "scenario_source": "observed", "sampler_sha": ..., "seat": ..., "proc": ...,
+   "interval": 60}
+followed by one sample object per line.
+
+Report exit codes: 0 pass, 1 fail (criteria), 2 verdict invalid.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import socket
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+__all__ = ["main", "theil_sen", "analyze", "validate"]
+
+WARMUP_S = 2 * 3600
+WARMUP_ACCELERATED_S = 10 * 60
+MAX_GAP_S = 5 * 60
+THEIL_SEN_MAX_POINTS = 1500
+MB = 1024 * 1024
+
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_INVALID = 2
+
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform.startswith("win")
+
+
+# --------------------------------------------------------------------------
+# generic helpers
+# --------------------------------------------------------------------------
+
+
+def now_utc() -> _dt.datetime:
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def iso(ts: _dt.datetime) -> str:
+    return ts.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(s: str) -> float:
+    """Parse an ISO-8601 timestamp (Z or offset) into epoch seconds."""
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    d = _dt.datetime.fromisoformat(s)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_dt.timezone.utc)
+    return d.timestamp()
+
+
+def run(cmd: list[str], timeout: int = 20) -> str:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def git_sha() -> str:
+    here = Path(__file__).resolve().parent
+    out = run(["git", "-C", str(here), "rev-parse", "HEAD"]).strip()
+    return out or "unknown"
+
+
+def seat_name() -> str:
+    out = run(["hostname", "-s"]).strip() if not IS_WIN else ""
+    if not out:
+        out = socket.gethostname().split(".")[0]
+    return out.lower()
+
+
+def proc_from_label(label: str) -> str:
+    """Derive a short process name from a launchd label / service name.
+
+    'io.github.hughesyadaddy.mouser'                       -> 'mouser'
+    'application.io.github.hughesyadaddy.deskflow.4066.40' -> 'deskflow'
+    'deskflow-core'                                        -> 'deskflow-core'
+    'DeskflowDaemon'                                       -> 'deskflowdaemon'
+    """
+    parts = [p for p in label.split(".") if p and not p.isdigit()]
+    if parts and parts[0] == "application":
+        parts = parts[1:]
+    return (parts[-1] if parts else label).lower()
+
+
+def to_mb(text: str) -> float | None:
+    """Convert top(1) style sizes ('28M', '8928K-', '1.2G', '512B') to MB."""
+    m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*([KMGB]?)", text.strip().upper())
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2)
+    scale = {"B": 1 / MB, "K": 1 / 1024, "M": 1.0, "G": 1024.0, "": 1.0}[unit]
+    return round(val * scale, 3)
+
+
+# --------------------------------------------------------------------------
+# macOS collectors
+# --------------------------------------------------------------------------
+
+_PS_RE = re.compile(
+    r"^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$"
+)
+
+
+def parse_ps(text: str, exe: str) -> list[tuple[int, str, str]]:
+    """Parse `ps -axo pid=,lstart=,args=` output; return (pid, start, args)."""
+    out = []
+    for line in text.splitlines():
+        m = _PS_RE.match(line)
+        if not m:
+            continue
+        pid, lstart, args = int(m.group(1)), m.group(2), m.group(3)
+        if args == exe or args.startswith(exe + " "):
+            try:
+                st = _dt.datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y")
+                start = st.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+            except ValueError:
+                start = lstart
+            out.append((pid, start, args))
+    return out
+
+
+def mac_find_pid(exe: str) -> tuple[int | None, str | None]:
+    text = run(["ps", "-axo", "pid=,lstart=,args="])
+    matches = parse_ps(text, exe)
+    if not matches:
+        return None, None
+    matches.sort(key=lambda t: t[0])
+    return matches[0][0], matches[0][1]
+
+
+def mac_phys_footprint(pid: int) -> int | None:
+    """ri_phys_footprint (bytes) via proc_pid_rusage(pid, RUSAGE_INFO_V4).
+
+    Layout from <sys/resource.h>: uint8_t ri_uuid[16] followed by 35 x
+    uint64_t; ri_phys_footprint is the 8th uint64 (index 7).
+    """
+    try:
+        import ctypes
+
+        class RusageInfoV4(ctypes.Structure):
+            _fields_ = [
+                ("ri_uuid", ctypes.c_uint8 * 16),
+                ("ri_user_time", ctypes.c_uint64),
+                ("ri_system_time", ctypes.c_uint64),
+                ("ri_pkg_idle_wkups", ctypes.c_uint64),
+                ("ri_interrupt_wkups", ctypes.c_uint64),
+                ("ri_pageins", ctypes.c_uint64),
+                ("ri_wired_size", ctypes.c_uint64),
+                ("ri_resident_size", ctypes.c_uint64),
+                ("ri_phys_footprint", ctypes.c_uint64),
+                ("ri_proc_start_abstime", ctypes.c_uint64),
+                ("ri_proc_exit_abstime", ctypes.c_uint64),
+                ("ri_child_user_time", ctypes.c_uint64),
+                ("ri_child_system_time", ctypes.c_uint64),
+                ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+                ("ri_child_interrupt_wkups", ctypes.c_uint64),
+                ("ri_child_pageins", ctypes.c_uint64),
+                ("ri_child_elapsed_abstime", ctypes.c_uint64),
+                ("ri_diskio_bytesread", ctypes.c_uint64),
+                ("ri_diskio_byteswritten", ctypes.c_uint64),
+                ("ri_cpu_time_qos_default", ctypes.c_uint64),
+                ("ri_cpu_time_qos_maintenance", ctypes.c_uint64),
+                ("ri_cpu_time_qos_background", ctypes.c_uint64),
+                ("ri_cpu_time_qos_utility", ctypes.c_uint64),
+                ("ri_cpu_time_qos_legacy", ctypes.c_uint64),
+                ("ri_cpu_time_qos_user_initiated", ctypes.c_uint64),
+                ("ri_cpu_time_qos_user_interactive", ctypes.c_uint64),
+                ("ri_billed_system_time", ctypes.c_uint64),
+                ("ri_serviced_system_time", ctypes.c_uint64),
+                ("ri_logical_writes", ctypes.c_uint64),
+                ("ri_lifetime_max_phys_footprint", ctypes.c_uint64),
+                ("ri_instructions", ctypes.c_uint64),
+                ("ri_cycles", ctypes.c_uint64),
+                ("ri_billed_energy", ctypes.c_uint64),
+                ("ri_serviced_energy", ctypes.c_uint64),
+                ("ri_interval_max_phys_footprint", ctypes.c_uint64),
+                ("ri_runnable_time", ctypes.c_uint64),
+            ]
+
+        assert ctypes.sizeof(RusageInfoV4) == 16 + 35 * 8
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        fn = libproc.proc_pid_rusage
+        fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        fn.restype = ctypes.c_int
+        buf = RusageInfoV4()
+        rc = fn(int(pid), 4, ctypes.byref(buf))  # RUSAGE_INFO_V4 == 4
+        if rc != 0:
+            return None
+        return int(buf.ri_phys_footprint)
+    except Exception:  # noqa: BLE001 - any failure -> caller falls back
+        return None
+
+
+def parse_top(text: str) -> dict:
+    """Parse the last line of `top -stats pid,mem,cmprs,ports,th`."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return {}
+    cols = lines[-1].split()
+    if len(cols) < 5 or not cols[0].isdigit():
+        return {}
+    ports = re.sub(r"\D", "", cols[3])
+    th = re.sub(r"\D", "", cols[4].split("/")[0])
+    return {
+        "rss_mb": to_mb(cols[1]),
+        "compressed_mb": to_mb(cols[2]),
+        "mach_ports": int(ports) if ports else None,
+        "threads": int(th) if th else None,
+    }
+
+
+def mac_top(pid: int) -> dict:
+    text = run(
+        ["top", "-l", "2", "-s", "1", "-stats", "pid,mem,cmprs,ports,th", "-pid", str(pid)],
+        timeout=15,
+    )
+    return parse_top(text)
+
+
+def mac_fds(pid: int) -> int | None:
+    text = run(["lsof", "-p", str(pid)], timeout=30)
+    lines = text.splitlines()
+    return max(len(lines) - 1, 0) if lines else None
+
+
+def mac_restart_count(label: str) -> int | None:
+    uid = os.getuid()
+    text = run(["launchctl", "print", f"gui/{uid}/{label}"])
+    m = re.search(r"^\s*runs\s*=\s*(\d+)", text, re.M)
+    return int(m.group(1)) if m else None
+
+
+def _newest_log(paths: list[Path]) -> Path | None:
+    existing = [p for p in paths if p.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=lambda p: p.stat().st_mtime)
+
+
+def _tail_text(path: Path, nbytes: int = 256 * 1024) -> str:
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - nbytes))
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def derive_scenario(proc: str, home: Path | None = None, log_path: str | None = None) -> str:
+    """Derive the observed scenario from the app's newest log line.
+
+    mouser        -> device-connected | device-absent
+    deskflow-core -> server | client
+    otherwise     -> unknown
+
+    ``log_path`` overrides the default log lookup for the process.
+    """
+    home = home or Path.home()
+    text = ""
+    override = Path(log_path) if log_path and log_path != "-" else None
+    if proc == "mouser":
+        log = override or _newest_log(
+            [home / "Library/Logs/Mouser/mouser.log"]
+            + sorted((home / "Library/Application Support/Mouser").glob("*.log"))
+            + sorted((home / "Library/Logs/Mouser").glob("*.log"))
+        )
+        text = _tail_text(log) if log else ""
+        last = None
+        for m in re.finditer(r"Device (Connected|Disconnected|Absent)", text):
+            last = m.group(1)
+        if last == "Connected":
+            return "device-connected"
+        if last in ("Disconnected", "Absent"):
+            return "device-absent"
+        return "unknown"
+    if proc in ("deskflow-core", "deskflow", "deskflow-daemon"):
+        log = override or _newest_log(
+            [home / "deskflow.log", home / "deskflow-core.log"]
+            + sorted((home / "Library/Logs").glob("deskflow*.log"))
+            + sorted((home / "Library/Application Support/Deskflow").glob("*.log"))
+        )
+        text = _tail_text(log) if log else ""
+        last = None
+        for m in re.finditer(r"starting (server|client) epoch|running as (server|client)", text):
+            last = m.group(1) or m.group(2)
+        return last or "unknown"
+    return "unknown"
+
+
+def mac_collect(label: str, exe: str, proc: str, scenario_log: str | None = None) -> dict:
+    pid, start = mac_find_pid(exe)
+    rec: dict = {
+        "pid": pid,
+        "start_time": start,
+        "exe": exe,
+        "phys_footprint_mb": None,
+        "metric_source": None,
+        "rss_mb": None,
+        "compressed_mb": None,
+        "mach_ports": None,
+        "threads": None,
+        "fds": None,
+    }
+    if pid is not None:
+        top = mac_top(pid)
+        rec.update(top)
+        fp = mac_phys_footprint(pid)
+        if fp is not None:
+            rec["phys_footprint_mb"] = round(fp / MB, 3)
+            rec["metric_source"] = "proc_pid_rusage"
+        else:
+            rec["phys_footprint_mb"] = top.get("rss_mb")
+            rec["metric_source"] = "top-mem-fallback"
+        rec["fds"] = mac_fds(pid)
+    rec["scenario"] = derive_scenario(proc, log_path=scenario_log)
+    rec["restart_count"] = mac_restart_count(label)
+    return rec
+
+
+# --------------------------------------------------------------------------
+# Windows collectors (via PowerShell JSON; see tools/fleet-soak-task.ps1)
+# --------------------------------------------------------------------------
+
+WIN_PROBE_PS = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$exe = $args[0]; $svc = $args[1]
+$p = Get-Process | Where-Object { $_.Path -eq $exe } | Sort-Object Id | Select-Object -First 1
+$restarts = $null
+try {
+  $restarts = (Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Service Control Manager'; Id=7036} -MaxEvents 5000 |
+    Where-Object { $_.Message -like "*$svc*" -and $_.Message -like '*running*' }).Count
+} catch {}
+$o = [ordered]@{ pid = $null }
+if ($p) {
+  $o = [ordered]@{
+    pid = $p.Id
+    start_time = $p.StartTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    exe = $p.Path
+    private_bytes_mb = [math]::Round($p.PrivateMemorySize64 / 1MB, 3)
+    rss_mb = [math]::Round($p.WorkingSet64 / 1MB, 3)
+    handles = $p.HandleCount
+    threads = $p.Threads.Count
+  }
+  Add-Type -Name U -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern int GetGuiResources(IntPtr h, int f);'
+  $o.gdi = [W.U]::GetGuiResources($p.Handle, 0)
+  $o.user = [W.U]::GetGuiResources($p.Handle, 1)
+}
+$o.restart_count = $restarts
+$o | ConvertTo-Json -Compress
+"""
+
+
+def win_probe(label: str, exe: str) -> dict:
+    text = run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", WIN_PROBE_PS, exe, label],
+        timeout=60,
+    )
+    try:
+        return json.loads(text.strip() or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def win_record_from_probe(probe: dict, exe: str, proc: str) -> dict:
+    return {
+        "pid": probe.get("pid"),
+        "start_time": probe.get("start_time"),
+        "exe": probe.get("exe") or exe,
+        "private_bytes_mb": probe.get("private_bytes_mb"),
+        "metric_source": "Get-Process" if probe.get("pid") is not None else None,
+        "rss_mb": probe.get("rss_mb"),
+        "compressed_mb": None,
+        "mach_ports": None,
+        "handles": probe.get("handles"),
+        "gdi": probe.get("gdi"),
+        "user": probe.get("user"),
+        "threads": probe.get("threads"),
+        "fds": probe.get("handles"),
+        "scenario": probe.get("scenario") or "unknown",
+        "restart_count": probe.get("restart_count"),
+    }
+
+
+# --------------------------------------------------------------------------
+# sample command
+# --------------------------------------------------------------------------
+
+
+def metric_name() -> str:
+    return "private_bytes" if IS_WIN else "phys_footprint"
+
+
+def make_header(proc: str, interval: int, seat: str | None = None) -> dict:
+    return {
+        "header": True,
+        "metric": metric_name(),
+        "scenario_source": "observed",
+        "sampler_sha": git_sha(),
+        "seat": seat or seat_name(),
+        "proc": proc,
+        "interval": int(interval),
+    }
+
+
+def ensure_header(path: Path, header: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("r", encoding="utf-8") as fh:
+            first = fh.readline()
+        try:
+            if json.loads(first).get("header"):
+                return
+        except json.JSONDecodeError:
+            pass
+        raise SystemExit(f"fleet-soak: {path} exists without a header line; refusing to append")
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(header, separators=(",", ":")) + "\n")
+
+
+def start_soak(base: Path, date: str | None = None) -> Path:
+    """Create base/<date>/ and point base/latest at it."""
+    date = date or _dt.date.today().isoformat()
+    day = base / date
+    day.mkdir(parents=True, exist_ok=True)
+    (day / "logs").mkdir(exist_ok=True)
+    latest = base / "latest"
+    if latest.is_symlink() or latest.exists():
+        if latest.is_dir() and not latest.is_symlink():
+            raise SystemExit(f"fleet-soak: {latest} is a real directory; refusing to replace")
+        latest.unlink()
+    latest.symlink_to(date, target_is_directory=True)
+    return day
+
+
+def collect_one(label: str, exe: str, proc: str, probe: dict | None = None,
+                scenario_log: str | None = None) -> dict:
+    if probe is not None:
+        rec = win_record_from_probe(probe, exe, proc)
+    elif IS_WIN:
+        rec = win_record_from_probe(win_probe(label, exe), exe, proc)
+    else:
+        rec = mac_collect(label, exe, proc, scenario_log)
+    return {"ts": iso(now_utc()), **rec, "heartbeat": True}
+
+
+def cmd_sample(a: argparse.Namespace) -> int:
+    if len(a.label) != len(a.exe):
+        print("fleet-soak: --label and --exe must be given the same number of times", file=sys.stderr)
+        return 2
+    procs = list(a.proc or [])
+    while len(procs) < len(a.label):
+        procs.append(proc_from_label(a.label[len(procs)]))
+    logs = list(a.scenario_log or [])
+    logs += [None] * (len(a.label) - len(logs))
+
+    soak_dir = None
+    if a.start_soak:
+        soak_dir = start_soak(Path(a.start_soak))
+    elif a.soak:
+        latest = Path(a.soak) / "latest"
+        soak_dir = latest.resolve() if latest.is_dir() else start_soak(Path(a.soak))
+    seat = seat_name()
+
+    outs: list[Path] = []
+    if a.out:
+        if len(a.label) != 1:
+            print("fleet-soak: --out only valid with a single --label/--exe; use --start-soak", file=sys.stderr)
+            return 2
+        outs = [Path(a.out)]
+    elif soak_dir is not None:
+        outs = [soak_dir / f"{seat}-{p}.jsonl" for p in procs]
+    else:
+        print("fleet-soak: --out or --start-soak required", file=sys.stderr)
+        return 2
+
+    probe = None
+    if a.probe_json:
+        raw = sys.stdin.read() if a.probe_json == "-" else Path(a.probe_json).read_text()
+        probe = json.loads(raw or "{}")
+
+    for out, p in zip(outs, procs):
+        ensure_header(out, make_header(p, a.interval, seat))
+
+    while True:
+        for label, exe, proc, out, slog in zip(a.label, a.exe, procs, outs, logs):
+            rec = collect_one(label, exe, proc, probe, slog)
+            with out.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            if a.verbose:
+                print(json.dumps(rec))
+        if a.once:
+            return 0
+        time.sleep(max(1, a.interval))
+
+
+# --------------------------------------------------------------------------
+# analysis
+# --------------------------------------------------------------------------
+
+
+def theil_sen(xs: list[float], ys: list[float]) -> float | None:
+    """Median of pairwise slopes. Returns None with fewer than 2 points.
+
+    Large series are bucketed to <= THEIL_SEN_MAX_POINTS evenly spaced
+    (median-per-bucket) points before the O(n^2) pass.
+    """
+    pts = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    if len(pts) < 2:
+        return None
+    pts.sort()
+    if len(pts) > THEIL_SEN_MAX_POINTS:
+        pts = _bucket(pts, THEIL_SEN_MAX_POINTS)
+    slopes = []
+    n = len(pts)
+    for i in range(n):
+        xi, yi = pts[i]
+        for j in range(i + 1, n):
+            xj, yj = pts[j]
+            if xj != xi:
+                slopes.append((yj - yi) / (xj - xi))
+    if not slopes:
+        return None
+    return statistics.median(slopes)
+
+
+def _bucket(pts: list[tuple[float, float]], k: int) -> list[tuple[float, float]]:
+    x0, x1 = pts[0][0], pts[-1][0]
+    if x1 == x0:
+        return pts[:k]
+    width = (x1 - x0) / k
+    buckets: dict[int, list[tuple[float, float]]] = {}
+    for x, y in pts:
+        idx = min(int((x - x0) / width), k - 1)
+        buckets.setdefault(idx, []).append((x, y))
+    out = []
+    for idx in sorted(buckets):
+        b = buckets[idx]
+        out.append((statistics.median(p[0] for p in b), statistics.median(p[1] for p in b)))
+    return out
+
+
+def load_jsonl(path: Path) -> tuple[dict | None, list[dict], list[str]]:
+    header = None
+    samples: list[dict] = []
+    problems: list[str] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                problems.append(f"line {n}: not JSON")
+                continue
+            if obj.get("header"):
+                if n == 1:
+                    header = obj
+                else:
+                    problems.append(f"line {n}: header not on first line")
+                continue
+            if "ts" not in obj:
+                problems.append(f"line {n}: sample without ts")
+                continue
+            try:
+                obj["_t"] = parse_ts(obj["ts"])
+            except (ValueError, TypeError):
+                problems.append(f"line {n}: bad ts {obj['ts']!r}")
+                continue
+            samples.append(obj)
+    samples.sort(key=lambda s: s["_t"])
+    return header, samples, problems
+
+
+def metric_value(s: dict, metric: str) -> float | None:
+    v = s.get(f"{metric}_mb")
+    if v is None and metric == "private_bytes":
+        v = s.get("private_bytes_mb")
+    return float(v) if v is not None else None
+
+
+def ports_value(s: dict) -> float | None:
+    v = s.get("mach_ports")
+    if v is None:
+        v = s.get("handles")
+    return float(v) if v is not None else None
+
+
+def percentile(vals: list[float], p: float) -> float | None:
+    if not vals:
+        return None
+    vs = sorted(vals)
+    k = (len(vs) - 1) * p
+    lo, hi = int(k), min(int(k) + 1, len(vs) - 1)
+    return vs[lo] + (vs[hi] - vs[lo]) * (k - lo)
+
+
+def validate(header: dict | None, samples: list[dict], problems: list[str],
+             interval: int, min_hours: float, min_completeness: float,
+             span_h: float | None, completeness: float | None) -> list[str]:
+    """Return a list of validity failures (empty == verdict is valid)."""
+    fails = list(problems)
+    if header is None:
+        fails.append("missing header line")
+    else:
+        if header.get("scenario_source") != "observed":
+            fails.append(f"header.scenario_source={header.get('scenario_source')!r} != 'observed'")
+        if header.get("metric") not in ("phys_footprint", "private_bytes"):
+            fails.append(f"header.metric={header.get('metric')!r} unknown")
+    if not samples:
+        fails.append("no samples in window")
+        return fails
+    max_gap = 0.0
+    gap_at = None
+    for a, b in zip(samples, samples[1:]):
+        g = b["_t"] - a["_t"]
+        if g > max_gap:
+            max_gap, gap_at = g, a["ts"]
+    if max_gap > MAX_GAP_S:
+        fails.append(f"gap {max_gap/60:.1f} min > {MAX_GAP_S/60:.0f} min after {gap_at}")
+    if completeness is not None and completeness < min_completeness:
+        fails.append(f"completeness {completeness:.3f} < {min_completeness}")
+    if span_h is not None and span_h < min_hours:
+        fails.append(f"span {span_h:.1f} h < min-hours {min_hours}")
+    return fails
+
+
+def analyze(header: dict | None, samples: list[dict], window_h: float | None,
+            accelerated: bool, scenario: str | None) -> dict:
+    metric = (header or {}).get("metric") or "phys_footprint"
+    interval = int((header or {}).get("interval") or 60)
+
+    if window_h and samples:
+        t_end = samples[-1]["_t"]
+        samples = [s for s in samples if s["_t"] >= t_end - window_h * 3600]
+    if scenario:
+        samples = [s for s in samples if s.get("scenario") == scenario]
+
+    res: dict = {
+        "metric": metric,
+        "interval": interval,
+        "samples": len(samples),
+        "window_h": window_h,
+        "accelerated": accelerated,
+        "scenario": scenario,
+    }
+    if not samples:
+        res.update(span_h=None, completeness=None, slope_mb_h=None, ports_slope_h=None,
+                   max_step_pct=None, restarts=0, restart_tuple_changes=0,
+                   restart_count_increases=0, p95_mb=None, max_mb=None, median_mb=None,
+                   analyzed=0, warmup_excluded=0)
+        return res
+
+    t0, t1 = samples[0]["_t"], samples[-1]["_t"]
+    span = t1 - t0
+    res["span_h"] = round(span / 3600, 3)
+    res["first_ts"], res["last_ts"] = samples[0]["ts"], samples[-1]["ts"]
+    expected = span / interval + 1
+    res["completeness"] = round(min(len(samples) / expected, 1.0), 4) if expected > 0 else None
+
+    # restarts over the full window (before warm-up exclusion)
+    tuple_changes = 0
+    rc_increases = 0
+    prev_tuple = None
+    prev_rc = None
+    for s in samples:
+        if s.get("pid") is not None:
+            tup = (s.get("exe"), s.get("pid"), s.get("start_time"))
+            if prev_tuple is not None and tup != prev_tuple:
+                tuple_changes += 1
+            prev_tuple = tup
+        rc = s.get("restart_count")
+        if rc is not None:
+            if prev_rc is not None and rc > prev_rc:
+                rc_increases += rc - prev_rc
+            prev_rc = rc
+    res["restart_tuple_changes"] = tuple_changes
+    res["restart_count_increases"] = rc_increases
+    res["restarts"] = tuple_changes + rc_increases
+
+    warm = WARMUP_ACCELERATED_S if accelerated else WARMUP_S
+    body = [s for s in samples if s["_t"] >= t0 + warm]
+    res["warmup_excluded"] = len(samples) - len(body)
+    res["analyzed"] = len(body)
+
+    xs = [s["_t"] / 3600 for s in body]
+    ys = [metric_value(s, metric) for s in body]
+    ps = [ports_value(s) for s in body]
+    slope = theil_sen(xs, ys)
+    pslope = theil_sen(xs, ps)
+    res["slope_mb_h"] = round(slope, 4) if slope is not None else None
+    res["ports_slope_h"] = round(pslope, 4) if pslope is not None else None
+
+    vals = [y for y in ys if y is not None]
+    res["p95_mb"] = round(percentile(vals, 0.95), 3) if vals else None
+    res["max_mb"] = round(max(vals), 3) if vals else None
+    res["median_mb"] = round(statistics.median(vals), 3) if vals else None
+
+    # max daily step: median per 24 h bucket from the start of the body
+    days: dict[int, list[float]] = {}
+    for s, y in zip(body, ys):
+        if y is None:
+            continue
+        days.setdefault(int((s["_t"] - t0) // 86400), []).append(y)
+    meds = [statistics.median(days[k]) for k in sorted(days)]
+    step = None
+    for a, b in zip(meds, meds[1:]):
+        if a > 0:
+            pct = (b - a) / a * 100.0
+            step = pct if step is None else max(step, pct)
+    res["max_step_pct"] = round(step, 3) if step is not None else None
+    res["daily_medians_mb"] = [round(m, 3) for m in meds]
+    return res
+
+
+def cmd_report(a: argparse.Namespace) -> int:
+    path = Path(a.infile)
+    if not path.is_file():
+        print(f"fleet-soak: INVALID: {path} not found")
+        return EXIT_INVALID
+    header, all_samples, problems = load_jsonl(path)
+    res = analyze(header, all_samples, a.window, a.accelerated, a.scenario)
+    res["seat"] = a.seat or (header or {}).get("seat")
+    res["proc"] = a.proc or (header or {}).get("proc")
+    res["in"] = str(path)
+
+    invalid: list[str] = []
+    if a.validate:
+        # re-select the windowed/scenario'd samples for gap detection
+        win = all_samples
+        if a.window and win:
+            t_end = win[-1]["_t"]
+            win = [s for s in win if s["_t"] >= t_end - a.window * 3600]
+        if a.scenario:
+            win = [s for s in win if s.get("scenario") == a.scenario]
+        invalid = validate(header, win, problems, res["interval"], a.min_hours,
+                           a.min_completeness, res.get("span_h"), res.get("completeness"))
+    elif header is None:
+        invalid = ["missing header line"]
+    elif res["samples"] == 0:
+        invalid = ["no samples in window"]
+    if res.get("slope_mb_h") is None and not invalid:
+        invalid = ["too few samples after warm-up exclusion to compute a slope"]
+
+    fails: list[str] = []
+    if not invalid:
+        if a.slope_max is not None and res["slope_mb_h"] > a.slope_max:
+            fails.append(f"slope {res['slope_mb_h']} MB/h > {a.slope_max}")
+        if a.ports_slope_max is not None:
+            if res["ports_slope_h"] is None:
+                fails.append("ports slope unavailable")
+            elif res["ports_slope_h"] > a.ports_slope_max:
+                fails.append(f"ports slope {res['ports_slope_h']}/h > {a.ports_slope_max}")
+        if a.cap is not None and res["p95_mb"] is not None and res["p95_mb"] > a.cap:
+            fails.append(f"p95 {res['p95_mb']} MB > cap {a.cap}")
+        if a.max_step is not None and res["max_step_pct"] is not None and res["max_step_pct"] > a.max_step:
+            fails.append(f"max daily step {res['max_step_pct']}% > {a.max_step}%")
+        if a.max_restarts is not None and res["restarts"] > a.max_restarts:
+            fails.append(f"restarts {res['restarts']} > {a.max_restarts}")
+
+    if invalid:
+        verdict, code = "INVALID", EXIT_INVALID
+    elif fails:
+        verdict, code = "FAIL", EXIT_FAIL
+    else:
+        verdict, code = "PASS", EXIT_PASS
+    res["verdict"] = verdict
+    res["failures"] = fails
+    res["invalid"] = invalid
+
+    if a.json:
+        print(json.dumps(res, indent=2, sort_keys=True))
+    else:
+        print(
+            f"fleet-soak {verdict}: seat={res['seat']} proc={res['proc']} metric={res['metric']} "
+            f"samples={res['samples']} span={res.get('span_h')}h completeness={res.get('completeness')} "
+            f"slope={res.get('slope_mb_h')}MB/h ports_slope={res.get('ports_slope_h')}/h "
+            f"p95={res.get('p95_mb')}MB max={res.get('max_mb')}MB step={res.get('max_step_pct')}% "
+            f"restarts={res.get('restarts')}"
+        )
+        for f in fails:
+            print(f"  FAIL: {f}")
+        for i in invalid:
+            print(f"  INVALID: {i}")
+    return code
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="fleet-soak", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("sample", help="append one or more samples to a JSONL file")
+    s.add_argument("--label", action="append", required=True,
+                   help="launchd label / Windows service name (repeatable, pairs with --exe)")
+    s.add_argument("--exe", action="append", required=True, help="absolute executable path")
+    s.add_argument("--proc", action="append", help="override the label-derived proc name")
+    s.add_argument("--scenario-log", action="append", metavar="FILE",
+                   help="log file to derive the scenario from ('-' = default lookup; pairs with --label)")
+    s.add_argument("--out", help="JSONL path (single target only)")
+    s.add_argument("--once", action="store_true")
+    s.add_argument("--interval", type=int, default=60)
+    s.add_argument("--start-soak", metavar="DIR",
+                   help="start a new soak: create DIR/<date>/ and point DIR/latest at it")
+    s.add_argument("--soak", metavar="DIR",
+                   help="append into DIR/latest (started with --start-soak if missing)")
+    s.add_argument("--probe-json", metavar="FILE", help="Windows: read Get-Process JSON from FILE or '-'")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sample)
+
+    r = sub.add_parser("report", help="compute a verdict from a JSONL file")
+    r.add_argument("--seat")
+    r.add_argument("--proc")
+    r.add_argument("--in", dest="infile", required=True)
+    r.add_argument("--window", type=float, help="hours (default: whole file)")
+    r.add_argument("--accelerated", action="store_true", help="exclude first 10 min instead of 2 h")
+    r.add_argument("--scenario")
+    r.add_argument("--slope-max", type=float, metavar="MB/h")
+    r.add_argument("--cap", type=float, metavar="MB", help="p95 footprint cap")
+    r.add_argument("--ports-slope-max", type=float, metavar="n/h")
+    r.add_argument("--max-step", type=float, metavar="PCT")
+    r.add_argument("--max-restarts", type=int)
+    r.add_argument("--min-hours", type=float, default=72)
+    r.add_argument("--min-completeness", type=float, default=0.95)
+    r.add_argument("--validate", action="store_true",
+                   help="fail (exit 2) on gaps > 5 min, low completeness, short span, bad header")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(func=cmd_report)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
