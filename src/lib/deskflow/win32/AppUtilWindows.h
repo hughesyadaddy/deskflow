@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -44,6 +45,16 @@ public:
   std::string getCurrentLanguageCode() override;
   HKL getCurrentKeyboardLayout() const;
 
+  //! Called when the daemon signals the close event (Global\\DeskflowClose).
+  /*!
+  The close event means "exit the process". Server/client mode needs nothing
+  beyond the Quit event the event loop already posts; auto mode must also end
+  the coordination epoch loop, so deskflow-core installs its runner's
+  requestQuit() here. Process-wide, like setLocalCoreRestartHandler().
+  */
+  using ProcessQuitHandler = std::function<void()>;
+  static void setProcessQuitHandler(ProcessQuitHandler handler);
+
 private:
   AppExitMode m_exitMode;
   IEventQueue *m_events;
@@ -58,4 +69,6 @@ private:
   void eventLoop();
 
   static BOOL WINAPI consoleHandler(DWORD Event);
+
+  inline static ProcessQuitHandler s_processQuitHandler;
 };

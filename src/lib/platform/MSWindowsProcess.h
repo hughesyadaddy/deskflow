@@ -14,8 +14,13 @@
 namespace deskflow::platform {
 
 namespace { // NOSONAR -- Deliberate anonymous
+/// Seconds to wait for a graceful exit after signaling the close event.
 const auto kDefaultShutdownTimeout = 10;
-}
+/// Milliseconds to wait for the process object after TerminateProcess.
+const DWORD kTerminateWaitMilliseconds = 10000;
+/// Worst-case wall time of shutdown(): graceful window plus the post-terminate wait.
+const auto kMaxShutdownSeconds = kDefaultShutdownTimeout + static_cast<int>(kTerminateWaitMilliseconds / 1000);
+} // namespace
 
 class MSWindowsProcess
 {

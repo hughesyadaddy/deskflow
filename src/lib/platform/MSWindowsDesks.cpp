@@ -982,7 +982,7 @@ void MSWindowsDesks::deskThread(const void *vdesk)
         if (s_windowStart == 0) {
           s_windowStart = now;
         } else if (now - s_windowStart >= 1000) {
-          LOG_INFO(
+          LOG_DEBUG(
               "move latency: %d moves/s, worst queue age %lums, worst coalesced %d, worst SendInput %lldus", s_moves,
               s_maxAge, s_maxDrained, static_cast<long long>(g_maxSendInputUs)
           );

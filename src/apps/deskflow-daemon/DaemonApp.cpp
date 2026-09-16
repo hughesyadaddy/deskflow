@@ -76,6 +76,19 @@ void DaemonApp::applyWatchdogCommand() const
   }
 
   QSettings config(m_configFile, QSettings::IniFormat);
+
+  // Desktop process mode means the GUI owns the core process. Spawning one
+  // here too (this path also runs unconditionally at boot from the persisted
+  // daemon/configFile) put two cores on the machine: the second exits 5 and
+  // the watchdog then backs off and relaunches forever.
+  const auto processMode = config.value(Settings::Core::ProcessMode, Settings::ProcessMode::Service).toInt();
+  if (processMode == Settings::ProcessMode::Desktop) {
+    LOG_INFO(
+        "config %s uses desktop process mode (GUI-owned core); daemon will not spawn a core", qPrintable(m_configFile)
+    );
+    return;
+  }
+
   const auto coreMode = config.value(Settings::Core::CoreMode).toInt();
 
   QString modeArg;

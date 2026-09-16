@@ -18,6 +18,14 @@ if (WIN32)
     SOURCE MSWindowsClipboardTests.cpp
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
   )
+  # Pure restart-backoff policy from MSWindowsWatchdog.h (no process spawning).
+  create_test(
+    NAME WatchdogPolicyTests
+    DEPENDS platform
+    LIBS base arch
+    SOURCE WatchdogPolicyTests.cpp
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
+  )
 elseif(APPLE)
   create_test(
     NAME OSXClipboardTests

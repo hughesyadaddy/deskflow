@@ -182,10 +182,27 @@ void MSWindowsProcess::shutdown(HANDLE handle, DWORD pid, int timeout)
   }
 
   // Last resort, terminate the process forcefully.
-  if (TerminateProcess(handle, s_exitSuccess)) {
-    LOG_WARN("forcefully terminated process %d", pid);
-  } else {
+  if (!TerminateProcess(handle, s_exitSuccess)) {
     LOG_ERR("failed to terminate process %d, error: %s", pid, windowsErrorToString(GetLastError()).c_str());
+    return;
+  }
+
+  // TerminateProcess is asynchronous: it returns as soon as termination is
+  // *initiated*. The dying core still owns its kernel objects (in particular
+  // the single-instance mutex) until the process object is signaled, so a
+  // relaunch spawned right after this call exits with s_exitDuplicate and
+  // trips the watchdog's failure backoff. Block until the object is really
+  // gone (bounded, so a wedged kernel teardown cannot hang the daemon).
+  LOG_WARN("forcefully terminated process %d, waiting for it to exit", pid);
+  const DWORD terminateWait = WaitForSingleObject(handle, kTerminateWaitMilliseconds);
+  if (terminateWait == WAIT_OBJECT_0) {
+    LOG_DEBUG("process %d exited after forceful termination", pid);
+  } else if (terminateWait == WAIT_TIMEOUT) {
+    LOG_ERR("process %d still alive %lu ms after forceful termination", pid, kTerminateWaitMilliseconds);
+  } else {
+    LOG_ERR(
+        "error waiting for terminated process %d to exit, error: %s", pid, windowsErrorToString(GetLastError()).c_str()
+    );
   }
 }
 

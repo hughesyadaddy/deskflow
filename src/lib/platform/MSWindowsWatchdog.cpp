@@ -87,6 +87,38 @@ MSWindowsWatchdog::MSWindowsWatchdog(bool foreground, FileLogOutputter &fileLogO
 {
   initSasFunc();
   initOutputReadPipe();
+  initJobObject();
+}
+
+MSWindowsWatchdog::~MSWindowsWatchdog()
+{
+  // Closing the last handle to a kill-on-close job terminates every process
+  // still in it: any core we spawned dies with the daemon.
+  if (m_job != nullptr) {
+    CloseHandle(m_job);
+    m_job = nullptr;
+  }
+}
+
+void MSWindowsWatchdog::initJobObject()
+{
+  m_job = CreateJobObjectW(nullptr, nullptr);
+  if (m_job == nullptr) {
+    LOG_ERR("could not create core job object, error: %s", windowsErrorToString(GetLastError()).c_str());
+    return;
+  }
+
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+  ZeroMemory(&limits, sizeof(limits));
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!SetInformationJobObject(m_job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+    LOG_ERR("could not set kill-on-close on core job object, error: %s", windowsErrorToString(GetLastError()).c_str());
+    CloseHandle(m_job);
+    m_job = nullptr;
+    return;
+  }
+
+  LOG_DEBUG("created kill-on-close job object for core processes");
 }
 
 void MSWindowsWatchdog::startAsync()
@@ -99,11 +131,16 @@ void MSWindowsWatchdog::startAsync()
 void MSWindowsWatchdog::stop()
 {
   const auto kThreadWaitSeconds = 5;
+  // The main loop's last act is MSWindowsProcess::shutdown() on the core:
+  // graceful window + post-terminate wait. Waiting for less than that (the
+  // old 5 s) returned from stop() with the core still alive and the daemon
+  // then exited underneath it.
+  const auto kMainThreadWaitSeconds = deskflow::platform::kMaxShutdownSeconds + kThreadWaitSeconds;
 
   m_running = false;
 
-  if (!m_mainThread->wait(kThreadWaitSeconds)) {
-    LOG_WARN("could not stop main thread");
+  if (!m_mainThread->wait(kMainThreadWaitSeconds)) {
+    LOG_WARN("could not stop main thread within %ds", kMainThreadWaitSeconds);
   }
 
   if (!m_outputThread->wait(kThreadWaitSeconds)) {
@@ -269,8 +306,7 @@ void MSWindowsWatchdog::mainLoop(const void *)
     case Running: {
       LOG_VERBOSE("watchdog process in running state");
       if (!isProcessRunning()) {
-        LOG_WARN("detected application not running, pid=%d", m_process->info().dwProcessId);
-        m_processState = StartPending;
+        m_processState = handleProcessExit();
       }
     } break;
 
@@ -391,13 +427,31 @@ void MSWindowsWatchdog::startProcess()
       throw std::runtime_error(windowsErrorToString(GetLastError()));
     }
   } else {
+    m_processStartTime = Arch::time();
+
+    // Tie the core to this daemon's lifetime (see initJobObject). Done right
+    // after creation so there is no window where a daemon crash orphans it.
+    if (m_job != nullptr) {
+      if (!AssignProcessToJobObject(m_job, m_process->info().hProcess)) {
+        LOG_WARN(
+            "could not assign core (pid=%d) to job object, error: %s; it will outlive a daemon crash",
+            m_process->info().dwProcessId, windowsErrorToString(GetLastError()).c_str()
+        );
+      }
+    }
+
     // Wait for program to fail. This needs to be 1 second, as the process may take some time to fail.
     LOG_DEBUG("watchdog waiting for process start result");
     Arch::sleep(1);
 
     if (!isProcessRunning()) {
-      m_process.reset();
-      throw std::runtime_error("process immediately stopped");
+      // Not a spawn failure: the core ran and chose to exit (typically exit 5,
+      // duplicate instance). Leave m_process in place and let the Running
+      // state route it through handleProcessExit(), which reads the exit
+      // code and applies the restart policy instead of the blind
+      // handleStartError() backoff.
+      LOG_WARN("core process exited during startup, pid=%d", m_process->info().dwProcessId);
+      return;
     }
 
     LOG_DEBUG("started core process from watchdog");
@@ -416,6 +470,10 @@ void MSWindowsWatchdog::setProcessConfig(const std::string_view &command, bool u
   LOG_DEBUG("setting watchdog process config (uiAccessCore=%s)", uiAccessCore ? "yes" : "no");
   m_command = std::wstring(command.begin(), command.end());
   m_uiAccessCore = uiAccessCore;
+
+  // A config change / IPC start is the explicit "try again" that ends a
+  // give-up (see handleProcessExit).
+  m_consecutiveFastExits = 0;
 
   if (m_command.empty()) {
     LOG_DEBUG("command cleared, queueing process stop");
@@ -554,6 +612,60 @@ MSWindowsWatchdog::ProcessState MSWindowsWatchdog::handleNoInteractiveSession()
   m_startFailures = 0;
   m_nextStartTime = Arch::time() + 2.0;
   return ProcessState::StartScheduled;
+}
+
+MSWindowsWatchdog::ProcessState MSWindowsWatchdog::handleProcessExit()
+{
+  namespace policy = deskflow::platform::watchdog;
+
+  const DWORD pid = m_process->info().dwProcessId;
+  DWORD exitCode = 0;
+  if (!GetExitCodeProcess(m_process->info().hProcess, &exitCode)) {
+    LOG_WARN("could not read exit code of core pid=%d, error: %s", pid, windowsErrorToString(GetLastError()).c_str());
+    exitCode = static_cast<DWORD>(s_exitFailed);
+  }
+  const auto uptimeMs = static_cast<long long>((Arch::time() - m_processStartTime) * 1000.0);
+
+  // The process object is signaled, so its kernel objects (single-instance
+  // mutex) are released; dropping our handle now is safe.
+  m_process.reset();
+
+  if (policy::isFastExit(static_cast<int>(exitCode), uptimeMs)) {
+    m_consecutiveFastExits++;
+  } else {
+    m_consecutiveFastExits = 0;
+  }
+
+  LOG_WARN(
+      "detected core not running, pid=%d, exit code=%d, uptime=%lldms, consecutive fast exits=%d", pid, exitCode,
+      uptimeMs, m_consecutiveFastExits
+  );
+
+  const int delayMs = policy::nextRestartDelayMs(static_cast<int>(exitCode), m_consecutiveFastExits, uptimeMs);
+
+  if (delayMs == policy::kRestartGiveUp) {
+    LOG_ERR(
+        "core exited %d times in a row within %llds of launch; not restarting it again until the config changes or "
+        "a start is requested",
+        m_consecutiveFastExits, policy::kFastExitUptimeMs / 1000
+    );
+    m_nextStartTime.reset();
+    return ProcessState::Idle;
+  }
+
+  if (delayMs > 0) {
+    m_nextStartTime = Arch::time() + delayMs / 1000.0;
+    if (exitCode == static_cast<DWORD>(s_exitDuplicate)) {
+      LOG_WARN("another core owns the machine (exit %d); retrying in %ds", s_exitDuplicate, delayMs / 1000);
+    } else {
+      LOG_WARN("core exited too soon after launch, delaying restart %dms", delayMs);
+    }
+    return ProcessState::StartScheduled;
+  }
+
+  LOG_INFO("restarting core immediately");
+  m_nextStartTime.reset();
+  return ProcessState::StartPending;
 }
 
 std::string MSWindowsWatchdog::processStateToString(MSWindowsWatchdog::ProcessState state)

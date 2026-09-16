@@ -194,9 +194,19 @@ HKL AppUtilWindows::getCurrentKeyboardLayout() const
   return layout;
 }
 
+void AppUtilWindows::setProcessQuitHandler(ProcessQuitHandler handler)
+{
+  s_processQuitHandler = std::move(handler);
+}
+
 void AppUtilWindows::eventLoop()
 {
-  HANDLE hCloseEvent = CreateEvent(nullptr, TRUE, FALSE, kCloseEventName);
+  // Auto-reset (bManualReset = FALSE): the wait below consumes the signal.
+  // With the old manual-reset event nothing ever called ResetEvent, so once
+  // the daemon had signaled it the object stayed signaled for as long as any
+  // handle was open, and a later epoch/instance opening the same name would
+  // see a stale "close" the moment it started waiting.
+  HANDLE hCloseEvent = CreateEvent(nullptr, FALSE, FALSE, kCloseEventName);
   if (!hCloseEvent) {
     LOG_CRIT("failed to create event for windows event loop");
     throw std::runtime_error(windowsErrorToString(GetLastError()));
@@ -214,7 +224,24 @@ void AppUtilWindows::eventLoop()
     DWORD closeEventResult = MsgWaitForMultipleObjects(1, &hCloseEvent, FALSE, 100, QS_ALLINPUT);
 
     if (closeEventResult == WAIT_OBJECT_0) {
-      LOG_DEBUG("windows event loop received close event");
+      LOG_INFO("windows event loop received close event (daemon requested process exit)");
+      // The close event means "exit the *process*", not "end the current
+      // app". In server/client mode the Quit event below does both. In auto
+      // mode Quit only ends the current epoch and the coordination loop
+      // re-elects and relaunches the role, so the daemon's graceful shutdown
+      // always timed out and fell through to TerminateProcess. The process
+      // quit handler is the auto-mode loop's own quit path (the same one the
+      // IPC stop request uses); fire it first so the epoch that Quit ends is
+      // the last one.
+      if (s_processQuitHandler) {
+        s_processQuitHandler();
+      } else {
+        // TODO(auto-mode): no handler is installed. deskflow-core.cpp must
+        // wire it right after constructing the runner (auto-mode branch):
+        //   AppUtilWindows::setProcessQuitHandler([&runner] { runner.requestQuit(); });
+        // Until then the daemon's close event only ends the epoch in auto mode.
+        LOG_DEBUG("no process quit handler installed; posting quit to the running app only");
+      }
       m_events->addEvent(Event(EventTypes::Quit));
       m_eventThreadRunning = false;
     } else if (closeEventResult == WAIT_OBJECT_0 + 1) {
