@@ -56,6 +56,7 @@ class Server
 
   friend class ServerTests;
   friend class ServerClipboardTests;
+  friend class ServerKeyLedgerTests;
 
 public:
   //! Lock cursor to screen data
@@ -606,26 +607,47 @@ private:
   //! True when \p screen has at least one chord-remap entry (caseless).
   bool screenHasChordRemaps(const std::string &screen) const;
 
-  //! Modifier keys the server has injected DOWN on the active client and not
-  //! yet released (button -> KeyID).
+  //! Keys the server has injected DOWN on the active client and not yet
+  //! released (button -> KeyID).
   /*!
   The single source of truth for "what is this server holding down over
-  there". Every path that injects a modifier records it here and every
+  there" (invariant I1: a machine only has keys down that were pressed
+  while it was the active target). EVERY key relayed to the active client
+  is recorded here -- modifiers and ordinary keys alike -- and every
   boundary that abandons the screen (switch, forced leave, disconnect,
-  teardown) releases everything in it. Without one authoritative ledger the
-  release depended on whichever feature happened to inject the key -- chord
-  hold-through, deferred Super, or a plain relay -- and any path that missed
-  it left a modifier physically held on the target, where it silently turns
-  ordinary letters into shortcuts.
+  teardown, Esc rescue) sends an explicit release for each entry. Tracking
+  only modifiers left ordinary keys to the client's own leave-time
+  sanitize, which never runs on the boundaries that skip CLeave.
   */
-  std::map<KeyButton, KeyID> m_modifiersHeldOnActive;
+  using HeldKeys = std::map<KeyButton, KeyID>;
+  HeldKeys m_keysHeldOnActive;
 
-  //! Record/forget a modifier the server injected on the active client.
-  void noteModifierSentToActive(KeyID id, KeyButton button);
-  void forgetModifierSentToActive(KeyButton button);
+  //! Keys injected DOWN by keyboard broadcast, per screen name.
+  /*!
+  Broadcast bypasses the active-client ledger by design (it targets every
+  screen), so it keeps its own per-screen ledger and is released per
+  screen on the same boundaries.
+  */
+  std::map<std::string, HeldKeys> m_keysHeldOnBroadcast;
 
-  //! Release every modifier this server is holding on the active client.
-  void releaseModifiersHeldOnActive();
+  //! Lock-modifier bits last shipped to the active client (via CEnter or a
+  //! lock-state update). Compared against the primary's OS truth on every
+  //! lock-key event so a change is pushed as STATE, not left to a toggle.
+  KeyModifierMask m_toggleMaskSentToActive = 0;
+
+  //! Record/forget a key the server injected on the active client.
+  void noteKeySentToActive(KeyID id, KeyButton button);
+  void forgetKeySentToActive(KeyButton button);
+
+  //! Release every key this server is holding on the active client.
+  void releaseKeysHeldOnActive();
+  //! Release every broadcast-held key on \p client (all screens if null).
+  void releaseKeysHeldOnBroadcast(const BaseClientProxy *client);
+  //! Best-effort release of \p keys on \p client; never throws.
+  void sendReleases(BaseClientProxy *client, HeldKeys &keys, const char *why);
+  //! Push the primary's lock state to the active client if it changed
+  //! since we last sent it (CEnter carries the initial state).
+  void syncToggleStateToActive();
   //! Clears we could not deliver because the session's client was already
   //! disconnecting (screen name -> held out-mods). Flushed to the fresh
   //! connection on reconnect-adoption so the target never keeps a synthetic

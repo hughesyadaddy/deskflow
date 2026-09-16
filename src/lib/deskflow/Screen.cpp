@@ -39,6 +39,52 @@ bool runScreenCommand(const QString &commandLine)
   return QProcess::startDetached(program, args);
 }
 
+//! Held (non-lock) modifiers the server reports on enter, with the key we
+//! press to re-assert each one and a reserved synthetic server button.
+/*!
+The buttons sit at the top of the server-button space (kButtonMask is
+0x1FF) where no real scan code lands, so a later DKeyUp from the server
+cannot alias them; Screen::keyUp maps the real up onto them by KeyID.
+*/
+struct ReassertedModifier
+{
+  KeyModifierMask bit;
+  KeyID key;
+  KeyButton button;
+};
+
+constexpr ReassertedModifier kReassertedModifiers[] = {
+    {KeyModifierShift, kKeyShift_L, 0x1F0},     //
+    {KeyModifierControl, kKeyControl_L, 0x1F1}, //
+    {KeyModifierAlt, kKeyAlt_L, 0x1F2},         //
+    {KeyModifierMeta, kKeyMeta_L, 0x1F3},       //
+    {KeyModifierSuper, kKeySuper_L, 0x1F4},     //
+};
+
+//! Modifier bit a real modifier KeyID drives, or 0.
+KeyModifierMask modifierBitForKey(KeyID id)
+{
+  switch (id) {
+  case kKeyShift_L:
+  case kKeyShift_R:
+    return KeyModifierShift;
+  case kKeyControl_L:
+  case kKeyControl_R:
+    return KeyModifierControl;
+  case kKeyAlt_L:
+  case kKeyAlt_R:
+    return KeyModifierAlt;
+  case kKeyMeta_L:
+  case kKeyMeta_R:
+    return KeyModifierMeta;
+  case kKeySuper_L:
+  case kKeySuper_R:
+    return KeyModifierSuper;
+  default:
+    return 0;
+  }
+}
+
 } // namespace
 
 //
@@ -119,6 +165,14 @@ void Screen::disable()
     leave();
   } else if (m_isPrimary && !m_entered) {
     enter(0);
+  }
+  if (m_isPrimary) {
+    // I1: a primary is never a target, yet relayed keys ARE injected into
+    // its OS (PrimaryClient::injectForwardedKey). Tearing the primary down
+    // with those still held (role flip, epoch teardown) used to strand them
+    // with no one left to release them.
+    m_screen->fakeAllKeysUp();
+    m_screen->sanitizeInjectedKeys();
   }
   m_screen->disable();
   if (m_isPrimary) {
@@ -236,9 +290,39 @@ void Screen::keyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton 
   m_screen->fakeKeyRepeat(id, mask, count, button, lang);
 }
 
-void Screen::keyUp(KeyID, KeyModifierMask, KeyButton button)
+void Screen::keyUp(KeyID id, KeyModifierMask, KeyButton button)
 {
-  m_screen->fakeKeyUp(button);
+  if (m_screen->fakeKeyUp(button)) {
+    return;
+  }
+  // The server never sent us the down for this button. If it is a modifier
+  // we re-asserted on enter (held across the crossing), this is its real
+  // release: map it onto the synthetic press so the key does not stay down
+  // until leave.
+  const KeyModifierMask bit = modifierBitForKey(id);
+  if (bit == 0) {
+    return;
+  }
+  const auto it = m_reassertedModifiers.find(bit);
+  if (it == m_reassertedModifiers.end()) {
+    return;
+  }
+  LOG_DEBUG("releasing modifier 0x%04x re-asserted on enter", bit);
+  m_screen->fakeKeyUp(it->second);
+  m_reassertedModifiers.erase(it);
+}
+
+void Screen::applyToggleMask(KeyModifierMask toggleMask)
+{
+  const KeyModifierMask osMods = m_screen->pollActiveModifiers();
+  for (const KeyModifierMask lock : {KeyModifierCapsLock, KeyModifierNumLock, KeyModifierScrollLock}) {
+    if (((toggleMask ^ osMods) & lock) == 0) {
+      continue;
+    }
+    const bool on = (toggleMask & lock) != 0;
+    LOG_DEBUG("lock 0x%04x: server says %s, OS says %s; applying", lock, on ? "on" : "off", on ? "off" : "on");
+    m_screen->setToggleState(lock, on);
+  }
 }
 
 void Screen::mouseDown(ButtonID button)
@@ -437,9 +521,32 @@ void Screen::enterPrimary() const
   // do nothing
 }
 
-void Screen::enterSecondary(KeyModifierMask) const
+void Screen::enterSecondary(KeyModifierMask mask)
 {
-  // do nothing
+  // The enter mask is the primary's OS truth at the crossing. Two things
+  // ride in it that a fresh target must honour (I4: every boundary resyncs):
+  //
+  // 1. Lock state. Caps/Num/Scroll are STATE, never toggles (I2); apply the
+  //    bits absolutely so a half-duplex Caps key cannot drift out of phase.
+  applyToggleMask(mask);
+
+  // 2. Physically held modifiers. The user crossed with Shift (or Ctrl...)
+  //    held down; our OS has no such key down, so shift-click and
+  //    modifier-only gestures would silently lose it. Press it here and
+  //    track it as synthetic so leave (or the server's real key up) releases
+  //    it. Only when the OS truth disagrees -- never double-press.
+  const KeyModifierMask osMods = m_screen->pollActiveModifiers();
+  for (const auto &mod : kReassertedModifiers) {
+    if ((mask & mod.bit) == 0 || (osMods & mod.bit) != 0) {
+      continue;
+    }
+    if (m_reassertedModifiers.contains(mod.bit)) {
+      continue;
+    }
+    LOG_DEBUG("re-asserting modifier 0x%04x held across enter", mod.bit);
+    m_screen->fakeKeyDown(mod.key, mask & ~IKeyState::s_lockModifierMask, mod.button, std::string{});
+    m_reassertedModifiers[mod.bit] = mod.button;
+  }
 }
 
 void Screen::leavePrimary()
@@ -452,7 +559,9 @@ void Screen::leavePrimary()
 
 void Screen::leaveSecondary()
 {
-  // release any keys we think are still down
+  // release any keys we think are still down (including modifiers
+  // re-asserted on enter; fakeAllKeysUp covers every synthetic key)
+  m_reassertedModifiers.clear();
   m_screen->fakeAllKeysUp();
 }
 

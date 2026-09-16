@@ -5,6 +5,7 @@
  */
 
 #include "base/Log.h"
+#include "deskflow/IKeyState.h"
 #include "deskflow/KeyboardLayoutManager.h"
 #include "deskflow/ProtocolUtil.h"
 
@@ -33,8 +34,8 @@ void ClientProxy1_8::synchronizeLanguages() const
 void ClientProxy1_8::keyDown(KeyID key, KeyModifierMask mask, KeyButton button, const std::string &language)
 {
   LOG(
-      (CLOG_VERBOSE "send key down to \"%s\" id=%d, mask=0x%04x, button=0x%04x, layout=%s", getName().c_str(), key,
-       mask, button, language.c_str())
+      (CLOG_DEBUG "send key down to \"%s\" id=%s, mask=0x%04x, button=0x%04x, layout=%s", getName().c_str(),
+       IKeyState::describeKey(key).c_str(), mask, button, language.c_str())
   );
   ProtocolUtil::writef(getStream(), kMsgDKeyDownLang, key, mask, button, &language);
 }

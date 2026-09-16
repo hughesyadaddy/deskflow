@@ -9,6 +9,8 @@
 #pragma once
 
 #include "base/IEventQueue.h"
+#include "base/String.h"
+#include "deskflow/KeyMap.h"
 #include "deskflow/KeyTypes.h"
 
 #include <set>
@@ -49,6 +51,50 @@ public:
   };
 
   using KeyButtonSet = std::set<KeyButton>;
+
+  //! The lock (toggle) modifier bits: Caps, Num and Scroll Lock.
+  inline static const KeyModifierMask s_lockModifierMask =
+      KeyModifierCapsLock | KeyModifierNumLock | KeyModifierScrollLock;
+
+  //! Lock modifier bit driven by lock key \p id, or 0 if \p id is not a lock key.
+  static KeyModifierMask lockModifierForKey(KeyID id)
+  {
+    switch (id) {
+    case kKeyCapsLock:
+      return KeyModifierCapsLock;
+    case kKeyNumLock:
+      return KeyModifierNumLock;
+    case kKeyScrollLock:
+      return KeyModifierScrollLock;
+    default:
+      return 0;
+    }
+  }
+
+  //! Key id for logs: "65 ('A')" for printable ids (actual case), else
+  //! "61413 (CapsLock)" via the KeyMap name table.
+  static std::string describeKey(KeyID id)
+  {
+    if (id >= 0x20 && id < 0x7F) {
+      return deskflow::string::sprintf("%u ('%c')", static_cast<unsigned>(id), static_cast<char>(id));
+    }
+    return deskflow::string::sprintf("%u (%s)", static_cast<unsigned>(id), deskflow::KeyMap::formatKey(id, 0).c_str());
+  }
+
+  //! Lock key that drives lock modifier bit \p lock, or kKeyNone.
+  static KeyID lockKeyForModifier(KeyModifierMask lock)
+  {
+    switch (lock) {
+    case KeyModifierCapsLock:
+      return kKeyCapsLock;
+    case KeyModifierNumLock:
+      return kKeyNumLock;
+    case KeyModifierScrollLock:
+      return kKeyScrollLock;
+    default:
+      return kKeyNone;
+    }
+  }
 
   //! @name manipulators
   //@{

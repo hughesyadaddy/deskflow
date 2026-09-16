@@ -745,6 +745,21 @@ void KeyState::updateKeyMap(deskflow::KeyMap *existing)
 
 void KeyState::updateKeyState()
 {
+  // Never silently forget a key we injected: zeroing m_syntheticKeys while
+  // the OS still has those keys down strands them (a re-enable or role flip
+  // used to land here with a modifier held and lose the only record of it).
+  // Release first, then rebuild from OS truth.
+  int32_t held = 0;
+  for (KeyButton i = 0; i < IKeyState::s_numButtons; ++i) {
+    if (m_syntheticKeys[i] > 0) {
+      ++held;
+    }
+  }
+  if (held > 0) {
+    LOG_DEBUG("key state update with %d synthetic key(s) still down; releasing before resync", held);
+    fakeAllKeysUp();
+  }
+
   // reset our state
   memset(&m_keys, 0, sizeof(m_keys));
   memset(&m_syntheticKeys, 0, sizeof(m_syntheticKeys));
@@ -804,6 +819,18 @@ void KeyState::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton serverID, c
 
   // ignore certain keys
   if (isIgnoredKey(id, mask)) {
+    // A lock key never toggles here (I2: Caps Lock is STATE, not a toggle).
+    // The mask that rides with it is the primary's lock state after the
+    // press, so apply that absolutely when it disagrees with our OS truth.
+    // This is also the wire-compatible path: a server that only relays the
+    // physical Caps key as DKeyDown still drives the state correctly.
+    if (const KeyModifierMask lock = lockModifierForKey(id); lock != 0) {
+      const bool wanted = (mask & lock) != 0;
+      if (((pollActiveModifiers() ^ mask) & lock) != 0) {
+        LOG_DEBUG("lock key 0x%04x: applying state %s from server mask", id, wanted ? "on" : "off");
+        setToggleState(lock, wanted);
+      }
+    }
     LOG_VERBOSE("ignored key %04x %04x", id, mask);
     return;
   }

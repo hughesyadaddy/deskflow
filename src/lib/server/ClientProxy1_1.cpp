@@ -8,6 +8,7 @@
 #include "server/ClientProxy1_1.h"
 
 #include "base/Log.h"
+#include "deskflow/IKeyState.h"
 #include "deskflow/ProtocolUtil.h"
 
 //
@@ -22,7 +23,10 @@ ClientProxy1_1::ClientProxy1_1(const std::string &name, deskflow::IStream *strea
 
 void ClientProxy1_1::keyDown(KeyID key, KeyModifierMask mask, KeyButton button, const std::string &)
 {
-  LOG_VERBOSE("send key down to \"%s\" id=%d, mask=0x%04x, button=0x%04x", getName().c_str(), key, mask, button);
+  LOG_DEBUG(
+      "send key down to \"%s\" id=%s, mask=0x%04x, button=0x%04x", getName().c_str(),
+      IKeyState::describeKey(key).c_str(), mask, button
+  );
   ProtocolUtil::writef(getStream(), kMsgDKeyDown, key, mask, button);
 }
 
@@ -31,15 +35,18 @@ void ClientProxy1_1::keyRepeat(
 )
 {
   LOG(
-      (CLOG_VERBOSE "send key repeat to \"%s\" id=%d, mask=0x%04x, count=%d, "
-                    "button=0x%04x, lang=\"%s\"",
-       getName().c_str(), key, mask, count, button, lang.c_str())
+      (CLOG_DEBUG "send key repeat to \"%s\" id=%s, mask=0x%04x, count=%d, "
+                  "button=0x%04x, lang=\"%s\"",
+       getName().c_str(), IKeyState::describeKey(key).c_str(), mask, count, button, lang.c_str())
   );
   ProtocolUtil::writef(getStream(), kMsgDKeyRepeat, key, mask, count, button, &lang);
 }
 
 void ClientProxy1_1::keyUp(KeyID key, KeyModifierMask mask, KeyButton button)
 {
-  LOG_VERBOSE("send key up to \"%s\" id=%d, mask=0x%04x, button=0x%04x", getName().c_str(), key, mask, button);
+  LOG_DEBUG(
+      "send key up to \"%s\" id=%s, mask=0x%04x, button=0x%04x", getName().c_str(), IKeyState::describeKey(key).c_str(),
+      mask, button
+  );
   ProtocolUtil::writef(getStream(), kMsgDKeyUp, key, mask, button);
 }
