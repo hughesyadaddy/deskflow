@@ -141,24 +141,13 @@ def test_bad_registry_is_usage_error(tmp_path: Path) -> None:
 # set so that the four good citations are proven to resolve and any registry
 # change (fix or new breakage) flips the test.
 # ---------------------------------------------------------------------------
-KNOWN_BAD_AT_HEAD = {"D2-automode-epoch-rebuild", "D5-unretained-runloops"}
 
 
-def test_real_registry_deskflow_citations_at_head() -> None:
+def test_real_registry_deskflow_citations_at_pinned_commit() -> None:
+    """The registry pins `commit`; every deskflow citation must resolve there."""
     res = run(str(REGISTRY), "--repo", "deskflow")
-    failing = {line.split()[1].rstrip(":") for line in res.stdout.splitlines() if line.startswith("FAIL ")}
-    assert failing == KNOWN_BAD_AT_HEAD, res.stdout + res.stderr
-    assert res.returncode == (1 if failing else 0)
-    assert "4/6 citations resolve" in res.stdout
-
-
-def test_real_registry_known_bad_have_documented_fixes() -> None:
-    """The corrections in the comment above must themselves be true at HEAD."""
-    amr = (ROOT / "src/apps/deskflow-core/AutoModeRunner.cpp").read_text().splitlines()
-    assert "epochLoop" in amr[90 - 1]
-    kbm = (ROOT / "src/lib/coordination/OSXKeyboardRelayMonitor.mm").read_text().splitlines()
-    assert "CFRunLoopGetCurrent" in kbm[288 - 1]
-    assert not (ROOT / "src/lib/platform/OSXKeyboardRelayMonitor.mm").exists()
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "6/6 citations resolve" in res.stdout
 
 
 def test_real_registry_infers_repo_without_flag() -> None:
