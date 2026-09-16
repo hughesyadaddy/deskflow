@@ -506,12 +506,15 @@ bool MouserLink::runLego(const std::string &token)
     platformClose(fd);
     if (t_helloRejectedByOldMouser) {
       t_helloRejectedByOldMouser = false;
-      // Token file present but the listener is an old Mouser: use the v1
-      // connector for this cycle instead of backing off forever on the lego
+      // Token file present but the listener is an old Mouser: use the legacy
+      // backend for this cycle instead of backing off forever on the lego
       // hello. The next loop iteration retries lego (Mouser may be upgraded).
-      const bool canFallBack = m_options.legacyEnabled && role() == Role::Client && m_options.legacyClientEnabled &&
-                               !m_options.legacyClientToken.empty();
-      if (canFallBack) {
+      const Role currentRole = role();
+      const bool canFallBackClient = m_options.legacyEnabled && currentRole == Role::Client &&
+                                      m_options.legacyClientEnabled && !m_options.legacyClientToken.empty();
+      const bool canFallBackServer = m_options.legacyEnabled && currentRole == Role::Server &&
+                                      m_options.legacyServerEnabled && !m_options.legacyServerToken.empty();
+      if (canFallBackClient) {
         if (!t_oldMouserLogged) {
           LOG_INFO(
               "mouser link: mouser on 127.0.0.1:%d is pre-lego (unauthorized, no reason); using legacy v1 connector",
@@ -523,7 +526,19 @@ bool MouserLink::runLego(const std::string &token)
         runLegacyConnector(m_options.legacyClientPort, m_options.legacyClientToken);
         return false;
       }
-      LOG_WARN("mouser link: mouser on 127.0.0.1:%d is pre-lego and no legacy connector is configured", m_options.port);
+      if (canFallBackServer) {
+        if (!t_oldMouserLogged) {
+          LOG_INFO(
+              "mouser link: mouser on 127.0.0.1:%d is pre-lego (unauthorized, no reason); using legacy 19796 listener",
+              m_options.port
+          );
+          t_oldMouserLogged = true;
+        }
+        m_mode = Mode::Legacy;
+        runLegacyListener(m_options.legacyServerPort, m_options.legacyServerToken);
+        return false;
+      }
+      LOG_WARN("mouser link: mouser on 127.0.0.1:%d is pre-lego and no legacy fallback is configured", m_options.port);
     }
     sleepInterruptible(m_backoff);
     escalateBackoff();
@@ -740,7 +755,15 @@ void MouserLink::handleLegoInbound(const std::string &line, bool &byeReceived)
     return;
   }
   if (type.isEmpty() && object.contains(QStringLiteral("ok"))) {
-    return; // stray ack
+    // Reply to a message we don't correlate by id (attach is the only one
+    // that gets an explicit ack). Surface a rejection instead of silently
+    // dropping it, e.g. mouser refusing attach because another peer already
+    // holds the session.
+    if (!object[QStringLiteral("ok")].toBool()) {
+      ++m_stats.attachRejections;
+      LOG_WARN("mouser link: attach rejected by mouser: %.128s", line.c_str());
+    }
+    return;
   }
   dispatchInbound(line);
 }

@@ -83,6 +83,7 @@ public:
     std::atomic<int> connects{0};
     std::atomic<int> hellosAccepted{0};
     std::atomic<int> attachesSent{0};
+    std::atomic<int> attachRejections{0};
     std::atomic<int> protoMismatches{0};
     std::atomic<int> protoMismatchLogs{0};
     std::atomic<int> authRejections{0};

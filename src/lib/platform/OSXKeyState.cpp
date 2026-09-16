@@ -211,6 +211,28 @@ void OSXKeyState::init()
 
     m_virtualKeyMap[s_controlKeys[i].m_virtualKey] = s_controlKeys[i].m_keyID;
   }
+
+  // Seed hardware-modifier freshness from OS truth at startup. Without this,
+  // m_lastHardwareModifierAt starts at time_point::lowest() ("never seen")
+  // for every modifier, on every seat -- not just a secondary screen whose
+  // tap never fires. The very first sanitizeInjectedKeys() call (screen
+  // enable(), lock/unlock/wake, KeyClearAll) can land before any hardware
+  // flagsChanged has been observed; with no seed, "no data yet" reads as
+  // "confirmed stale" and releases a modifier the user is already physically
+  // holding from before this process started. Reads the raw APIs directly
+  // (not the hookable osModifierFlags()/now(), which setHooks() only wires
+  // up after construction returns) so this is a one-time real hardware read
+  // at process start, and tests that install hooks afterward are unaffected.
+  const CGEventFlags startupFlags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+  const double startupNow = monotonicSeconds();
+  for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
+    const auto vk = static_cast<uint8_t>(virtualKey);
+    const int slot = hardwareSlotForVirtualKey(vk);
+    const CGEventFlags flag = modifierFlagForVirtualKey(vk);
+    if (slot >= 0 && (startupFlags & flag) != 0) {
+      m_lastHardwareModifierAt[slot].store(startupNow, std::memory_order_relaxed);
+    }
+  }
 }
 
 KeyModifierMask OSXKeyState::mapModifiersFromOSX(uint32_t mask) const
