@@ -10,7 +10,7 @@
   (PyInstaller/CPython extension modules, e.g. the Mouser dist) and *.sys under
   each -Root with
 
-    signtool sign /sha1 <tp> /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com
+    signtool sign /sm /sha1 <tp> /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com
 
   then verifies every file with Get-AuthenticodeSignature. Any file whose Status
   is not 'Valid' or whose signer thumbprint differs from the requested one is
@@ -175,7 +175,7 @@ function Invoke-SignTool {
 function Invoke-SignFiles {
   param([string]$SignTool, [string]$Tp, [string[]]$Files, [string]$Timestamp, [bool]$NoTimestampOk = $false)
   if ($Files.Count -eq 0) { return }
-  $base = @('sign', '/sha1', $Tp, '/fd', 'SHA256')
+  $base = @('sign', '/sm', '/sha1', $Tp, '/fd', 'SHA256')
   $withTs = $base + @('/td', 'SHA256', '/tr', $Timestamp)
 
   # One signtool invocation per batch keeps timestamp round-trips low. Keep
