@@ -1305,9 +1305,24 @@ void MSWindowsKeyState::setToggleState(KeyModifierMask bit, bool on)
       (downOk && upOk) ? "pressed" : "injection dropped"
   );
   // The injected press is queued on the input desktop and GetKeyState()
-  // reflects it only once this thread's queue catches up, so trust the
-  // injection outcome for the immediate answer and the OS read otherwise.
-  const bool actual = (downOk && upOk) ? on : ((GetKeyState(vk) & 0x01) != 0);
+  // reflects it only once this thread's queue catches up. Poll briefly for
+  // that to happen (bounded, ~10ms) rather than trusting the injection
+  // outcome blind -- a queued-but-dropped press (blocked by a secure
+  // desktop/UAC switch mid-injection) would otherwise desync the tracked
+  // mask from the OS permanently, for the rest of the epoch.
+  bool actual = (GetKeyState(vk) & 0x01) != 0;
+  if (downOk && upOk) {
+    for (int attempt = 0; attempt < 5 && actual != on; ++attempt) {
+      Sleep(2);
+      actual = (GetKeyState(vk) & 0x01) != 0;
+    }
+    if (actual != on) {
+      LOG_WARN(
+          "toggle vk=0x%02x did not reach '%s' after injection+poll; tracked mask left at OS-observed state", vk,
+          on ? "on" : "off"
+      );
+    }
+  }
   syncTracked(bit, actual);
 }
 

@@ -67,6 +67,10 @@ WIN_ONLY = {"authenticode"}
 
 MAC_APPS = ("/Applications/Deskflow.app", "/Applications/Mouser.app")
 # Loose Mach-Os outside any bundle that must still carry the fleet signature.
+# deskflow-prio now installs inside Deskflow.app (covered by the MAC_APPS scan
+# above); this legacy path is kept as a no-op safety net for any seat still
+# carrying the old out-of-tree /usr/local/bin/deskflow-prio pair -- it should
+# report nothing on a seat deployed from this branch.
 MAC_EXTRA_BINARIES = ("/usr/local/bin/deskflow-prio",)
 MAC_DESKFLOW_ROOT = "~/Desktop/deskflow"
 DESKFLOW_CORE = "/Applications/Deskflow.app/Contents/MacOS/deskflow-core"
