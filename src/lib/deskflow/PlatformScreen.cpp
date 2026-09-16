@@ -88,6 +88,16 @@ void PlatformScreen::clearStaleModifiers()
   getKeyState()->clearStaleModifiers();
 }
 
+void PlatformScreen::setToggleState(KeyModifierMask toggle, bool on)
+{
+  getKeyState()->setToggleState(toggle, on);
+}
+
+void PlatformScreen::sanitizeInjectedKeys()
+{
+  getKeyState()->sanitizeInjectedKeys();
+}
+
 std::string PlatformScreen::sidesMaskToString(uint32_t sides)
 {
   using enum DirectionMask;

@@ -37,3 +37,11 @@ create_test(
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/server"
 )
 
+
+create_test(
+  NAME ServerKeyLedgerTests
+  DEPENDS server
+  LIBS base arch app ${extra_libs}
+  SOURCE ServerKeyLedgerTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/server"
+)

@@ -61,6 +61,8 @@ public:
   int32_t pollActiveGroup() const override;
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
   void clearStaleModifiers() override;
+  void setToggleState(KeyModifierMask toggle, bool on) override;
+  void sanitizeInjectedKeys() override;
 
   // IPlatformScreen overrides
   void enable() override = 0;

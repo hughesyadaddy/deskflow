@@ -71,3 +71,11 @@ if(BUILD_X11_SUPPORT)
   )
 endif()
 
+
+create_test(
+  NAME KeyStateLedgerTests
+  DEPENDS app
+  LIBS arch base mt common ${extra_libs}
+  SOURCE KeyStateLedgerTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/deskflow"
+)

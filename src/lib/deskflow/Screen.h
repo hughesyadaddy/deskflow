@@ -13,6 +13,7 @@
 #include "deskflow/MouseTypes.h"
 #include "deskflow/OptionTypes.h"
 
+#include <map>
 #include <string>
 
 class IClipboard;
@@ -128,6 +129,13 @@ public:
   match the given modifier mask.
   */
   void keyUp(KeyID id, KeyModifierMask, KeyButton);
+
+  //! Apply lock state
+  /*!
+  Drives Caps/Num/Scroll Lock to the states in \p toggleMask (lock keys are
+  STATE, not toggles). Only bits that disagree with the OS are touched.
+  */
+  void applyToggleMask(KeyModifierMask toggleMask);
 
   //! Notify of mouse press
   /*!
@@ -286,7 +294,7 @@ protected:
   void disableSecondary();
 
   void enterPrimary() const;
-  void enterSecondary(KeyModifierMask toggleMask) const;
+  void enterSecondary(KeyModifierMask mask);
   void leavePrimary();
   void leaveSecondary();
 
@@ -309,6 +317,12 @@ private:
 
   // true if we're faking input on a primary screen
   bool m_fakeInput = false;
+
+  // modifiers re-asserted on enter because the server said they were
+  // physically held but our OS did not have them down (modifier bit ->
+  // reserved synthetic server button). Released by the server's real key
+  // up (see keyUp) or by leaveSecondary(), whichever comes first.
+  std::map<KeyModifierMask, KeyButton> m_reassertedModifiers;
 
   IEventQueue *m_events = nullptr;
 };

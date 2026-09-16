@@ -153,52 +153,100 @@ bool Server::isChordRemapSourceModifierKey(KeyID id, KeyButton button) const
   return ::isChordRemapSourceModifierRelease(id, button, m_chordRemapSession.entry.inMods);
 }
 
-namespace {
-//! True for the modifier KeyIDs whose loss strands input on the target.
-bool isTrackedModifierKeyId(KeyID id)
+void Server::noteKeySentToActive(KeyID id, KeyButton button)
 {
-  switch (id) {
-  case kKeySuper_L:
-  case kKeySuper_R:
-  case kKeyAlt_L:
-  case kKeyAlt_R:
-  case kKeyControl_L:
-  case kKeyControl_R:
-  case kKeyShift_L:
-  case kKeyShift_R:
-  case kKeyMeta_L:
-  case kKeyMeta_R:
-    return true;
-  default:
-    return false;
+  // The primary is never a target (PrimaryClient::keyDown is a no-op), so
+  // nothing is held there to release.
+  if (m_active == m_primaryClient || button == 0) {
+    return;
   }
+  m_keysHeldOnActive[button] = id;
 }
-} // namespace
 
-void Server::noteModifierSentToActive(KeyID id, KeyButton button)
+void Server::forgetKeySentToActive(KeyButton button)
 {
-  if (isTrackedModifierKeyId(id)) {
-    m_modifiersHeldOnActive[button] = id;
+  m_keysHeldOnActive.erase(button);
+}
+
+void Server::sendReleases(BaseClientProxy *client, HeldKeys &keys, const char *why)
+{
+  if (keys.empty()) {
+    return;
   }
+  // A dying proxy may not take a write (the socket drops it with an output
+  // error event rather than throwing), but anything else must not abort the
+  // boundary we are in the middle of: log and keep clearing.
+  for (const auto &[button, id] : keys) {
+    LOG_DEBUG(
+        "releasing key %s (button 0x%04x) held on \"%s\": %s", IKeyState::describeKey(id).c_str(), button,
+        getName(client).c_str(), why
+    );
+    try {
+      client->keyUp(id, 0, button);
+    } catch (const std::exception &e) { // NOSONAR
+      LOG_WARN(
+          "could not release key %s on \"%s\": %s", IKeyState::describeKey(id).c_str(), getName(client).c_str(),
+          e.what()
+      );
+    }
+  }
+  keys.clear();
 }
 
-void Server::forgetModifierSentToActive(KeyButton button)
+void Server::releaseKeysHeldOnActive()
 {
-  m_modifiersHeldOnActive.erase(button);
-}
-
-void Server::releaseModifiersHeldOnActive()
-{
-  if (m_modifiersHeldOnActive.empty()) {
+  if (m_keysHeldOnActive.empty()) {
     return;
   }
   if (m_active != nullptr) {
-    for (const auto &[button, id] : m_modifiersHeldOnActive) {
-      LOG_DEBUG("releasing modifier 0x%04x held on \"%s\"", id, getName(m_active).c_str());
-      m_active->keyUp(id, 0, button);
-    }
+    sendReleases(m_active, m_keysHeldOnActive, "leaving active screen");
   }
-  m_modifiersHeldOnActive.clear();
+  m_keysHeldOnActive.clear();
+}
+
+void Server::releaseKeysHeldOnBroadcast(const BaseClientProxy *client)
+{
+  for (auto it = m_keysHeldOnBroadcast.begin(); it != m_keysHeldOnBroadcast.end();) {
+    const auto found = m_clients.find(it->first);
+    BaseClientProxy *target = (found != m_clients.end()) ? found->second : nullptr;
+    if (client != nullptr && target != client) {
+      ++it;
+      continue;
+    }
+    if (target != nullptr) {
+      sendReleases(target, it->second, "broadcast boundary");
+    }
+    it = m_keysHeldOnBroadcast.erase(it);
+  }
+}
+
+void Server::syncToggleStateToActive()
+{
+  if (m_active == nullptr || m_active == m_primaryClient) {
+    return;
+  }
+  const KeyModifierMask now = m_primaryClient->getToggleMask() & IKeyState::s_lockModifierMask;
+  const KeyModifierMask changed = now ^ m_toggleMaskSentToActive;
+  if (changed == 0) {
+    return;
+  }
+  // Lock keys are STATE (I2): ship the fresh lock mask for each changed bit
+  // as a lock-key down/up carrying the mask. Wire-compatible: an old client
+  // drops the lock KeyID and ignores it; a new one applies the mask bit
+  // absolutely (KeyState::fakeKeyDown -> setToggleState).
+  for (const KeyModifierMask lock : {KeyModifierCapsLock, KeyModifierNumLock, KeyModifierScrollLock}) {
+    if ((changed & lock) == 0) {
+      continue;
+    }
+    const KeyID key = IKeyState::lockKeyForModifier(lock);
+    LOG_DEBUG(
+        "lock 0x%04x changed to %s on primary; updating \"%s\"", lock, (now & lock) ? "on" : "off",
+        getName(m_active).c_str()
+    );
+    m_active->keyDown(key, now, 0, std::string{});
+    m_active->keyUp(key, now, 0);
+  }
+  m_toggleMaskSentToActive = now;
 }
 
 void Server::cancelChordRemapSession()
@@ -402,6 +450,20 @@ Server::~Server()
   // modifier on the target (five-Esc rescue of a server core lands here too).
   if (m_chordRemapSession.active) {
     cancelChordRemapSession();
+  }
+  // Every epoch flip lands here. Release what we hold on the active client
+  // and tell it we are leaving (its own leave-time sanitize then runs) --
+  // otherwise teardown is an unreleased boundary and the target keeps
+  // whatever was down. Broadcast-held keys go per screen.
+  releaseKeysHeldOnActive();
+  releaseKeysHeldOnBroadcast(nullptr);
+  if (m_active != nullptr && m_active != m_primaryClient) {
+    try {
+      LOG_DEBUG("teardown: leaving active client \"%s\"", getName(m_active).c_str());
+      m_active->leave();
+    } catch (const std::exception &e) { // NOSONAR
+      LOG_WARN("teardown: could not leave \"%s\": %s", getName(m_active).c_str(), e.what());
+    }
   }
 
   try {
@@ -720,7 +782,7 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
       LOG_WARN("can't leave screen");
       return;
     }
-    releaseModifiersHeldOnActive();
+    releaseKeysHeldOnActive();
 
     // update the primary client's clipboards if we're leaving the
     // primary screen.
@@ -751,8 +813,10 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     // increment enter sequence number
     ++m_seqNum;
 
-    // enter new screen
-    m_active->enter(x, y, m_seqNum, m_primaryClient->getToggleMask(), forScreensaver);
+    // enter new screen (the enter mask IS the lock-state baseline)
+    const KeyModifierMask toggleMask = m_primaryClient->getToggleMask();
+    m_toggleMaskSentToActive = toggleMask & IKeyState::s_lockModifierMask;
+    m_active->enter(x, y, m_seqNum, toggleMask, forScreensaver);
 
     if (m_enableClipboard) {
       // send the clipboard data to new active screen
@@ -1916,6 +1980,9 @@ void Server::handleKeyboardBroadcastEvent(const Event &event)
 
   // enter new state
   if (newState != m_keyboardBroadcasting || info->m_screens != m_keyboardBroadcastingScreens) {
+    // Keys pressed under the old broadcast set will not get their release
+    // under the new one (ups only go where downs went): release them now.
+    releaseKeysHeldOnBroadcast(nullptr);
     m_keyboardBroadcasting = newState;
     m_keyboardBroadcastingScreens = info->m_screens;
     LOG(
@@ -2130,7 +2197,10 @@ bool Server::screenHasChordRemaps(const std::string &screen) const
 
 void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang, const char *screens)
 {
-  LOG_VERBOSE("onKeyDown id=%d mask=0x%04x button=0x%04x lang=%s", id, mask, button, lang.c_str());
+  LOG_DEBUG(
+      "onKeyDown id=%s mask=0x%04x button=0x%04x lang=%s", IKeyState::describeKey(id).c_str(), mask, button,
+      lang.c_str()
+  );
   assert(m_active != nullptr);
 
   // Keyboard rescue: five plain Esc downs within 2s soft-restarts local core.
@@ -2139,7 +2209,8 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
     // screen first, or the restart strands it there (the one structural
     // boundary that used to skip the ledger).
     cancelChordRemapSession();
-    releaseModifiersHeldOnActive();
+    releaseKeysHeldOnActive();
+    releaseKeysHeldOnBroadcast(nullptr);
     requestLocalCoreRestart();
     return;
   }
@@ -2163,7 +2234,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
       m_deferredSuper.consumedByChord = true;
     } else {
       // Real Win combo: deliver the withheld Super down, then the key.
-      noteModifierSentToActive(m_deferredSuper.id, m_deferredSuper.button);
+      noteKeySentToActive(m_deferredSuper.id, m_deferredSuper.button);
       m_active->keyDown(m_deferredSuper.id, mask, m_deferredSuper.button, lang);
       m_deferredSuper.emitted = true;
       LOG_DEBUG("emitting deferred super down (non-chord key) for \"%s\"", getName(m_active).c_str());
@@ -2193,7 +2264,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
-    noteModifierSentToActive(id, button);
+    noteKeySentToActive(id, button);
     m_active->keyDown(id, mask, button, lang);
   } else {
     if (!screens && m_keyboardBroadcasting) {
@@ -2204,15 +2275,24 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
     }
     for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {
       if (IKeyState::KeyInfo::contains(screens, index->first)) {
+        if (index->second != m_primaryClient && button != 0) {
+          m_keysHeldOnBroadcast[index->first][button] = id;
+        }
         index->second->keyDown(id, mask, button, lang);
       }
     }
+  }
+
+  // Lock keys are STATE: if this press flipped a lock on the primary, push
+  // the fresh state now rather than trusting the toggle to land in phase.
+  if (IKeyState::lockModifierForKey(id) != 0) {
+    syncToggleStateToActive();
   }
 }
 
 void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const char *screens)
 {
-  LOG_VERBOSE("onKeyUp id=%d mask=0x%04x button=0x%04x", id, mask, button);
+  LOG_DEBUG("onKeyUp id=%s mask=0x%04x button=0x%04x", IKeyState::describeKey(id).c_str(), mask, button);
   assert(m_active != nullptr);
 
   // Resolve a deferred Super on its release: chord hold (nothing to send),
@@ -2231,13 +2311,13 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
         return; // its chord already completed; nothing left to send
       }
       if (deferred.emitted) {
-        forgetModifierSentToActive(button);
+        forgetKeySentToActive(button);
         m_active->keyUp(id, mask, button);
         return;
       }
       m_active->keyDown(deferred.id, mask, deferred.button, std::string{});
       m_active->keyUp(deferred.id, mask, deferred.button);
-      forgetModifierSentToActive(deferred.button);
+      forgetKeySentToActive(deferred.button);
       LOG_DEBUG("deferred super resolved as lone tap for \"%s\"", getName(m_active).c_str());
       return;
     }
@@ -2261,7 +2341,7 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
-    forgetModifierSentToActive(button);
+    forgetKeySentToActive(button);
     m_active->keyUp(id, mask, button);
   } else {
     if (!screens && m_keyboardBroadcasting) {
@@ -2272,17 +2352,26 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
     }
     for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {
       if (IKeyState::KeyInfo::contains(screens, index->first)) {
+        if (const auto held = m_keysHeldOnBroadcast.find(index->first); held != m_keysHeldOnBroadcast.end()) {
+          held->second.erase(button);
+        }
         index->second->keyUp(id, mask, button);
       }
     }
+  }
+
+  // The lock state has certainly settled by the release (a hook may report
+  // the pre-toggle state on the down); re-check so nothing is missed.
+  if (IKeyState::lockModifierForKey(id) != 0) {
+    syncToggleStateToActive();
   }
 }
 
 void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang)
 {
   LOG(
-      (CLOG_VERBOSE "onKeyRepeat id=%d mask=0x%04x count=%d button=0x%04x lang=\"%s\"", id, mask, count, button,
-       lang.c_str())
+      (CLOG_DEBUG "onKeyRepeat id=%s mask=0x%04x count=%d button=0x%04x lang=\"%s\"",
+       IKeyState::describeKey(id).c_str(), mask, count, button, lang.c_str())
   );
   assert(m_active != nullptr);
 
@@ -2702,6 +2791,13 @@ void Server::closeClient(BaseClientProxy *client, const char *msg)
   // client.
   LOG_INFO("disconnecting client \"%s\"", getName(client).c_str());
 
+  // release what we hold there while the link is still open, before the
+  // close goes out (forceLeaveClient below is then only best-effort)
+  if (client == m_active) {
+    releaseKeysHeldOnActive();
+  }
+  releaseKeysHeldOnBroadcast(client);
+
   // send message
   // FIXME -- avoid type cast (kinda hard, though)
   auto clientProxy = static_cast<ClientProxy *>(client);
@@ -2772,12 +2868,21 @@ void Server::removeOldClient(BaseClientProxy *client)
 
 void Server::forceLeaveClient(const BaseClientProxy *client)
 {
+  // Broadcast-held keys on a dying screen: best-effort release (the write
+  // is dropped on a dead socket, never thrown), then forget them.
+  releaseKeysHeldOnBroadcast(client);
+
   if (const auto *active = (m_activeSaver != nullptr) ? m_activeSaver : m_active; active == client) {
-    // The proxy is dying: whatever we hold there cannot be released over the
-    // wire. Drop the ledger so it never leaks onto whichever screen becomes
-    // active next; the client's own enter-time sanitize covers the physical
-    // key if it reconnects.
-    m_modifiersHeldOnActive.clear();
+    // The proxy may be dying, but it may also be alive and merely leaving
+    // the config: send the releases anyway (a dead socket drops the write
+    // and raises an output error rather than throwing), and clear the
+    // ledger so nothing leaks onto whichever screen becomes active next.
+    if (active == m_active) {
+      releaseKeysHeldOnActive();
+    } else {
+      m_keysHeldOnActive.clear();
+    }
+    m_toggleMaskSentToActive = 0;
     if (m_chordRemapSession.active) {
       // The active client is disconnecting: the clear below goes into a dead
       // socket, so queue it for the reconnect before cancelling.

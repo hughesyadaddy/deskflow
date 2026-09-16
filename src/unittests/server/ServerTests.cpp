@@ -721,7 +721,12 @@ void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
     remote.clearKeys();
     server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
     QCOMPARE(restartCalls, 1);
-    QVERIFY(remote.keys().empty());
+    // The fifth Esc is swallowed; the only traffic is the ledger releasing
+    // the Esc still held there (the rescue is a boundary like any other).
+    for (const auto &key : remote.keys()) {
+      QCOMPARE(key.kind, RecordedKeyEvent::Kind::Up);
+      QCOMPARE(key.id, kKeyEscape);
+    }
     QCOMPARE(server.m_active, &remote);
 
     server.m_clients.erase("remote");
@@ -1262,7 +1267,7 @@ void ServerTests::heldModifier_releasedOnScreenSwitch()
     // Super held, then a non-chord key: the withheld Win down is delivered.
     server.onKeyDown(kKeySuper_L, KeyModifierSuper, 0x38, "en", nullptr);
     server.onKeyDown(static_cast<KeyID>('e'), KeyModifierSuper, 0x0E, "en", nullptr);
-    QVERIFY(server.m_modifiersHeldOnActive.count(0x38) == 1);
+    QVERIFY(server.m_keysHeldOnActive.count(0x38) == 1);
     remote.clearKeys();
 
     // Cursor leaves tiny11 while Win is still held there.
@@ -1276,7 +1281,7 @@ void ServerTests::heldModifier_releasedOnScreenSwitch()
       }
     }
     QVERIFY(releasedSuper);
-    QVERIFY(server.m_modifiersHeldOnActive.empty());
+    QVERIFY(server.m_keysHeldOnActive.empty());
 
     server.m_clients.erase("tiny11");
   }
@@ -1298,10 +1303,10 @@ void ServerTests::heldModifier_forgottenWhenClientDies()
 
     server.onKeyDown(kKeySuper_L, KeyModifierSuper, 0x38, "en", nullptr);
     server.onKeyDown(static_cast<KeyID>('e'), KeyModifierSuper, 0x0E, "en", nullptr);
-    QVERIFY(!server.m_modifiersHeldOnActive.empty());
+    QVERIFY(!server.m_keysHeldOnActive.empty());
 
     server.forceLeaveClient(&remote);
-    QVERIFY(server.m_modifiersHeldOnActive.empty());
+    QVERIFY(server.m_keysHeldOnActive.empty());
 
     server.m_clients.erase("tiny11");
   }
