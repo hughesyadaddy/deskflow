@@ -158,6 +158,25 @@ elseif (APPLE)
   option(BUILD_OSX_BUNDLE "Build mac os bundle" ON)
 endif()
 
+# Fleet strict signing: when ON, an empty or ad-hoc ("-") macOS codesign
+# identity is a configure-time error instead of a silent ad-hoc fallback.
+# Default OFF for now; Phase 3 of the fleet memory program flips it to ON.
+option(FLEET_STRICT_SIGNING
+  "Fail configure when APPLE_CODESIGN_DEV is empty or '-' (ad-hoc) on macOS" OFF)
+
+if(APPLE AND BUILD_OSX_BUNDLE)
+  if("${APPLE_CODESIGN_DEV}" STREQUAL "" OR "${APPLE_CODESIGN_DEV}" STREQUAL "-")
+    set(_fleet_adhoc_signing TRUE)
+  else()
+    set(_fleet_adhoc_signing FALSE)
+  endif()
+  if(FLEET_STRICT_SIGNING AND _fleet_adhoc_signing)
+    message(FATAL_ERROR
+      "FLEET_STRICT_SIGNING=ON but APPLE_CODESIGN_DEV is empty or '-' (ad-hoc). "
+      "Set DESKFLOW_CODESIGN_ID in .env and pass -DAPPLE_CODESIGN_DEV=<identity>.")
+  endif()
+endif()
+
 include(cmake/Libraries.cmake)
 configure_libs()
 
@@ -207,14 +226,24 @@ install(
 if(BUILD_OSX_BUNDLE AND BUILD_INSTALLER)
   # The license files above land in Contents/Resources after macdeployqt
   # signed the bundle, breaking its resource seal; re-sign last.
-  if(APPLE_CODESIGN_DEV)
+  if(FLEET_STRICT_SIGNING)
+    # Identity was validated at configure time above; no ad-hoc fallback.
     set(MAC_FINAL_CODESIGN_ID "${APPLE_CODESIGN_DEV}")
-  else()
+  elseif(_fleet_adhoc_signing)
+    message(WARNING "ad-hoc signing (FLEET_STRICT_SIGNING=OFF): final bundle re-sign uses '-'")
     set(MAC_FINAL_CODESIGN_ID "-")
+  else()
+    set(MAC_FINAL_CODESIGN_ID "${APPLE_CODESIGN_DEV}")
   endif()
-  install(CODE "execute_process(COMMAND
-    /usr/bin/codesign --force --deep
-    \"--sign=${MAC_FINAL_CODESIGN_ID}\"
-    \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_PROPER_NAME}.app\"
-  )")
+  install(CODE "
+    execute_process(COMMAND
+      /usr/bin/codesign --force --deep
+      \"--sign=${MAC_FINAL_CODESIGN_ID}\"
+      \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_PROPER_NAME}.app\"
+      RESULT_VARIABLE _final_codesign_rc
+    )
+    if(NOT _final_codesign_rc EQUAL 0)
+      message(FATAL_ERROR \"codesign of \${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_PROPER_NAME}.app failed (exit \${_final_codesign_rc})\")
+    endif()
+  ")
 endif()

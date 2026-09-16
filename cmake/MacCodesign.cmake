@@ -15,6 +15,20 @@
 # To use, simply generate a personal certificate for free with Xcode and pass the ID to CMake.
 # Full instructions are in the docs.
 
+# Note: "-" is a truthy string to CMake's if(), so the include gate in the
+# top-level CMakeLists.txt does not filter an explicit ad-hoc identity.
+if("${APPLE_CODESIGN_DEV}" STREQUAL "" OR "${APPLE_CODESIGN_DEV}" STREQUAL "-")
+  if(FLEET_STRICT_SIGNING)
+    message(FATAL_ERROR
+      "FLEET_STRICT_SIGNING=ON but APPLE_CODESIGN_DEV is empty or '-' (ad-hoc); "
+      "MacCodesign.cmake requires a real developer identity.")
+  endif()
+  message(WARNING "ad-hoc signing (FLEET_STRICT_SIGNING=OFF): codesign-dev target signs with '-'")
+endif()
+
+# The codesign invocations below run as add_custom_command steps, so a
+# non-zero codesign exit already fails the build; no execute_process here.
+
 function(configure_mac_codesign target)
   set_property(GLOBAL APPEND PROPERTY _MAC_CODESIGN_DEPENDS $<TARGET_FILE:${target}>)
 
