@@ -1,4 +1,4 @@
-# Fleet deploy controller (Windows seat) — same CLI as scripts/fleet-deploy.sh.
+# Fleet deploy controller (Windows seat) - same CLI as scripts/fleet-deploy.sh.
 #requires -Version 5.1
 #
 #   .\scripts\fleet-deploy.ps1 [--dry-run] [--json PATH|-] [--self-test] [--ref REF]
@@ -8,7 +8,7 @@
 # Every FLEET_HOSTS entry is targeted exactly once: the seat whose id matches
 # $env:COMPUTERNAME (case-insensitive; FLEET_LOCAL_ID overrides) runs
 # scripts\fleet-deploy-windows.ps1 directly, remote Macs get
-# `ssh user@host 'cd … && git … && bash scripts/fleet-deploy-macos.sh'`,
+# `ssh user@host 'cd ... && git ... && bash scripts/fleet-deploy-macos.sh'`,
 # remote Windows seats get ssh + powershell. Clients first, server
 # (FLEET_ROLE_<id>=server, default hackintosh) last. Lock = New-Item on
 # tools\state\deploy.lock.d (same path as the bash controller's mkdir lock).

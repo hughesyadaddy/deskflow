@@ -5,7 +5,7 @@
 .DESCRIPTION
   Configures with CMake + MSVC, builds deskflow-core, deskflow-daemon, deskflow GUI,
   and deskflow-vhid-bridge. With -Install, delegates to scripts/install-windows.ps1
-  for a full quit → cmake --install → service → GUI restart cycle.
+  for a full quit -> cmake --install -> service -> GUI restart cycle.
 .EXAMPLE
   pwsh scripts\build-windows.ps1
   pwsh scripts\build-windows.ps1 -Install

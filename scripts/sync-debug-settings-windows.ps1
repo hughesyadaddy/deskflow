@@ -7,7 +7,7 @@
   scripts/sync-debug-settings-macos.sh. Sharing settings (client/mouser* and
   server/hidPassthrough* / server/mouserBridge*) live in Deskflow.conf and are
   preserved as-is; configure them in Server Configuration or Client Configuration
-  → Sharing.
+  -> Sharing.
 #>
 param(
   [string]$SettingsDir = $(if ($env:DESKFLOW_SETTINGS_DIR) { $env:DESKFLOW_SETTINGS_DIR } else { Join-Path $env:APPDATA 'Deskflow' })

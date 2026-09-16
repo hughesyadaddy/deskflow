@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  deskflow-ctl — the ONE way to stop/start/restart Deskflow on Windows.
+  deskflow-ctl - the ONE way to stop/start/restart Deskflow on Windows.
 
 .DESCRIPTION
   Verbs:
@@ -15,7 +15,7 @@
                    interactive console session via a scheduled task.
     restart        stop then start.
     status         inventory: service state/PID + every Deskflow process with
-                   path, session, parent — prints, never throws on findings.
+                   path, session, parent - prints, never throws on findings.
     assert-single  exactly { deskflow-daemon.exe: 1 in session 0 (== service PID),
                    deskflow-core.exe: 1 with parent == service PID in the console
                    session, deskflow.exe: 1 in the console session,
@@ -23,8 +23,8 @@
                    Throws (exit 1) on any mismatch.
 
   Elevation: interactive sessions self-elevate (RunAs). Over SSH (no
-  interactive desktop) the caller must already be elevated — `whoami /groups`
-  must show "High Mandatory Level" — otherwise the script throws.
+  interactive desktop) the caller must already be elevated - `whoami /groups`
+  must show "High Mandatory Level" - otherwise the script throws.
 
   Nothing here stops, starts or kills Mouser: Mouser is an independent app
   owned by its own installer.
@@ -88,7 +88,7 @@ function Assert-Elevated {
   param([string[]]$ForwardArgs)
   if ((Test-IsAdmin) -and (Test-HighIntegrity)) { return }
   if (-not (Test-InteractiveDesktop)) {
-    throw "deskflow-ctl $Verb needs an elevated token (whoami /groups must show 'High Mandatory Level'); over SSH run from an elevated shell — RunAs cannot prompt here."
+    throw "deskflow-ctl $Verb needs an elevated token (whoami /groups must show 'High Mandatory Level'); over SSH run from an elevated shell - RunAs cannot prompt here."
   }
   Write-Host "Re-launching elevated for deskflow-ctl $Verb..."
   $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }

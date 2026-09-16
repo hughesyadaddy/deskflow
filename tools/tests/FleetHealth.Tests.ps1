@@ -143,7 +143,7 @@ Describe "Invoke-FleetHealth" {
 
   It "emits a JSON array when run as a script" {
     # Drive the script through powershell so the main block runs; everything mocked away via
-    # an empty install root (authenticode FAIL is expected) — we only assert the JSON envelope.
+    # an empty install root (authenticode FAIL is expected) - we only assert the JSON envelope.
     $exe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell.exe" }
     $out = & $exe -NoProfile -ExecutionPolicy Bypass -File $script:Script -Checks authenticode -Thumbprint X `
       -InstallRoots (Join-Path $TestDrive "empty")

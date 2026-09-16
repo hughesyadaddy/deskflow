@@ -46,7 +46,7 @@ if (-not (Test-Path $Sys)) {
 }
 
 if (-not (Test-Path $Inf)) {
-    throw "Missing $Inf — copy deskflow-vhid.inf beside deskflow-vhid.sys in $DriverDir"
+    throw "Missing $Inf - copy deskflow-vhid.inf beside deskflow-vhid.sys in $DriverDir"
 }
 
 # Stage INF + SYS together for pnputil.
