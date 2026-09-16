@@ -230,6 +230,16 @@ void Coordinator::setEventQueue(IEventQueue *events)
   m_events = events;
 }
 
+void Coordinator::setRunningRole(Role role)
+{
+  m_runningRole.store(role, std::memory_order_release);
+}
+
+Role Coordinator::runningRole() const
+{
+  return m_runningRole.load(std::memory_order_acquire);
+}
+
 FleetState Coordinator::fleetSnapshot() const
 {
   std::scoped_lock lock{m_mutex};
@@ -641,14 +651,18 @@ bool Coordinator::sendKeyForward(
     }
   }
 
+  // The RUNNING app decides, not the election: after a flip the election
+  // says Client up to a dwell before the ServerApp actually stops, and
+  // Server::onKeyDown still owns the keyboard until then.
+  if (runningRole() != Role::Client) {
+    return false;
+  }
+
   PeerOutbox *destination = nullptr;
   std::string line;
   bool logFirst = false;
   {
     std::scoped_lock lock{m_mutex};
-    if (m_election.role() != Role::Client) {
-      return false;
-    }
 
     KeyboardRouteInput input;
     input.selfName = m_config.selfName;
@@ -805,7 +819,7 @@ void Coordinator::followSender(const Message &claim)
   decide(Role::Client, address);
 }
 
-void Coordinator::decide(Role role, const std::string &serverAddress)
+void Coordinator::decide(Role role, const std::string &serverAddress, bool restart)
 {
   std::function<void()> interrupt;
   {
@@ -823,7 +837,7 @@ void Coordinator::decide(Role role, const std::string &serverAddress)
     } else {
       m_election.becameClient(serverAddress);
     }
-    m_decision = RoleDecision{role, serverAddress, false};
+    m_decision = RoleDecision{role, serverAddress, false, restart};
     m_hasDecision = true;
     m_wedgeStrikes = 0;
     interrupt = m_interrupt;
@@ -915,7 +929,9 @@ void Coordinator::workerLoop()
         } else if (++m_wedgeStrikes >= kWedgeStrikesToRestart) {
           LOG_WARN("coordination: server transport wedged; restarting server epoch");
           m_wedgeStrikes = 0;
-          decide(Role::Server, {});
+          // restart=true: same role and address as the running epoch, and
+          // the epoch loop would otherwise keep it (no rebuild).
+          decide(Role::Server, {}, true);
         }
       }
     } else if (role == Role::Init && now - m_startedAt <= kDiscoveryWindowS) {
@@ -927,12 +943,16 @@ void Coordinator::workerLoop()
     // one), and a server epoch must never keep one (Server::onKeyDown owns
     // the keyboard). Heals epoch handoffs that missed the explicit
     // updateKeyboardRelayForRole call and taps/hooks that died silently
-    // (permission loss, tap teardown).
+    // (permission loss, tap teardown). Keyed off the RUNNING app, not the
+    // election: the election flips at once while the app follows at the
+    // end of the dwell, and starting a relay under a still-running
+    // ServerApp would capture every key twice.
     if (m_config.keyboardFollowCursor) {
-      if (role == Role::Client && !m_keyboardRelay->running()) {
+      const Role running = runningRole();
+      if (running == Role::Client && !m_keyboardRelay->running()) {
         LOG_WARN("coordination: keyboard relay not running in client epoch; restarting");
         updateKeyboardRelayForRole(Role::Client);
-      } else if (role == Role::Server && m_keyboardRelay->running()) {
+      } else if (running == Role::Server && m_keyboardRelay->running()) {
         LOG_WARN("coordination: keyboard relay still running in server epoch; stopping");
         m_keyboardRelay->stop();
       }

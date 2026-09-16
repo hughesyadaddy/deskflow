@@ -20,4 +20,6 @@ private Q_SLOTS:
   void quietEpochResetsDwell();
   void failureBackoffUnchanged();
   void deferredIsDisarmedWhenEpochEnds();
+  void restartDecisionForRunningRoleRebuilds();
+  void decisionInBuildGapInterruptsImmediately();
 };

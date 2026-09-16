@@ -16,6 +16,7 @@
 #include "coordination/Peer.h"
 #include "deskflow/KeyTypes.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -55,6 +56,9 @@ struct RoleDecision
   Role role = Role::Init;
   std::string serverAddress; // when role == Client
   bool quit = false;
+  //! Rebuild the app even when role/address match the running epoch
+  //! (server transport wedged; the epoch loop must not "keep" it).
+  bool restart = false;
 };
 
 //! Orchestrates election, mesh, input detection, and the reconciler.
@@ -108,6 +112,18 @@ public:
   //! Main-thread event queue for cross-thread coordination events.
   void setEventQueue(IEventQueue *events);
 
+  //! Role of the app epoch that is actually running (Init between epochs).
+  /*!
+  The election role (m_election) flips the moment decide() runs, but the
+  app follows only when the epoch loop's dwell gate lets it (up to the
+  dwell later). Anything that must agree with the *running* app -- the
+  keyboard relay reconciler, key forwarding -- keys off this instead, so
+  an outgoing server never starts a relay while its ServerApp still owns
+  the keyboard. AutoModeRunner sets it around each epoch's event loop.
+  */
+  void setRunningRole(Role role);
+  Role runningRole() const;
+
   //! Server epoch: update cursor host/screen in fleet state.
   //! \p screenName is the active screen name (deskflow screen names identify cursor host).
   void updateCursorHost(const std::string &screenName);
@@ -157,7 +173,7 @@ private:
   bool relayPassThroughLocal();
   void promoteSelf(const char *reason);
   void followSender(const Message &claim);
-  void decide(Role role, const std::string &serverAddress);
+  void decide(Role role, const std::string &serverAddress, bool restart = false);
   void broadcastClaim();
   void workerLoop();
   void discoverOnce();
@@ -175,6 +191,9 @@ private:
   std::unique_ptr<IKeyboardRelayMonitor> m_keyboardRelay;
 
   IEventQueue *m_events = nullptr;
+  //! Set by the epoch loop; read on the worker tick and inside the OS
+  //! keyboard hook (no lock: see runningRole()).
+  std::atomic<Role> m_runningRole{Role::Init};
   std::string m_fleetCursorHost;
   //! Monotonic fleet fragment sequence (authoritative).
   int64_t m_fleetSeq = 0;

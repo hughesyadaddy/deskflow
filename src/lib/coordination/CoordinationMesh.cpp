@@ -459,16 +459,23 @@ void PeerOutbox::stop()
   }
 }
 
+uint64_t PeerOutbox::enqueueLocked(std::string line, ReplyHandler onReply)
+{
+  const uint64_t ticket = ++m_posted;
+  m_queue.push_back(Job{std::move(line), std::move(onReply), ticket});
+  if (m_queue.size() > kMaxQueuedLines) {
+    m_queue.pop_front();
+    ++m_resolved; // dropped counts as resolved for forward() waiters
+    LOG_WARN("coordination: outbox to %s full (%zu queued); dropped the oldest line", m_ip.c_str(), kMaxQueuedLines);
+  }
+  return ticket;
+}
+
 void PeerOutbox::post(std::string line, ReplyHandler onReply)
 {
   {
     std::scoped_lock lock{m_mutex};
-    m_queue.push_back(Job{std::move(line), std::move(onReply)});
-    ++m_posted;
-    if (m_queue.size() > kMaxQueuedLines) {
-      m_queue.pop_front();
-      ++m_resolved; // dropped counts as resolved for forward() waiters
-    }
+    enqueueLocked(std::move(line), std::move(onReply));
   }
   m_wake.notify_all();
 }
@@ -479,14 +486,17 @@ bool PeerOutbox::forward(std::string line, int graceMs)
   {
     std::scoped_lock lock{m_mutex};
     if (m_state == State::Backoff) {
+      if (m_clock() < m_nextAttemptAt) {
+        return false;
+      }
+      // Window open: queue the line so the lane makes its attempt now
+      // and re-settles the state. Reported as not delivered regardless
+      // (the key stays local); a Reachable result serves the next key.
+      enqueueLocked(std::move(line), {});
+      m_wake.notify_all();
       return false;
     }
-    m_queue.push_back(Job{std::move(line), {}});
-    ticket = ++m_posted;
-    if (m_queue.size() > kMaxQueuedLines) {
-      m_queue.pop_front();
-      ++m_resolved;
-    }
+    ticket = enqueueLocked(std::move(line), {});
   }
   m_wake.notify_all();
 
@@ -498,7 +508,19 @@ bool PeerOutbox::forward(std::string line, int graceMs)
   // very job. A timeout is reported as "not delivered" (the key stays
   // local); the attempt itself keeps running and settles the state.
   m_jobDone.wait_for(lock, std::chrono::milliseconds(graceMs), [&] { return m_resolved >= ticket || m_stop; });
-  return m_resolved >= ticket && m_state == State::Reachable;
+  if (m_resolved >= ticket) {
+    return m_state == State::Reachable;
+  }
+  // Timed out. The caller handles the key locally now, so a late delivery
+  // would type it twice: withdraw it unless the lane already picked it up
+  // (an in-flight connect cannot be recalled).
+  const auto pending =
+      std::find_if(m_queue.begin(), m_queue.end(), [ticket](const Job &job) { return job.ticket == ticket; });
+  if (pending != m_queue.end()) {
+    m_queue.erase(pending);
+    ++m_resolved;
+  }
+  return false;
 }
 
 PeerOutbox::State PeerOutbox::state() const
@@ -589,7 +611,13 @@ void PeerOutbox::pump(double now)
         }
         // Everything behind the failed line is stale by now (>= one
         // connect timeout old); periodic senders re-post.
-        m_queue.clear();
+        if (!m_queue.empty()) {
+          LOG_WARN(
+              "coordination: peer %s unreachable; dropped %zu queued line(s) (retry in %.0f s)", host.c_str(),
+              m_queue.size(), m_backoffS
+          );
+          m_queue.clear();
+        }
         m_resolved = m_posted;
       }
     }

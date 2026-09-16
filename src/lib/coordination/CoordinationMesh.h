@@ -139,7 +139,10 @@ public:
 
   static constexpr double kBackoffMinS = 1.0;
   static constexpr double kBackoffMaxS = 30.0;
-  static constexpr size_t kMaxQueuedLines = 8;
+  //! Queue depth per lane. Deep enough that a burst of key events behind
+  //! one connect never drops a Down while its Up still delivers (stuck
+  //! modifier); every drop is logged.
+  static constexpr size_t kMaxQueuedLines = 64;
 
   PeerOutbox(std::string ip, std::string lan, Transport transport, Clock clock);
   PeerOutbox(const PeerOutbox &) = delete;
@@ -154,13 +157,18 @@ public:
   //! the peer's reply line when set (query semantics); never on failure.
   void post(std::string line, ReplyHandler onReply = {});
 
-  //! Queue \p line only when the peer is not in backoff.
+  //! Queue \p line for a key forward; never blocks past \p graceMs.
   /*!
   Returns whether the caller may treat the line as delivered: true when the
-  peer is reachable (the send is in flight), false in backoff (nothing was
-  queued). While reachability is still Unknown the call waits at most
-  \p graceMs for the attempt to resolve, so the very first send to a peer
-  can still report an honest result without a full connect timeout.
+  peer is reachable (the send is in flight), false in backoff. Inside the
+  backoff window nothing is queued; once the window has opened the line is
+  queued anyway (still reported as not delivered) so the attempt re-settles
+  the state -- a client posts nothing else on the server lane between
+  version probes, and without this a single transient failure kept keys
+  local until the next probe. While reachability is still Unknown the call
+  waits at most \p graceMs for the attempt to resolve; on timeout the line
+  is withdrawn from the queue when it has not been picked up yet, so a key
+  reported as "kept local" is never also delivered late.
   */
   bool forward(std::string line, int graceMs);
 
@@ -182,9 +190,12 @@ private:
   {
     std::string line;
     ReplyHandler onReply;
+    uint64_t ticket = 0; //!< m_posted value at enqueue (forward() withdrawal)
   };
 
   void run();
+  //! Append a job; drops (and logs) the oldest past kMaxQueuedLines.
+  uint64_t enqueueLocked(std::string line, ReplyHandler onReply);
   std::string otherAddressLocked(const std::string &host) const;
 
   const std::string m_ip;

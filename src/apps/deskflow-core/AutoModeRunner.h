@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "coordination/Coordinator.h"
 #include "coordination/ElectionState.h"
 
 #include <QString>
@@ -23,11 +24,6 @@
 class EventQueue;
 class QThread;
 
-namespace deskflow::coordination {
-class Coordinator;
-struct RoleDecision;
-} // namespace deskflow::coordination
-
 //! Rate limiter for auto-mode epoch flips (pure logic, no threads).
 /*!
 Every role flip tears down and rebuilds a ServerApp/ClientApp, including
@@ -35,7 +31,10 @@ the platform screen and event tap. A flapping peer can request a flip
 every second; this gate guarantees a minimum dwell time per epoch and
 coalesces every flip request that lands inside that window into a single
 deferred interrupt. Hysteresis: when an epoch was cut short by a deferred
-flip the dwell doubles (up to \c maxDwell); a quiet epoch resets it.
+flip the dwell doubles (up to \c maxDwell, 3x the base: the election role
+and the running app diverge for the whole dwell, so the ceiling bounds
+how long a machine can be "server by election, client by app"); a quiet
+epoch resets it.
 
 Time is injected so the policy is unit-testable; AutoModeRunner drives it
 with std::chrono::steady_clock.
@@ -50,7 +49,7 @@ public:
   struct Config
   {
     Duration minDwell{5000};
-    Duration maxDwell{30000};
+    Duration maxDwell{15000};
   };
 
   enum class Action
@@ -160,7 +159,9 @@ docs/coordination/design.md). One process, one TCC identity, roles flip
 in place. Flips are rate-limited by EpochFlipGate: a decision that lands
 inside the dwell window is consumed by a deferred timer, and when the
 latest decision still names the role that is already running the epoch
-is kept (no rebuild at all).
+is kept (no rebuild at all, unless the decision asks for a restart). A
+decision that landed between epochs (the app build gap) was never gated
+and interrupts the new epoch at once.
 */
 class AutoModeRunner
 {
@@ -184,8 +185,27 @@ public:
   //! Backoff after an epoch ends with a failure code (hot-loop guard).
   static constexpr std::chrono::milliseconds kFailureBackoff{500};
 
+  //! Hysteresis ceiling as a multiple of the base dwell (5 s -> 15 s).
+  static constexpr int kMaxDwellMultiplier = 3;
+
   //! Dwell configuration: DESKFLOW_AUTO_DWELL_MS overrides the 5 s default.
   static EpochFlipGate::Config gateConfigFromEnvironment();
+
+  //! Does \p decision name the epoch that is already running?
+  /*!
+  True when the loop may drop the decision and keep the running app: same
+  role, same server address, not a quit, and not a forced restart (a
+  wedged server re-decides its own role precisely to be rebuilt). Pure so
+  the epoch-loop tests exercise the production comparison.
+  */
+  static bool keepsRunningEpoch(
+      const deskflow::coordination::RoleDecision &decision, deskflow::coordination::Role runningRole,
+      const std::string &runningServer
+  )
+  {
+    return !decision.quit && !decision.restart && decision.role == runningRole &&
+           decision.serverAddress == runningServer;
+  }
 
 private:
   void epochLoop();
@@ -198,8 +218,8 @@ private:
   //! Consume the coordinator's pending decision while an app is running.
   /*!
   Returns true when the running app must be interrupted. When the latest
-  decision names the role/address already running, the decision is
-  dropped and the epoch continues (lock held by caller).
+  decision names the role/address already running (see keepsRunningEpoch),
+  the decision is dropped and the epoch continues (lock held by caller).
   */
   bool consumePendingDecisionLocked();
   //! Next decision for the loop: the one the timer consumed, else await.

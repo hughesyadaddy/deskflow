@@ -58,6 +58,8 @@ void CoordinatorFleetPublishTests::cleanupTestCase()
 
 void CoordinatorFleetPublishTests::armAsServer(Coordinator &coordinator, const std::string &selfName)
 {
+  // Election and running app agree (no epoch handoff in flight).
+  coordinator.setRunningRole(Role::Server);
   std::scoped_lock lock{coordinator.m_mutex};
   coordinator.m_fleetState.server = selfName;
   coordinator.m_election.becameServer();
@@ -65,6 +67,7 @@ void CoordinatorFleetPublishTests::armAsServer(Coordinator &coordinator, const s
 
 void CoordinatorFleetPublishTests::armAsClient(Coordinator &coordinator)
 {
+  coordinator.setRunningRole(Role::Client);
   std::scoped_lock lock{coordinator.m_mutex};
   coordinator.m_election.becameClient("10.0.0.5");
 }

@@ -70,8 +70,8 @@ EpochFlipGate::Config AutoModeRunner::gateConfigFromEnvironment()
     const long ms = std::strtol(raw, &end, 10);
     if (end != raw && *end == '\0' && ms >= 0) {
       config.minDwell = std::chrono::milliseconds(ms);
-      // Hysteresis ceiling scales with the base dwell (6x, i.e. 5 s -> 30 s).
-      config.maxDwell = std::chrono::milliseconds(ms * 6);
+      // Hysteresis ceiling scales with the base dwell (3x, i.e. 5 s -> 15 s).
+      config.maxDwell = std::chrono::milliseconds(ms * kMaxDwellMultiplier);
     } else {
       LOG_WARN("auto mode: ignoring invalid DESKFLOW_AUTO_DWELL_MS=\"%s\"", raw);
     }
@@ -239,7 +239,7 @@ bool AutoModeRunner::consumePendingDecisionLocked()
   // Non-blocking here: a decision (or quit) is pending and this thread is
   // the only consumer while an app runs (the loop is inside the app).
   RoleDecision decision = m_coordinator->awaitRoleDecision();
-  if (!decision.quit && decision.role == m_runningRole && decision.serverAddress == m_runningServer) {
+  if (keepsRunningEpoch(decision, m_runningRole, m_runningServer)) {
     LOG_INFO(
         "coordination: latest decision is the running %s epoch%s%s; keeping it (no rebuild, %d request(s) coalesced)",
         roleName(decision.role), m_runningServer.empty() ? "" : " towards ", m_runningServer.c_str(),
@@ -362,11 +362,17 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
     m_runningServer = serverAddress;
     m_gate.epochStarted(EpochFlipGate::Clock::now());
     m_appRunning = true;
-  }
-  // A decision can land in the gap before this epoch's loop starts;
-  // route it through the gate so it is never lost (and never hot-loops).
-  if (m_coordinator->hasPendingDecision()) {
-    onFlipRequested();
+    // Published before the app's loop starts, so the coordinator's relay
+    // reconciler and key forwarding follow the app that actually runs.
+    m_coordinator->setRunningRole(role);
+    // A decision can land in the gap before this epoch's loop starts. It
+    // was made while no epoch ran, so it was never rate-limited: consume
+    // it now rather than deferring a whole dwell (a same-role decision is
+    // still dropped by consumePendingDecisionLocked, so no hot loop).
+    if (m_coordinator->hasPendingDecision() && consumePendingDecisionLocked()) {
+      LOG_INFO("coordination: decision arrived while the %s epoch was being built; interrupting it", roleName(role));
+      m_events.addEvent(Event(EventTypes::Quit));
+    }
   }
 
   int result = s_exitFailed;
@@ -390,6 +396,7 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
     m_gate.epochEnded(EpochFlipGate::Clock::now());
     m_runningRole = Role::Init;
     m_runningServer.clear();
+    m_coordinator->setRunningRole(Role::Init);
   }
   m_gateCv.notify_all();
 

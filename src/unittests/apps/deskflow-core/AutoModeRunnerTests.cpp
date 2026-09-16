@@ -15,36 +15,28 @@
 #include <vector>
 
 using deskflow::coordination::Role;
+using deskflow::coordination::RoleDecision;
 using Action = EpochFlipGate::Action;
 using namespace std::chrono_literals;
 
 namespace {
 
-struct Decision
-{
-  Role role = Role::Init;
-  std::string server;
-  bool operator==(const Decision &other) const
-  {
-    return role == other.role && server == other.server;
-  }
-};
-
 //! Model of the AutoModeRunner epoch loop around a real EpochFlipGate.
 /*!
 The "coordinator" is a single overwritten decision slot (exactly what
 Coordinator::decide() does) and the "app factory" is a counter of
-constructed epochs. Time is a manual steady_clock so the tests can
-walk through the dwell window deterministically.
+constructed epochs. The keep-or-rebuild comparison is the production
+AutoModeRunner::keepsRunningEpoch. Time is a manual steady_clock so the
+tests can walk through the dwell window deterministically.
 */
 struct Harness
 {
   EpochFlipGate::TimePoint now{EpochFlipGate::Clock::duration{0}};
   EpochFlipGate gate;
-  std::optional<Decision> pending;  // Coordinator::m_decision + m_hasDecision
-  std::optional<Decision> consumed; // AutoModeRunner::m_consumedDecision
-  std::vector<Decision> built;      // fake app factory log
-  Decision running;
+  std::optional<RoleDecision> pending;  // Coordinator::m_decision + m_hasDecision
+  std::optional<RoleDecision> consumed; // AutoModeRunner::m_consumedDecision
+  std::vector<RoleDecision> built;      // fake app factory log
+  RoleDecision running;
   bool quitPosted = false;
 
   Harness() = default;
@@ -58,12 +50,18 @@ struct Harness
     return static_cast<int>(built.size());
   }
 
-  void startEpoch(Decision decision)
+  // AutoModeRunner::runEpoch() up to the app's event loop.
+  void startEpoch(RoleDecision decision)
   {
     built.push_back(decision);
     running = decision;
     quitPosted = false;
     gate.epochStarted(now);
+    // A decision that landed in the build gap interrupts at once.
+    if (pending && consume()) {
+      quitPosted = true;
+      endEpoch();
+    }
   }
 
   // AutoModeRunner::consumePendingDecisionLocked()
@@ -72,9 +70,9 @@ struct Harness
     if (!pending) {
       return false;
     }
-    Decision decision = *pending;
+    RoleDecision decision = *pending;
     pending.reset();
-    if (decision == running) {
+    if (AutoModeRunner::keepsRunningEpoch(decision, running.role, running.serverAddress)) {
       return false;
     }
     consumed = decision;
@@ -82,9 +80,9 @@ struct Harness
   }
 
   // Coordinator::decide() followed by AutoModeRunner::onFlipRequested()
-  Action requestFlip(Role role, std::string server = {})
+  Action requestFlip(Role role, std::string server = {}, bool restart = false)
   {
-    pending = Decision{role, std::move(server)};
+    pending = RoleDecision{role, std::move(server), false, restart};
     const Action action = gate.requestFlip(now);
     if (action == Action::InterruptNow && consume()) {
       quitPosted = true;
@@ -108,7 +106,7 @@ struct Harness
   {
     gate.epochEnded(now);
     if (consumed) {
-      Decision next = *consumed;
+      RoleDecision next = *consumed;
       consumed.reset();
       startEpoch(next);
       return;
@@ -145,7 +143,7 @@ void AutoModeRunnerTests::flipsWithinDwellProduceOneRebuild()
   h.advance(1ms);
   QCOMPARE(h.rebuilds(), 2); // one rebuild for the whole window
   QCOMPARE(h.running.role, Role::Client);
-  QCOMPARE(h.running.server, std::string("a"));
+  QCOMPARE(h.running.serverAddress, std::string("a"));
 }
 
 void AutoModeRunnerTests::latestRequestedRoleWins()
@@ -161,7 +159,7 @@ void AutoModeRunnerTests::latestRequestedRoleWins()
 
   h.advance(5s);
   QCOMPARE(h.rebuilds(), 2);
-  QCOMPARE(h.built.back().server, std::string("last"));
+  QCOMPARE(h.built.back().serverAddress, std::string("last"));
 }
 
 void AutoModeRunnerTests::flapBackToRunningRoleKeepsEpoch()
@@ -198,7 +196,13 @@ void AutoModeRunnerTests::flipAfterDwellInterruptsImmediately()
 
 void AutoModeRunnerTests::hysteresisDoublesDwellUnderChurn()
 {
-  Harness h(EpochFlipGate::Config{5000ms, 30000ms});
+  // The ceiling is 3x the base dwell: the election role and the running
+  // app disagree for the whole deferred window, so 15 s is the worst case
+  // a machine can be server-by-election while its ClientApp still runs.
+  QCOMPARE(EpochFlipGate::Config{}.maxDwell, 15000ms);
+  QCOMPARE(AutoModeRunner::kMaxDwellMultiplier, 3);
+
+  Harness h(EpochFlipGate::Config{5000ms, 15000ms});
   h.startEpoch({Role::Server, {}});
   QCOMPARE(h.gate.currentDwell(), 5000ms);
 
@@ -215,17 +219,18 @@ void AutoModeRunnerTests::hysteresisDoublesDwellUnderChurn()
   QCOMPARE(h.gate.deferredDeadline().value(), h.now + 4s);
   h.advance(4s);
   QCOMPARE(h.rebuilds(), 3);
-  QCOMPARE(h.gate.currentDwell(), 20000ms);
+  QCOMPARE(h.gate.currentDwell(), 15000ms); // 20 s capped to the ceiling
 
-  // Keeps doubling up to the ceiling, never beyond.
+  // Stays at the ceiling, never beyond.
   h.advance(1s);
-  h.requestFlip(Role::Client, "a");
-  h.advance(19s);
-  QCOMPARE(h.gate.currentDwell(), 30000ms);
+  QCOMPARE(h.requestFlip(Role::Client, "a"), Action::Deferred);
+  QCOMPARE(h.gate.deferredDeadline().value(), h.now + 14s);
+  h.advance(14s);
+  QCOMPARE(h.gate.currentDwell(), 15000ms);
   h.advance(1s);
   h.requestFlip(Role::Server);
-  h.advance(29s);
-  QCOMPARE(h.gate.currentDwell(), 30000ms);
+  h.advance(14s);
+  QCOMPARE(h.gate.currentDwell(), 15000ms);
   QCOMPARE(h.rebuilds(), 5);
 }
 
@@ -257,7 +262,8 @@ void AutoModeRunnerTests::failureBackoffUnchanged()
   // App died on its own (no decision): re-arm the same role immediately.
   h.endEpoch();
   QCOMPARE(h.rebuilds(), 2);
-  QCOMPARE(h.running, (Decision{Role::Client, "a"}));
+  QCOMPARE(h.running.role, Role::Client);
+  QCOMPARE(h.running.serverAddress, std::string("a"));
   QCOMPARE(h.gate.currentDwell(), 5000ms); // a failure is not churn
 
   // A decision arriving while no app runs is not gated.
@@ -281,6 +287,60 @@ void AutoModeRunnerTests::deferredIsDisarmedWhenEpochEnds()
   h.endEpoch();
   QVERIFY(!h.gate.deferredDeadline().has_value());
   QVERIFY(!h.gate.takeDeferredIfDue(h.now + 10s));
+}
+
+void AutoModeRunnerTests::restartDecisionForRunningRoleRebuilds()
+{
+  // The wedge detector re-decides Server while a Server epoch runs; the
+  // "same role, keep it" shortcut must not swallow that restart.
+  RoleDecision same{Role::Server, {}, false, false};
+  RoleDecision restart{Role::Server, {}, false, true};
+  QVERIFY(AutoModeRunner::keepsRunningEpoch(same, Role::Server, {}));
+  QVERIFY(!AutoModeRunner::keepsRunningEpoch(restart, Role::Server, {}));
+  QVERIFY(!AutoModeRunner::keepsRunningEpoch(RoleDecision{Role::Server, {}, true, false}, Role::Server, {}));
+
+  // After the dwell: interrupts and rebuilds the very same role at once.
+  Harness h;
+  h.startEpoch({Role::Server, {}});
+  h.advance(6s);
+  QCOMPARE(h.requestFlip(Role::Server, {}, true), Action::InterruptNow);
+  QCOMPARE(h.rebuilds(), 2);
+  QCOMPARE(h.running.role, Role::Server);
+
+  // Inside the dwell: deferred like any flip, then still rebuilt.
+  h.advance(1s);
+  QCOMPARE(h.requestFlip(Role::Server, {}, true), Action::Deferred);
+  h.advance(4s);
+  QCOMPARE(h.rebuilds(), 3);
+  QCOMPARE(h.running.role, Role::Server);
+
+  // A plain same-role decision against the restarted epoch is still kept.
+  h.advance(11s);
+  QCOMPARE(h.requestFlip(Role::Server), Action::InterruptNow);
+  QCOMPARE(h.rebuilds(), 3);
+}
+
+void AutoModeRunnerTests::decisionInBuildGapInterruptsImmediately()
+{
+  // A decision made while no epoch ran (between takeDecision() and the
+  // app's event loop) was never rate-limited: the fresh epoch yields to
+  // it at once instead of a full dwell later.
+  Harness h;
+  h.pending = RoleDecision{Role::Client, "a", false, false};
+  h.startEpoch({Role::Server, {}});
+  QCOMPARE(h.rebuilds(), 2);
+  QCOMPARE(h.running.role, Role::Client);
+  QCOMPARE(h.running.serverAddress, std::string("a"));
+  QVERIFY(!h.pending.has_value());
+  QVERIFY(!h.gate.deferredDeadline().has_value());
+  QCOMPARE(h.gate.currentDwell(), 5000ms); // not counted as churn
+
+  // The same role landing in the gap is dropped, never a hot loop.
+  h.pending = RoleDecision{Role::Client, "a", false, false};
+  h.endEpoch();
+  QCOMPARE(h.rebuilds(), 3);
+  QVERIFY(!h.pending.has_value());
+  QCOMPARE(h.running.role, Role::Client);
 }
 
 QTEST_MAIN(AutoModeRunnerTests)

@@ -14,11 +14,13 @@
 #include "base/Log.h"
 #include "coordination/CoordinationMesh.h"
 #include "coordination/Coordinator.h"
+#include "coordination/KeyboardRelayMonitor.h"
 #include "coordination/Peer.h"
 #include "deskflow/KeyTypes.h"
 
 #include <QTest>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -50,10 +52,15 @@ private Q_SLOTS:
   void outbox_backoffDoublesToCapAndTriesOneAddressPerWindow();
   void outbox_successResetsBackoffAndRemembersAddress();
   void outbox_forwardRefusesInBackoffWithoutQueuing();
+  void outbox_forwardInBackoffEnqueuesAtAttemptBoundary();
+  void outbox_reachableFailureResettlesOnRetry();
   void outbox_forwardUnknownReturnsWithinGrace();
+  void outbox_forwardTimeoutWithdrawsQueuedKey();
   void outbox_queueIsCapped();
   void heartbeat_doesNotBlockOnUnreachablePeers();
   void keyForward_returnsWithinGraceWhenPeerUnreachable();
+  void keyForward_followsRunningRoleNotElection();
+  void relayReconciler_followsRunningRoleNotElection();
   void mesh_handlerThreadsAreBounded();
 };
 
@@ -91,6 +98,41 @@ struct FakeTransport
     };
   }
 };
+
+//! Relay monitor double: records start/stop so the reconciler is observable.
+struct FakeKeyboardRelay : public deskflow::coordination::IKeyboardRelayMonitor
+{
+  std::atomic<int> starts{0};
+  std::atomic<bool> live{false};
+
+  bool start(RelayPassThroughQuery, KeyForwardSend) override
+  {
+    ++starts;
+    live = true;
+    return true;
+  }
+  void stop() override
+  {
+    live = false;
+  }
+  bool running() const override
+  {
+    return live;
+  }
+};
+
+//! Poll \p condition for up to \p timeoutMs (worker ticks are 1 s).
+template <typename Condition> bool waitFor(Condition condition, int timeoutMs)
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  while (!condition()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return true;
+}
 
 double elapsedMs(const std::chrono::steady_clock::time_point &since)
 {
@@ -239,10 +281,81 @@ void CoordinatorTests::outbox_forwardRefusesInBackoffWithoutQueuing()
   outbox.pump(clock.now);
   QCOMPARE(outbox.state(), PeerOutbox::State::Backoff);
 
+  // Inside the backoff window: refused, nothing queued.
+  clock.now = 0.5;
   const auto started = std::chrono::steady_clock::now();
   QVERIFY(!outbox.forward("key", 500));
   QVERIFY(elapsedMs(started) < 50.0);
   QVERIFY(outbox.idle()); // a refused key is never delivered late
+}
+
+void CoordinatorTests::outbox_forwardInBackoffEnqueuesAtAttemptBoundary()
+{
+  // A client posts nothing else on the server lane between version probes
+  // (15 s), so a key must be allowed to make the window's attempt itself;
+  // otherwise one transient failure keeps keys local until the next probe.
+  FakeClock clock;
+  FakeTransport transport;
+  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  outbox.post("a");
+  outbox.pump(clock.now);
+  QCOMPARE(outbox.state(), PeerOutbox::State::Backoff);
+  QCOMPARE(outbox.nextAttemptAt(), 1.0);
+
+  // Window open: still reported as not delivered (the key stays local),
+  // but the line is queued so the lane attempts now.
+  transport.okFor = [](const std::string &) { return true; };
+  clock.now = outbox.nextAttemptAt();
+  const auto started = std::chrono::steady_clock::now();
+  QVERIFY(!outbox.forward("key", 500));
+  QVERIFY(elapsedMs(started) < 50.0);
+  QVERIFY(!outbox.idle());
+
+  const size_t before = transport.hosts.size();
+  outbox.pump(clock.now);
+  QCOMPARE(transport.hosts.size(), before + 1);
+  QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
+  QVERIFY(outbox.idle());
+
+  // Re-settled: the next key is forwarded for real.
+  QVERIFY(outbox.forward("key2", 500));
+}
+
+void CoordinatorTests::outbox_reachableFailureResettlesOnRetry()
+{
+  FakeClock clock;
+  FakeTransport transport;
+  transport.okFor = [](const std::string &) { return true; };
+  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  outbox.post("a");
+  outbox.pump(clock.now);
+  QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
+
+  // Reachable -> transient failure with more lines queued behind it: the
+  // lane drops them (logged), enters the minimum backoff window and
+  // reports forwards as local for exactly that window.
+  transport.okFor = [](const std::string &) { return false; };
+  clock.now = 10.0;
+  outbox.post("b");
+  outbox.post("c");
+  outbox.post("d");
+  outbox.pump(clock.now);
+  QCOMPARE(outbox.state(), PeerOutbox::State::Backoff);
+  QCOMPARE(outbox.nextAttemptAt(), 11.0);
+  QVERIFY(outbox.idle());
+  clock.now = 10.5;
+  QVERIFY(!outbox.forward("key", 500));
+  QVERIFY(outbox.idle());
+
+  // Peer answers again: the boundary attempt re-settles Reachable and
+  // resets the schedule.
+  transport.okFor = [](const std::string &) { return true; };
+  clock.now = 11.0;
+  QVERIFY(!outbox.forward("key", 500));
+  outbox.pump(clock.now);
+  QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
+  QCOMPARE(outbox.nextAttemptAt(), 0.0);
+  QVERIFY(outbox.forward("key2", 500));
 }
 
 void CoordinatorTests::outbox_forwardUnknownReturnsWithinGrace()
@@ -257,7 +370,9 @@ void CoordinatorTests::outbox_forwardUnknownReturnsWithinGrace()
   outbox.start();
 
   // Unknown + slow peer: the hook gets an answer within the grace, not
-  // after the connect.
+  // after the connect. (The key's own connect is already in flight and
+  // cannot be recalled; see outbox_forwardTimeoutWithdrawsQueuedKey for
+  // the queued case.)
   auto started = std::chrono::steady_clock::now();
   QVERIFY(!outbox.forward("key", 20));
   QVERIFY(elapsedMs(started) < 150.0);
@@ -275,6 +390,31 @@ void CoordinatorTests::outbox_forwardUnknownReturnsWithinGrace()
   QVERIFY(quick.forward("key", 1000));
   QVERIFY(elapsedMs(started) < 50.0);
   quick.stop();
+}
+
+void CoordinatorTests::outbox_forwardTimeoutWithdrawsQueuedKey()
+{
+  // The hook handled the key locally when the grace ran out; delivering
+  // it later would type it twice. A key still waiting behind an in-flight
+  // line is withdrawn.
+  FakeClock clock;
+  FakeTransport slow;
+  slow.okFor = [](const std::string &) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    return true;
+  };
+  PeerOutbox outbox("10.0.0.5", "", slow.fn(), clock.fn());
+  outbox.start();
+
+  outbox.post("hello"); // picked up by the lane at once: in flight for 300 ms
+  QVERIFY(waitFor([&outbox] { return !outbox.idle(); }, 500));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  QVERIFY(!outbox.forward("key", 20)); // queued behind "hello", times out
+  QVERIFY(waitFor([&outbox] { return outbox.idle(); }, 2000));
+  QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
+  outbox.stop();
+  QCOMPARE(slow.hosts.size(), static_cast<size_t>(1)); // "hello" only
 }
 
 void CoordinatorTests::outbox_queueIsCapped()
@@ -342,6 +482,7 @@ void CoordinatorTests::keyForward_returnsWithinGraceWhenPeerUnreachable()
     coordinator.m_election.becameClient(kBlackholeA);
     coordinator.m_fleetState.cursorHost = "hackintosh";
   }
+  coordinator.setRunningRole(deskflow::coordination::Role::Client);
 
   // Inside the keyboard hook: unknown reachability resolves as "keep the
   // key local" within the grace, never after a 700 ms connect.
@@ -352,12 +493,96 @@ void CoordinatorTests::keyForward_returnsWithinGraceWhenPeerUnreachable()
   coordinator.stop();
 }
 
+void CoordinatorTests::keyForward_followsRunningRoleNotElection()
+{
+  using deskflow::coordination::Role;
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "test-token";
+  config.peers = deskflow::coordination::parsePeerList(std::string("hackintosh=") + kBlackholeA);
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  // Not started (no lane threads): whether the key reached the forwarding
+  // stage at all is observable through the first-forward log latch.
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_election.becameClient(kBlackholeA);
+    coordinator.m_fleetState.cursorHost = "hackintosh";
+  }
+
+  // Election says Client, but the ServerApp of the previous epoch is still
+  // running (dwell): Server::onKeyDown owns the keyboard, nothing forwards.
+  coordinator.setRunningRole(Role::Server);
+  QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+  QVERIFY(!coordinator.m_loggedKeyForward);
+  coordinator.setRunningRole(Role::Init);
+  QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+  QVERIFY(!coordinator.m_loggedKeyForward);
+
+  // Only a running ClientApp forwards (Unknown reachability + no lane:
+  // reported local, but the key went to the outbox).
+  coordinator.setRunningRole(Role::Client);
+  QVERIFY(!coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"));
+  QVERIFY(coordinator.m_loggedKeyForward);
+}
+
+void CoordinatorTests::relayReconciler_followsRunningRoleNotElection()
+{
+  using deskflow::coordination::Role;
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "test-token";
+  config.keyboardFollowCursor = true;
+  config.peers = deskflow::coordination::parsePeerList(std::string("hackintosh=") + kBlackholeA);
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  auto relay = std::make_unique<FakeKeyboardRelay>();
+  auto *relayPtr = relay.get();
+  coordinator.m_keyboardRelay = std::move(relay);
+  QVERIFY(coordinator.start());
+
+  // Election flipped to Client while the ServerApp still runs its dwell:
+  // the reconciler must NOT start a relay under a live ServerApp.
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_election.becameClient(kBlackholeA);
+  }
+  coordinator.setRunningRole(Role::Server);
+  QVERIFY(!waitFor([relayPtr] { return relayPtr->starts.load() > 0; }, 2500));
+  QCOMPARE(relayPtr->starts.load(), 0);
+
+  // The ClientApp epoch actually starts: the reconciler heals a missing
+  // relay within a tick.
+  coordinator.setRunningRole(Role::Client);
+  QVERIFY(waitFor([relayPtr] { return relayPtr->starts.load() > 0; }, 2500));
+  QVERIFY(relayPtr->running());
+
+  // Election promotes to Server while the ClientApp still runs: the relay
+  // stays (the ClientApp still needs it); it is stopped once a ServerApp
+  // is the running epoch.
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_election.becameServer();
+  }
+  QVERIFY(!waitFor([relayPtr] { return !relayPtr->running(); }, 2500));
+  coordinator.setRunningRole(Role::Server);
+  QVERIFY(waitFor([relayPtr] { return !relayPtr->running(); }, 2500));
+
+  coordinator.stop();
+}
+
 void CoordinatorTests::mesh_handlerThreadsAreBounded()
 {
   int received = 0;
-  CoordinationMesh mesh(0, "test-token", [&received](const Message &, const std::function<void(const std::string &)> &) {
-    ++received;
-  });
+  CoordinationMesh mesh(
+      0, "test-token", [&received](const Message &, const std::function<void(const std::string &)> &) { ++received; }
+  );
   QVERIFY(mesh.start());
 
   // Idle connections park inside handleClient until the read timeout; the
