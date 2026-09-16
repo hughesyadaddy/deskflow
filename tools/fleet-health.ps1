@@ -20,6 +20,9 @@
                   daemon (session 0, == service PID), one service-owned core and
                   one GUI in the console session, all from the install root,
                   no bridge, nothing from any other path.
+    bridge        the local Mouser bridge on 127.0.0.1:-BridgePort (19795) answers
+                  a {"t":"status"} line with attached:true and peer:"deskflow-core"
+                  (.NET TcpClient; 2 s connect + read timeout).
 
 .EXAMPLE
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\fleet-health.ps1 -Checks authenticode,session
@@ -33,7 +36,8 @@ param(
   [string[]]$InstallRoots = @("C:\Program Files\Deskflow", "C:\Program Files\Mouser"),
   [string]$ServiceName = "Deskflow",
   [string[]]$GuiProcesses = @("deskflow", "Mouser"),
-  [string]$Ctl = ""
+  [string]$Ctl = "",
+  [int]$BridgePort = 19795
 )
 
 Set-StrictMode -Version 2
@@ -174,6 +178,66 @@ function Test-Instances([string]$CtlPath) {
   New-Result "instances" "FAIL" $text
 }
 
+function Invoke-BridgeStatus([int]$P) {
+  # Sends {"t":"status"} to the local Mouser bridge and returns the first reply
+  # line, or "" when nothing is listening / nothing answers within 2 s.
+  $line = ""
+  try {
+    $client = New-Object System.Net.Sockets.TcpClient
+    $ar = $client.BeginConnect("127.0.0.1", $P, $null, $null)
+    if (-not ($ar.AsyncWaitHandle.WaitOne(2000, $false) -and $client.Connected)) {
+      $client.Close()
+      return ""
+    }
+    $client.EndConnect($ar)
+    $stream = $client.GetStream()
+    $stream.ReadTimeout = 2000
+    $stream.WriteTimeout = 2000
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("{`"t`":`"status`"}`n")
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush()
+    $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+    $line = $reader.ReadLine()
+    if ($null -eq $line) { $line = "" }
+    $client.Close()
+  } catch { $line = "" }
+  $line
+}
+
+function Test-BridgeReply([string]$Reply) {
+  # Returns @{ ok; detail } for one status line; mirrors parse_bridge_status in tools/fleet-health.
+  $text = ("" + $Reply).Trim()
+  if (-not $text) {
+    return @{ ok = $false; detail = "no reply from bridge (Mouser not listening or status unsupported)" }
+  }
+  try { $obj = $text | ConvertFrom-Json } catch { $obj = $null }
+  if ($null -eq $obj) {
+    return @{ ok = $false; detail = ("unparseable bridge reply: " + $text.Substring(0, [Math]::Min(120, $text.Length))) }
+  }
+  $problems = @()
+  $attached = if ($obj.PSObject.Properties["attached"]) { $obj.attached } else { $null }
+  $peer = if ($obj.PSObject.Properties["peer"]) { $obj.peer } else { $null }
+  if ($attached -isnot [bool] -or -not $attached) {
+    $problems += ("attached={0} (want true)" -f ($(if ($null -eq $attached) { "null" } else { "$attached".ToLowerInvariant() })))
+  }
+  if ($peer -ne "deskflow-core") {
+    $problems += ("peer={0} (want 'deskflow-core')" -f ($(if ($null -eq $peer) { "null" } else { "`"$peer`"" })))
+  }
+  if ($problems.Count -gt 0) {
+    return @{ ok = $false; detail = ($problems -join "; ") }
+  }
+  $extra = ""
+  foreach ($k in @("session", "proto", "ver")) {
+    if ($obj.PSObject.Properties[$k]) { $extra += (" {0}={1}" -f $k, $obj.$k) }
+  }
+  @{ ok = $true; detail = ("attached to deskflow-core" + $extra) }
+}
+
+function Test-Bridge([int]$P) {
+  $r = Test-BridgeReply (Invoke-BridgeStatus $P)
+  New-Result "bridge" ($(if ($r.ok) { "PASS" } else { "FAIL" })) $r.detail
+}
+
 function Test-Mesh([string[]]$PeerList, [int]$P) {
   $out = @()
   if ($PeerList.Count -eq 0) {
@@ -191,16 +255,18 @@ function Test-Mesh([string[]]$PeerList, [int]$P) {
 
 function Invoke-FleetHealth {
   param([string]$Checks, [string]$Thumbprint, [string]$Peers, [int]$Port,
-        [string[]]$InstallRoots, [string]$ServiceName, [string[]]$GuiProcesses, [string]$Ctl = "")
+        [string[]]$InstallRoots, [string]$ServiceName, [string[]]$GuiProcesses, [string]$Ctl = "",
+        [int]$BridgePort = 19795)
   $results = @()
   $wanted = @($Checks.Split(",") | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
-  if ($wanted -contains "all") { $wanted = @("authenticode", "session", "mesh", "instances") }
+  if ($wanted -contains "all") { $wanted = @("authenticode", "session", "mesh", "instances", "bridge") }
   foreach ($c in $wanted) {
     switch ($c) {
       "authenticode" { $results += Test-Authenticode (Resolve-Thumbprint $Thumbprint) $InstallRoots }
       "session"      { $results += Test-Session $ServiceName $GuiProcesses }
       "mesh"         { $results += Test-Mesh @($Peers.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }) $Port }
       "instances"    { $results += Test-Instances (Resolve-Ctl $Ctl) }
+      "bridge"       { $results += Test-Bridge $BridgePort }
       default        { $results += New-Result $c "SKIP" "macOS-only check" }
     }
   }
@@ -209,7 +275,7 @@ function Invoke-FleetHealth {
 
 if ($MyInvocation.InvocationName -ne ".") {
   $r = Invoke-FleetHealth -Checks $Checks -Thumbprint $Thumbprint -Peers $Peers -Port $Port `
-    -InstallRoots $InstallRoots -ServiceName $ServiceName -GuiProcesses $GuiProcesses -Ctl $Ctl
+    -InstallRoots $InstallRoots -ServiceName $ServiceName -GuiProcesses $GuiProcesses -Ctl $Ctl -BridgePort $BridgePort
   # Always emit a JSON *array*, even for a single result.
   $json = ConvertTo-Json -InputObject @($r) -Depth 3 -Compress
   if (-not $json.StartsWith("[")) { $json = "[" + $json + "]" }

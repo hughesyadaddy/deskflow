@@ -42,6 +42,8 @@ setup() {
   export SHIM_STATE="$TMP/state"
   export HOME="$TMP/home"
   export DESKFLOW_CTL_AGENT_DIR="$TMP/LaunchAgents"
+  export DESKFLOW_CTL_DAEMON_DIR="$TMP/LaunchDaemons"
+  export DESKFLOW_CTL_DAEMON_STAGE_DIR="$TMP/stage"
   mkdir -p "$SHIMS" "$BUILD" "$TMP/Applications" "$SHIM_STATE" "$HOME"
   : >"$SHIM_LOG"
   # Presence of cmake_install.cmake selects the staged `cmake --install` path.
@@ -60,6 +62,9 @@ if [[ "${1:-}" == "--install" ]]; then
   chmod +x "$prefix/Deskflow.app/Contents/MacOS/deskflow-core"
   # CMake bundles the login-bridge installer as a Resource before signing.
   [[ -n "${SHIM_OMIT_BRIDGE:-}" ]] || : > "$prefix/Deskflow.app/Contents/Resources/install-login-bridge-macos.sh"
+  # deskflow-prio ships in the bundle (root LaunchDaemon, installed by deskflow-ctl prio).
+  : > "$prefix/Deskflow.app/Contents/MacOS/deskflow-prio"
+  chmod +x "$prefix/Deskflow.app/Contents/MacOS/deskflow-prio"
 fi
 exit 0
 EOF
@@ -218,6 +223,33 @@ log_lacks() {
   [ "$status" -eq 0 ]
   log_lacks "launchctl bootstrap"
   log_has "launchctl print"
+}
+
+@test "the deskflow-prio LaunchDaemon is rendered and its root install printed as a human step (never sudo/osascript here)" {
+  PRIO=io.github.hughesyadaddy.deskflow-prio
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  staged="$DESKFLOW_CTL_DAEMON_STAGE_DIR/$PRIO.plist"
+  [ -f "$staged" ]
+  grep -q "<string>$APP/Contents/MacOS/deskflow-prio</string>" "$staged"
+  grep -q "<string>$PRIO</string>" "$staged"
+  [[ "$output" == *"sudo install -m 644 -o root -g wheel \"$staged\" \"$DESKFLOW_CTL_DAEMON_DIR/$PRIO.plist\""* ]]
+  [[ "$output" == *"sudo chown root:wheel $APP/Contents/MacOS/deskflow-prio"* ]]
+  [[ "$output" == *"sudo launchctl bootstrap system \"$DESKFLOW_CTL_DAEMON_DIR/$PRIO.plist\""* ]]
+  log_has "launchctl print system/$PRIO"
+  log_lacks "launchctl bootstrap system"
+  log_lacks "osascript"
+  # The script itself never escalates.
+  run grep -En '^[^#]*\bsudo\b' "$SCRIPT"
+  [ "$status" -ne 0 ]
+
+  # --no-restart still surfaces the step so the operator sees it after a deploy.
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" --no-restart
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"deskflow-ctl prio"* ]]
+  [[ "$output" == *"sudo launchctl bootstrap system"* ]]
+  log_lacks "launchctl bootstrap"
 }
 
 @test "every remaining '|| true' is tagged fleet:allow" {

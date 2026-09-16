@@ -259,6 +259,12 @@ std::string SingleInstanceLock::lastMessage()
   return t_lastMessage;
 }
 
+// Lock names are per role on every scope, including Machine. A Machine lock
+// therefore serializes same-role instances across users/sessions (core vs
+// core: root LoginWindow core vs user core) and nothing else: Core and
+// VhidBridge never contend, so the bridge is not excluded by this lock. On
+// macOS bridge-vs-core exclusion is provided by launchd tearing down the
+// LoginWindow session at login plus the bridge's release_all() on exit.
 std::string SingleInstanceLock::lockName(Role role, Scope scope)
 {
 #if defined(_WIN32)

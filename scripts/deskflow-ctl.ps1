@@ -43,6 +43,11 @@ param(
   [switch]$NoGui,
   [switch]$NoSign,
   [int]$StopTimeoutSec = 25,
+  # How long to let the SCM report StopPending before taskkilling the daemon.
+  # The daemon's STOP_PENDING waitHint is 30 s because its watchdog stop can
+  # legitimately take 25 s (20 s core shutdown + 5 s thread join); polling for
+  # less than that killed a daemon that was still tearing down cleanly.
+  [int]$ServiceStopTimeoutSec = 30,
   [int]$StartTimeoutSec = 15
 )
 
@@ -166,7 +171,10 @@ function Stop-Deskflow {
     if ($svc.State -ne 'Stopped') {
       Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
     }
-    $deadline = (Get-Date).AddSeconds(10)
+    # Poll at least as long as the watchdog stop can take (25 s; the daemon's
+    # STOP_PENDING waitHint is 30 s). Never taskkill before that elapses.
+    $pollSec = [Math]::Max($ServiceStopTimeoutSec, 25)
+    $deadline = (Get-Date).AddSeconds($pollSec)
     while ((Get-Date) -lt $deadline) {
       $s = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
       if (-not $s -or $s.Status -eq 'Stopped') { break }
@@ -174,7 +182,7 @@ function Stop-Deskflow {
     }
     $svc = Get-DeskflowService
     if ($svc -and $svc.ProcessId -gt 0) {
-      Write-Host "  service did not stop cleanly; taskkill /F /T /PID $($svc.ProcessId)"
+      Write-Host "  service did not stop within ${pollSec}s; taskkill /F /T /PID $($svc.ProcessId)"
       Invoke-TaskKillPid -ProcessId $svc.ProcessId
     }
   }

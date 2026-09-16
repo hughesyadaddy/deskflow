@@ -96,8 +96,31 @@ Describe 'Stop-Deskflow' {
     }
     Mock Get-Service { [pscustomobject]@{ Name = 'Deskflow'; Status = 'StopPending' } }
 
-    # (the 10 s SCM poll runs against the wall clock here; Start-Sleep is mocked)
+    # NOTE: the SCM StopPending poll is now >= 25 s of wall clock (the daemon's
+    # STOP_PENDING waitHint is 30 s because its watchdog stop can take 25 s), and
+    # Stop-Deskflow clamps $ServiceStopTimeoutSec to that floor. Start-Sleep is
+    # mocked, so this case busy-spins ~25 s on Get-Date; mock Get-Date with a
+    # fake clock if that is too slow on tiny11.
     Stop-Deskflow -RootDir $script:Root
+    $script:Killed | Should -Contain 1000
+  }
+
+  It 'never polls the SCM for less than 25 s before taskkilling, even when asked to' {
+    # The floor exists because deskflow-daemon's watchdog stop takes up to 25 s
+    # (20 s core shutdown + 5 s thread join); killing earlier interrupts a clean teardown.
+    $script:Table.Add((New-Proc 'deskflow-daemon.exe' 1000 4 0 "$script:Root\deskflow-daemon.exe"))
+    Mock Get-CimInstance {
+      if ($ClassName -eq 'Win32_Service') { return (New-Svc 'StopPending' 1000) }
+      if ($Filter -like "Name LIKE 'deskflow%'") { return @($script:Table.ToArray()) }
+      return @()
+    }
+    $script:Polls = 0
+    Mock Get-Service { $script:Polls++; [pscustomobject]@{ Name = 'Deskflow'; Status = 'StopPending' } }
+    $ServiceStopTimeoutSec = 1
+    $started = Get-Date
+    Stop-Deskflow -RootDir $script:Root
+    ((Get-Date) - $started).TotalSeconds | Should -BeGreaterOrEqual 24
+    $script:Polls | Should -BeGreaterThan 1
     $script:Killed | Should -Contain 1000
   }
 

@@ -94,6 +94,9 @@ public:
   }
 
   QString helloReply = QStringLiteral(R"({"ok":true,"proto":2,"caps":["focus","hidr"]})");
+  //! When set, answers v1 hellos ("type":"hello", no "proto") with this instead of helloReply,
+  //! so one fake can play an OLD Mouser: proto-2 hello rejected, v1 hello accepted.
+  QString legacyHelloReply;
   bool answerPings = true;
 
 private:
@@ -103,7 +106,9 @@ private:
       const QString line = QString::fromUtf8(socket->readLine()).trimmed();
       m_lines.emplace_back(index, line);
       if (line.contains(QStringLiteral("\"hello\""))) {
-        socket->write((helloReply + QStringLiteral("\n")).toUtf8());
+        const bool v1 = !line.contains(QStringLiteral("\"proto\""));
+        const auto &reply = (v1 && !legacyHelloReply.isEmpty()) ? legacyHelloReply : helloReply;
+        socket->write((reply + QStringLiteral("\n")).toUtf8());
       } else if (answerPings && line.contains(QStringLiteral("\"ping\""))) {
         socket->write("{\"t\":\"pong\"}\n");
       }
@@ -531,6 +536,40 @@ void MouserLinkTests::legacyConnectorTranslatesFocus()
   QCOMPARE(oldMouser.count(QStringLiteral("\"t\":\"focus\"")), 0);
 
   link.stop();
+
+  // Token file PRESENT but the listener is an old Mouser: its RemoteDeviceServer
+  // answers the proto-2 hello with {"ok":false,"error":"unauthorized"} (no
+  // "reason"). That must not be a Hello::Failed backoff forever: the link runs
+  // the v1 connector for the cycle and connects.
+  writeToken(tokenFile, "lego-secret");
+  FakeMouser stubbornOldMouser;
+  stubbornOldMouser.helloReply = QStringLiteral(R"({"ok":false,"error":"unauthorized"})");
+  stubbornOldMouser.legacyHelloReply = QStringLiteral(R"({"ok":true})");
+  auto fallbackOptions = fastOptions(stubbornOldMouser.port(), tokenFile);
+  fallbackOptions.legacyEnabled = true;
+  fallbackOptions.legacyClientEnabled = true;
+  fallbackOptions.legacyClientPort = stubbornOldMouser.port();
+  fallbackOptions.legacyClientToken = "old-secret";
+  MouserLink fallback(fallbackOptions);
+  fallback.setRole(MouserLink::Role::Client);
+  fallback.start();
+
+  QTRY_VERIFY_WITH_TIMEOUT(fallback.connected(), kWait);
+  QCOMPARE(fallback.mode(), MouserLink::Mode::Legacy);
+  // Connection 0 carried the rejected proto-2 hello (lego token), connection 1 the accepted v1 hello.
+  QCOMPARE(stubbornOldMouser.connections(), 2);
+  QCOMPARE(stubbornOldMouser.first(QStringLiteral("\"hello\""), 0)[QStringLiteral("proto")].toInt(), 2);
+  QCOMPARE(
+      stubbornOldMouser.first(QStringLiteral("\"hello\""), 0)[QStringLiteral("token")].toString(),
+      QStringLiteral("lego-secret")
+  );
+  const auto v1 = stubbornOldMouser.first(QStringLiteral("\"hello\""), 1);
+  QCOMPARE(v1[QStringLiteral("version")].toInt(), 1);
+  QCOMPARE(v1[QStringLiteral("token")].toString(), QStringLiteral("old-secret"));
+  QCOMPARE(fallback.stats().authRejections.load(), 0);
+  QCOMPARE(fallback.stats().protoMismatches.load(), 0);
+
+  fallback.stop();
 }
 
 QTEST_MAIN(MouserLinkTests)

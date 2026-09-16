@@ -13,6 +13,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QSettings>
 #include <QSignalSpy>
 
 using namespace deskflow::gui;
@@ -175,6 +176,23 @@ void CoreProcessTests::duplicate_exit_stops_without_retry()
   QTest::qWait(1200);
   QCOMPARE(core.spawnCount, 1);
   QCOMPARE(core.processState(), ProcessState::Stopped);
+
+  // Exit 5 while our own launchd agent is loaded means the agent won the race: attach to it
+  // via IPC (externally supervised) instead of reporting Stopped for a core that is running.
+  FakeCoreProcess attached(config);
+  attached.start(ProcessMode::Desktop);
+  QCOMPARE(attached.spawnCount, 1);
+  QVERIFY(!attached.isExternallySupervised());
+  attached.supervised = true; // the agent came up between the probe and the spawn
+  attached.finish(5, QProcess::NormalExit);
+  QCOMPARE(attached.processState(), ProcessState::Started);
+  QVERIFY(attached.isExternallySupervised());
+  QCOMPARE(attached.spawnCount, 1);
+  flushDeferredDeletes();
+  QCOMPARE(attached.processObjects(), 0);
+  QCOMPARE(attached.pendingRetryDelayMs(), -1);
+  attached.stop();
+  QCOMPARE(attached.processState(), ProcessState::Stopped);
 }
 
 void CoreProcessTests::normal_exit_while_started_retries_after_base_delay()
@@ -240,13 +258,27 @@ void CoreProcessTests::windows_service_forces_service_mode()
   FakeCoreProcess core(config);
   core.windowsService = true;
 
+  Settings::setValue(Settings::Core::ProcessMode, ProcessMode::Desktop);
+  Settings::save(false);
+
   core.start(ProcessMode::Desktop);
   // Service mode: nothing spawned, the daemon is asked instead (we stay Starting until it answers).
   QCOMPARE(core.spawnCount, 0);
   QCOMPARE(core.processObjects(), 0);
   QCOMPARE(core.processState(), ProcessState::Starting);
+
+  // The forced mode must be persisted to the settings file the daemon is handed, otherwise
+  // the daemon reads Desktop, refuses to spawn, and the GUI shows Started with no core.
+  QCOMPARE(Settings::value(Settings::Core::ProcessMode).value<ProcessMode>(), ProcessMode::Service);
+  {
+    QSettings onDisk(m_settingsFile, QSettings::IniFormat);
+    QCOMPARE(onDisk.value(Settings::Core::ProcessMode).toInt(), static_cast<int>(ProcessMode::Service));
+  }
+
   core.stop(ProcessMode::Service);
   QCOMPARE(core.processState(), ProcessState::Stopped);
+  Settings::setValue(Settings::Core::ProcessMode, ProcessMode::Desktop);
+  Settings::save(false);
 }
 
 void CoreProcessTests::externally_supervised_core_attaches_via_ipc_and_kickstarts_on_restart()

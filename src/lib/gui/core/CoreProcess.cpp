@@ -210,11 +210,22 @@ void CoreProcess::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatu
   releaseProcess();
 
   // Another core already owns this machine (a launchd agent, the service's core, or a
-  // second GUI). Never stop or kill it and never retry: retrying would just re-collide,
-  // and stopping it via IPC makes its supervisor respawn it, which ping-pongs forever.
+  // second GUI).
   if (exitCode == s_exitDuplicate && exitStatus == QProcess::NormalExit) {
-    qWarning("another core owns this machine (exit code %d), leaving it running and not retrying", exitCode);
     m_consecutiveCrashes = 0;
+    // The owner may be our own launchd agent that came up between the probe in start()
+    // and the spawn (or that the installer just loaded). Attach to it via IPC rather
+    // than showing Stopped for a core that is actually running. start() re-probes and
+    // takes the externally-supervised path, so nothing is spawned again.
+    if (wasStarted && probeExternalSupervisor()) {
+      qInfo("another core owns this machine (exit code %d) and the launchd agent is loaded, attaching", exitCode);
+      setProcessState(Stopped);
+      start();
+      return;
+    }
+    // Never stop or kill the other core and never retry: retrying would just re-collide,
+    // and stopping it via IPC makes its supervisor respawn it, which ping-pongs forever.
+    qWarning("another core owns this machine (exit code %d), leaving it running and not retrying", exitCode);
     setProcessState(Stopped);
     return;
   }
@@ -507,6 +518,13 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
       m_serviceModeForcedLogged = true;
     }
     processMode = ProcessMode::Service;
+    // The daemon re-reads the on-disk settings file we hand it (startProcessFromDaemon); if
+    // that still says Desktop, its boot-time guard refuses to spawn and the GUI reports
+    // Started with no core anywhere. Persist the forced mode before sending the start.
+    if (currentMode != ProcessMode::Service) {
+      Settings::setValue(Settings::Core::ProcessMode, ProcessMode::Service);
+      Settings::save(false); // sync only; no serverSettingsChanged cascade mid-start
+    }
   }
 
   // Probed once per start(): an externally supervised core (launchd) is attached to via IPC only.

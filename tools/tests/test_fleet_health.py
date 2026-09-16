@@ -67,6 +67,9 @@ CTL_FAIL = ("deskflow-ctl assert-single: FAIL\n"
             "  deskflow-core count=2 (want 1)\n"
             "  non-canonical process pid=777 /tmp/build/bin/deskflow-core\n")
 
+# Mouser's reply to {"t":"status"} on 127.0.0.1:19795 when deskflow-core is attached.
+BRIDGE_OK = '{"t":"status","attached":true,"peer":"deskflow-core","session":"a1b2","proto":2}'
+
 # Fixture JSON as emitted by tools/fleet-health.ps1 for --check instances.
 WIN_INSTANCES_PASS = [{"check": "instances", "status": "PASS",
                        "detail": "deskflow-ctl assert-single: OK (daemon=1 session 0 pid 1000; core=1 child of service in session 1; gui=1; bridge=0)"}]
@@ -110,6 +113,7 @@ def mac_ok_table(hid="macbookpro", peers=()):
                                     "\t\tio.github.hughesyadaddy.deskflow-core\n\t}\n}", ""),
         (hid, fh.deskflow_gui_running_cmd()): (0, "4242\n", ""),
         (hid, fh.ctl_assert_single_cmd()): (0, CTL_OK + "\n", ""),
+        (hid, fh.bridge_status_cmd()): (0, BRIDGE_OK + "\n", ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, 24800))] = (0, "", "")
@@ -442,6 +446,88 @@ def test_scan_includes_deskflow_prio_and_flags_it_when_adhoc():
     assert by["identifiers"].status == "FAIL" and "deskflow-prio=dfprio" in by["identifiers"].detail
 
 
+# ---------------------------------------------------------------- bridge
+
+
+def test_bridge_cmd_targets_loopback_lego_port_with_nc_timeout():
+    cmd = fh.bridge_status_cmd()
+    assert "bridge" in fh.ALL_CHECKS
+    assert "nc -w2 127.0.0.1 19795" in cmd
+    assert '{"t":"status"}' in cmd.replace("\\n", "")
+    assert fh.BRIDGE_PORT == 19795 and fh.BRIDGE_PEER == "deskflow-core"
+
+
+def test_parse_bridge_status():
+    ok, detail = fh.parse_bridge_status(BRIDGE_OK)
+    assert ok and "attached to deskflow-core" in detail and "session=a1b2" in detail
+    ok, detail = fh.parse_bridge_status("")
+    assert not ok and "no reply" in detail
+    ok, detail = fh.parse_bridge_status("garbage\n")
+    assert not ok and "unparseable" in detail
+    ok, detail = fh.parse_bridge_status('{"attached":false,"peer":"deskflow-core"}')
+    assert not ok and "attached=false" in detail
+    ok, detail = fh.parse_bridge_status('{"attached":true,"peer":"mouser-gui"}')
+    assert not ok and 'peer="mouser-gui"' in detail
+    ok, detail = fh.parse_bridge_status('{"attached":true}')
+    assert not ok and "peer=null" in detail
+    # Only the first JSON object line counts; a noisy banner before it is ignored.
+    ok, _ = fh.parse_bridge_status("hello\n" + BRIDGE_OK + "\n")
+    assert ok
+
+
+def test_bridge_mac_pass_and_fail():
+    results, runner = run_checks([mac()], mac_ok_table(), ["bridge"])
+    assert [r.check for r in results] == ["bridge"]
+    assert results[0].status == "PASS" and "deskflow-core" in results[0].detail
+    assert ("macbookpro", fh.bridge_status_cmd()) in runner.calls
+
+    # Mouser up but the core never attached (legacy/off mode): FAIL, named.
+    t = mac_ok_table()
+    t[("macbookpro", fh.bridge_status_cmd())] = (0, '{"t":"status","attached":false,"peer":null}\n', "")
+    results, _ = run_checks([mac()], t, ["bridge"])
+    assert results[0].status == "FAIL" and "attached=false" in results[0].detail
+
+    # Nothing listening on 19795: nc exits 1 with no output.
+    t[("macbookpro", fh.bridge_status_cmd())] = (1, "", "")
+    results, _ = run_checks([mac()], t, ["bridge"])
+    assert results[0].status == "FAIL" and "19795" in results[0].detail
+
+    # Wrong peer attached (e.g. a stray build from another path).
+    t[("macbookpro", fh.bridge_status_cmd())] = (0, '{"attached":true,"peer":"deskflow-core-dev"}\n', "")
+    results, _ = run_checks([mac()], t, ["bridge"])
+    assert results[0].status == "FAIL" and "deskflow-core-dev" in results[0].detail
+
+
+def test_bridge_windows_via_ps1_fixture_json():
+    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["bridge"], "", 24800, [])
+    assert "-Checks bridge" in cmd
+    t = {("tiny11", cmd): (0, json.dumps([{"check": "bridge", "status": "PASS",
+                                            "detail": "attached to deskflow-core session=a1b2 proto=2"}]), "")}
+    results, _ = run_checks([win()], t, ["bridge"])
+    assert results[0].status == "PASS" and "deskflow-core" in results[0].detail
+    t = {("tiny11", cmd): (1, json.dumps([{"check": "bridge", "status": "FAIL",
+                                            "detail": "attached=false (want true); peer=null (want 'deskflow-core')"}]), "")}
+    results, _ = run_checks([win()], t, ["bridge"])
+    assert results[0].status == "FAIL" and "attached=false" in results[0].detail
+
+
+def test_bridge_is_included_in_all(tmp_path, capsys):
+    env_file = write_env(tmp_path)
+    runner = FakeRunner(mac_ok_table())
+    rc = fh.main(["--json", "--env", str(env_file)], runner=runner)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert [r for r in out["results"] if r["check"] == "bridge"][0]["status"] == "PASS"
+    assert ("macbookpro", fh.bridge_status_cmd()) in runner.calls
+
+
+def test_bridge_ps1_collector_declares_the_check():
+    ps1 = (Path(fh.__file__).parent / "fleet-health.ps1").read_text()
+    assert '"bridge"       { $results += Test-Bridge $BridgePort }' in ps1
+    assert "System.Net.Sockets.TcpClient" in ps1
+    assert '"instances", "bridge")' in ps1  # part of "all"
+
+
 # ------------------------------------------------------------------ mesh
 
 
@@ -555,7 +641,7 @@ def test_main_all_checks_single_mac_host(tmp_path, capsys):
     rc = fh.main(["--env", str(env_file)], runner=FakeRunner(mac_ok_table()))
     text = capsys.readouterr().out
     assert rc == 0
-    for check in ("sign", "no-adhoc", "identifiers", "tcc", "session", "mesh", "instances"):
+    for check in ("sign", "no-adhoc", "identifiers", "tcc", "session", "mesh", "instances", "bridge"):
         assert f"| {check}" in text
     assert "authenticode" not in text  # windows-only, not shown for a mac unless explicit
 

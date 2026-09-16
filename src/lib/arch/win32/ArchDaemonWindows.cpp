@@ -356,7 +356,11 @@ void ArchDaemonWindows::serviceHandler(DWORD ctrl)
   case SERVICE_CONTROL_STOP:
   case SERVICE_CONTROL_SHUTDOWN:
     m_serviceState = SERVICE_STOP_PENDING;
-    setStatus(m_serviceState, 0, 5000);
+    // The watchdog's stop path waits kMaxShutdownSeconds (20 s) for the core plus 5 s
+    // for its own thread before it gives up, so a 5 s hint made the SCM declare the
+    // service hung and deskflow-ctl.ps1 taskkill a daemon that was still tearing
+    // down cleanly. 30 s covers the full 25 s worst case with slack.
+    setStatus(m_serviceState, 0, 30000);
     PostThreadMessage(m_daemonThreadID, m_quitMessage, 0, 0);
     ARCH->broadcastCondVar(m_serviceCondVar);
     while (isRunState(m_serviceState)) {

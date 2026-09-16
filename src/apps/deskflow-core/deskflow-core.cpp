@@ -146,9 +146,15 @@ int main(int argc, char **argv)
   // Two locks, both held for the life of the process (the kernel releases
   // them on death, so a crash never leaves a stale guard):
   //   Session -- one core per logged-in user.
-  //   Machine -- one core per host, so a LoginWindow/root core and a
-  //              user-session core cannot both grab the input hooks. The
-  //              machine lock waits briefly so a bridge handoff can drain.
+  //   Machine -- one core per host across users/sessions, so a root or
+  //              other-user core and this user's core cannot both grab the
+  //              input hooks. Lock files are named per role, so this only
+  //              serializes core-vs-core; it does NOT exclude the LoginWindow
+  //              vhid-bridge (it holds "vhid-bridge.*", a different name).
+  //              Bridge exclusion comes from launchd tearing down the
+  //              LoginWindow session at login and the bridge's release_all()
+  //              on exit. The 3 s wait only covers a previous core (e.g. the
+  //              one kickstart -k just killed) still dropping its lock.
   std::optional<deskflow::SingleInstanceLock> sessionLock;
   std::optional<deskflow::SingleInstanceLock> machineLock;
   if (parser.singleInstanceOnly()) {

@@ -34,6 +34,12 @@ built bundle to /Applications/Deskflow.app (or DESKFLOW_INSTALL_APP), clears
 quarantine, verifies codesign (fatal on failure), and starts it again through
 scripts/deskflow-ctl (launchctl bootstrap). --no-restart leaves it stopped.
 
+The deskflow-prio LaunchDaemon (system/io.github.hughesyadaddy.deskflow-prio,
+root: task_for_pid) is rendered by `deskflow-ctl prio`; this script never
+escalates privileges, so when the daemon is missing or stale the exact
+admin commands (install plist to /Library/LaunchDaemons, chown the binary,
+launchctl bootstrap system) are printed as a human step.
+
 Requires a prior Release build (build/bin/Deskflow.app or cmake --install).
 EOF
 }
@@ -58,7 +64,13 @@ quit_deskflow() {
 }
 
 start_deskflow() {
-  [[ "$RESTART" -eq 1 ]] || return 0
+  if [[ "$RESTART" -ne 1 ]]; then
+    # `deskflow-ctl start` also handles the prio LaunchDaemon; with
+    # --no-restart still surface it so the operator sees the root step.
+    echo "== Deskflow left stopped; deskflow-prio LaunchDaemon (deskflow-ctl prio) =="
+    DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" prio
+    return 0
+  fi
   echo "== Starting Deskflow (deskflow-ctl start) =="
   DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" start
 }

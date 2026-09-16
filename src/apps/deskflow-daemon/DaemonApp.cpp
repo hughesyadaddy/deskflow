@@ -77,18 +77,11 @@ void DaemonApp::applyWatchdogCommand() const
 
   QSettings config(m_configFile, QSettings::IniFormat);
 
-  // Desktop process mode means the GUI owns the core process. Spawning one
-  // here too (this path also runs unconditionally at boot from the persisted
-  // daemon/configFile) put two cores on the machine: the second exits 5 and
-  // the watchdog then backs off and relaunches forever.
-  const auto processMode = config.value(Settings::Core::ProcessMode, Settings::ProcessMode::Service).toInt();
-  if (processMode == Settings::ProcessMode::Desktop) {
-    LOG_INFO(
-        "config %s uses desktop process mode (GUI-owned core); daemon will not spawn a core", qPrintable(m_configFile)
-    );
-    return;
-  }
-
+  // An explicit IPC start from the GUI is authoritative: the GUI has already decided the
+  // daemon owns the core (it forces Service mode whenever the service is installed), so
+  // the on-disk core/processMode is not consulted here. The Desktop-mode guard lives in
+  // run(), on the unattended boot-time re-apply of the persisted daemon/configFile,
+  // which is the only path where spawning would race a GUI-owned core.
   const auto coreMode = config.value(Settings::Core::CoreMode).toInt();
 
   QString modeArg;
@@ -209,7 +202,26 @@ void DaemonApp::run(QThread &daemonThread)
       !persistedConfig.isEmpty()) {
     LOG_DEBUG("using last known config file: %s", persistedConfig.toUtf8().constData());
     m_configFile = persistedConfig;
-    applyWatchdogCommand();
+
+    // Boot-time re-apply only: Desktop process mode means the GUI owns the core.
+    // Spawning one here too put two cores on the machine: the second exits 5 and
+    // the watchdog then backs off and relaunches forever. An explicit IPC start
+    // (applyWatchdogCommand via startProcessRequested) is authoritative and skips this.
+    // Remote paths are not opened here (SMB auth leak, see applyWatchdogCommand which rejects them).
+    const auto isRemote =
+        persistedConfig.startsWith(QStringLiteral("\\\\")) || persistedConfig.startsWith(QStringLiteral("//"));
+    const auto bootMode = isRemote ? static_cast<int>(Settings::ProcessMode::Service)
+                                   : QSettings(persistedConfig, QSettings::IniFormat)
+                                         .value(Settings::Core::ProcessMode, Settings::ProcessMode::Service)
+                                         .toInt();
+    if (bootMode == Settings::ProcessMode::Desktop) {
+      LOG_INFO(
+          "config %s uses desktop process mode (GUI-owned core); daemon will not auto-spawn a core at boot",
+          persistedConfig.toUtf8().constData()
+      );
+    } else {
+      applyWatchdogCommand();
+    }
   }
 #endif
 

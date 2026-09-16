@@ -9,16 +9,24 @@
 #                                       launchd) and exactly one GUI run from the
 #                                       canonical bundle, and nothing runs from
 #                                       any other path
+#   scripts/deskflow-ctl prio           render the deskflow-prio LaunchDaemon plist;
+#                                       install+bootstrap it when root, otherwise
+#                                       print the exact sudo commands (also run by
+#                                       `start`)
 #
 # launchd is the only owner of deskflow-core and the GUI:
 #   gui/$UID/io.github.hughesyadaddy.deskflow-core   deskflow-core auto (KeepAlive on crash)
 #   gui/$UID/io.github.hughesyadaddy.deskflow        Deskflow GUI (RunAtLoad)
+#   system/io.github.hughesyadaddy.deskflow-prio     deskflow-prio (root LaunchDaemon,
+#                                                    task_for_pid needs root)
 # The login-window bridge (/Library/LaunchAgents/org.deskflow.vhid-bridge.plist)
 # is untouched. Mouser is never touched: it is an independent agent with its
 # own installer.
 #
 # Env: DESKFLOW_INSTALL_APP (default /Applications/Deskflow.app),
-#      DESKFLOW_CTL_STOP_TIMEOUT / DESKFLOW_CTL_START_TIMEOUT (seconds).
+#      DESKFLOW_CTL_STOP_TIMEOUT / DESKFLOW_CTL_START_TIMEOUT (seconds),
+#      DESKFLOW_CTL_DAEMON_DIR (default /Library/LaunchDaemons),
+#      DESKFLOW_CTL_DAEMON_STAGE_DIR (default ~/Library/Deskflow/launchd).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,7 +34,13 @@ APP="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
 APP="${APP%/}"
 CORE_LABEL="io.github.hughesyadaddy.deskflow-core"
 GUI_LABEL="io.github.hughesyadaddy.deskflow"
+PRIO_LABEL="io.github.hughesyadaddy.deskflow-prio"
 AGENT_DIR="${DESKFLOW_CTL_AGENT_DIR:-$HOME/Library/LaunchAgents}"
+DAEMON_DIR="${DESKFLOW_CTL_DAEMON_DIR:-/Library/LaunchDaemons}"
+# Staged (rendered) daemon plist. NOT under ~/Library/LaunchAgents: launchd
+# would load it as a user agent at login and deskflow-prio would fail
+# task_for_pid every 30 s.
+DAEMON_STAGE_DIR="${DESKFLOW_CTL_DAEMON_STAGE_DIR:-$HOME/Library/Deskflow/launchd}"
 LOG_DIR="$HOME/Library/Logs/Deskflow"
 TEMPLATE_DIR="$ROOT/tools/launchd"
 STOP_TIMEOUT="${DESKFLOW_CTL_STOP_TIMEOUT:-10}"
@@ -38,7 +52,7 @@ DOMAIN="gui/$(id -u)"
 # PATH shim can observe the escalation in tests.
 enable -n kill 2>/dev/null || true # fleet:allow builtin may already be disabled
 
-usage() { sed -n '2,25p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,33p' "${BASH_SOURCE[0]}"; }
 die() { echo "deskflow-ctl: $*" >&2; exit 1; }
 log() { echo "== deskflow-ctl: $* =="; }
 
@@ -58,8 +72,17 @@ inventory() {
 
 canonical_path() { [[ "$1" == "$APP/Contents/MacOS/"* ]]; }
 
+# The processes `stop` owns: this user's deskflow-core and Deskflow GUI from
+# the canonical bundle. Filtered by uid and basename on purpose: the root
+# LoginWindow vhid-bridge and the root deskflow-prio LaunchDaemon also run
+# from the bundle, and waiting on / signalling them makes `stop` hang forever
+# (or EPERM) at the login window.
 pids_under_bundle() {
-  inventory | awk -F'\t' -v app="$APP/Contents/MacOS/" 'index($3, app) == 1 { print $1 }'
+  inventory | awk -F'\t' -v app="$APP/Contents/MacOS/" -v uid="$(id -u)" '
+    index($3, app) == 1 && $2 == uid {
+      n = split($3, parts, "/"); base = parts[n]
+      if (base == "deskflow-core" || base == "Deskflow") print $1
+    }'
 }
 
 count_role() {
@@ -96,6 +119,76 @@ render_agent() {
     chmod 644 "$dst"
     log "rendered $dst"
   fi
+}
+
+# ------------------------------------------------------- prio LaunchDaemon
+render_prio_daemon() {
+  # Renders tools/launchd/$PRIO_LABEL.plist into $DAEMON_STAGE_DIR. The
+  # template carries the default bundle path literally (LaunchDaemons cannot
+  # expand anything), so both the __APP__ placeholder and the literal
+  # /Applications/Deskflow.app are rewritten to $APP. Prints the staged path.
+  local src="$TEMPLATE_DIR/$PRIO_LABEL.plist" dst="$DAEMON_STAGE_DIR/$PRIO_LABEL.plist" tmp
+  [[ -f "$src" ]] || die "missing template $src"
+  mkdir -p "$DAEMON_STAGE_DIR"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+  sed -e "s#__APP__#$APP#g" -e "s#/Applications/Deskflow\.app#$APP#g" "$src" >"$tmp"
+  if [[ -f "$dst" ]] && cmp -s "$tmp" "$dst"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$dst"
+    chmod 644 "$dst"
+    log "rendered $dst" >&2 # stdout is the staged path (command substitution)
+  fi
+  echo "$dst"
+}
+
+daemon_loaded() { launchctl print "system/$1" >/dev/null 2>&1; }
+
+prio_binary_owner_ok() {
+  # LaunchDaemons should not run a user-writable binary as root: require root:wheel.
+  local bin="$1" owner
+  owner="$(stat -f '%Su:%Sg' "$bin" 2>/dev/null || true)" # fleet:allow stat failure = not ok
+  [[ "$owner" == "root:wheel" ]]
+}
+
+cmd_prio() {
+  local bin="$APP/Contents/MacOS/deskflow-prio" staged installed
+  if [[ ! -x "$bin" ]]; then
+    log "deskflow-prio not in bundle ($bin); skipping LaunchDaemon"
+    return 0
+  fi
+  staged="$(render_prio_daemon)"
+  installed="$DAEMON_DIR/$PRIO_LABEL.plist"
+
+  if daemon_loaded "$PRIO_LABEL" && [[ -f "$installed" ]] && cmp -s "$staged" "$installed" &&
+     prio_binary_owner_ok "$bin"; then
+    log "prio: system/$PRIO_LABEL loaded, $installed up to date, $bin is root:wheel"
+    return 0
+  fi
+
+  if [[ "$(id -u)" -eq 0 ]]; then
+    log "prio: installing $installed and bootstrapping system/$PRIO_LABEL"
+    install -d "$DAEMON_DIR"
+    install -m 644 -o root -g wheel "$staged" "$installed"
+    chown root:wheel "$bin"
+    if daemon_loaded "$PRIO_LABEL"; then
+      launchctl bootout "system/$PRIO_LABEL" || die "launchctl bootout system/$PRIO_LABEL failed"
+    fi
+    launchctl bootstrap system "$installed"
+    return 0
+  fi
+
+  # No privilege escalation inside the ctl (no sudo prompts from a deploy
+  # over SSH, no osascript). Documented human step, exact commands:
+  cat <<EOF
+== deskflow-ctl: prio: system/$PRIO_LABEL needs root; run once as admin: ==
+  sudo install -d $DAEMON_DIR
+  sudo install -m 644 -o root -g wheel "$staged" "$installed"
+  sudo chown root:wheel "$bin"
+  sudo launchctl bootout system/$PRIO_LABEL 2>/dev/null; sudo launchctl bootstrap system "$installed"
+(rendered from $TEMPLATE_DIR/$PRIO_LABEL.plist; verify with: sudo launchctl print system/$PRIO_LABEL)
+EOF
+  return 0
 }
 
 bootstrap_agent() {
@@ -175,6 +268,7 @@ cmd_start() {
   done
   bootstrap_agent "$GUI_LABEL"
   log "started: core pid $(agent_pid "$CORE_LABEL")"
+  cmd_prio
 }
 
 cmd_restart() {
@@ -238,6 +332,7 @@ case "${1:-}" in
   restart) cmd_restart ;;
   status) cmd_status ;;
   assert-single) cmd_assert_single ;;
+  prio) cmd_prio ;;
   -h|--help|help) usage ;;
   *) usage >&2; die "unknown verb '${1:-}'" ;;
 esac

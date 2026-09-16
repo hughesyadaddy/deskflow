@@ -47,6 +47,14 @@ constexpr size_t kMaxLineBytes = 64 * 1024;
 constexpr size_t kMaxQueued = 256;
 constexpr auto kIdlePoll = std::chrono::milliseconds(1000);
 
+// Link-thread-private: set by helloLego() when the peer on the lego port turned
+// out to be an OLD Mouser (its RemoteDeviceServer answers a proto-2 hello with
+// {"ok":false,"error":"unauthorized"} and no "reason"), consumed by runLego().
+// Without this the hello classified as Failed and backed off forever, never
+// falling back to the v1 connector even though the token file existed.
+thread_local bool t_helloRejectedByOldMouser = false;
+thread_local bool t_oldMouserLogged = false;
+
 void platformClose(int fd)
 {
 #if defined(_WIN32)
@@ -226,7 +234,14 @@ std::string MouserLink::defaultTokenFile()
   if (const auto env = qEnvironmentVariable("DESKFLOW_MOUSER_TOKEN_FILE"); !env.isEmpty()) {
     return env.toStdString();
   }
+#if defined(Q_OS_WIN)
+  // Mouser writes %APPDATA%\Mouser\bridge.token (roaming). Qt's
+  // GenericDataLocation is %LOCALAPPDATA%, so the old lookup never found it
+  // and every Windows seat silently ran the legacy path.
+  const auto base = qEnvironmentVariable("APPDATA");
+#else
   const auto base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+#endif
   if (base.isEmpty()) {
     return {};
   }
@@ -489,6 +504,27 @@ bool MouserLink::runLego(const std::string &token)
     return false;
   case Hello::Failed:
     platformClose(fd);
+    if (t_helloRejectedByOldMouser) {
+      t_helloRejectedByOldMouser = false;
+      // Token file present but the listener is an old Mouser: use the v1
+      // connector for this cycle instead of backing off forever on the lego
+      // hello. The next loop iteration retries lego (Mouser may be upgraded).
+      const bool canFallBack = m_options.legacyEnabled && role() == Role::Client && m_options.legacyClientEnabled &&
+                               !m_options.legacyClientToken.empty();
+      if (canFallBack) {
+        if (!t_oldMouserLogged) {
+          LOG_INFO(
+              "mouser link: mouser on 127.0.0.1:%d is pre-lego (unauthorized, no reason); using legacy v1 connector",
+              m_options.port
+          );
+          t_oldMouserLogged = true;
+        }
+        m_mode = Mode::Legacy;
+        runLegacyConnector(m_options.legacyClientPort, m_options.legacyClientToken);
+        return false;
+      }
+      LOG_WARN("mouser link: mouser on 127.0.0.1:%d is pre-lego and no legacy connector is configured", m_options.port);
+    }
     sleepInterruptible(m_backoff);
     escalateBackoff();
     return false;
@@ -496,6 +532,7 @@ bool MouserLink::runLego(const std::string &token)
 
   m_absentLogged = false;
   m_protoLogged = false;
+  t_oldMouserLogged = false;
   resetBackoff();
   ++m_stats.connects;
   ++m_stats.hellosAccepted;
@@ -587,6 +624,7 @@ MouserLink::Hello MouserLink::helloLego(int fd, const std::string &token)
     return Hello::Failed;
   }
   const QJsonObject object = parseObject(reply);
+  t_helloRejectedByOldMouser = false;
   if (!object[QStringLiteral("ok")].toBool()) {
     const QString reason = object[QStringLiteral("reason")].toString();
     if (reason == QStringLiteral("proto")) {
@@ -594,6 +632,14 @@ MouserLink::Hello MouserLink::helloLego(int fd, const std::string &token)
     }
     if (reason == QStringLiteral("auth")) {
       return Hello::AuthRejected;
+    }
+    // Pre-lego Mouser: its RemoteDeviceServer (v1 protocol) sits on the same
+    // port and rejects our proto-2 hello as {"ok":false,"error":"unauthorized"}
+    // with no "reason" key. runLego() runs the v1 connector for this cycle.
+    if (!object.contains(QStringLiteral("reason")) &&
+        object[QStringLiteral("error")].toString() == QStringLiteral("unauthorized")) {
+      t_helloRejectedByOldMouser = true;
+      return Hello::Failed;
     }
     LOG_WARN("mouser link: hello rejected: %.128s", reply.c_str());
     return Hello::Failed;

@@ -3,7 +3,7 @@
 
 Usage:
   tools/fleet-health [--host all|local|<id>]
-                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|instances|all]
+                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|instances|bridge|all]
                      [--json] [--env PATH]
 
 Reads scripts/fleet.env (same format as fleet-doctor / fleet-deploy.sh):
@@ -28,6 +28,11 @@ Checks:
                              exactly one Deskflow core (owned by launchd / the
                              service) and one GUI from the canonical path, nothing
                              else. Exit 0 from the ctl = PASS.
+  bridge                     the local Mouser bridge on 127.0.0.1:19795 answers
+                             {"t":"status"} with attached:true and
+                             peer:"deskflow-core" (macOS: nc -w2; Windows: the
+                             ps1 collector via .NET TcpClient). Catches a core
+                             that is running but silently in legacy/off mode.
 
 Environment overrides:
   DESKFLOW_EXPECT_AUTHORITY  expected `Authority=` prefix (default "Apple Development")
@@ -56,7 +61,7 @@ REPO_ROOT = TOOLS_DIR.parent
 DEFAULT_ENV_FILE = REPO_ROOT / "scripts" / "fleet.env"
 IDENTIFIERS_FILE = TOOLS_DIR / "fleet-health.identifiers"
 
-ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh", "instances")
+ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh", "instances", "bridge")
 MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc"}
 WIN_ONLY = {"authenticode"}
 
@@ -69,6 +74,9 @@ MOUSER_LABEL = "io.github.hughesyadaddy.mouser"
 # launchd is the only owner of deskflow-core on macOS (scripts/deskflow-ctl).
 DESKFLOW_CORE_LABEL = "io.github.hughesyadaddy.deskflow-core"
 DEFAULT_PORT = 24800
+# Mouser's lego listener on every seat; deskflow-core attaches to it (MouserLink).
+BRIDGE_PORT = 19795
+BRIDGE_PEER = "deskflow-core"
 DEFAULT_AUTHORITY = "Apple Development"
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
 
@@ -264,6 +272,55 @@ def deskflow_gui_running_cmd() -> str:
 
 def nc_cmd(addr: str, port: int) -> str:
     return f"nc -z -w3 {shlex.quote(addr)} {port}"
+
+
+def bridge_status_cmd(port: int = BRIDGE_PORT) -> str:
+    """Ask the local Mouser bridge (127.0.0.1:BRIDGE_PORT) for its status line.
+
+    Mouser's lego listener answers a `{"t":"status"}` line with one JSON line
+    describing the attached peer. `nc -w2` bounds the wait; the printf pipe
+    keeps the socket open long enough for the reply.
+    """
+    return f"printf '{{\"t\":\"status\"}}\\n' | nc -w2 127.0.0.1 {port}"
+
+
+def parse_bridge_status(output: str) -> Tuple[bool, str]:
+    """(pass, detail) for a bridge status reply.
+
+    PASS iff a JSON object in the output has attached == true and
+    peer == "deskflow-core". Anything else names what was wrong.
+    """
+    text = output.strip()
+    if not text:
+        return False, "no reply from bridge (Mouser not listening or status unsupported)"
+    payload = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            candidate = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+    if payload is None:
+        return False, f"unparseable bridge reply: {text[:120]}"
+    attached = payload.get("attached")
+    peer = payload.get("peer")
+    problems = []
+    if attached is not True:
+        problems.append(f"attached={json.dumps(attached)} (want true)")
+    if peer != BRIDGE_PEER:
+        problems.append(f"peer={json.dumps(peer)} (want {BRIDGE_PEER!r})")
+    if problems:
+        return False, "; ".join(problems)
+    extra = ""
+    for key in ("session", "proto", "ver"):
+        if key in payload:
+            extra += f" {key}={payload[key]}"
+    return True, f"attached to {BRIDGE_PEER}{extra}"
 
 
 def ctl_assert_single_cmd(root: str = MAC_DESKFLOW_ROOT) -> str:
@@ -553,6 +610,15 @@ class FleetHealth:
             self._add(host, "instances", FAIL,
                       f"deskflow-ctl assert-single rc={rc}: " + ("; ".join(problems) or "no output")[:300])
 
+    def check_bridge_mac(self, host: Host) -> None:
+        rc, out, err = self.runner(host, bridge_status_cmd())
+        if rc != 0 and not out.strip():
+            self._add(host, "bridge", FAIL,
+                      f"nc 127.0.0.1:{BRIDGE_PORT} rc={rc}: {(err or 'no Mouser bridge listening').strip()[:120]}")
+            return
+        ok, detail = parse_bridge_status(out)
+        self._add(host, "bridge", PASS if ok else FAIL, detail)
+
     def check_mesh_leg_mac(self, src: Host, dst: Host) -> None:
         rc, out, err = self.runner(src, nc_cmd(dst.addr, self.port))
         status = PASS if rc == 0 else FAIL
@@ -619,6 +685,8 @@ class FleetHealth:
                     self.check_session_mac(host)
                 elif c == "instances":
                     self.check_instances_mac(host)
+                elif c == "bridge":
+                    self.check_bridge_mac(host)
                 elif c == "mesh":
                     if not peers:
                         self._add(host, "mesh", SKIP, "no peers")
