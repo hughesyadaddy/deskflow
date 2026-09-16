@@ -31,11 +31,19 @@ BeforeAll {
       (Join-Path $Base 'Qt6Core.dll'),
       (Join-Path $Base 'sub/deskflow-vhid-bridge.exe'),
       (Join-Path $Base 'sub/deep/plugin.DLL'),
+      # PyInstaller dist layout: CPython extension modules and a driver.
+      (Join-Path $Base 'sub/_internal/_ssl.pyd'),
+      (Join-Path $Base 'sub/_internal/hidapi.sys'),
       (Join-Path $Base 'README.txt'),
-      (Join-Path $Base 'sub/config.json')
+      (Join-Path $Base 'sub/config.json'),
+      (Join-Path $Base 'sub/_internal/base_library.zip'),
+      (Join-Path $Base 'sub/_internal/module.pyc')
     )
-    foreach ($f in $files) { Set-Content -Path $f -Value 'x' }
-    return @($files | Where-Object { $_ -match '\.(exe|dll)$' } | ForEach-Object { (Resolve-Path $_).Path })
+    foreach ($f in $files) {
+      New-Item -ItemType Directory -Force -Path (Split-Path $f -Parent) | Out-Null
+      Set-Content -Path $f -Value 'x'
+    }
+    return @($files | Where-Object { $_ -match '(?i)\.(exe|dll|pyd|sys)$' } | ForEach-Object { (Resolve-Path $_).Path })
   }
 
   function New-FakeKits {
@@ -139,18 +147,23 @@ Describe 'sign-windows.ps1' {
   }
 
   Context 'signing' {
-    It 'signs every .exe and .dll under the root (and nothing else) with the required flags' {
+    It 'signs every .exe/.dll/.pyd/.sys under the root (and nothing else) with the required flags' {
       $signed = Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
         -EnvFileArg $script:MissingEnv -Timestamp 'http://timestamp.digicert.com' -KitsRoot $script:Kits -OnlyVerify $false
 
-      $script:Expected.Count | Should -Be 4
-      @($signed).Count | Should -Be 4
+      $script:Expected.Count | Should -Be 6
+      @($signed).Count | Should -Be 6
       foreach ($f in $script:Expected) {
         $script:Cur = $f
         $signed | Should -Contain $f
         Should -Invoke Invoke-SignTool -Times 1 -Exactly -ParameterFilter { $Arguments -contains $script:Cur }
       }
-      Should -Invoke Invoke-SignTool -Times 0 -Exactly -ParameterFilter { ($Arguments -join ' ') -match 'README\.txt|config\.json' }
+      # G3 regression: PyInstaller extension modules (.pyd) and drivers (.sys) must be signed.
+      @($signed | Where-Object { $_ -like '*_ssl.pyd' }).Count | Should -Be 1
+      @($signed | Where-Object { $_ -like '*hidapi.sys' }).Count | Should -Be 1
+      Should -Invoke Invoke-SignTool -Times 0 -Exactly -ParameterFilter {
+        ($Arguments -join ' ') -match 'README\.txt|config\.json|base_library\.zip|module\.pyc'
+      }
       Should -Invoke Invoke-SignTool -Times 1 -Exactly -ParameterFilter {
         $Arguments[0] -eq 'sign' -and
         ($Arguments -join ' ') -like "*/sha1 $($script:Tp) /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com*"
@@ -167,7 +180,7 @@ Describe 'sign-windows.ps1' {
       $expected2 = New-FixtureTree -Base $root2
       $signed = Invoke-SignWindows -Roots @($script:Root, $root2) -ThumbprintArg $script:Tp -SignToolArg '' `
         -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false
-      @($signed).Count | Should -Be 8
+      @($signed).Count | Should -Be 12
       foreach ($f in ($script:Expected + $expected2)) { $signed | Should -Contain $f }
     }
 
@@ -185,7 +198,25 @@ Describe 'sign-windows.ps1' {
         Should -Throw -ExpectedMessage '*does not exist*'
     }
 
-    It 'retries once without /tr and warns when the timestamp server fails' {
+    It 'is fatal by default when the timestamp server fails (never retries without /tr)' {
+      # G5 regression: an untimestamped signature dies with the cert.
+      Mock Invoke-SignTool {
+        if ($Arguments -contains '/tr') {
+          [pscustomobject]@{ ExitCode = 1; Output = 'SignTool Error: The specified timestamp server either could not be reached or returned an invalid response.' }
+        } else {
+          [pscustomobject]@{ ExitCode = 0; Output = 'Successfully signed' }
+        }
+      }
+      { Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
+          -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false } |
+        Should -Throw -ExpectedMessage '*Refusing to sign without a timestamp*AllowNoTimestamp*'
+      Should -Invoke Invoke-SignTool -Times 1 -Exactly
+      Should -Invoke Invoke-SignTool -Times 0 -Exactly -ParameterFilter { $Arguments -notcontains '/tr' }
+      # Nothing is reported as verified when signing aborted.
+      Should -Invoke Get-AuthenticodeSignature -Times 0 -Exactly
+    }
+
+    It 'retries once without /tr and warns when the timestamp server fails and -AllowNoTimestamp is set' {
       Mock Invoke-SignTool {
         if ($Arguments -contains '/tr') {
           [pscustomobject]@{ ExitCode = 1; Output = 'SignTool Error: The specified timestamp server either could not be reached or returned an invalid response.' }
@@ -195,7 +226,7 @@ Describe 'sign-windows.ps1' {
       }
       $warnings = @()
       $out = Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
-        -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false 3>&1
+        -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false -NoTimestampOk $true 3>&1
       $warnings = @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
       $warnings.Count | Should -BeGreaterOrEqual 1
       ($warnings | ForEach-Object { $_.Message }) -join "`n" | Should -Match 'timestamp'
@@ -214,12 +245,22 @@ Describe 'sign-windows.ps1' {
       Should -Invoke Invoke-SignTool -Times 1 -Exactly
     }
 
-    It 'throws when the timestamp retry also fails' {
+    It 'throws when the -AllowNoTimestamp retry also fails' {
       Mock Invoke-SignTool { [pscustomobject]@{ ExitCode = 1; Output = 'SignTool Error: timestamp server unreachable' } }
       { Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
-          -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false 3>$null } |
+          -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false -NoTimestampOk $true 3>$null } |
         Should -Throw -ExpectedMessage '*signtool sign failed*'
       Should -Invoke Invoke-SignTool -Times 2 -Exactly
+    }
+
+    It 'matches signable extensions case-insensitively' {
+      $root2 = Join-Path $TestDrive 'caps'
+      New-Item -ItemType Directory -Force -Path $root2 | Out-Null
+      foreach ($n in @('A.EXE', 'b.Dll', 'c.PYD', 'd.SYS', 'e.TXT')) { Set-Content -Path (Join-Path $root2 $n) -Value 'x' }
+      $signed = Invoke-SignWindows -Roots @($root2) -ThumbprintArg $script:Tp -SignToolArg '' `
+        -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false
+      @($signed).Count | Should -Be 4
+      @($signed | Where-Object { $_ -like '*e.TXT' }).Count | Should -Be 0
     }
   }
 
@@ -257,7 +298,7 @@ Describe 'sign-windows.ps1' {
       Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
         -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:EmptyKits -OnlyVerify $true | Out-Null
       Should -Invoke Invoke-SignTool -Times 0 -Exactly
-      Should -Invoke Get-AuthenticodeSignature -Times 4 -Exactly
+      Should -Invoke Get-AuthenticodeSignature -Times 6 -Exactly
     }
 
     It '-VerifyOnly throws on an unsigned file' {

@@ -1,19 +1,25 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Authenticode-sign every .exe/.dll under one or more roots with the fleet cert.
+  Authenticode-sign every .exe/.dll/.pyd/.sys under one or more roots with the fleet cert.
 .DESCRIPTION
   Locates signtool.exe (PATH first, then the newest Windows 10 SDK under
   "C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64"), resolves the signing
   thumbprint (-Thumbprint, then $env:DESKFLOW_SIGN_THUMBPRINT, then
-  DESKFLOW_SIGN_THUMBPRINT= in the repo .env), signs every *.exe and *.dll under
+  DESKFLOW_SIGN_THUMBPRINT= in the repo .env), signs every *.exe, *.dll, *.pyd
+  (PyInstaller/CPython extension modules, e.g. the Mouser dist) and *.sys under
   each -Root with
 
     signtool sign /sha1 <tp> /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com
 
-  (a timestamp-server failure is retried once without /tr, with a warning), then
-  verifies every file with Get-AuthenticodeSignature. Any file whose Status is
-  not 'Valid' or whose signer thumbprint differs from the requested one is fatal.
+  then verifies every file with Get-AuthenticodeSignature. Any file whose Status
+  is not 'Valid' or whose signer thumbprint differs from the requested one is
+  fatal.
+
+  A timestamp-server failure is fatal by default: a signature without an RFC
+  3161 timestamp stops validating the moment the certificate expires. Pass
+  -AllowNoTimestamp to retry once without /tr (with a warning) for throwaway
+  local builds only.
 
   Nothing here is best-effort: a missing thumbprint, a missing signtool, a
   signtool failure or a verify failure all throw. The script never silently
@@ -27,6 +33,10 @@
   Skip signing; only run the Get-AuthenticodeSignature gate over every file.
   Used by build-windows.ps1 as a post-install check (the install root is
   already in use by the service at that point, so re-signing is not possible).
+.PARAMETER AllowNoTimestamp
+  If the timestamp server fails, retry once WITHOUT /tr instead of throwing.
+  The resulting signature expires with the certificate; never use for
+  fleet-deployed or released binaries.
 .EXAMPLE
   powershell scripts\sign-windows.ps1 -Root 'C:\Program Files\Deskflow'
   powershell scripts\sign-windows.ps1 -Root C:\Users\alexh\Desktop\Mouser\dist\Mouser -Thumbprint <sha1>
@@ -39,8 +49,14 @@ param(
   [string]$EnvFile,
   [string]$TimestampUrl = 'http://timestamp.digicert.com',
   [string]$KitsBinRoot = 'C:\Program Files (x86)\Windows Kits\10\bin',
-  [switch]$VerifyOnly
+  [switch]$VerifyOnly,
+  [switch]$AllowNoTimestamp
 )
+
+# Extensions that carry Authenticode signatures and ship in a Deskflow or
+# Mouser (PyInstaller) install root. Keep in sync with Get-SignTargets and
+# the Pester fixture in tools/tests/SignWindows.Tests.ps1.
+$script:SignExtensions = @('.exe', '.dll', '.pyd', '.sys')
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -133,8 +149,10 @@ function Get-SignTargets {
     if (-not (Test-Path -LiteralPath $r -PathType Container)) {
       throw "Sign root '$r' does not exist or is not a directory."
     }
-    $files += @(Get-ChildItem -LiteralPath $r -Recurse -File -Include '*.exe', '*.dll' |
-      Where-Object { $_.Extension -in '.exe', '.dll' } |
+    # No -Include: it only filters when the path ends in a wildcard, so match
+    # on the (case-insensitive) extension instead.
+    $files += @(Get-ChildItem -LiteralPath $r -Recurse -File |
+      Where-Object { $script:SignExtensions -contains $_.Extension.ToLowerInvariant() } |
       Select-Object -ExpandProperty FullName)
   }
   return @($files | Sort-Object -Unique)
@@ -155,7 +173,7 @@ function Invoke-SignTool {
 }
 
 function Invoke-SignFiles {
-  param([string]$SignTool, [string]$Tp, [string[]]$Files, [string]$Timestamp)
+  param([string]$SignTool, [string]$Tp, [string[]]$Files, [string]$Timestamp, [bool]$NoTimestampOk = $false)
   if ($Files.Count -eq 0) { return }
   $base = @('sign', '/sha1', $Tp, '/fd', 'SHA256')
   $withTs = $base + @('/td', 'SHA256', '/tr', $Timestamp)
@@ -176,8 +194,15 @@ function Invoke-SignFiles {
   foreach ($b in $batches) {
     $res = Invoke-SignTool -SignTool $SignTool -Arguments ($withTs + $b)
     if ($res.ExitCode -ne 0 -and $res.Output -match '(?i)timestamp') {
-      Write-Warning ("timestamp server $Timestamp failed; retrying once WITHOUT a timestamp " +
-        '(signature will expire with the cert).')
+      if (-not $NoTimestampOk) {
+        # An untimestamped signature dies with the cert; refuse rather than
+        # silently ship one. Retry the run (or fix the timestamp server).
+        throw ("signtool sign failed: timestamp server $Timestamp unreachable or rejected " +
+          "(exit $($res.ExitCode)). Refusing to sign without a timestamp; pass -AllowNoTimestamp " +
+          "only for throwaway local builds.`n$($res.Output)")
+      }
+      Write-Warning ("timestamp server $Timestamp failed; -AllowNoTimestamp set, retrying once " +
+        'WITHOUT a timestamp (signature will expire with the cert).')
       Write-Warning $res.Output
       $res = Invoke-SignTool -SignTool $SignTool -Arguments ($base + $b)
     }
@@ -216,7 +241,8 @@ function Invoke-SignWindows {
     [string]$EnvFileArg,
     [string]$Timestamp,
     [string]$KitsRoot,
-    [bool]$OnlyVerify
+    [bool]$OnlyVerify,
+    [bool]$NoTimestampOk = $false
   )
   if (-not $Roots -or $Roots.Count -eq 0) { throw 'sign-windows.ps1: -Root is required.' }
 
@@ -225,13 +251,13 @@ function Invoke-SignWindows {
   # @() guards against PowerShell unrolling an empty result to $null.
   $files = @(Get-SignTargets -Roots $Roots)
   if ($files.Count -eq 0) {
-    throw "No .exe/.dll files found under: $($Roots -join ', ')"
+    throw "No .exe/.dll/.pyd/.sys files found under: $($Roots -join ', ')"
   }
 
   if (-not $OnlyVerify) {
     $signtool = Find-SignTool -Explicit $SignToolArg -KitsRoot $KitsRoot
     Write-Host "== Signing $($files.Count) file(s) with $tp via $signtool =="
-    Invoke-SignFiles -SignTool $signtool -Tp $tp -Files $files -Timestamp $Timestamp
+    Invoke-SignFiles -SignTool $signtool -Tp $tp -Files $files -Timestamp $Timestamp -NoTimestampOk $NoTimestampOk
   } else {
     Write-Host "== Verifying signatures on $($files.Count) file(s) against $tp =="
   }
@@ -245,5 +271,6 @@ function Invoke-SignWindows {
 # which is how the Pester tests exercise it.
 if ($MyInvocation.InvocationName -ne '.') {
   $null = Invoke-SignWindows -Roots $Root -ThumbprintArg $Thumbprint -SignToolArg $SignToolPath `
-    -EnvFileArg $EnvFile -Timestamp $TimestampUrl -KitsRoot $KitsBinRoot -OnlyVerify ([bool]$VerifyOnly)
+    -EnvFileArg $EnvFile -Timestamp $TimestampUrl -KitsRoot $KitsBinRoot -OnlyVerify ([bool]$VerifyOnly) `
+    -NoTimestampOk ([bool]$AllowNoTimestamp)
 }

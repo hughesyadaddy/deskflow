@@ -79,6 +79,24 @@ if [[ "$rc" -eq 0 ]]; then
   else
     fail "install scripts missing RESULT_VARIABLE check for codesign/macdeployqt"
   fi
+  # The install-time re-seal (--force --deep) must keep the per-binary
+  # org.deskflow.* identifiers, entitlements and hardened-runtime flag that
+  # MacCodesign.cmake applied; without --preserve-metadata codesign rewrites
+  # the identifier to <name>-<uuid> and drops entitlements.
+  reseal="$(tr '\n' ' ' < "$b/cmake_install.cmake" | grep -oE 'codesign --force --deep[^)]*' | head -1)"
+  if grep -qE -- '--preserve-metadata=identifier,entitlements,flags,runtime' <<<"$reseal" \
+     && grep -qE -- '--options runtime' <<<"$reseal"; then
+    pass "install re-seal passes --preserve-metadata=identifier,entitlements,flags,runtime --options runtime"
+  else
+    fail "install re-seal lacks --preserve-metadata/--options runtime: '$reseal'"
+  fi
+  # deskflow-prio must be built into the bundle's Contents/MacOS (not a
+  # /usr/local out-of-tree binary).
+  if grep -qE 'deskflow-prio' "$b/build.ninja" 2>/dev/null || grep -rqE 'deskflow-prio' "$b/src/apps/deskflow-prio/" 2>/dev/null; then
+    pass "deskflow-prio target is configured"
+  else
+    fail "deskflow-prio target missing from the generated build"
+  fi
 else
   fail "strict OFF configure failed (exit $rc); unrelated dependency problem? see tail:"
   tail -30 "$b.log"
@@ -91,7 +109,7 @@ b="$base-ident"
 rc=$(run_configure "$b" -DFLEET_STRICT_SIGNING=ON -DAPPLE_CODESIGN_DEV=FAKEIDENT)
 if [[ "$rc" -eq 0 ]]; then
   gen="$(cat "$b"/CMakeFiles/codesign-dev.dir/build.make 2>/dev/null || grep -h codesign "$b/build.ninja" 2>/dev/null)"
-  for ident in org.deskflow.deskflow-core org.deskflow.deskflow-vhid-bridge org.deskflow.deskflow; do
+  for ident in org.deskflow.deskflow-core org.deskflow.deskflow-vhid-bridge org.deskflow.deskflow-prio org.deskflow.deskflow; do
     if grep -qE -- "--identifier ${ident} .*Contents/MacOS/" <<<"$gen" \
        && grep -qF "$ident" "$REPO_ROOT/tools/fleet-health.identifiers"; then
       pass "codesign-dev signs a Contents/MacOS binary with --identifier $ident (allowlisted)"
