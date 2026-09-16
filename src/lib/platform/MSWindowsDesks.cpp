@@ -84,6 +84,8 @@
 #define DESKFLOW_MSG_FAKE_INPUT DESKFLOW_HOOK_LAST_MSG + 12
 // sanitize stale physically-held modifiers on the input-desktop-bound thread
 #define DESKFLOW_MSG_SANITIZE_MODS DESKFLOW_HOOK_LAST_MSG + 13
+// std::vector<WORD>* (in: candidate VKs, out: VKs released); <unused>
+#define DESKFLOW_MSG_RELEASE_KEYS DESKFLOW_HOOK_LAST_MSG + 14
 
 static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
 {
@@ -96,6 +98,11 @@ static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
   inp.ki.dwExtraInfo = 0;
   SendInput(1, &inp, sizeof(inp));
 }
+
+namespace {
+// Defined with deskSanitizeStaleModifiers below (shares its menu masking).
+void deskReleaseHeldKeys(std::vector<WORD> *vks);
+} // namespace
 
 //! Worst SendInput duration seen since the last report (microseconds).
 /*!
@@ -279,8 +286,36 @@ void MSWindowsDesks::sanitizeStaleModifiers(uint32_t heldByUsBits) const
   sendMessage(DESKFLOW_MSG_SANITIZE_MODS, static_cast<WPARAM>(heldByUsBits), 0);
 }
 
+void MSWindowsDesks::releaseHeldKeys(std::vector<WORD> &vks) const
+{
+  if (vks.empty()) {
+    return;
+  }
+  if (onActiveDeskThread()) {
+    // Already bound to the input desktop (the key-sync callback runs here);
+    // posting to ourselves and waiting would deadlock.
+    deskReleaseHeldKeys(&vks);
+    return;
+  }
+  if (m_activeDesk == nullptr || m_activeDesk->m_window == nullptr) {
+    vks.clear(); // nothing was released; do not let the caller claim it was
+    return;
+  }
+  // Synchronous: the pointer must stay valid until the desk has filled it.
+  sendMessage(DESKFLOW_MSG_RELEASE_KEYS, reinterpret_cast<WPARAM>(&vks), 0);
+}
+
 bool MSWindowsDesks::fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool /*isAutoRepeat*/) const
 {
+  if (onActiveDeskThread()) {
+    // Called from the desk thread itself (fakeAllKeysUp inside the key-sync
+    // callback on a desk switch). Posting would only queue the release
+    // behind the resync that follows, so the resync would poll the OS with
+    // the key still down and re-adopt it as physical -- inject inline
+    // instead. FIFO is preserved: this thread is the queue's only consumer.
+    send_keyboard_input(virtualKey, scanCode, flags);
+    return true;
+  }
   if (sendInputMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey))) {
     return true;
   }
@@ -483,7 +518,58 @@ void deskSanitizeStaleModifiers(uint32_t heldByUsBits)
   }
 }
 
+// Boundary release of specific VKs (MSWindowsKeyState::sanitizeInjectedKeys).
+// Same desk-thread requirement as deskSanitizeStaleModifiers, but the caller
+// names the keys: its injected ledger plus Shift. Each VK is re-probed here
+// (the caller's pre-filter ran on another thread/desktop) and *vks is
+// trimmed to what was actually released, so the caller logs the truth.
+void deskReleaseHeldKeys(std::vector<WORD> *vks)
+{
+  auto isExtended = [](WORD vk) { return vk == VK_LWIN || vk == VK_RWIN || vk == VK_RMENU || vk == VK_RCONTROL; };
+  auto opensMenu = [](WORD vk) { return vk == VK_LWIN || vk == VK_RWIN || vk == VK_LMENU || vk == VK_RMENU; };
+
+  std::vector<WORD> held;
+  bool maskMenu = false;
+  for (const WORD vk : *vks) {
+    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
+      continue;
+    }
+    held.push_back(vk);
+    maskMenu = maskMenu || opensMenu(vk);
+  }
+  if (maskMenu) {
+    // Same no-op key trick as above: a bare Win/Alt up must not open a menu.
+    INPUT dummy[2] = {};
+    dummy[0].type = INPUT_KEYBOARD;
+    dummy[0].ki.wVk = 0xE8;
+    dummy[1].type = INPUT_KEYBOARD;
+    dummy[1].ki.wVk = 0xE8;
+    dummy[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, dummy, sizeof(INPUT));
+  }
+
+  std::vector<WORD> released;
+  for (const WORD vk : held) {
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = vk;
+    input.ki.wScan = static_cast<WORD>(MapVirtualKey(vk, MAPVK_VK_TO_VSC));
+    input.ki.dwFlags = KEYEVENTF_KEYUP | (isExtended(vk) ? KEYEVENTF_EXTENDEDKEY : 0);
+    if (SendInput(1, &input, sizeof(input)) == 1) {
+      released.push_back(vk);
+    } else {
+      LOG_WARN("failed to release held key vk=0x%02x: %d", vk, GetLastError());
+    }
+  }
+  vks->swap(released);
+}
+
 } // namespace
+
+bool MSWindowsDesks::onActiveDeskThread() const
+{
+  return m_activeDesk != nullptr && m_activeDesk->m_threadID == GetCurrentThreadId();
+}
 
 void MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
 {
@@ -932,6 +1018,10 @@ void MSWindowsDesks::deskThread(const void *vdesk)
 
     case DESKFLOW_MSG_SANITIZE_MODS:
       deskSanitizeStaleModifiers(static_cast<uint32_t>(msg.wParam));
+      break;
+
+    case DESKFLOW_MSG_RELEASE_KEYS:
+      deskReleaseHeldKeys(reinterpret_cast<std::vector<WORD> *>(msg.wParam));
       break;
 
     case DESKFLOW_MSG_FAKE_KEY:

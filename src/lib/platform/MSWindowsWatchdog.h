@@ -130,6 +130,16 @@ public:
   void setProcessConfig(const std::string_view &command, bool uiAccessCore);
 
   /**
+   * @brief Relaunch the core with the current config (keyboard rescue).
+   *
+   * Used when the 5x Esc rescue reaches a core that has no GUI IPC client to
+   * restart it. Queues a start with the existing command; startProcess()
+   * shuts the running core down and launches a fresh one. A no-op (logged)
+   * when no command is configured, so it can never act as a kill switch.
+   */
+  void requestRestart();
+
+  /**
    * @brief Stop the main loop and output loop threads.
    */
   void stop();

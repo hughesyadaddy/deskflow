@@ -38,6 +38,8 @@ Q_SIGNALS:
   void startProcessRequested();
   void stopProcessRequested();
   void clearSettingsRequested();
+  //! Daemon only: relaunch the core (keyboard rescue with no GUI attached).
+  void restartProcessRequested();
 
 protected:
   /**!

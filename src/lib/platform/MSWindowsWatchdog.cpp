@@ -485,6 +485,25 @@ void MSWindowsWatchdog::setProcessConfig(const std::string_view &command, bool u
   }
 }
 
+void MSWindowsWatchdog::requestRestart()
+{
+  LOG_VERBOSE("locking process state mutex for watchdog restart request");
+  std::scoped_lock lock{m_processStateMutex};
+
+  if (m_command.empty()) {
+    LOG_WARN("keyboard rescue: core restart requested but no watchdog command is configured; ignoring");
+    return;
+  }
+  if (m_processState == ProcessState::StopPending) {
+    LOG_WARN("keyboard rescue: core restart requested while a stop is pending; ignoring");
+    return;
+  }
+
+  LOG_INFO("keyboard rescue: relaunching core via watchdog");
+  m_processState = ProcessState::StartPending;
+  m_nextStartTime.reset();
+}
+
 void MSWindowsWatchdog::outputLoop(const void *)
 {
   static constexpr DWORD kBufSize = 4096;

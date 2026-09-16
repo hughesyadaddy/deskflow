@@ -16,6 +16,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -155,6 +156,14 @@ public:
   //! thread (synchronous). See deskSanitizeStaleModifiers in the .cpp.
   void sanitizeStaleModifiers(uint32_t heldByUsBits) const;
 
+  //! Release each VK in \p vks that the input desktop still reports held.
+  /*!
+  Probe and release both run on the desk thread (synchronous). On return
+  \p vks holds only the VKs whose UP was actually injected. Safe to call
+  from the desk thread itself (runs inline instead of self-posting).
+  */
+  void releaseHeldKeys(std::vector<WORD> &vks) const;
+
   //! Fake mouse press/release
   /*!
   Synthesize a press or release of mouse button \c id.
@@ -225,6 +234,9 @@ private:
 
   // communication with desk threads
   void waitForDesk() const;
+  //! True when called from the active desk's own thread. Such a caller must
+  //! never sendMessage() to itself (it would wait on its own queue forever).
+  bool onActiveDeskThread() const;
   //! Post a message to the active desk thread and block until it is processed.
   void sendMessage(UINT, WPARAM, LPARAM) const;
   //! Post a self-contained fake-input message without waiting (latency path).

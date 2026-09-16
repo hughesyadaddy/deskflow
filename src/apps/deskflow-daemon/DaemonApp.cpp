@@ -135,6 +135,18 @@ void DaemonApp::clearWatchdogCommand()
 #endif
 }
 
+void DaemonApp::restartWatchdogProcess() const
+{
+#if defined(Q_OS_WIN)
+  // Keyboard rescue (5x Esc / fleet rescue) reached a core with no GUI to
+  // restart it; the core asked us instead. MSWindowsWatchdog::requestRestart
+  // queues StartPending, and startProcess() replaces the running core.
+  m_pWatchdog->requestRestart();
+#else
+  LOG_ERR("restarting watchdog process not implemented on this platform");
+#endif
+}
+
 void DaemonApp::clearSettings()
 {
   LOG_INFO("clearing daemon settings");
@@ -160,6 +172,10 @@ void DaemonApp::connectIpcServer(const ipc::DaemonIpcServer *ipcServer) const
   );
   connect(
       ipcServer, &ipc::DaemonIpcServer::clearSettingsRequested, this, &DaemonApp::clearSettings, Qt::DirectConnection
+  );
+  connect(
+      ipcServer, &ipc::DaemonIpcServer::restartProcessRequested, this, &DaemonApp::restartWatchdogProcess,
+      Qt::DirectConnection
   );
 }
 
