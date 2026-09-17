@@ -86,7 +86,13 @@ function Test-Authenticode([string]$Thumb, [string[]]$Roots) {
   $files = @()
   foreach ($r in $Roots) {
     if (Test-Path -LiteralPath $r) {
-      $files += Get-ChildItem -LiteralPath $r -Recurse -File -Include *.exe, *.dll -ErrorAction SilentlyContinue
+      # -Include is silently ignored by Get-ChildItem when paired with
+      # -LiteralPath (a documented PowerShell gotcha), so this used to scan
+      # -- and fail authenticode on -- every non-executable file in the
+      # install tree (icons, .qm translations, .svg, .json, ...). Filter by
+      # extension explicitly instead of relying on -Include.
+      $files += Get-ChildItem -LiteralPath $r -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in ".exe", ".dll" }
     }
   }
   if ($files.Count -eq 0) {
