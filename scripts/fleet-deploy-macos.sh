@@ -138,7 +138,7 @@ configure_deskflow() {
 build_install_deskflow() {
   cd "$DESKFLOW_ROOT"
   echo "== [$HOST_TAG] deskflow build + install =="
-  gui_exec cmake --build build --target deskflow-core Deskflow deskflow-vhid-bridge -j"$(sysctl -n hw.ncpu)"
+  gui_exec cmake --build build --target deskflow-core Deskflow deskflow-vhid-bridge deskflow-prio -j"$(sysctl -n hw.ncpu)"
   # install-macos.sh restarts Deskflow through scripts/deskflow-ctl (launchd).
   # It never touches Mouser; MOUSER_RESTART is set only in deploy_mouser.
   gui_exec bash scripts/install-macos.sh

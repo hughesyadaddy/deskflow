@@ -86,9 +86,12 @@ verify_signature() {
     echo "error: codesign --verify --deep --strict failed for $app — installed bundle is unsigned or broken" >&2
     exit 1
   fi
+  # Plain `codesign -dv` never prints Authority= lines regardless of how the
+  # binary is signed -- that chain is only emitted at -vvv verbosity. Using
+  # plain -dv here made this check fail on every real (non-ad-hoc) signature.
   local info
-  if ! info="$(codesign -dv "$core" 2>&1)"; then
-    echo "error: codesign -dv failed for $core" >&2
+  if ! info="$(codesign -dvvv "$core" 2>&1)"; then
+    echo "error: codesign -dvvv failed for $core" >&2
     exit 1
   fi
   if ! grep -q '^Authority=' <<<"$info"; then
