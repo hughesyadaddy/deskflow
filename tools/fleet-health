@@ -12,7 +12,8 @@ Reads scripts/fleet.env (same format as fleet-doctor / fleet-deploy.sh):
   FLEET_SSH_USER_<id>=<user>          (optional)
   FLEET_OS_<id>=macos|windows         (optional; default: tiny11/win*/tiny* => windows)
   FLEET_ADDR_<id>=<host/ip>           (optional; address peers use for the mesh check)
-  FLEET_DESKFLOW_PORT=24800           (optional)
+  FLEET_MESH_PORT=24851               (optional; coordination-mesh port, NOT the
+                                       KVM/Synergy port -- see the mesh check below)
   FLEET_DESKFLOW_PATH_macos=~/Desktop/deskflow   (where scripts/deskflow-ctl lives)
   FLEET_DESKFLOW_PATH_windows=C:/Users/alexh/Desktop/deskflow
   DESKFLOW_SIGN_THUMBPRINT=<sha1>     (Windows Authenticode thumbprint)
@@ -25,7 +26,12 @@ Checks:
   session                    deskflow-core loaded via launchd; Deskflow GUI and
                              Mouser processes running (Mouser is intentionally
                              not launchd-managed, so this is a process check)
-  mesh                       every seat reaches every other seat on the port
+  mesh                       every seat reaches every other seat on the
+                             coordination-mesh port (always listening
+                             regardless of role). NOT the KVM/Synergy port:
+                             in auto-elect mode only the currently-elected
+                             server binds that one, so checking it there
+                             would fail on every client seat by design.
   instances                  `scripts/deskflow-ctl assert-single` on each host:
                              exactly one Deskflow core (owned by launchd / the
                              service) and one GUI from the canonical path, nothing
@@ -78,7 +84,11 @@ MAC_DESKFLOW_ROOT = "~/Desktop/deskflow"
 DESKFLOW_CORE = "/Applications/Deskflow.app/Contents/MacOS/deskflow-core"
 # launchd is the only owner of deskflow-core on macOS (scripts/deskflow-ctl).
 DESKFLOW_CORE_LABEL = "io.github.hughesyadaddy.deskflow-core"
-DEFAULT_PORT = 24800
+# Coordination-mesh port (src/lib/coordination/Coordinator.h meshPort default):
+# always listening on every seat, unlike the KVM/Synergy port which only the
+# currently-elected server binds in auto mode. This is what the mesh check
+# probes -- see its docstring above.
+DEFAULT_MESH_PORT = 24851
 # Mouser's lego listener on every seat; deskflow-core attaches to it (MouserLink).
 BRIDGE_PORT = 19795
 BRIDGE_PEER = "deskflow-core"
@@ -467,7 +477,7 @@ class FleetHealth:
         self.runner = runner
         self.allowlist = list(allowlist) if allowlist is not None else load_identifier_allowlist()
         self.osenv = osenv if osenv is not None else dict(os.environ)
-        self.port = int(env.get("FLEET_DESKFLOW_PORT") or DEFAULT_PORT)
+        self.mesh_port = int(env.get("FLEET_MESH_PORT") or DEFAULT_MESH_PORT)
         self._scan_cache: Dict[str, Tuple[int, List[MachO], str]] = {}
         self.results: List[Result] = []
 
@@ -636,9 +646,9 @@ class FleetHealth:
         self._add(host, "bridge", PASS if ok else FAIL, detail)
 
     def check_mesh_leg_mac(self, src: Host, dst: Host) -> None:
-        rc, out, err = self.runner(src, nc_cmd(dst.addr, self.port))
+        rc, out, err = self.runner(src, nc_cmd(dst.addr, self.mesh_port))
         status = PASS if rc == 0 else FAIL
-        detail = f"{src.id} -> {dst.id} ({dst.addr}:{self.port}) " + ("ok" if rc == 0 else f"rc={rc}")
+        detail = f"{src.id} -> {dst.id} ({dst.addr}:{self.mesh_port}) " + ("ok" if rc == 0 else f"rc={rc}")
         self._add(src, "mesh", status, detail)
 
     # -- Windows checks (delegated to tools/fleet-health.ps1)
@@ -646,7 +656,7 @@ class FleetHealth:
         root = self.env.get("FLEET_DESKFLOW_PATH_windows") or WIN_DESKFLOW_ROOT
         thumb = self.env.get("DESKFLOW_SIGN_THUMBPRINT", "")
         peer_addrs = [p.addr for p in peers] if "mesh" in checks else []
-        cmd = ps1_cmd(root, checks, thumb, self.port, peer_addrs)
+        cmd = ps1_cmd(root, checks, thumb, self.mesh_port, peer_addrs)
         rc, out, err = self.runner(host, cmd)
         payload = None
         for candidate in (out.strip(), out.strip()[out.find("["):] if "[" in out else ""):

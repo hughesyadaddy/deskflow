@@ -117,7 +117,7 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.bridge_status_cmd()): (0, BRIDGE_OK + "\n", ""),
     }
     for p in peers:
-        t[(hid, fh.nc_cmd(p, 24800))] = (0, "", "")
+        t[(hid, fh.nc_cmd(p, fh.DEFAULT_MESH_PORT))] = (0, "", "")
     return t
 
 
@@ -418,7 +418,7 @@ def test_instances_mac_root_from_env():
 
 
 def test_instances_windows_via_ps1_fixture_json():
-    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["instances"], "", 24800, [])
+    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["instances"], "", fh.DEFAULT_MESH_PORT, [])
     assert "-Checks instances" in cmd
     t = {("tiny11", cmd): (0, json.dumps(WIN_INSTANCES_PASS), "")}
     results, _ = run_checks([win()], t, ["instances"])
@@ -510,7 +510,7 @@ def test_bridge_mac_pass_and_fail():
 
 
 def test_bridge_windows_via_ps1_fixture_json():
-    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["bridge"], "", 24800, [])
+    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["bridge"], "", fh.DEFAULT_MESH_PORT, [])
     assert "-Checks bridge" in cmd
     t = {("tiny11", cmd): (0, json.dumps([{"check": "bridge", "status": "PASS",
                                             "detail": "attached to deskflow-core session=a1b2 proto=2"}]), "")}
@@ -547,11 +547,13 @@ def test_mesh_all_pairs_mac_and_windows():
     t = {}
     t.update(mac_ok_table("hackintosh", peers=["macbookpro", "tiny11"]))
     t.update(mac_ok_table("macbookpro", peers=["hackintosh", "tiny11"]))
-    t[("macbookpro", fh.nc_cmd("tiny11", 24800))] = (1, "", "")
-    win_cmd = fh.ps1_cmd("C:/Users/alexh/Desktop/deskflow", ["mesh"], "", 24800, ["hackintosh", "macbookpro"])
+    t[("macbookpro", fh.nc_cmd("tiny11", fh.DEFAULT_MESH_PORT))] = (1, "", "")
+    win_cmd = fh.ps1_cmd(
+        "C:/Users/alexh/Desktop/deskflow", ["mesh"], "", fh.DEFAULT_MESH_PORT, ["hackintosh", "macbookpro"]
+    )
     t[("tiny11", win_cmd)] = (0, json.dumps([
-        {"check": "mesh", "status": "PASS", "detail": "TINY11 -> hackintosh:24800 ok"},
-        {"check": "mesh", "status": "PASS", "detail": "TINY11 -> macbookpro:24800 ok"},
+        {"check": "mesh", "status": "PASS", "detail": "TINY11 -> hackintosh:24851 ok"},
+        {"check": "mesh", "status": "PASS", "detail": "TINY11 -> macbookpro:24851 ok"},
     ]), "")
     results, runner = run_checks(hosts, t, ["mesh"])
     mesh = by_check(results, "mesh")
@@ -565,7 +567,7 @@ def test_mesh_port_from_env_and_single_host_skip():
     hosts = [mac("hackintosh"), mac("macbookpro")]
     t = {("hackintosh", fh.nc_cmd("macbookpro", 24801)): (0, "", ""),
          ("macbookpro", fh.nc_cmd("hackintosh", 24801)): (0, "", "")}
-    results, _ = run_checks(hosts, t, ["mesh"], env={"FLEET_DESKFLOW_PORT": "24801"})
+    results, _ = run_checks(hosts, t, ["mesh"], env={"FLEET_MESH_PORT": "24801"})
     assert [r.status for r in results] == ["PASS", "PASS"]
     results, _ = run_checks([mac("solo")], {}, ["mesh"])
     assert results[0].status == "SKIP" and results[0].ok
@@ -576,7 +578,7 @@ def test_mesh_port_from_env_and_single_host_skip():
 
 def test_windows_authenticode_and_session_via_ps1():
     env = {"FLEET_DESKFLOW_PATH_windows": "C:/Users/alexh/Desktop/deskflow", "DESKFLOW_SIGN_THUMBPRINT": "AB12"}
-    cmd = fh.ps1_cmd("C:/Users/alexh/Desktop/deskflow", ["authenticode", "session"], "AB12", 24800, [])
+    cmd = fh.ps1_cmd("C:/Users/alexh/Desktop/deskflow", ["authenticode", "session"], "AB12", fh.DEFAULT_MESH_PORT, [])
     assert cmd.startswith("powershell.exe -NoProfile -ExecutionPolicy Bypass -File")
     assert "fleet-health.ps1" in cmd and "-Thumbprint AB12" in cmd
     t = {("tiny11", cmd): (0, json.dumps([
@@ -590,7 +592,7 @@ def test_windows_authenticode_and_session_via_ps1():
 
 
 def test_windows_authenticode_thumbprint_mismatch():
-    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["authenticode"], "", 24800, [])
+    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["authenticode"], "", fh.DEFAULT_MESH_PORT, [])
     t = {("tiny11", cmd): (1, json.dumps([{"check": "authenticode", "status": "FAIL",
                                             "detail": "deskflow.exe: thumbprint DEADBEEF"}]), "")}
     results, _ = run_checks([win()], t, ["authenticode"])
@@ -598,7 +600,7 @@ def test_windows_authenticode_thumbprint_mismatch():
 
 
 def test_windows_ps1_garbage_output_fails_every_check():
-    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["authenticode", "session"], "", 24800, [])
+    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["authenticode", "session"], "", fh.DEFAULT_MESH_PORT, [])
     t = {("tiny11", cmd): (255, "", "ssh: connect to host tiny11 port 22: Connection refused")}
     results, _ = run_checks([win()], t, ["authenticode", "session"], explicit=False)
     assert [r.status for r in results] == ["FAIL", "FAIL"]
@@ -606,7 +608,7 @@ def test_windows_ps1_garbage_output_fails_every_check():
 
 
 def test_windows_ps1_missing_result_is_fail():
-    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["authenticode", "session"], "", 24800, [])
+    cmd = fh.ps1_cmd(fh.WIN_DESKFLOW_ROOT, ["authenticode", "session"], "", fh.DEFAULT_MESH_PORT, [])
     t = {("tiny11", cmd): (0, json.dumps([{"check": "authenticode", "status": "PASS", "detail": ""}]), "")}
     results, _ = run_checks([win()], t, ["authenticode", "session"], explicit=False)
     assert by_check(results, "session")[0].status == "FAIL"

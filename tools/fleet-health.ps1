@@ -15,7 +15,10 @@
                   else DESKFLOW_SIGN_THUMBPRINT from the repo .env / scripts/fleet.env).
     session       `sc query Deskflow` reports RUNNING; deskflow and Mouser
                   processes exist with SessionId -ne 0; quser shows an Active session.
-    mesh          Test-NetConnection to each -Peers entry on -Port succeeds.
+    mesh          Test-NetConnection to each -Peers entry on -Port (the
+                  coordination-mesh port, always listening regardless of
+                  role -- NOT the KVM/Synergy port, which only the
+                  currently-elected server binds in auto mode) succeeds.
     instances     scripts\deskflow-ctl.ps1 assert-single exits 0: exactly one
                   daemon (session 0, == service PID), one service-owned core and
                   one GUI in the console session, all from the install root,
@@ -32,7 +35,7 @@ param(
   [string]$Checks = "authenticode,session,mesh,instances",
   [string]$Thumbprint = "",
   [string]$Peers = "",
-  [int]$Port = 24800,
+  [int]$Port = 24851,
   [string[]]$InstallRoots = @("C:\Program Files\Deskflow", "C:\Program Files\Mouser"),
   [string]$ServiceName = "Deskflow",
   [string[]]$GuiProcesses = @("deskflow", "Mouser"),
