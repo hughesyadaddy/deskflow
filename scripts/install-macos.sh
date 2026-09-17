@@ -11,10 +11,29 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 if [[ -f .env ]]; then
+  # .env is this seat's persistent config, but an explicit environment
+  # variable set on invocation (as the test suite and CI callers do, e.g.
+  # DESKFLOW_INSTALL_APP pointed at a temp dir) must win, not get silently
+  # clobbered by a real seat's .env -- preserve and restore any variable
+  # .env also declares that was already set in the environment. Plain
+  # indexed arrays only: /usr/bin/env bash on macOS is 3.2, no `declare -A`.
+  _env_overrides=()
+  while IFS='=' read -r _env_key _; do
+    [[ -z "$_env_key" || "$_env_key" == \#* ]] && continue
+    if [[ -n "${!_env_key+x}" ]]; then
+      _env_overrides+=("$_env_key=${!_env_key}")
+    fi
+  done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env)
   set -a
   # shellcheck disable=SC1091
   source .env
   set +a
+  if [[ ${#_env_overrides[@]} -gt 0 ]]; then
+    for _env_kv in "${_env_overrides[@]}"; do
+      export "$_env_kv"
+    done
+  fi
+  unset _env_overrides _env_key _env_kv
 fi
 
 BUILD_DIR="${DESKFLOW_BUILD_DIR:-build}"

@@ -112,6 +112,7 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.launchctl_cmd()): (0, "gui/501 => {\n\tservices = {\n\t\tio.github.hughesyadaddy.mouser\n"
                                     "\t\tio.github.hughesyadaddy.deskflow-core\n\t}\n}", ""),
         (hid, fh.deskflow_gui_running_cmd()): (0, "4242\n", ""),
+        (hid, fh.mouser_running_cmd()): (0, "4243\n", ""),
         (hid, fh.ctl_assert_single_cmd()): (0, CTL_OK + "\n", ""),
         (hid, fh.bridge_status_cmd()): (0, BRIDGE_OK + "\n", ""),
     }
@@ -374,16 +375,18 @@ def test_session_mac_pass_and_fail():
     t = mac_ok_table()
     t[("macbookpro", fh.launchctl_cmd())] = (0, "gui/501 => { services = { com.apple.foo } }", "")
     t[("macbookpro", fh.deskflow_gui_running_cmd())] = (1, "", "")
+    t[("macbookpro", fh.mouser_running_cmd())] = (1, "", "")
     results, _ = run_checks([mac()], t, ["session"])
     assert results[0].status == "FAIL"
-    assert "io.github.hughesyadaddy.mouser not loaded" in results[0].detail
     assert "io.github.hughesyadaddy.deskflow-core not loaded" in results[0].detail
     assert "Deskflow GUI not running" in results[0].detail
-    # launchd owns deskflow-core: a loaded Mouser alone is not enough
+    assert "Mouser not running" in results[0].detail
+    # Mouser is intentionally not launchd-managed: a process check is what
+    # matters, launchd not loading it must not fail the check on its own.
     t = mac_ok_table()
-    t[("macbookpro", fh.launchctl_cmd())] = (0, "gui/501 => { services = { io.github.hughesyadaddy.mouser } }", "")
+    t[("macbookpro", fh.launchctl_cmd())] = (0, "gui/501 => { services = { io.github.hughesyadaddy.deskflow-core } }", "")
     results, _ = run_checks([mac()], t, ["session"])
-    assert results[0].status == "FAIL" and "deskflow-core not loaded" in results[0].detail
+    assert results[0].status == "PASS"
 
 
 # ------------------------------------------------------------- instances

@@ -22,7 +22,9 @@ Checks:
                              plus /usr/local/bin/deskflow-prio (macOS)
   tcc                        TCC grants are cert-based and granted (macOS)
   authenticode               Authenticode thumbprint on every exe/dll (Windows)
-  session                    agents loaded / GUI running in the console session
+  session                    deskflow-core loaded via launchd; Deskflow GUI and
+                             Mouser processes running (Mouser is intentionally
+                             not launchd-managed, so this is a process check)
   mesh                       every seat reaches every other seat on the port
   instances                  `scripts/deskflow-ctl assert-single` on each host:
                              exactly one Deskflow core (owned by launchd / the
@@ -74,7 +76,6 @@ MAC_APPS = ("/Applications/Deskflow.app", "/Applications/Mouser.app")
 MAC_EXTRA_BINARIES = ("/usr/local/bin/deskflow-prio",)
 MAC_DESKFLOW_ROOT = "~/Desktop/deskflow"
 DESKFLOW_CORE = "/Applications/Deskflow.app/Contents/MacOS/deskflow-core"
-MOUSER_LABEL = "io.github.hughesyadaddy.mouser"
 # launchd is the only owner of deskflow-core on macOS (scripts/deskflow-ctl).
 DESKFLOW_CORE_LABEL = "io.github.hughesyadaddy.deskflow-core"
 DEFAULT_PORT = 24800
@@ -272,6 +273,14 @@ def launchctl_cmd() -> str:
 def deskflow_gui_running_cmd() -> str:
     # The GUI executable is Contents/MacOS/Deskflow (capital D); deskflow-core is the daemon.
     return "pgrep -f 'Deskflow.app/Contents/MacOS/Deskflow$'"
+
+
+def mouser_running_cmd() -> str:
+    # Mouser is intentionally NOT launchd-managed (its own in-app "Start at
+    # login" toggle has a self-sync bug that pops the window); the installer
+    # spawns it directly instead. A process check is the correct liveness
+    # signal here, not a launchd-agent lookup.
+    return "pgrep -f 'Mouser.app/Contents/MacOS/Mouser$'"
 
 
 def nc_cmd(addr: str, port: int) -> str:
@@ -590,18 +599,19 @@ class FleetHealth:
         rc, out, err = self.runner(host, launchctl_cmd())
         if rc != 0:
             problems.append(f"launchctl print gui/$UID rc={rc}")
-        else:
-            for label in (MOUSER_LABEL, DESKFLOW_CORE_LABEL):
-                if label not in out:
-                    problems.append(f"{label} not loaded in gui/$UID")
+        elif DESKFLOW_CORE_LABEL not in out:
+            problems.append(f"{DESKFLOW_CORE_LABEL} not loaded in gui/$UID")
         rc, out, err = self.runner(host, deskflow_gui_running_cmd())
         if rc != 0 or not out.strip():
             problems.append("Deskflow GUI not running")
+        rc, out, err = self.runner(host, mouser_running_cmd())
+        if rc != 0 or not out.strip():
+            problems.append("Mouser not running")
         if problems:
             self._add(host, "session", FAIL, "; ".join(problems))
         else:
             self._add(host, "session", PASS,
-                      f"{MOUSER_LABEL} + {DESKFLOW_CORE_LABEL} loaded; Deskflow GUI running")
+                      f"{DESKFLOW_CORE_LABEL} loaded; Deskflow GUI + Mouser running")
 
     def check_instances_mac(self, host: Host) -> None:
         root = self.env.get("FLEET_DESKFLOW_PATH_macos") or MAC_DESKFLOW_ROOT

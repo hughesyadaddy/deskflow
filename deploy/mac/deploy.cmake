@@ -26,6 +26,50 @@ if (OSX_BUNDLE)
   # -executable: macdeployqt only rewrites the bundle's main executable by
   # default; deskflow-core would keep absolute Qt paths and load a second
   # Qt at runtime (fatal cocoa-plugin clash on machines that have one).
+  #
+  # macdeployqt's own -codesign= re-signs every nested binary it touches
+  # with the real identity (good: Authority/TeamIdentifier end up correct,
+  # which is why `sign`/`no-adhoc`/`tcc` all pass), but WITHOUT an
+  # --identifier, so it resets each one to codesign's filename-derived
+  # default -- clobbering the org.deskflow.<target> identifier that
+  # cmake/MacCodesign.cmake's codesign-dev step stamped on it during the
+  # build. The top-level CMakeLists.txt's final --deep
+  # --preserve-metadata=identifier resign then faithfully preserves
+  # whatever identifier is on disk at that point, i.e. this wrong one.
+  # Re-stamp each first-party nested binary's identifier right here, using
+  # the same GLOBAL PROPERTY list MacCodesign.cmake already built, so that
+  # final preserve-metadata pass has the correct identifier to preserve.
+  get_property(_mac_codesign_target_names GLOBAL PROPERTY _MAC_CODESIGN_TARGET_NAMES)
+  get_property(_mac_codesign_identifiers GLOBAL PROPERTY _MAC_CODESIGN_IDENTIFIERS)
+  set(_reidentify_cmds)
+  set(_i 0)
+  foreach(_bin_name IN LISTS _mac_codesign_target_names)
+    list(GET _mac_codesign_identifiers ${_i} _ident)
+    math(EXPR _i "${_i} + 1")
+    if(_bin_name STREQUAL CMAKE_PROJECT_PROPER_NAME)
+      # The app's own main executable must keep an identifier coherent with
+      # the bundle's CFBundleIdentifier (io.github.hughesyadaddy.deskflow),
+      # not org.deskflow.deskflow -- macdeployqt/the final bundle-level
+      # --preserve-metadata resign already leave it consistent with
+      # Info.plist. Re-stamping it here mismatched the two and made launchd
+      # refuse to run it as an interactive LaunchAgent (exit 1, no log),
+      # even though a plain manual fork/exec of the same binary worked fine.
+      continue()
+    endif()
+    string(APPEND _reidentify_cmds "
+    execute_process(COMMAND
+      /usr/bin/codesign --force --options runtime
+      --identifier ${_ident}
+      --entitlements \"${CMAKE_SOURCE_DIR}/src/apps/res/entitlements-dev.plist\"
+      --sign \"${MAC_DEPLOY_CODESIGN_ID}\"
+      \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_PROPER_NAME}.app/Contents/MacOS/${_bin_name}\"
+      RESULT_VARIABLE _reidentify_rc
+    )
+    if(NOT _reidentify_rc EQUAL 0)
+      message(FATAL_ERROR \"re-identify of ${_bin_name} failed (exit \${_reidentify_rc})\")
+    endif()
+")
+  endforeach()
   install(CODE "
     execute_process(COMMAND
       ${DEPLOYQT}
@@ -37,6 +81,7 @@ if (OSX_BUNDLE)
     if(NOT _deployqt_rc EQUAL 0)
       message(FATAL_ERROR \"macdeployqt/codesign of \${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_PROPER_NAME}.app failed (exit \${_deployqt_rc})\")
     endif()
+    ${_reidentify_cmds}
   ")
   set(CPACK_PACKAGE_ICON "${MY_DIR}/dmg-volume.icns")
   set(CPACK_DMG_BACKGROUND_IMAGE "${MY_DIR}/dmg-background.tiff")

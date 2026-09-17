@@ -55,10 +55,29 @@ gui_exec() {
 load_dotenv() {
   cd "$DESKFLOW_ROOT"
   if [[ -f .env ]]; then
+    # .env is this seat's persistent config; an explicit environment
+    # variable set on invocation (as tests/CI callers do) must win, not get
+    # silently clobbered -- preserve and restore anything .env also declares
+    # that was already set. See scripts/install-macos.sh for the same fix.
+    # Plain indexed array only: /usr/bin/env bash on macOS is 3.2, no
+    # `declare -A`.
+    _env_overrides=()
+    while IFS='=' read -r _env_key _; do
+      [[ -z "$_env_key" || "$_env_key" == \#* ]] && continue
+      if [[ -n "${!_env_key+x}" ]]; then
+        _env_overrides+=("$_env_key=${!_env_key}")
+      fi
+    done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env)
     set -a
     # shellcheck disable=SC1091
     source .env
     set +a
+    if [[ ${#_env_overrides[@]} -gt 0 ]]; then
+      for _env_kv in "${_env_overrides[@]}"; do
+        export "$_env_kv"
+      done
+    fi
+    unset _env_overrides _env_key _env_kv
   fi
 }
 

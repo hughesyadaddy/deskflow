@@ -4,7 +4,7 @@
 #
 # The real script runs against a temp install path with cmake/codesign/
 # launchctl/ps/xattr/sleep replaced by PATH shims that log to $SHIM_LOG.
-# `codesign -dv` output is controlled per test via $SHIM_CODESIGN_DV.
+# `codesign -dvvv` output is controlled per test via $SHIM_CODESIGN_DV.
 
 SCRIPT="$BATS_TEST_DIRNAME/../../scripts/install-macos.sh"
 
@@ -73,8 +73,10 @@ EOF
 echo "codesign $*" >> "$SHIM_LOG"
 case "${1:-}" in
   --verify) exit "${SHIM_CODESIGN_VERIFY_RC:-0}" ;;
-  -dv)
-    # Real codesign prints -dv details to stderr.
+  -dvvv)
+    # Real codesign prints -dvvv details to stderr. Plain -dv never prints
+    # Authority= lines regardless of signature, which is why the real
+    # script uses -dvvv; the shim only answers that flag.
     printf '%s\n' "${SHIM_CODESIGN_DV:-}" >&2
     exit "${SHIM_CODESIGN_DV_RC:-0}"
     ;;
@@ -155,7 +157,7 @@ log_lacks() {
   [[ "$output" == *"TeamIdentifier=ABCDE12345"* ]]
   [ -f "$APP/Contents/MacOS/deskflow-core" ]
   log_has "codesign --verify --deep --strict $APP"
-  log_has "codesign -dv $APP/Contents/MacOS/deskflow-core"
+  log_has "codesign -dvvv $APP/Contents/MacOS/deskflow-core"
   log_has "launchctl bootstrap gui/$(id -u) $DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow-core.plist"
   log_has "launchctl bootstrap gui/$(id -u) $DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow.plist"
   # stop (ps inventory) happens before the bundle swap, start after verify
@@ -210,10 +212,10 @@ log_lacks() {
   log_lacks "launchctl bootstrap"
 }
 
-@test "codesign -dv itself failing exits 1" {
+@test "codesign -dvvv itself failing exits 1" {
   SHIM_CODESIGN_DV="" SHIM_CODESIGN_DV_RC=1 run bash "$SCRIPT"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"codesign -dv failed"* ]]
+  [[ "$output" == *"codesign -dvvv failed"* ]]
 }
 
 @test "--no-restart still enforces the signature check" {

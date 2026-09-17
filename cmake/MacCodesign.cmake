@@ -31,6 +31,11 @@ endif()
 
 function(configure_mac_codesign target)
   set_property(GLOBAL APPEND PROPERTY _MAC_CODESIGN_DEPENDS $<TARGET_FILE:${target}>)
+  # Plain target name (== the installed Contents/MacOS/<name> filename for
+  # these targets), for consumers that need it outside a build-time COMMAND
+  # context, where the $<TARGET_FILE:...> genex above can't be resolved
+  # with configure-time string commands like get_filename_component.
+  set_property(GLOBAL APPEND PROPERTY _MAC_CODESIGN_TARGET_NAMES "${target}")
   # Stable code identifier per target. Without --identifier codesign derives
   # one from the file name (plus an LC_UUID-style suffix for bare Mach-Os,
   # e.g. deskflow-core-5555), which changes per build and breaks both TCC
