@@ -28,6 +28,34 @@ DESKFLOW_ROOT="${DESKFLOW_ROOT/#\~/$HOME}"
 MOUSER_ROOT="${FLEET_MOUSER_ROOT:-$HOME/Desktop/Mouser}"
 MOUSER_ROOT="${MOUSER_ROOT/#\~/$HOME}"
 MOUSER_FORK_URL="${FLEET_MOUSER_FORK_URL:-https://github.com/hughesyadaddy/Mouser.git}"
+
+# Hard structural guard: DESKFLOW_ROOT/MOUSER_ROOT default to the real repo
+# checkouts (FLEET_DESKFLOW_ROOT/FLEET_MOUSER_ROOT override them), and this
+# script does real `git checkout`/`pull --ff-only`/build/install against
+# whichever they resolve to. A 2026-09-16 incident had a downstream script
+# (install-macos.sh) overwrite the real /Applications/Deskflow.app because a
+# test's path override got silently clobbered; that specific bug is fixed,
+# but this check exists so no future bug of the same shape -- here or in a
+# caller -- can point real git/build/install operations at a real checkout
+# while under a test harness. BATS_TEST_FILENAME is set by bats for every
+# test, unconditionally.
+if [[ -n "${BATS_TEST_FILENAME:-}" ]]; then
+  for _sandbox_check_path in "$DESKFLOW_ROOT" "$MOUSER_ROOT"; do
+    case "$_sandbox_check_path" in
+      "$TMPDIR"*|/tmp/*|/private/tmp/*|/private/var/folders/*|"${BATS_TMPDIR:-__unset__}"*|\
+      "${BATS_RUN_TMPDIR:-__unset__}"*|"${BATS_TEST_TMPDIR:-__unset__}"*|"${BATS_FILE_TMPDIR:-__unset__}"*)
+        ;;
+      *)
+        echo "FATAL: running under bats (BATS_TEST_FILENAME set) but '$_sandbox_check_path'" \
+             "is not inside a tmp sandbox. Refusing to touch it -- this is exactly the bug" \
+             "class that overwrote the real /Applications/Deskflow.app on 2026-09-16." \
+             "Aborting." >&2
+        exit 90
+        ;;
+    esac
+  done
+  unset _sandbox_check_path
+fi
 BRANCH="${FLEET_BRANCH:-main}"
 MOUSER_BRANCH="${FLEET_MOUSER_BRANCH:-$BRANCH}"
 DEPLOY_DESKFLOW="${FLEET_DEPLOY_DESKFLOW:-1}"
@@ -161,8 +189,13 @@ build_install_deskflow() {
   # install-macos.sh restarts Deskflow through scripts/deskflow-ctl (launchd).
   # It never touches Mouser; MOUSER_RESTART is set only in deploy_mouser.
   gui_exec bash scripts/install-macos.sh
-  if ! codesign --verify --deep --strict /Applications/Deskflow.app; then
-    fail "codesign --verify --deep --strict /Applications/Deskflow.app failed — refusing to call this deploy a success"
+  # Match install-macos.sh's own DESKFLOW_INSTALL_APP resolution -- a
+  # hardcoded /Applications/Deskflow.app here ignores a real override and,
+  # under a test harness, would probe the real path regardless of how
+  # correctly the rest of this script is sandboxed.
+  local install_app="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
+  if ! codesign --verify --deep --strict "$install_app"; then
+    fail "codesign --verify --deep --strict $install_app failed — refusing to call this deploy a success"
   fi
   echo "== [$HOST_TAG] codesign verify OK =="
 }

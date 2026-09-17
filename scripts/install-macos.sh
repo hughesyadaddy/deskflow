@@ -44,6 +44,29 @@ SOURCE_APP="$ROOT/$BUILD_DIR/bin/Deskflow.app"
 CTL="$ROOT/scripts/deskflow-ctl"
 RESTART=1
 
+# Hard structural guard, independent of the .env-precedence fix above: a
+# 2026-09-16 incident had this script run under `bats` with its own .env
+# clobbering the test's DESKFLOW_INSTALL_APP override, so install_bundle()
+# overwrote the REAL /Applications/Deskflow.app with the test's empty
+# placeholder binary. That specific bug is fixed, but this check exists so
+# no *future* bug of the same shape (here or in a caller) can ever again
+# point a destructive install at a real path while under a test harness --
+# BATS_TEST_FILENAME is set by bats for every test, unconditionally.
+if [[ -n "${BATS_TEST_FILENAME:-}" ]]; then
+  case "$INSTALL_APP" in
+    "$TMPDIR"*|/tmp/*|/private/tmp/*|/private/var/folders/*|"${BATS_TMPDIR:-__unset__}"*|\
+    "${BATS_RUN_TMPDIR:-__unset__}"*|"${BATS_TEST_TMPDIR:-__unset__}"*|"${BATS_FILE_TMPDIR:-__unset__}"*)
+      ;;
+    *)
+      echo "FATAL: running under bats (BATS_TEST_FILENAME set) but DESKFLOW_INSTALL_APP" \
+           "('$INSTALL_APP') is not inside a tmp sandbox. Refusing to touch it -- this is" \
+           "exactly the bug class that overwrote the real /Applications/Deskflow.app on" \
+           "2026-09-16. Aborting." >&2
+      exit 90
+      ;;
+  esac
+fi
+
 usage() {
   cat <<'EOF'
 Usage: scripts/install-macos.sh [--no-restart] [--install-app PATH]

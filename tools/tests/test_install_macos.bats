@@ -264,3 +264,19 @@ log_lacks() {
   run grep -n 'Installed unsigned' "$SCRIPT"
   [ "$status" -ne 0 ]
 }
+
+@test "refuses to run under bats against a non-sandboxed install path (2026-09-16 incident regression)" {
+  # A real .env clobbering this override is exactly what corrupted the real
+  # /Applications/Deskflow.app on 2026-09-16 -- this proves the independent
+  # hard guard catches ANY non-tmp DESKFLOW_INSTALL_APP under bats, even
+  # without that specific bug, and aborts before touching anything (no
+  # stop/install/codesign log lines at all).
+  export DESKFLOW_INSTALL_APP="/Library/Application Support/DeskflowGuardRegressionTest/Deskflow.app"
+  run bash "$SCRIPT"
+  [ "$status" -eq 90 ]
+  [[ "$output" == *"FATAL: running under bats"* ]]
+  [[ "$output" == *"is not inside a tmp sandbox"* ]]
+  [ ! -e "/Library/Application Support/DeskflowGuardRegressionTest" ]
+  log_lacks "Stopping Deskflow"
+  log_lacks "Installing to"
+}

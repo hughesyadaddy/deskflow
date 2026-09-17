@@ -376,3 +376,17 @@ script_lacks() {
   log_lacks "git checkout"
   log_has "python3 scripts/build_macos_gui_session.py"
 }
+
+@test "refuses to run under bats against a non-sandboxed FLEET_MOUSER_ROOT (2026-09-16 incident regression)" {
+  # FLEET_MOUSER_ROOT defaults to the real ~/Desktop/Mouser when unset; this
+  # proves the independent hard guard catches ANY non-tmp override under
+  # bats before any git/build/install step runs, regardless of whether the
+  # override itself was set correctly.
+  export FLEET_MOUSER_ROOT="/Library/Application Support/DeskflowGuardRegressionTest/Mouser"
+  run bash "$SCRIPT"
+  [ "$status" -eq 90 ]
+  [[ "$output" == *"FATAL: running under bats"* ]]
+  [[ "$output" == *"is not inside a tmp sandbox"* ]]
+  [ ! -e "/Library/Application Support/DeskflowGuardRegressionTest" ]
+  [ ! -s "$SHIM_LOG" ]
+}
