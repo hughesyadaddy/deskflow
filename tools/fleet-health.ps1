@@ -176,7 +176,11 @@ function Invoke-CtlAssertSingle([string]$CtlPath) {
     return @{ ok = $false; text = "deskflow-ctl.ps1 missing at $CtlPath" }
   }
   try {
-    $out = & $CtlPath assert-single 2>&1 | Out-String
+    # deskflow-ctl.ps1's success line is Write-Host, which lands on the
+    # Information stream, not stdout -- `2>&1` alone never captures it, so
+    # this used to report PASS with an empty detail (indistinguishable from
+    # a check that silently never ran). `*>&1` merges every stream.
+    $out = & $CtlPath assert-single *>&1 | Out-String
     return @{ ok = $true; text = $out.Trim() }
   } catch {
     return @{ ok = $false; text = ("" + $_.Exception.Message).Trim() }
