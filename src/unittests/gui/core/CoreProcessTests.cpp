@@ -9,6 +9,9 @@
 #include "common/Settings.h"
 #include "gui/config/ServerConfig.h"
 #include "gui/core/CoreProcess.h"
+#ifdef Q_OS_MACOS
+#include "gui/OSXHelpers.h"
+#endif
 
 #include <QCoreApplication>
 #include <QDir>
@@ -337,18 +340,16 @@ void CoreProcessTests::macos_gui_never_spawns_a_core()
   core.start(ProcessMode::Desktop);
   QCOMPARE(core.processState(), ProcessState::Started);
 #ifdef Q_OS_MACOS
-  QVERIFY(core.isExternallySupervised());
-  QCOMPARE(core.spawnCount, 0);
-  core.restart();
-  QCOMPARE(core.kickstarts, 1);
-  QCOMPARE(core.spawnCount, 0);
+  // Decided by the fleet core agent plist on this machine, never by a launchctl probe.
+  const bool launchdOwned = macLaunchdOwnsCore();
 #else
-  QVERIFY(!core.isExternallySupervised());
-  QCOMPARE(core.spawnCount, 1);
-  core.restart();
-  QCOMPARE(core.kickstarts, 0);
-  QCOMPARE(core.spawnCount, 2);
+  const bool launchdOwned = false;
 #endif
+  QCOMPARE(core.isExternallySupervised(), launchdOwned);
+  QCOMPARE(core.spawnCount, launchdOwned ? 0 : 1);
+  core.restart();
+  QCOMPARE(core.kickstarts, launchdOwned ? 1 : 0);
+  QCOMPARE(core.spawnCount, launchdOwned ? 0 : 2);
   core.stop();
   QCOMPARE(core.processState(), ProcessState::Stopped);
 }
