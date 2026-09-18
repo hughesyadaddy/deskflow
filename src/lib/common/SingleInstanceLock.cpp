@@ -159,6 +159,12 @@ int openLockFile(SingleInstanceLock::Role role, SingleInstanceLock::Scope scope,
     fd = ::open(outPath.c_str(), O_RDONLY | cloexec);
   }
   if (fd >= 0) {
+    // umask-proof (the root bridge runs with umask 077): a private root lock file
+    // would push every user-session core to the /tmp fallback.
+    struct stat st{};
+    if (::fstat(fd, &st) == 0 && st.st_uid == geteuid() && (st.st_mode & 0444) != 0444) {
+      ::fchmod(fd, 0644);
+    }
     return fd;
   }
   const int primaryErrno = errno;

@@ -5,6 +5,17 @@
 // Usage: deskflow-vhid-bridge <server_hosts> <client_screen_name>
 //          [port [width height [scale_factor]]]
 //          [--size=WxH] [--scale=S] [--scale-fixed] [--calibrate] [--coord-port=N]
+//          [--debug-keys]
+//
+// Logging never includes key ids, masks or anything else decodable to typed
+// text: at the login window that stream is the password. --debug-keys adds
+// per-key lines carrying only button/usage/held counts and is for diagnosis
+// only, never for a production plist.
+//
+// The bridge only injects while the console user is loginwindow. When a user
+// session takes the console (login, fast user switch) it releases every key,
+// sends CBYE, disconnects and waits; SIGTERM drains the same way and exits 0
+// at once instead of after the next message or socket timeout.
 //
 // Pointer scale: by default the bridge self-calibrates (slam to a corner, emit
 // a known delta, read the cursor back -> counts per point) and then runs every
@@ -54,10 +65,12 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #include <CoreGraphics/CoreGraphics.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/hid/IOHIDEventServiceKeys.h>
 #include <IOKit/hid/IOHIDKeys.h>
@@ -99,6 +112,101 @@ void log_line(const std::string &message)
   // stderr is captured by the LaunchDaemon log; stdout is reserved for none.
   std::string line = "[bridge] " + message + "\n";
   ::write(STDERR_FILENO, line.data(), line.size());
+}
+
+bool g_debug_keys = false;
+
+void log_keys(const std::string &message)
+{
+  if (g_debug_keys)
+    log_line(message);
+}
+
+// Self-pipe: the signal handler and the console-user watcher write a byte so a
+// blocking read/poll/sleep wakes immediately instead of at the next message.
+int g_wake_pipe[2] = {-1, -1};
+std::atomic<bool> g_stop{false};
+// True while a user session owns the console (not loginwindow): inject nothing.
+std::atomic<bool> g_stand_down{false};
+
+void wake()
+{
+  const char byte = 1;
+  (void)!::write(g_wake_pipe[1], &byte, 1);
+}
+
+void drain_wake_pipe()
+{
+  char buf[64];
+  while (::read(g_wake_pipe[0], buf, sizeof(buf)) > 0) {
+  }
+}
+
+bool must_pause()
+{
+  return g_stop.load() || g_stand_down.load();
+}
+
+// Sleeps up to timeout_ms; returns early (true) when woken by the self-pipe.
+bool wait_or_wake(int timeout_ms)
+{
+  pollfd pfd{};
+  pfd.fd = g_wake_pipe[0];
+  pfd.events = POLLIN;
+  if (::poll(&pfd, 1, timeout_ms) > 0) {
+    drain_wake_pipe();
+    return true;
+  }
+  return false;
+}
+
+bool console_user_is_loginwindow(SCDynamicStoreRef store)
+{
+  uid_t uid = 0;
+  gid_t gid = 0;
+  CFStringRef name = SCDynamicStoreCopyConsoleUser(store, &uid, &gid);
+  if (name == nullptr)
+    return true;
+  const bool loginwindow = CFStringCompare(name, CFSTR("loginwindow"), 0) == kCFCompareEqualTo;
+  CFRelease(name);
+  return loginwindow;
+}
+
+void apply_console_user(SCDynamicStoreRef store)
+{
+  const bool standDown = !console_user_is_loginwindow(store);
+  if (g_stand_down.exchange(standDown) != standDown) {
+    log_line(standDown ? "console user is a user session: standing down" : "console user is loginwindow: resuming");
+    wake();
+  }
+}
+
+void console_user_changed(SCDynamicStoreRef store, CFArrayRef, void *)
+{
+  apply_console_user(store);
+}
+
+// Watches State:/Users/ConsoleUser on its own run loop for the life of the process.
+void start_console_user_watch()
+{
+  SCDynamicStoreRef store = SCDynamicStoreCreate(nullptr, CFSTR("deskflow-vhid-bridge"), console_user_changed, nullptr);
+  if (store == nullptr) {
+    log_line("console-user watch unavailable (SCDynamicStoreCreate failed); assuming loginwindow");
+    return;
+  }
+  apply_console_user(store);
+  CFStringRef key = SCDynamicStoreKeyCreateConsoleUser(nullptr);
+  CFArrayRef keys = CFArrayCreate(nullptr, reinterpret_cast<const void **>(&key), 1, &kCFTypeArrayCallBacks);
+  SCDynamicStoreSetNotificationKeys(store, keys, nullptr);
+  CFRelease(keys);
+  CFRelease(key);
+  std::thread([store] {
+    CFRunLoopSourceRef source = SCDynamicStoreCreateRunLoopSource(nullptr, store, 0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+    CFRunLoopRun();
+    CFRelease(source);
+    CFRelease(store);
+  }).detach();
 }
 
 std::string hex_str(unsigned v)
@@ -351,6 +459,12 @@ bool body_has_code(const std::vector<uint8_t> &body, const char (&code)[4])
   return body.size() >= 4 && std::memcmp(body.data(), code, 4) == 0;
 }
 
+// A blocking connect() to a black-holed host (firewall drop, sleeping machine)
+// stalls ~75s, defeating the reconnect backoff; a healthy link must also notice a
+// silently-dead host (no RST) rather than blocking in recv() forever. Bound both.
+constexpr int kConnectTimeoutMs = 4000;
+constexpr int kIoTimeoutSeconds = 10; // > deskflow's 5s CALV keep-alive interval
+
 // ---------------------------------------------------------------------------
 // Framed socket I/O. Every message is a 4-byte big-endian length + payload.
 // ---------------------------------------------------------------------------
@@ -411,6 +525,16 @@ private:
   {
     size_t got = 0;
     while (got < n) {
+      pollfd pfds[2] = {};
+      pfds[0].fd = fd_;
+      pfds[0].events = POLLIN;
+      pfds[1].fd = g_wake_pipe[0];
+      pfds[1].events = POLLIN;
+      const int ready = ::poll(pfds, 2, kIoTimeoutSeconds * 1000);
+      if (ready < 0 && errno == EINTR)
+        continue;
+      if (ready <= 0 || (pfds[1].revents & POLLIN) != 0)
+        return false; // idle timeout, or woken to stop / stand down
       ssize_t r = ::recv(fd_, buffer + got, n - got, 0);
       if (r == 0)
         return false; // peer closed
@@ -439,12 +563,6 @@ private:
   }
   int fd_ = -1;
 };
-
-// A blocking connect() to a black-holed host (firewall drop, sleeping machine)
-// stalls ~75s, defeating the reconnect backoff; a healthy link must also notice a
-// silently-dead host (no RST) rather than blocking in recv() forever. Bound both.
-constexpr int kConnectTimeoutMs = 4000;
-constexpr int kIoTimeoutSeconds = 10; // > deskflow's 5s CALV keep-alive interval
 
 void set_io_timeouts(int fd)
 {
@@ -1061,7 +1179,7 @@ public:
     if (!handshake(socket))
       return;
     release_all();
-    while (!g_stop.load()) {
+    while (!must_pause()) {
       std::optional<std::vector<uint8_t>> message = socket.read_message();
       if (!message)
         break;
@@ -1070,6 +1188,13 @@ public:
       warn_stuck_keys();
     }
     release_all();
+    if (must_pause()) {
+      // Leaving on purpose: tell the server so it drops us now rather than at
+      // its keep-alive timeout, then the user-session core can take the screen.
+      std::vector<uint8_t> bye;
+      append_bytes(bye, proto::kClose, sizeof(proto::kClose));
+      socket.write_message(bye);
+    }
   }
 
 private:
@@ -1104,8 +1229,7 @@ private:
         held.warned = true;
         any = true;
       }
-      summary += " {btn=" + std::to_string(button) + " id=0x" + to_hex(held.key_id) + " usage=0x" +
-                 to_hex(held.usage.value_or(0)) + " mods=0x" + to_hex(held.modifier_bits) +
+      summary += " {btn=" + std::to_string(button) +
                  " held=" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(now - held.since).count()) +
                  "s}";
     }
@@ -1402,6 +1526,7 @@ private:
     log_line("keyboard rescue: escape burst -- releasing input and restarting bridge");
     release_all();
     g_stop.store(true);
+    wake();
     std::exit(0); // launchd KeepAlive restarts us clean
   }
 
@@ -1433,7 +1558,7 @@ private:
     } else {
       std::optional<uint16_t> usage = translate_key(id16);
       if (!usage) {
-        log_line("unmapped key id 0x" + to_hex(id16));
+        log_keys("unmapped key btn=" + std::to_string(button));
         return true;
       }
       entry.usage = usage;
@@ -1465,10 +1590,9 @@ private:
       }
     }
     held_keys_[button] = entry;
-    log_line(
-        "key down id=0x" + to_hex(id16) + " mask=0x" + to_hex(static_cast<uint16_t>(mask)) +
-        " btn=" + std::to_string(button) + " -> usage=0x" + to_hex(entry.usage.value_or(0)) + " mods=0x" +
-        to_hex(entry.modifier_bits) + " held=" + std::to_string(held_keys_.size())
+    log_keys(
+        "key down btn=" + std::to_string(button) + " usage=0x" + to_hex(entry.usage.value_or(0)) +
+        " held=" + std::to_string(held_keys_.size())
     );
     emit_keyboard();
     return true;
@@ -1484,9 +1608,8 @@ private:
     const bool desired = bridge_logic::desired_caps_from_mask(mask);
     const CapsTruth truth = target_caps_lock_state();
     const bool emit = bridge_logic::caps_edge_needed(truth.state, desired);
-    log_line(
-        "caps " + std::string(key_id == 0 ? "mask-only" : "down") + " id=0x" + to_hex(key_id) + " mask=0x" +
-        to_hex(static_cast<uint16_t>(mask)) + " btn=" + std::to_string(button) +
+    log_keys(
+        "caps " + std::string(key_id == 0 ? "mask-only" : "down") + " btn=" + std::to_string(button) +
         " desired=" + (desired ? "on" : "off") + " truth=" + (truth.state ? (*truth.state ? "on" : "off") : "unknown") +
         " (" + truth.source + ") -> " + (emit ? "EDGE" : "skip")
     );
@@ -1514,9 +1637,8 @@ private:
     const uint16_t usage = was_held ? it->second.usage.value_or(0) : 0;
     if (was_held)
       held_keys_.erase(it);
-    log_line(
-        "key up id=0x" + to_hex(id16) + " mask=0x" + to_hex(static_cast<uint16_t>(mask)) +
-        " btn=" + std::to_string(button) + " -> usage=0x" + to_hex(usage) + (was_held ? "" : " (not held)") +
+    log_keys(
+        "key up btn=" + std::to_string(button) + " usage=0x" + to_hex(usage) + (was_held ? "" : " (not held)") +
         " held=" + std::to_string(held_keys_.size())
     );
     if (id16 == bridge_logic::kKeyIdCapsLock)
@@ -1667,16 +1789,22 @@ private:
   bool closed_loop_disabled_ = false;
   int saturated_residuals_ = 0;
 
-public:
-  static std::atomic<bool> g_stop;
 };
-
-std::atomic<bool> Bridge::g_stop{false};
 
 } // namespace
 
 int main(int argc, char **argv)
 {
+  ::umask(077);
+  if (::pipe(g_wake_pipe) != 0) {
+    log_line("pipe() failed: " + std::string(std::strerror(errno)));
+    return 1;
+  }
+  for (int fd : g_wake_pipe) {
+    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+  }
+
   // Split flag arguments (--size=WxH, --scale=S) from positionals so the
   // launchd plist generated by the GUI can pass options without having to
   // fill every preceding positional slot. Legacy positional forms still work.
@@ -1715,6 +1843,8 @@ int main(int argc, char **argv)
       scale_fixed = true;
     } else if (arg == "--calibrate") {
       calibrate = true; // the default; accepted so plists can say so explicitly
+    } else if (arg == "--debug-keys") {
+      g_debug_keys = true;
     } else {
       positional.push_back(arg);
     }
@@ -1728,7 +1858,7 @@ int main(int argc, char **argv)
     log_line(
         "usage: deskflow-vhid-bridge <server_hosts> <client_screen_name> "
         "[port [width height [scale_factor]]] [--size=WxH] [--scale=S] [--scale-fixed] [--calibrate] "
-        "[--coord-port=N]"
+        "[--coord-port=N] [--debug-keys]"
     );
     return 2;
   }
@@ -1811,7 +1941,10 @@ int main(int argc, char **argv)
     scale_factor = *flag_scale;
 
   struct sigaction sa{};
-  sa.sa_handler = [](int) { Bridge::g_stop.store(true); };
+  sa.sa_handler = [](int) {
+    g_stop.store(true);
+    wake();
+  };
   sigaction(SIGTERM, &sa, nullptr);
   sigaction(SIGINT, &sa, nullptr);
   signal(SIGPIPE, SIG_IGN);
@@ -1849,12 +1982,17 @@ int main(int argc, char **argv)
     std::this_thread::sleep_for(milliseconds(250)); // let the accel property settle
     bridge.calibrate();
   }
+  start_console_user_watch();
   const uint16_t coord_port = flag_coord_port.value_or(0);
   // Cycle the candidate list; back off only after a full pass with no server
   // accepting, so a role flip to any peer is picked up within one pass.
   int backoff_ms = 500;
   size_t host_idx = 0;
-  while (!Bridge::g_stop.load()) {
+  while (!g_stop.load()) {
+    if (g_stand_down.load()) {
+      wait_or_wake(1000);
+      continue;
+    }
     if (coord_port != 0) {
       std::vector<std::string> refreshed = server_hosts;
       if (refresh_hosts_from_coord_snapshot(coord_port, client_name, refreshed)) {
@@ -1867,7 +2005,7 @@ int main(int argc, char **argv)
     if (fd < 0) {
       host_idx = (host_idx + 1) % server_hosts.size();
       if (host_idx == 0) {
-        std::this_thread::sleep_for(milliseconds(backoff_ms));
+        wait_or_wake(backoff_ms);
         backoff_ms = std::min(backoff_ms * 2, 5000);
       }
       continue;
@@ -1877,6 +2015,8 @@ int main(int argc, char **argv)
     FramedSocket socket(fd);
     bridge.run(socket);
     log_line("host connection closed");
+    drain_wake_pipe();
   }
+  log_line("stopping (signal)");
   return 0;
 }
