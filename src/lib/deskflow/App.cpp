@@ -161,6 +161,7 @@ void App::initApp()
     );
     m_bye(s_exitArgs);
   }
+  CLOG->setDebugCategories(Settings::value(Settings::Log::Categories).toString().split(QLatin1Char(',')));
   loggingFilterWarning();
 
   // setup file logging after parsing args
