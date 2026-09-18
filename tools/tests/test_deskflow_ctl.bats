@@ -7,7 +7,7 @@
 # defaults to the caller's, since stop only owns this user's processes).
 
 SCRIPT="$BATS_TEST_DIRNAME/../../scripts/deskflow-ctl"
-REPO="$BATS_TEST_DIRNAME/../.."
+REPO="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
 
 setup() {
   TMP="$(mktemp -d "${BATS_TEST_TMPDIR:-${TMPDIR:-/tmp}}/deskflow-ctl.XXXXXX")"
@@ -16,6 +16,7 @@ setup() {
   export SHIM_STATE="$TMP/state"
   export APP="$TMP/Applications/Deskflow.app"
   export HOME="$TMP/home"
+  STATE="$HOME/Library/Application Support/Deskflow"
   mkdir -p "$SHIMS" "$SHIM_STATE/loaded" "$SHIM_STATE/pid" "$APP/Contents/MacOS" "$HOME"
   : >"$SHIM_LOG"
   : >"$SHIM_STATE/ps.txt"
@@ -76,6 +77,12 @@ EOF
 exit 0
 EOF
 
+  # The only osascript use is the converge toast; never show a real one.
+  make_shim osascript <<'EOF'
+echo "osascript $*" >> "$SHIM_LOG"
+exit 0
+EOF
+
   export PATH="$SHIMS:$PATH"
   export DESKFLOW_INSTALL_APP="$APP"
   export DESKFLOW_CTL_AGENT_DIR="$TMP/LaunchAgents"
@@ -104,6 +111,7 @@ log_lacks() { ! grep -qF -- "$1" "$SHIM_LOG" || { echo "unexpected in shim log: 
 
 CORE=io.github.hughesyadaddy.deskflow-core
 GUI=io.github.hughesyadaddy.deskflow
+CONVERGE=io.github.hughesyadaddy.deskflow-converge
 DOMAIN="gui/$(id -u)"
 
 # --- stop ---------------------------------------------------------------------
@@ -132,8 +140,13 @@ DOMAIN="gui/$(id -u)"
   [[ "$output" == *"escalating: SIGKILL"* ]]
   [ ! -s "$SHIM_STATE/ps.txt" ]
   # No pattern-based killing or `open` anywhere in the ctl (comments excluded).
-  run grep -E '^[^#]*[[:space:]](pkill|pgrep|killall|osascript|open)[[:space:]]' "$SCRIPT"
+  # osascript is allowed for one thing only: the converge toast (notify()).
+  run grep -E '^[^#]*[[:space:]](pkill|pgrep|killall|open)[[:space:]]' "$SCRIPT"
   [ "$status" -ne 0 ]
+  run grep -cE '^[^#]*[[:space:]]osascript[[:space:]]' "$SCRIPT"
+  [ "$output" -eq 1 ]
+  run grep -E '^[^#]*[[:space:]]osascript[[:space:]]' "$SCRIPT"
+  [[ "$output" == *"display notification"* ]]
 }
 
 @test "stop is a no-op when nothing is loaded or running" {
@@ -199,9 +212,49 @@ DOMAIN="gui/$(id -u)"
   grep -q "<string>$APP/Contents/MacOS/deskflow-core</string>" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
   grep -q "<string>auto</string>" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
   grep -q "<string>$HOME/Library/Logs/Deskflow/deskflow-core.log</string>" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
-  ! grep -q "__APP__\|__HOME__" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist" "$DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+  ! grep -q "__APP__\|__HOME__\|__CTL__" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist" "$DESKFLOW_CTL_AGENT_DIR/$GUI.plist" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
   [ -d "$HOME/Library/Logs/Deskflow" ]
   [[ "$output" == *"started: core pid 300"* ]]
+  # launchd-owned marker in both process plists; GUI comes back after a crash.
+  grep -q "DESKFLOW_LAUNCHD" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  grep -q "DESKFLOW_LAUNCHD" "$DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+  grep -q "SuccessfulExit" "$DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+  # enable precedes every bootstrap (a disabled label makes bootstrap a silent no-op at login).
+  for label in $CORE $GUI $CONVERGE; do
+    en="$(grep -n "launchctl enable $DOMAIN/$label" "$SHIM_LOG" | head -1 | cut -d: -f1)"
+    bs="$(grep -n "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$label.plist" "$SHIM_LOG" | cut -d: -f1)"
+    [ -n "$en" ] && [ "$en" -lt "$bs" ]
+  done
+  # The converge tick is bootstrapped last and points at this checkout's ctl.
+  grep -q "<string>$REPO/scripts/deskflow-ctl</string>" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
+  grep -q "<string>--apply</string>" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
+  grep -q "<key>StartInterval</key>" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
+  gui_line="$(grep -n "bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist" "$SHIM_LOG" | cut -d: -f1)"
+  conv_line="$(grep -n "bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist" "$SHIM_LOG" | cut -d: -f1)"
+  [ "$gui_line" -lt "$conv_line" ]
+}
+
+@test "stop writes the quit-intent sentinel and boots out the converge tick; start/restart clear it" {
+  load_agent $CONVERGE; load_agent $CORE 100; add_proc 100 "$APP/Contents/MacOS/deskflow-core"
+  run bash "$SCRIPT" stop
+  [ "$status" -eq 0 ]
+  [ -f "$HOME/Library/Application Support/Deskflow/quit-intent" ]
+  log_has "launchctl bootout $DOMAIN/$CONVERGE"
+  # the sentinel lands before the first bootout so a racing converge sees it
+  first_bootout="$(grep -n "launchctl bootout" "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  [ "$first_bootout" -ge 1 ]
+
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 0 ]
+  [ ! -e "$HOME/Library/Application Support/Deskflow/quit-intent" ]
+
+  bash "$SCRIPT" stop
+  [ -f "$HOME/Library/Application Support/Deskflow/quit-intent" ]
+  run bash "$SCRIPT" restart
+  [ "$status" -eq 0 ]
+  [ ! -e "$HOME/Library/Application Support/Deskflow/quit-intent" ]
 }
 
 @test "start kickstarts (without -k) an agent that is already loaded instead of bootstrapping twice" {
@@ -366,6 +419,193 @@ EOF
   [ -f "$DESKFLOW_CTL_DAEMON_STAGE_DIR/$PRIO.plist" ]
   [[ "$output" == *"sudo launchctl bootstrap system"* ]]
   log_has "launchctl print system/$PRIO"
+}
+
+# --- converge -----------------------------------------------------------------
+
+healthy() {
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  load_agent $GUI 301;  add_proc 301 "$APP/Contents/MacOS/Deskflow"
+  load_agent $CONVERGE
+  bash "$SCRIPT" start >/dev/null 2>&1 || true  # renders the plists; agents already loaded
+  : >"$SHIM_LOG"
+}
+
+@test "converge on a healthy seat does nothing, writes health.json, no toast" {
+  healthy
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"nothing to do"* ]]
+  [[ "$output" == *"assert-single: OK"* ]]
+  log_lacks "launchctl bootstrap"
+  log_lacks "launchctl kickstart"
+  log_lacks "osascript"
+  [ -f "$STATE/health.json" ]
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['assert_single']=='OK' and d['actions']==[] and d['counts']['core']==1 and d['mode']=='apply'" "$STATE/health.json"
+  run bash "$SCRIPT" converge --apply --quiet
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "converge without --apply only prints the plan; --apply bootstraps the missing GUI and toasts once" {
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  load_agent $CONVERGE
+  bash "$SCRIPT" start >/dev/null 2>&1 || true
+  rm -f "$SHIM_STATE/loaded/$GUI"   # a GUI booted out of launchd entirely
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"plan (plan): bootstrap $GUI"* ]]
+  log_lacks "launchctl bootstrap"
+  log_lacks "launchctl enable"
+  log_lacks "osascript"
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['mode']=='plan' and d['plan']==['bootstrap $GUI'] and d['actions']==[]" "$STATE/health.json"
+
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"acted: bootstrap $GUI"* ]]
+  log_has "launchctl enable $DOMAIN/$GUI"
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+  log_has "osascript -e display notification"
+  log_lacks "kill "
+  log_lacks "kickstart -k"
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['actions']==['bootstrap $GUI'] and d['assert_single']=='OK' and d['budget']['used']==1" "$STATE/health.json"
+  [ "$(wc -l <"$STATE/converge-actions")" -eq 1 ]
+}
+
+@test "converge kickstarts (never -k) a loaded agent with no pid, but not its own StartInterval job" {
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  load_agent $GUI;  # loaded, dead, KeepAlive gave up
+  load_agent $CONVERGE  # loaded, idle between ticks: normal
+  bash "$SCRIPT" start >/dev/null 2>&1 || true
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply
+  log_has "launchctl kickstart $DOMAIN/$GUI"
+  log_lacks "launchctl kickstart -k"
+  log_lacks "launchctl kickstart $DOMAIN/$CONVERGE"
+  log_lacks "launchctl bootout"
+  log_lacks "kill "
+}
+
+@test "converge --apply exits 1 when assert-single still fails after acting (or nothing to act on)" {
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  add_proc 302 "$APP/Contents/MacOS/deskflow-core"   # a second core: converge never kills it
+  load_agent $GUI 301;  add_proc 301 "$APP/Contents/MacOS/Deskflow"
+  load_agent $CONVERGE
+  bash "$SCRIPT" start >/dev/null 2>&1 || true
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply --quiet
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"deskflow-core count=2"* ]]
+  log_lacks "kill "
+  grep -q "^302" "$SHIM_STATE/ps.txt"
+  # plan mode reports the same state but never fails
+  run bash "$SCRIPT" converge
+  [ "$status" -eq 0 ]
+}
+
+@test "converge re-renders a stale plist (config repair) even when gated, without restarting anything" {
+  healthy
+  echo "<plist>stale</plist>" >"$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  bash "$SCRIPT" stop >/dev/null   # writes quit-intent
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  load_agent $GUI 301;  add_proc 301 "$APP/Contents/MacOS/Deskflow"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"acted: render $CORE"* ]]
+  grep -q "<string>$APP/Contents/MacOS/deskflow-core</string>" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  log_lacks "launchctl kickstart"
+  log_lacks "launchctl bootout"
+  # renders are free: the start budget is untouched
+  [ ! -e "$STATE/converge-actions" ]
+}
+
+@test "quit-intent from this boot gates every start; a sentinel older than the boot is stale and removed" {
+  load_agent $CONVERGE
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  mkdir -p "$STATE"; date +%s >"$STATE/quit-intent"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]                       # a quit is intended, not a failure
+  [[ "$output" == *"gated: quit-intent"* ]]
+  log_lacks "launchctl bootstrap"
+  log_lacks "launchctl enable"
+  log_lacks "launchctl kickstart"
+  [ -f "$STATE/quit-intent" ]
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['gate'].startswith('quit-intent') and 'bootstrap $CORE' in d['plan'] and 'bootstrap $GUI' in d['plan'] and not [a for a in d['actions'] if not a.startswith('render')]" "$STATE/health.json"
+
+  # Pre-boot sentinel: a reboot ends a quit.
+  touch -t 200001010000 "$STATE/quit-intent"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  [ ! -e "$STATE/quit-intent" ]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+}
+
+@test "a deploy lock younger than 30 min makes converge a no-op exit 0; an old one is ignored" {
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  mkdir -p "$HOME/Library/Deskflow"; echo $$ >"$HOME/Library/Deskflow/deploy.lock"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"deploy lock"* ]]
+  log_lacks "launchctl bootstrap"
+  log_lacks "launchctl enable"
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['gate'].startswith('deploy lock')" "$STATE/health.json"
+
+  touch -t 200001010000 "$HOME/Library/Deskflow/deploy.lock"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+}
+
+@test "converge stops acting after 3 start actions in a rolling hour and then exits 1 while still broken" {
+  load_agent $CONVERGE
+  mkdir -p "$STATE"
+  now="$(date +%s)"
+  printf '%s\n%s\n' "$((now - 3000))" "$((now - 100))" >"$STATE/converge-actions"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  # Nothing rendered yet: converge renders (free) and bootstraps the core as
+  # the third start of the hour; the GUI must wait.
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 1 ]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  log_lacks "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+  [ "$(wc -l <"$STATE/converge-actions")" -eq 3 ]
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert 'bootstrap $CORE' in d['actions'] and 'bootstrap $GUI' in d['plan'] and 'bootstrap $GUI' not in d['actions'] and d['gate'].startswith('action budget')" "$STATE/health.json"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"budget exhausted"* ]]
+  log_lacks "launchctl bootstrap"
+  log_lacks "osascript"
+  # entries older than the window fall out of the count
+  printf '%s\n%s\n%s\n' "$((now - 4000))" "$((now - 3900))" "$((now - 3800))" >"$STATE/converge-actions"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply
+  log_has "launchctl kickstart $DOMAIN/$CORE"
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+}
+
+@test "converge rejects unknown options and a missing bundle" {
+  run bash "$SCRIPT" converge --force
+  [ "$status" -eq 1 ]
+  rm -rf "$APP"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"bundle missing"* ]]
+  log_lacks "launchctl"
+}
+
+@test "prio prints the machine lock dir step (1777) alongside the daemon install" {
+  add_prio_binary
+  run bash "$SCRIPT" prio
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"sudo install -d -m 1777 /private/var/db/deskflow"* ]]
 }
 
 @test "unknown verb exits 1 with usage" {
