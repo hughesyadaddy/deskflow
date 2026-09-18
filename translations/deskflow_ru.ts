@@ -495,6 +495,10 @@ A bound IP is now invalid, you may need to restart the server.</source>
 Привязанный IP-адрес стал недействительным. Возможно требуется перезапуск сервера.</translation>
     </message>
     <message>
+        <source>Grant Accessibility: System Settings &gt; Privacy &amp; Security &gt; Accessibility &gt; Deskflow</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>&amp;File</source>
         <translation>&amp;Файл</translation>
     </message>
@@ -884,6 +888,14 @@ Additionally, check you are able to %1 the server config file: %2</source>
         <translation>%1 уже запущен</translation>
     </message>
     <message>
+        <source>install-login-bridge-macos.sh is not bundled with this build</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>install script did not render the agent plist within %1 s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>Bridge binary missing from this build</source>
         <translation type="unfinished"></translation>
     </message>
@@ -905,14 +917,6 @@ Additionally, check you are able to %1 the server config file: %2</source>
     </message>
     <message>
         <source>bridge binary not found at %1</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <source>no coordination peers configured — add the other computers first</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <source>could not stage the agent plist</source>
         <translation type="unfinished"></translation>
     </message>
     <message>

@@ -521,6 +521,10 @@ Vuoi connetterti al server?
         <translation>Disconnetti</translation>
     </message>
     <message>
+        <source>Grant Accessibility: System Settings &gt; Privacy &amp; Security &gt; Accessibility &gt; Deskflow</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>%1 Connection Error</source>
         <translation>Errore di connessione %1</translation>
     </message>
@@ -884,6 +888,14 @@ Inoltre, verifica di poter %1 il file di configurazione del server: %2</translat
         <translation>%1 è già in esecuzione</translation>
     </message>
     <message>
+        <source>install-login-bridge-macos.sh is not bundled with this build</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>install script did not render the agent plist within %1 s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>Bridge binary missing from this build</source>
         <translation type="unfinished"></translation>
     </message>
@@ -905,14 +917,6 @@ Inoltre, verifica di poter %1 il file di configurazione del server: %2</translat
     </message>
     <message>
         <source>bridge binary not found at %1</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <source>no coordination peers configured — add the other computers first</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <source>could not stage the agent plist</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
