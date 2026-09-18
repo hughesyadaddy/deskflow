@@ -30,6 +30,13 @@ bool macSetStartAtLogin(bool enable);
 //! source of truth, like the login-window bridge).
 bool macStartAtLoginEnabled();
 
+//! Path of the quit-intent sentinel: present = the user quit the GUI on purpose,
+//! so launchd's KeepAlive and the converge agent must leave it down until the
+//! next explicit start (deskflow-ctl start/restart remove it).
+QString macQuitIntentPath();
+//! Write the quit-intent sentinel (tray Quit); returns false when it could not be written.
+bool macWriteQuitIntent();
+
 /**
  * @brief isOSXAccessibilityGranted Check whether this process is trusted to control
  * the keyboard and mouse (System Settings > Privacy & Security > Accessibility).

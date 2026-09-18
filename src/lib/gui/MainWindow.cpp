@@ -55,6 +55,7 @@
 #include <QSettings>
 #include <QShortcut>
 #include <QShowEvent>
+#include <QTimer>
 
 #include <memory>
 
@@ -168,15 +169,17 @@ MainWindow::MainWindow()
   restoreWindow();
 
 #if defined(Q_OS_MACOS)
-  // Self-managed launch: verify the SMAppService login registration on EVERY
-  // launch and repair it when missing. Replacing the app bundle (fleet
-  // deploys re-sign and overwrite /Applications/Deskflow.app) invalidates
-  // the registration, and the old one-time flag then left the app
-  // permanently unregistered -- machines silently stopped auto-starting
-  // after login. Deliberate tradeoff: disabling the login item in System
-  // Settings gets re-enabled on the next app launch; this fleet requires
-  // hands-off recovery after login above opt-out ergonomics.
-  if (!macStartAtLoginEnabled()) {
+  // Under the fleet LaunchAgent (DESKFLOW_LAUNCHD=1 in its plist) launchd owns the
+  // launch; a Login Item as well means two GUIs race at login and one exits 5.
+  // Otherwise the app registers itself on every launch: replacing the bundle
+  // (fleet deploys re-sign /Applications/Deskflow.app) invalidates the record.
+  const bool launchdOwned = qEnvironmentVariable("DESKFLOW_LAUNCHD") == QLatin1String("1");
+  if (launchdOwned) {
+    if (macStartAtLoginEnabled()) {
+      qInfo("launchd owns the gui launch, unregistering the login item");
+      macSetStartAtLogin(false);
+    }
+  } else if (!macStartAtLoginEnabled()) {
     macSetStartAtLogin(true);
     Settings::setValue(Settings::Gui::LoginItemConfigured, true);
     Settings::save();
@@ -316,6 +319,8 @@ void MainWindow::connectSlots()
         if (!fleetGraph.isEmpty()) {
           text += QStringLiteral(" · %1").arg(fleetGraph);
         }
+        if (m_awaitingAccessibility)
+          return;
         m_statusBar->setMessage(text);
         if (m_trayIcon)
           m_trayIcon->setToolTip(QStringLiteral("%1 — %2").arg(kAppName, text));
@@ -802,6 +807,34 @@ void MainWindow::open(bool showWindow)
   }
 }
 
+#ifdef Q_OS_MACOS
+void MainWindow::openWhenAccessibilityGranted(bool showWindow)
+{
+  m_awaitingAccessibility = true;
+  const auto text = tr("Grant Accessibility: System Settings > Privacy & Security > Accessibility > Deskflow");
+  m_statusBar->setMessage(text);
+  if (m_trayIcon)
+    m_trayIcon->setToolTip(QStringLiteral("%1 — %2").arg(kAppName, text));
+  toggleCanRunCore(false);
+  qWarning("accessibility not granted; tray is up, waiting for the grant");
+
+  auto *poll = new QTimer(this);
+  poll->setInterval(kAccessibilityPollMs);
+  connect(poll, &QTimer::timeout, this, [this, poll, showWindow] {
+    if (!isOSXAccessibilityGranted(false))
+      return;
+    poll->stop();
+    poll->deleteLater();
+    m_awaitingAccessibility = false;
+    qInfo("accessibility granted, starting normally");
+    toggleCanRunCore(canRunCore());
+    updateStatus();
+    open(showWindow);
+  });
+  poll->start();
+}
+#endif
+
 void MainWindow::createMenuBar()
 {
   m_menuFile->addAction(m_actionStartCore);
@@ -1081,6 +1114,9 @@ void MainWindow::closeEvent(QCloseEvent *event)
     Settings::setValue(Settings::Gui::AutoStartCore, m_coreProcess.isStarted());
   }
   qDebug() << "quitting application";
+#if defined(Q_OS_MACOS)
+  macWriteQuitIntent();
+#endif
 
   // any connected dock view acitons will be triggered
   // disconnect them before accepting the event

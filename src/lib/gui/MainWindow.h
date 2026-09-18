@@ -70,6 +70,15 @@ public:
     return m_coreProcess.mode();
   }
   void open(bool showWindow = false);
+#ifdef Q_OS_MACOS
+  /**
+   * @brief Show the tray in a "grant Accessibility" state and call open() once the
+   * process becomes trusted (polled every @c kAccessibilityPollMs). A freshly
+   * re-signed bundle is untrusted at every deploy; exiting instead left no tray at all.
+   */
+  void openWhenAccessibilityGranted(bool showWindow);
+  static constexpr int kAccessibilityPollMs = 5000;
+#endif
   ServerConfig &serverConfig()
   {
     return m_serverConfig;
@@ -201,6 +210,7 @@ private:
   QStringList m_checkedServers;
   QSystemTrayIcon *m_trayIcon = nullptr;
   int m_trayRetries = 0;
+  bool m_awaitingAccessibility = false;
   QLocalServer *m_guiDupeChecker = nullptr;
   deskflow::gui::ipc::DaemonIpcClient *m_daemonIpcClient = nullptr;
 

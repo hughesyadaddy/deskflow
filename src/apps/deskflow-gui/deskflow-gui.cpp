@@ -145,9 +145,9 @@ int main(int argc, char *argv[])
     return 1;
   }
 
-  if (!checkMacAssistiveDevices()) {
-    return 1;
-  }
+  // Not trusted yet (every re-signed deploy resets TCC): the native prompt is shown
+  // once and the tray still comes up so the app is not silently absent.
+  const bool accessibilityGranted = checkMacAssistiveDevices();
 #endif
 
   // --no-reset
@@ -161,7 +161,15 @@ int main(int argc, char *argv[])
 #endif
 
   MainWindow mainWindow;
+#if defined(Q_OS_MACOS)
+  if (!accessibilityGranted) {
+    mainWindow.openWhenAccessibilityGranted(parser.isSet(showOption));
+  } else {
+    mainWindow.open(parser.isSet(showOption));
+  }
+#else
   mainWindow.open(parser.isSet(showOption));
+#endif
 
   return QApplication::exec();
 }

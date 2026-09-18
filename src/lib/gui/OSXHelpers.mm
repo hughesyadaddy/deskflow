@@ -16,6 +16,10 @@
 #import <UserNotifications/UNNotificationTrigger.h>
 #import <UserNotifications/UNUserNotificationCenter.h>
 
+#import <QCoreApplication>
+#import <QDir>
+#import <QFile>
+#import <QFileInfo>
 #import <QtGlobal>
 
 #pragma clang diagnostic push
@@ -144,6 +148,27 @@ bool macStartAtLoginEnabled()
     return [SMAppService mainAppService].status == SMAppServiceStatusEnabled;
   }
   return false;
+}
+
+QString macQuitIntentPath()
+{
+  return QDir::homePath() + QStringLiteral("/Library/Application Support/Deskflow/quit-intent");
+}
+
+bool macWriteQuitIntent()
+{
+  const auto path = macQuitIntentPath();
+  if (!QDir().mkpath(QFileInfo(path).absolutePath())) {
+    qWarning("could not create the quit-intent directory for %s", qPrintable(path));
+    return false;
+  }
+  QFile sentinel(path);
+  if (!sentinel.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    qWarning("could not write the quit-intent sentinel %s", qPrintable(path));
+    return false;
+  }
+  sentinel.write(QByteArray::number(QCoreApplication::applicationPid()) + '\n');
+  return true;
 }
 
 bool isOSXAccessibilityGranted(bool promptUser)
