@@ -65,6 +65,82 @@ enum
 
 static const double kCarbonLoopWaitTimeout = 10.0;
 
+static int64_t toCGScrollPhase(ScrollPhase phase)
+{
+  switch (phase) {
+  case ScrollPhase::Began:
+    return kCGScrollPhaseBegan;
+  case ScrollPhase::Changed:
+    return kCGScrollPhaseChanged;
+  case ScrollPhase::Ended:
+    return kCGScrollPhaseEnded;
+  case ScrollPhase::Cancelled:
+    return kCGScrollPhaseCancelled;
+  case ScrollPhase::MayBegin:
+    return kCGScrollPhaseMayBegin;
+  case ScrollPhase::None:
+    break;
+  }
+  return 0;
+}
+
+static ScrollPhase fromCGScrollPhase(int64_t phase)
+{
+  switch (phase) {
+  case kCGScrollPhaseBegan:
+    return ScrollPhase::Began;
+  case kCGScrollPhaseChanged:
+    return ScrollPhase::Changed;
+  case kCGScrollPhaseEnded:
+    return ScrollPhase::Ended;
+  case kCGScrollPhaseCancelled:
+    return ScrollPhase::Cancelled;
+  case kCGScrollPhaseMayBegin:
+    return ScrollPhase::MayBegin;
+  default:
+    return ScrollPhase::None;
+  }
+}
+
+static MomentumPhase fromCGMomentumPhase(int64_t phase)
+{
+  switch (phase) {
+  case kCGMomentumScrollPhaseBegin:
+    return MomentumPhase::Began;
+  case kCGMomentumScrollPhaseContinue:
+    return MomentumPhase::Changed;
+  case kCGMomentumScrollPhaseEnd:
+    return MomentumPhase::Ended;
+  default:
+    return MomentumPhase::None;
+  }
+}
+
+static int64_t toCGMomentumPhase(MomentumPhase phase)
+{
+  switch (phase) {
+  case MomentumPhase::Began:
+    return kCGMomentumScrollPhaseBegin;
+  case MomentumPhase::Changed:
+    return kCGMomentumScrollPhaseContinue;
+  case MomentumPhase::Ended:
+    return kCGMomentumScrollPhaseEnd;
+  case MomentumPhase::None:
+    break;
+  }
+  return kCGMomentumScrollPhaseNone;
+}
+
+static int32_t toFixed16(double value)
+{
+  return static_cast<int32_t>(lround(value * kScrollFixedOne));
+}
+
+static double fromFixed16(int32_t value)
+{
+  return static_cast<double>(value) / kScrollFixedOne;
+}
+
 // Clipboard polling cadence. Each tick is a cheap NSPasteboard changeCount
 // read; PasteboardSynchronize only runs when the count moved. 1 s while this
 // screen is the active input target (sync latency <= 1 s), 2 s when the cursor
@@ -732,6 +808,49 @@ void OSXScreen::fakeMouseWheel(ScrollDelta delta) const
   CFRelease(scrollEvent);
 }
 
+void OSXScreen::fakeMouseWheelEx(const WheelEx &in) const
+{
+  WheelEx ex = in;
+  applyScrollModifierFixed(ex);
+  if (ex.isEmpty()) {
+    return;
+  }
+
+  CGEventRef scrollEvent = nullptr;
+  if (ex.continuous) {
+    const double px = fromFixed16(ex.xDelta);
+    const double py = fromFixed16(ex.yDelta);
+    scrollEvent = CGEventCreateScrollWheelEvent(
+        nullptr, kCGScrollEventUnitPixel, 2, static_cast<int32_t>(lround(py)), static_cast<int32_t>(lround(px))
+    );
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventIsContinuous, 1);
+    CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis1, py);
+    CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis2, px);
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventScrollPhase, toCGScrollPhase(ex.phase));
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventMomentumPhase, toCGMomentumPhase(ex.momentum));
+  } else {
+    if (ex.xDelta == 0 && ex.yDelta == 0) {
+      return; // phases have no meaning on a line device
+    }
+    // one wire line is one line here, like fakeMouseWheel; the integer axis
+    // takes whole lines through the shared carry while FixedPt keeps the
+    // exact fraction of this event
+    const int32_t linesX = takeWheelLines(m_wheelCarryX, ex.xDelta, kScrollFixedOne);
+    const int32_t linesY = takeWheelLines(m_wheelCarryY, ex.yDelta, kScrollFixedOne);
+    scrollEvent = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, linesY, linesX);
+    CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis1, fromFixed16(ex.yDelta));
+    CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis2, fromFixed16(ex.xDelta));
+  }
+
+  // Fix for sticky keys
+  CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
+  CGEventSetFlags(scrollEvent, modifiers);
+  deskflow::platform::markInjectedEvent(scrollEvent);
+
+  CGEventPost(kCGHIDEventTap, scrollEvent);
+  CFRelease(scrollEvent);
+}
+
 void OSXScreen::showCursor()
 {
   LOG_DEBUG("showing cursor");
@@ -1223,6 +1342,39 @@ bool OSXScreen::onMouseWheel(int32_t xDelta, int32_t yDelta) const
   LOG_VERBOSE("event: button wheel delta=%+d,%+d", xDelta, yDelta);
   sendEvent(EventTypes::PrimaryScreenWheel, WheelInfo::alloc(xDelta, yDelta));
   return true;
+}
+
+bool OSXScreen::onMouseWheelEx(const WheelEx &ex) const
+{
+  LOG_VERBOSE(
+      "event: wheel ex delta=%+d,%+d cont=%d phase=%d momentum=%d", ex.xDelta, ex.yDelta, ex.continuous,
+      static_cast<int>(ex.phase), static_cast<int>(ex.momentum)
+  );
+  sendEvent(EventTypes::PrimaryScreenWheelEx, WheelExInfo::alloc(ex));
+  return true;
+}
+
+WheelEx OSXScreen::decodeScrollEvent(CGEventRef event) const
+{
+  WheelEx ex;
+  ex.continuous = CGEventGetIntegerValueField(event, kCGScrollWheelEventIsContinuous) != 0;
+  if (ex.continuous) {
+    ex.xDelta = toFixed16(CGEventGetDoubleValueField(event, kCGScrollWheelEventPointDeltaAxis2));
+    ex.yDelta = toFixed16(CGEventGetDoubleValueField(event, kCGScrollWheelEventPointDeltaAxis1));
+  } else {
+    ex.xDelta = toFixed16(wheelLinesFromEvent(
+        CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis2),
+        CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2)
+    ));
+    ex.yDelta = toFixed16(wheelLinesFromEvent(
+        CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis1),
+        CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1)
+    ));
+  }
+  ex.phase = fromCGScrollPhase(CGEventGetIntegerValueField(event, kCGScrollWheelEventScrollPhase));
+  ex.momentum = fromCGMomentumPhase(CGEventGetIntegerValueField(event, kCGScrollWheelEventMomentumPhase));
+  ex.timestampMs = static_cast<uint32_t>(CGEventGetTimestamp(event) / 1000000ULL);
+  return ex;
 }
 
 void OSXScreen::displayReconfigurationCallback(
@@ -1870,12 +2022,14 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
     // on the system. It hasn't been a problem before, though.
     return event;
     break;
-  case kCGEventScrollWheel:
-    screen->onMouseWheel(
-        screen->mapScrollWheelToDeskflow(CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2)),
-        screen->mapScrollWheelToDeskflow(CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1))
-    );
+  case kCGEventScrollWheel: {
+    // a sub-notch tick with no phase is noise; a zero-delta phase marker is not
+    const WheelEx ex = screen->decodeScrollEvent(event);
+    if (!ex.isEmpty()) {
+      screen->onMouseWheelEx(ex);
+    }
     break;
+  }
   case kCGEventKeyDown:
   case kCGEventKeyUp:
   case kCGEventFlagsChanged:

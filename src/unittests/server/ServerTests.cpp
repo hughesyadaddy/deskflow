@@ -12,12 +12,16 @@
 #include "base/EventQueue.h"
 #include "base/Log.h"
 #include "common/Settings.h"
+#include "deskflow/AppUtil.h"
 #include "deskflow/PlatformScreen.h"
 #include "deskflow/Screen.h"
 #include "deskflow/ipc/CoreIpcServer.h"
 #include "io/IStream.h"
 #include "server/Config.h"
 #include "server/ChordRemapTypes.h"
+#include "deskflow/ProtocolUtil.h"
+#include "server/ClientProxy1_8.h"
+#include "server/ClientProxy1_9.h"
 #include "server/PrimaryClient.h"
 #include "server/Server.h"
 #include "server/TopologyLink.h"
@@ -30,6 +34,7 @@
 #include <Carbon/Carbon.h>
 #endif
 
+#include <cstring>
 #include <memory>
 #include <sstream>
 #include <utility>
@@ -429,6 +434,16 @@ public:
     m_mouseMoves.emplace_back(x, y);
   }
 
+  void mouseWheelEx(const WheelEx &ex) override
+  {
+    m_wheelEx.push_back(ex);
+  }
+
+  const std::vector<WheelEx> &wheelEx() const
+  {
+    return m_wheelEx;
+  }
+
   const std::vector<RecordedKeyEvent> &keys() const
   {
     return m_keys;
@@ -452,7 +467,103 @@ public:
 private:
   std::vector<RecordedKeyEvent> m_keys;
   std::vector<std::pair<int32_t, int32_t>> m_mouseMoves;
+  std::vector<WheelEx> m_wheelEx;
 };
+
+// Captures every writef() a real ClientProxy makes, so a test can assert on
+// the wire bytes a given protocol minor produces.
+class RecordingStream : public deskflow::IStream
+{
+public:
+  void close() override
+  {
+  }
+  uint32_t read(void *, uint32_t) override
+  {
+    return 0;
+  }
+  void write(const void *buffer, uint32_t n) override
+  {
+    const auto *bytes = static_cast<const uint8_t *>(buffer);
+    m_messages.emplace_back(bytes, bytes + n);
+  }
+  void flush() override
+  {
+  }
+  void shutdownInput() override
+  {
+  }
+  void shutdownOutput() override
+  {
+  }
+  void *getEventTarget() const override
+  {
+    return const_cast<RecordingStream *>(this);
+  }
+  bool isReady() const override
+  {
+    return false;
+  }
+  uint32_t getSize() const override
+  {
+    return 0;
+  }
+
+  std::vector<std::vector<uint8_t>> messagesWithCode(const char *code) const
+  {
+    std::vector<std::vector<uint8_t>> out;
+    for (const auto &m : m_messages) {
+      if (m.size() >= 4 && memcmp(m.data(), code, 4) == 0) {
+        out.push_back(m);
+      }
+    }
+    return out;
+  }
+
+  std::vector<std::vector<uint8_t>> m_messages;
+};
+
+// ClientProxy1_8's constructor asks AppUtil for the local keyboard layouts.
+class TestAppUtil : public AppUtil
+{
+public:
+  int run() override
+  {
+    return 0;
+  }
+  void startNode() override
+  {
+  }
+  std::vector<std::string> getKeyboardLayoutList() override
+  {
+    return {"en"};
+  }
+  std::string getCurrentLanguageCode() override
+  {
+    return "en";
+  }
+};
+
+int32_t readBigEndian32(const std::vector<uint8_t> &m, size_t at)
+{
+  return static_cast<int32_t>(
+      (static_cast<uint32_t>(m[at]) << 24) | (static_cast<uint32_t>(m[at + 1]) << 16) |
+      (static_cast<uint32_t>(m[at + 2]) << 8) | static_cast<uint32_t>(m[at + 3])
+  );
+}
+
+int16_t readBigEndian16(const std::vector<uint8_t> &m, size_t at)
+{
+  return static_cast<int16_t>((static_cast<uint16_t>(m[at]) << 8) | static_cast<uint16_t>(m[at + 1]));
+}
+
+WheelEx wheelLines(double x, double y)
+{
+  WheelEx ex;
+  ex.xDelta = static_cast<int32_t>(x * kScrollFixedOne);
+  ex.yDelta = static_cast<int32_t>(y * kScrollFixedOne);
+  return ex;
+}
 
 void loadConfigWithSuperTabRemap(deskflow::server::Config &config)
 {
@@ -1309,6 +1420,280 @@ void ServerTests::heldModifier_forgottenWhenClientDies()
     QVERIFY(server.m_keysHeldOnActive.empty());
 
     server.m_clients.erase("tiny11");
+  }
+}
+
+void ServerTests::wheelEx_relaysToActiveClient()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    WheelEx ex = wheelLines(0.5, -0.25);
+    ex.continuous = true;
+    ex.phase = ScrollPhase::Changed;
+    ex.timestampMs = 1234;
+    server.onMouseWheelEx(ex);
+
+    QCOMPARE(remote.wheelEx().size(), 1u);
+    QCOMPARE(remote.wheelEx()[0].xDelta, ex.xDelta);
+    QCOMPARE(remote.wheelEx()[0].yDelta, ex.yDelta);
+    QVERIFY(remote.wheelEx()[0].continuous);
+    QCOMPARE(remote.wheelEx()[0].phase, ScrollPhase::Changed);
+    QCOMPARE(remote.wheelEx()[0].timestampMs, 1234u);
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::wheelEx_leaveClosesOpenMomentum()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  QVERIFY(fixture.config.connect("remote", Direction::Left, 0.0f, 1.0f, "server", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    WheelEx lift = wheelLines(0, -3);
+    lift.continuous = true;
+    lift.phase = ScrollPhase::Ended;
+    server.onMouseWheelEx(lift);
+    WheelEx flick = wheelLines(0, -3);
+    flick.continuous = true;
+    flick.momentum = MomentumPhase::Changed;
+    server.onMouseWheelEx(flick);
+    QVERIFY(!server.m_wheelPhaseOpen);
+    QVERIFY(server.m_wheelMomentumOpen);
+
+    // pointer leaves mid-flick: the client must see the momentum end
+    server.switchScreen(fixture.primary, 10, 10, false);
+    QCOMPARE(server.m_active, fixture.primary);
+    QVERIFY(!server.m_wheelMomentumOpen);
+    QCOMPARE(remote.wheelEx().size(), 3u);
+    const WheelEx &ended = remote.wheelEx().back();
+    QCOMPARE(ended.xDelta, 0);
+    QCOMPARE(ended.yDelta, 0);
+    QVERIFY(ended.continuous);
+    QCOMPARE(ended.momentum, MomentumPhase::Ended);
+    QCOMPARE(ended.phase, ScrollPhase::None);
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::wheelEx_leaveCancelsOpenTouchPhase()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  QVERIFY(fixture.config.connect("remote", Direction::Left, 0.0f, 1.0f, "server", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    WheelEx drag = wheelLines(0, -2);
+    drag.continuous = true;
+    drag.phase = ScrollPhase::Changed;
+    server.onMouseWheelEx(drag);
+    QVERIFY(server.m_wheelPhaseOpen);
+
+    // finger still down when the pointer leaves: cancel, do not "end momentum"
+    server.switchScreen(fixture.primary, 10, 10, false);
+    QVERIFY(!server.m_wheelPhaseOpen);
+    QCOMPARE(remote.wheelEx().size(), 2u);
+    const WheelEx &cancelled = remote.wheelEx().back();
+    QVERIFY(cancelled.continuous);
+    QCOMPARE(cancelled.phase, ScrollPhase::Cancelled);
+    QCOMPARE(cancelled.momentum, MomentumPhase::None);
+    QCOMPARE(cancelled.xDelta, 0);
+    QCOMPARE(cancelled.yDelta, 0);
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::wheelEx_leaveWithoutOpenGestureSendsNothing()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  QVERIFY(fixture.config.connect("remote", Direction::Left, 0.0f, 1.0f, "server", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    WheelEx began = wheelLines(0, -1);
+    began.continuous = true;
+    began.phase = ScrollPhase::Began;
+    server.onMouseWheelEx(began);
+    WheelEx ended;
+    ended.continuous = true;
+    ended.phase = ScrollPhase::Ended;
+    server.onMouseWheelEx(ended);
+    QVERIFY(!server.m_wheelPhaseOpen);
+    QVERIFY(!server.m_wheelMomentumOpen);
+
+    server.switchScreen(fixture.primary, 10, 10, false);
+    QCOMPARE(remote.wheelEx().size(), 2u);
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::clientProxy1_9_sendsDmwx()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  fixture.init("server");
+  // the proxy adopts (and deletes) its stream
+  auto *stream = new RecordingStream;
+  TestAppUtil appUtil;
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    ClientProxy1_9 proxy("remote", stream, &server, &fixture.events);
+    WheelEx ex = wheelLines(-1.5, 0.25);
+    ex.continuous = true;
+    ex.phase = ScrollPhase::Changed;
+    ex.momentum = MomentumPhase::Began;
+    ex.timestampMs = 0x80000001u;
+    proxy.mouseWheelEx(ex);
+
+    const auto dmwx = stream->messagesWithCode("DMWX");
+    QCOMPARE(dmwx.size(), 1u);
+    const auto &m = dmwx[0];
+    QCOMPARE(m.size(), 19u);
+    QCOMPARE(readBigEndian32(m, 4), ex.xDelta);
+    QCOMPARE(readBigEndian32(m, 8), ex.yDelta);
+    QCOMPARE(m[12], 1);
+    QCOMPARE(m[13], static_cast<uint8_t>(ScrollPhase::Changed));
+    QCOMPARE(m[14], static_cast<uint8_t>(MomentumPhase::Began));
+    QCOMPARE(static_cast<uint32_t>(readBigEndian32(m, 15)), 0x80000001u);
+    QVERIFY(stream->messagesWithCode("DMWM").empty());
+  }
+}
+
+void ServerTests::clientProxy1_9_reexpressesLegacyNotchesAsDmwx()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  fixture.init("server");
+  // the proxy adopts (and deletes) its stream
+  auto *stream = new RecordingStream;
+  TestAppUtil appUtil;
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    ClientProxy1_9 proxy("remote", stream, &server, &fixture.events);
+    proxy.mouseWheel(120, -30);
+
+    QVERIFY(stream->messagesWithCode("DMWM").empty());
+    const auto dmwx = stream->messagesWithCode("DMWX");
+    QCOMPARE(dmwx.size(), 1u);
+    QCOMPARE(readBigEndian32(dmwx[0], 4), kScrollFixedOne);
+    QCOMPARE(readBigEndian32(dmwx[0], 8), -kScrollFixedOne / 4);
+    QCOMPARE(dmwx[0][12], 0);
+    QCOMPARE(dmwx[0][13], 0);
+    QCOMPARE(dmwx[0][14], 0);
+  }
+}
+
+void ServerTests::clientProxy1_8_degradesToWholeNotchDmwm()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  fixture.init("server");
+  // the proxy adopts (and deletes) its stream
+  auto *stream = new RecordingStream;
+  TestAppUtil appUtil;
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    ClientProxy1_8 proxy("remote", stream, &server, &fixture.events);
+
+    // the whole notch goes out at once; the 0.75 waits in the bank
+    proxy.mouseWheelEx(wheelLines(0, 1.75));
+    auto dmwm = stream->messagesWithCode("DMWM");
+    QCOMPARE(dmwm.size(), 1u);
+    QCOMPARE(dmwm[0].size(), 8u);
+    QCOMPARE(readBigEndian16(dmwm[0], 4), 0);
+    QCOMPARE(readBigEndian16(dmwm[0], 6), 120);
+
+    // sub-notch ticks bank until a whole notch has accrued
+    proxy.mouseWheelEx(wheelLines(0, 0.25));
+    dmwm = stream->messagesWithCode("DMWM");
+    QCOMPARE(dmwm.size(), 2u);
+    QCOMPARE(readBigEndian16(dmwm[1], 6), 120);
+    for (int i = 0; i < 3; ++i) {
+      proxy.mouseWheelEx(wheelLines(0, 0.25));
+      QCOMPARE(stream->messagesWithCode("DMWM").size(), 2u);
+    }
+    proxy.mouseWheelEx(wheelLines(0, 0.25));
+    dmwm = stream->messagesWithCode("DMWM");
+    QCOMPARE(dmwm.size(), 3u);
+    QCOMPARE(readBigEndian16(dmwm[2], 6), 120);
+
+    // pixels bank at ten per line, never more than whole notches out
+    WheelEx px = wheelLines(-4, 0);
+    px.continuous = true;
+    proxy.mouseWheelEx(px);
+    proxy.mouseWheelEx(px);
+    QCOMPARE(stream->messagesWithCode("DMWM").size(), 3u);
+    proxy.mouseWheelEx(px);
+    dmwm = stream->messagesWithCode("DMWM");
+    QCOMPARE(dmwm.size(), 4u);
+    QCOMPARE(readBigEndian16(dmwm[3], 4), -120);
+    QCOMPARE(readBigEndian16(dmwm[3], 6), 0);
+  }
+}
+
+void ServerTests::clientProxy1_8_neverSendsDmwx()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  fixture.init("server");
+  // the proxy adopts (and deletes) its stream
+  auto *stream = new RecordingStream;
+  TestAppUtil appUtil;
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    ClientProxy1_8 proxy("remote", stream, &server, &fixture.events);
+    WheelEx marker;
+    marker.continuous = true;
+    marker.phase = ScrollPhase::Began;
+    proxy.mouseWheelEx(marker);
+    marker.phase = ScrollPhase::None;
+    marker.momentum = MomentumPhase::Ended;
+    proxy.mouseWheelEx(marker);
+    proxy.mouseWheelEx(wheelLines(0, 0.5));
+    proxy.mouseWheel(0, 120);
+
+    QVERIFY(stream->messagesWithCode("DMWX").empty());
+    const auto dmwm = stream->messagesWithCode("DMWM");
+    QCOMPARE(dmwm.size(), 1u);
+    QCOMPARE(readBigEndian16(dmwm[0], 6), 120);
   }
 }
 

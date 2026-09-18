@@ -97,6 +97,7 @@ public:
   void fakeMouseMove(int32_t x, int32_t y) override;
   void fakeMouseRelativeMove(int32_t dx, int32_t dy) const override;
   void fakeMouseWheel(ScrollDelta delta) const override;
+  void fakeMouseWheelEx(const WheelEx &ex) const override;
 
   // IKeyState overrides
   virtual void updateKeys();

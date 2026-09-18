@@ -766,6 +766,18 @@ void MSWindowsScreen::fakeMouseWheel(ScrollDelta delta) const
   m_desks->fakeMouseWheel(delta.x, delta.y);
 }
 
+void MSWindowsScreen::fakeMouseWheelEx(const WheelEx &ex) const
+{
+  // SendInput takes any WHEEL_DELTA fraction, so sub-notch motion goes
+  // straight through instead of being banked to whole notches
+  const ScrollDelta delta{
+      WheelEx::fixedToNotchUnits(ex.xDelta, ex.continuous), WheelEx::fixedToNotchUnits(ex.yDelta, ex.continuous)
+  };
+  if (delta.x != 0 || delta.y != 0) {
+    fakeMouseWheel(delta);
+  }
+}
+
 void MSWindowsScreen::updateKeys()
 {
   m_desks->updateKeys();

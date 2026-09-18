@@ -358,6 +358,7 @@ private:
   void handleMotionPrimaryEvent(const Event &event);
   void handleMotionSecondaryEvent(const Event &event);
   void handleWheelEvent(const Event &event);
+  void handleWheelExEvent(const Event &event);
   void handleSwitchWaitTimeout();
   void handleClientDisconnected(BaseClientProxy *client);
 
@@ -402,6 +403,11 @@ private:
   bool onMouseMovePrimary(int32_t x, int32_t y);
   void onMouseMoveSecondary(int32_t dx, int32_t dy);
   void onMouseWheel(int32_t xDelta, int32_t yDelta);
+  void onMouseWheelEx(const WheelEx &ex);
+  //! A trackpad gesture (finger down) or its momentum is still running on
+  //! m_active; a leave must close it so the target never waits on a
+  //! terminal phase it will not get.
+  void closeOpenWheelGesture();
 
   // add client to list and attach event handlers for client
   bool addClient(BaseClientProxy *);
@@ -574,6 +580,8 @@ private:
 
   // relative mouse move option
   bool m_relativeMoves = false;
+  bool m_wheelPhaseOpen = false;
+  bool m_wheelMomentumOpen = false;
 
   // flag whether or not we have broadcasting enabled and the screens to
   // which we should send broadcasted keys.

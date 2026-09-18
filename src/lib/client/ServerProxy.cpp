@@ -236,6 +236,10 @@ ServerProxy::ConnectionResult ServerProxy::parseMessage(const uint8_t *code)
     mouseWheel();
   }
 
+  else if (memcmp(code, kMsgDMouseWheelEx, 4) == 0) {
+    mouseWheelEx();
+  }
+
   else if (memcmp(code, kMsgDKeyDown, 4) == 0) {
     uint16_t id = 0;
     uint16_t mask = 0;
@@ -751,6 +755,28 @@ void ServerProxy::mouseWheel()
 
   // forward
   m_client->mouseWheel(xDelta, yDelta);
+}
+
+void ServerProxy::mouseWheelEx()
+{
+  // get mouse up to date
+  flushCompressedMouse();
+
+  int32_t xDelta = 0;
+  int32_t yDelta = 0;
+  uint8_t continuous = 0;
+  uint8_t phase = 0;
+  uint8_t momentum = 0;
+  uint32_t timestampMs = 0;
+  ProtocolUtil::readf(m_stream, kMsgDMouseWheelEx + 4, &xDelta, &yDelta, &continuous, &phase, &momentum, &timestampMs);
+  const WheelEx ex = WheelEx::fromWire(xDelta, yDelta, continuous, phase, momentum, timestampMs);
+  LOG_VERBOSE(
+      "recv mouse wheel ex %+d,%+d cont=%d phase=%d momentum=%d ts=%u", ex.xDelta, ex.yDelta, ex.continuous,
+      static_cast<int>(ex.phase), static_cast<int>(ex.momentum), ex.timestampMs
+  );
+
+  // forward
+  m_client->mouseWheelEx(ex);
 }
 
 void ServerProxy::screensaver()

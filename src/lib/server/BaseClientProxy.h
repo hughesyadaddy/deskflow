@@ -8,6 +8,7 @@
 #pragma once
 
 #include "deskflow/IClient.h"
+#include "deskflow/ProtocolTypes.h"
 
 namespace deskflow {
 class IStream;
@@ -73,6 +74,11 @@ public:
   void mouseMove(int32_t xAbs, int32_t yAbs) override = 0;
   void mouseRelativeMove(int32_t xRel, int32_t yRel) override = 0;
   void mouseWheel(int32_t xDelta, int32_t yDelta) override = 0;
+  //! Relay an extended wheel event. Peers below protocol 1.9 cannot take
+  //! DMWX, so the default banks the motion in 120-per-notch units and
+  //! flushes whole notches through mouseWheel(), keeping the remainder;
+  //! phase-only messages send nothing.
+  virtual void mouseWheelEx(const WheelEx &ex);
   void screensaver(bool activate) override = 0;
   void resetOptions() override = 0;
   void setOptions(const OptionsList &options) override = 0;
@@ -93,4 +99,6 @@ private:
   std::string m_name;
   int32_t m_x = 0;
   int32_t m_y = 0;
+  int32_t m_wheelBankX = 0;
+  int32_t m_wheelBankY = 0;
 };

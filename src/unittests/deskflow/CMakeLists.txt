@@ -87,3 +87,11 @@ create_test(
   SOURCE KeyStateLedgerTests.cpp
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/deskflow"
 )
+
+create_test(
+  NAME WheelExProtocolTests
+  DEPENDS app
+  LIBS arch base io ${extra_libs}
+  SOURCE WheelExProtocolTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/deskflow"
+)

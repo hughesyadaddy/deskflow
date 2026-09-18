@@ -12,6 +12,7 @@
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
 #include "deskflow/OptionTypes.h"
+#include "deskflow/ProtocolTypes.h"
 
 #include <map>
 #include <string>
@@ -171,6 +172,9 @@ public:
   Each wheel click should generate a delta of +/-120.
   */
   void mouseWheel(int32_t xDelta, int32_t yDelta) const;
+
+  //! Notify of extended mouse wheel motion
+  void mouseWheelEx(const WheelEx &ex) const;
 
   //! Notify of options changes
   /*!

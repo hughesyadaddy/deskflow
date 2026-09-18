@@ -191,6 +191,10 @@ enum class EventTypes : uint32_t
   /// This event is sent when mouse wheel is rotated. Event data is a pointer to WheelInfo.
   PrimaryScreenWheel,
 
+  /// This event is sent when a scroll device reports sub-notch, pixel or gesture-phase
+  /// detail. Event data is a pointer to WheelExInfo.
+  PrimaryScreenWheelEx,
+
   /// This event is sent when screensaver is activated.
   PrimaryScreenSaverActivated,
 

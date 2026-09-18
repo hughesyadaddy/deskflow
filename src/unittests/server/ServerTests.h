@@ -38,4 +38,12 @@ private Q_SLOTS:
   void deferredSuper_droppedOnScreenSwitch();
   void heldModifier_releasedOnScreenSwitch();
   void heldModifier_forgottenWhenClientDies();
+  void wheelEx_relaysToActiveClient();
+  void wheelEx_leaveClosesOpenMomentum();
+  void wheelEx_leaveCancelsOpenTouchPhase();
+  void wheelEx_leaveWithoutOpenGestureSendsNothing();
+  void clientProxy1_9_sendsDmwx();
+  void clientProxy1_9_reexpressesLegacyNotchesAsDmwx();
+  void clientProxy1_8_degradesToWholeNotchDmwm();
+  void clientProxy1_8_neverSendsDmwx();
 };

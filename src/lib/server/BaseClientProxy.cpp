@@ -32,3 +32,14 @@ std::string BaseClientProxy::getName() const
 {
   return m_name;
 }
+
+void BaseClientProxy::mouseWheelEx(const WheelEx &ex)
+{
+  m_wheelBankX += WheelEx::fixedToNotchUnits(ex.xDelta, ex.continuous);
+  m_wheelBankY += WheelEx::fixedToNotchUnits(ex.yDelta, ex.continuous);
+  const int32_t x = WheelEx::takeWholeNotches(m_wheelBankX);
+  const int32_t y = WheelEx::takeWholeNotches(m_wheelBankY);
+  if (x != 0 || y != 0) {
+    mouseWheel(x, y);
+  }
+}

@@ -291,6 +291,11 @@ void Client::mouseWheel(int32_t xDelta, int32_t yDelta)
   m_screen->mouseWheel(xDelta, yDelta);
 }
 
+void Client::mouseWheelEx(const WheelEx &ex)
+{
+  m_screen->mouseWheelEx(ex);
+}
+
 void Client::screensaver(bool activate)
 {
   m_screen->screensaver(activate);
@@ -623,14 +628,16 @@ void Client::handleHello()
     return;
   }
 
+  const int16_t minor = negotiatedProtocolMinor(serverMajor, serverMinor);
   LOG_DEBUG(
-      "saying hello back with version %s %d.%d", protocolName.c_str(), kProtocolMajorVersion, kProtocolMinorVersion
+      "saying hello back with version %s %d.%d (server %d.%d)", protocolName.c_str(), kProtocolMajorVersion, minor,
+      serverMajor, serverMinor
   );
 
   // dynamically build write format for hello back since `ProtocolUtil::writef`
   // doesn't support formatting fixed length strings yet.
   std::string helloBackMessage = protocolName + kMsgHelloBackArgs;
-  ProtocolUtil::writef(m_stream, helloBackMessage.c_str(), kProtocolMajorVersion, kProtocolMinorVersion, &m_name);
+  ProtocolUtil::writef(m_stream, helloBackMessage.c_str(), kProtocolMajorVersion, minor, &m_name);
 
   // now connected but waiting to complete handshake
   setupScreen();

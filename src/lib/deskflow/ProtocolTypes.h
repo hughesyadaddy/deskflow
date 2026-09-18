@@ -45,7 +45,24 @@ static const int16_t kProtocolMajorVersion = 1;
  * @note When incrementing the minor version, the Deskflow application version should also increment
  * @since Protocol version 1.0
  */
-static const int16_t kProtocolMinorVersion = 8;
+static const int16_t kProtocolMinorVersion = 9;
+
+/**
+ * @brief Minor version a client must announce in its hello-back
+ *
+ * A server only constructs proxies for minors it knows, so a client
+ * announcing a newer minor than the server is rejected outright.
+ * Announce the older of the two and let the server pick the proxy.
+ *
+ * @since Protocol version 1.9
+ */
+constexpr int16_t negotiatedProtocolMinor(int16_t serverMajor, int16_t serverMinor)
+{
+  if (serverMajor != kProtocolMajorVersion) {
+    return kProtocolMinorVersion;
+  }
+  return serverMinor < kProtocolMinorVersion ? serverMinor : kProtocolMinorVersion;
+}
 
 /**
  * @brief Default TCP port for Deskflow connections
@@ -862,6 +879,152 @@ extern const char *const kMsgDMouseWheel;
  * @since Protocol version 1.0
  */
 extern const char *const kMsgDMouseWheel1_0;
+
+/**
+ * @brief Extended mouse wheel scroll event
+ *
+ * **Message Code**: `"DMWX"`
+ * **Direction**: Primary → Secondary
+ * **Format**: `"DMWX%4i%4i%1i%1i%1i%4i"`
+ * **Parameters**:
+ * - `$1`: X delta (4 bytes, signed 16.16 fixed point)
+ * - `$2`: Y delta (4 bytes, signed 16.16 fixed point)
+ * - `$3`: continuous (1 byte) - 1 when deltas are pixels (trackpad), 0 when lines (wheel)
+ * - `$4`: scroll phase (1 byte) - a ScrollPhase value
+ * - `$5`: momentum phase (1 byte) - a MomentumPhase value
+ * - `$6`: device timestamp (4 bytes, unsigned milliseconds, wraps)
+ *
+ * Carries what kMsgDMouseWheel throws away: sub-notch precision, the
+ * pixel/line distinction and the gesture phases a trackpad emits. Phase
+ * markers are sent even when both deltas are zero. Only sent to peers
+ * that negotiated protocol 1.9 or later; older peers receive
+ * kMsgDMouseWheel with the deltas converted to 120-per-notch units.
+ *
+ * @see kMsgDMouseWheel
+ * @since Protocol version 1.9
+ */
+extern const char *const kMsgDMouseWheelEx;
+
+/**
+ * @brief Scroll gesture phase carried by kMsgDMouseWheelEx
+ * @since Protocol version 1.9
+ */
+enum class ScrollPhase : uint8_t
+{
+  None = 0,
+  Began = 1,
+  Changed = 2,
+  Ended = 3,
+  Cancelled = 4,
+  MayBegin = 5,
+};
+
+/**
+ * @brief Momentum (inertial) scroll phase carried by kMsgDMouseWheelEx
+ * @since Protocol version 1.9
+ */
+enum class MomentumPhase : uint8_t
+{
+  None = 0,
+  Began = 1,
+  Changed = 2,
+  Ended = 3,
+};
+
+/**
+ * @brief One unit (1.0) in the 16.16 fixed-point deltas of kMsgDMouseWheelEx
+ * @since Protocol version 1.9
+ */
+static const int32_t kScrollFixedOne = 65536;
+
+/**
+ * @brief Wheel units per notch in kMsgDMouseWheel
+ * @since Protocol version 1.9
+ */
+static const int32_t kScrollNotchUnits = 120;
+
+/**
+ * @brief Pixels of continuous scroll that equal one line when degrading to kMsgDMouseWheel
+ * @since Protocol version 1.9
+ */
+static const int32_t kScrollPixelsPerLine = 10;
+
+/**
+ * @brief Decoded kMsgDMouseWheelEx payload
+ * @since Protocol version 1.9
+ */
+struct WheelEx
+{
+  int32_t xDelta = 0;
+  int32_t yDelta = 0;
+  bool continuous = false;
+  ScrollPhase phase = ScrollPhase::None;
+  MomentumPhase momentum = MomentumPhase::None;
+  uint32_t timestampMs = 0;
+
+  /**
+   * @brief Build a line-unit WheelEx from legacy 120-per-notch deltas
+   */
+  static constexpr WheelEx fromNotches(int32_t xNotchUnits, int32_t yNotchUnits)
+  {
+    WheelEx ex;
+    ex.xDelta = notchUnitsToFixed(xNotchUnits);
+    ex.yDelta = notchUnitsToFixed(yNotchUnits);
+    return ex;
+  }
+
+  static constexpr int32_t notchUnitsToFixed(int32_t notchUnits)
+  {
+    return static_cast<int32_t>(static_cast<int64_t>(notchUnits) * kScrollFixedOne / kScrollNotchUnits);
+  }
+
+  /**
+   * @brief Convert one 16.16 delta to legacy 120-per-notch units, rounding to nearest
+   */
+  static constexpr int32_t fixedToNotchUnits(int32_t fixed, bool continuous)
+  {
+    const int64_t divisor = static_cast<int64_t>(kScrollFixedOne) * (continuous ? kScrollPixelsPerLine : 1);
+    const int64_t scaled = static_cast<int64_t>(fixed) * kScrollNotchUnits;
+    const int64_t half = divisor / 2;
+    const int64_t rounded = scaled >= 0 ? (scaled + half) / divisor : -((-scaled + half) / divisor);
+    return static_cast<int32_t>(rounded);
+  }
+
+  /**
+   * @brief Remove and return the whole notches banked in \p notchUnits, leaving the remainder
+   */
+  static constexpr int32_t takeWholeNotches(int32_t &notchUnits)
+  {
+    const int32_t whole = (notchUnits / kScrollNotchUnits) * kScrollNotchUnits;
+    notchUnits -= whole;
+    return whole;
+  }
+
+  /**
+   * @brief Build a WheelEx from raw wire fields, mapping unknown phase bytes to None
+   */
+  static constexpr WheelEx
+  fromWire(int32_t xDelta, int32_t yDelta, uint8_t continuous, uint8_t phase, uint8_t momentum, uint32_t timestampMs)
+  {
+    WheelEx ex;
+    ex.xDelta = xDelta;
+    ex.yDelta = yDelta;
+    ex.continuous = continuous != 0;
+    ex.phase = phase <= static_cast<uint8_t>(ScrollPhase::MayBegin) ? static_cast<ScrollPhase>(phase) : ScrollPhase::None;
+    ex.momentum = momentum <= static_cast<uint8_t>(MomentumPhase::Ended) ? static_cast<MomentumPhase>(momentum)
+                                                                          : MomentumPhase::None;
+    ex.timestampMs = timestampMs;
+    return ex;
+  }
+
+  /**
+   * @brief True when the message carries no scroll motion and no gesture phase
+   */
+  constexpr bool isEmpty() const
+  {
+    return xDelta == 0 && yDelta == 0 && phase == ScrollPhase::None && momentum == MomentumPhase::None;
+  }
+};
 
 /** @} */ // end of protocol_mouse group
 

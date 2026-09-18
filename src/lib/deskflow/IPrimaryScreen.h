@@ -10,6 +10,9 @@
 
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
+#include "deskflow/ProtocolTypes.h"
+
+#include <cstdlib>
 
 //! Primary screen interface
 /*!
@@ -56,6 +59,20 @@ public:
   public:
     int32_t m_xDelta;
     int32_t m_yDelta;
+  };
+  //! Extended wheel motion event data
+  class WheelExInfo
+  {
+  public:
+    static WheelExInfo *alloc(const WheelEx &ex)
+    {
+      auto *info = static_cast<WheelExInfo *>(malloc(sizeof(WheelExInfo)));
+      info->m_ex = ex;
+      return info;
+    }
+
+  public:
+    WheelEx m_ex;
   };
   //! Hot key event data
   class HotKeyInfo

@@ -361,6 +361,12 @@ void Screen::mouseWheel(int32_t xDelta, int32_t yDelta) const
   m_screen->fakeMouseWheel({xDelta, yDelta});
 }
 
+void Screen::mouseWheelEx(const WheelEx &ex) const
+{
+  assert(!m_isPrimary);
+  m_screen->fakeMouseWheelEx(ex);
+}
+
 void Screen::resetOptions()
 {
   // reset options

@@ -168,6 +168,7 @@ This table lists all protocol messages in alphabetical order. For a typical sequ
 | [**DMUP**](@ref kMsgDMouseUp) | @ref kMsgDMouseUp | Data | Server→Client | Mouse up | [MsgSize](#constraint-protocol-max-message-length) | 1.0+ |
 | [**DMWM**](@ref kMsgDMouseWheel) | @ref kMsgDMouseWheel | Data | Server→Client | Mouse wheel | [MsgSize](#constraint-protocol-max-message-length) | 1.3+ |
 | [**DMWM**](@ref kMsgDMouseWheel1_0) | @ref kMsgDMouseWheel1_0 | Data | Server→Client | Mouse wheel (legacy) | [MsgSize](#constraint-protocol-max-message-length) | 1.0-1.2 |
+| [**DMWX**](@ref kMsgDMouseWheelEx) | @ref kMsgDMouseWheelEx | Data | Server→Client | Extended mouse wheel (fixed-point, phases) | [MsgSize](#constraint-protocol-max-message-length) | 1.9+ |
 | [**DSOP**](@ref kMsgDSetOptions) | @ref kMsgDSetOptions | Data | Server→Client | Set options | [MsgSize](#constraint-protocol-max-message-length), [ListSize](#constraint-max-list) | 1.0+ |
 | [**EBAD**](@ref kMsgEBad) | @ref kMsgEBad | Error | Server→Client | Protocol violation | [MsgSize](#constraint-protocol-max-message-length) | 1.0+ |
 | [**EBSY**](@ref kMsgEBusy) | @ref kMsgEBusy | Error | Server→Client | Server busy | [MsgSize](#constraint-protocol-max-message-length) | 1.0+ |
@@ -290,12 +291,50 @@ A modifier (modifier mask) represents the state of modifier keys (like Shift, Co
 | **1.6** | Jan 2014 | Synergy | Clipboard streaming | 1.6+ |
 | **1.7** | Nov 2021 | Synergy | Secure input notifications | 1.7+ |
 | **1.8** | Jun 2025 | Synergy | Language synchronization | 1.8+ |
+| **1.9** | Sep 2026 | Deskflow fork | Extended mouse wheel (@ref kMsgDMouseWheelEx) | 1.9+ |
+
+### Extended Mouse Wheel (Protocol v1.9+)
+
+`DMWM` carries two signed 16-bit deltas in 120-per-notch units, which drops
+everything a modern scroll device reports beyond whole notches. `DMWX`
+(@ref kMsgDMouseWheelEx, format `DMWX%4i%4i%1i%1i%1i%4i`) carries:
+
+| Field | Size | Meaning |
+|-------|------|---------|
+| X delta, Y delta | 4 bytes each, signed | 16.16 fixed point. Pixels when `continuous` is 1 (trackpad, Magic Mouse), lines when 0 (wheel). Lines already include the sender's acceleration. |
+| continuous | 1 byte | 1 = pixel deltas from a continuous device, 0 = line deltas |
+| scroll phase | 1 byte | @ref ScrollPhase: 0 None, 1 Began, 2 Changed, 3 Ended, 4 Cancelled, 5 MayBegin |
+| momentum phase | 1 byte | @ref MomentumPhase: 0 None, 1 Began, 2 Changed, 3 Ended |
+| timestamp | 4 bytes, unsigned | Sender's device timestamp in milliseconds, wraps at 2^32 |
+
+Rules:
+
+- A message whose deltas are both zero is still sent when it carries a phase
+  (a gesture's `Began`/`Ended`, a momentum `Ended`). A zero-delta message with
+  no phase is never sent.
+- When the pointer leaves a client mid-gesture the server sends a zero-delta
+  `DMWX` before `COUT` (leave): scroll phase `Cancelled` while the finger is
+  still down, momentum `Ended` while a flick is coasting. The client never
+  waits on a terminal phase it will not get.
+- A 1.9 server only emits `DMWX` to a client whose hello-back announced 1.9.
+  Anything older receives `DMWM`: the fixed-point motion is banked in
+  120-per-notch units, whole notches are flushed and the remainder kept
+  (pixels convert at 10 per line), and phase-only messages are dropped.
+- macOS senders put the integer `DeltaAxis` line count on the wire for a
+  wheel notch (a slow notch reports `FixedPtDelta` 0.1 but scrolls one line);
+  `FixedPtDelta` is used only when it is at least one line (fast notch with a
+  fraction) or when the integer rounds a hi-res sub-notch tick to zero.
+- A 1.9 client accepts both `DMWM` and `DMWX`. Receivers without a native
+  precision path (X11, libei) bank `DMWX` the same way and inject whole
+  notches; Windows injects any `WHEEL_DELTA` fraction; macOS injects pixel
+  events with `IsContinuous` and the phases set, or line events with the
+  fractional part in `FixedPtDeltaAxis`.
 
 ### Version Migration Guide
 
 When implementing a client that supports multiple protocol versions:
 
-1. **Version Negotiation**: During handshake, client should advertise highest supported version
+1. **Version Negotiation**: During handshake, the client announces the lower of its own minor and the server's `Hello` minor (see `negotiatedProtocolMinor`). A server only constructs proxies for minors it knows, so announcing a newer minor than the server would be rejected as incompatible.
 2. **Feature Detection**: Check server's version in `Hello` message before using version-specific features
 3. **Fallback Mechanism**: Be prepared to operate with only features available in the negotiated version
 4. **Graceful Degradation**: If server supports a lower version than client's minimum, handle `EIncompatible` error gracefully
