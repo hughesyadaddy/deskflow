@@ -142,10 +142,10 @@ protected:
 
   //! Start @p process; return false when it could not be started.
   virtual bool spawnCoreProcess(QProcess *process, const QString &program, const QStringList &args);
-  //! True when an external supervisor (launchd on macOS) already owns the core; probed once per start().
-  virtual bool probeExternalSupervisor() const;
-  //! Ask the external supervisor to restart the core (launchctl kickstart -k).
-  virtual void kickstartExternalCore() const;
+  //! True when an external supervisor owns the core (always on macOS: launchd), so the GUI never spawns one.
+  virtual bool hasExternalSupervisor() const;
+  //! Ask the external supervisor to restart the core (launchctl kickstart -k); never blocks.
+  virtual void kickstartExternalCore();
   //! True when the Deskflow Windows service is installed (always false off Windows).
   virtual bool isWindowsServiceInstalled() const;
 
@@ -161,6 +161,8 @@ private:
   void stopForegroundProcess();
   void stopProcessFromDaemon();
   void releaseProcess();
+  void releaseCoreIpcClient();
+  void scheduleCoreIpcReattach();
   void scheduleRetry(int delayMs);
   void doRestart();
   QPair<bool, QString> persistServerConfig() const;
