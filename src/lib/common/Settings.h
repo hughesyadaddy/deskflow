@@ -126,6 +126,9 @@ public:
   {
     inline static const auto File = QStringLiteral("log/file");
     inline static const auto Level = QStringLiteral("log/level");
+    // Comma-separated message prefixes (e.g. "coordination") logged at DEBUG
+    // while `level` stays INFO; see Log::setDebugCategories.
+    inline static const auto Categories = QStringLiteral("log/categories");
     inline static const auto ToFile = QStringLiteral("log/toFile");
     inline static const auto GuiDebug = QStringLiteral("log/guiDebug");
   };
@@ -327,6 +330,7 @@ private:
     , Settings::Daemon::LogLevel
     , Settings::Log::File
     , Settings::Log::Level
+    , Settings::Log::Categories
     , Settings::Log::ToFile
     , Settings::Log::GuiDebug
     , Settings::Gui::Autohide

@@ -17,6 +17,13 @@
 
   The login-window bridge stays separate:
   /Library/LaunchAgents/org.deskflow.vhid-bridge.plist (LoginWindow, KeepAlive).
+
+  Logging: ONE sink. The core writes its own rotated log via Deskflow.conf
+  `[log] toFile=true file=~/Library/Deskflow/deskflow-core.log` (5 MiB x 3
+  generations, FileLogOutputter). launchd's stdout/stderr capture used to
+  duplicate every line into ~/Library/Logs/Deskflow/deskflow-core.log with no
+  rotation, so it now goes to /dev/null. Crashes are in
+  ~/Library/Logs/DiagnosticReports; `[log] toFile` MUST stay true on every seat.
 -->
 <plist version="1.0">
 <dict>
@@ -44,8 +51,8 @@
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
   <key>StandardOutPath</key>
-  <string>__HOME__/Library/Logs/Deskflow/deskflow-core.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/Library/Logs/Deskflow/deskflow-core.log</string>
+  <string>/dev/null</string>
 </dict>
 </plist>

@@ -336,7 +336,10 @@ def mocked_mac(fs, monkeypatch):
     monkeypatch.setattr(fs, "mac_top", lambda pid: {"rss_mb": 130.0, "compressed_mb": 4.0,
                                                     "mach_ports": 311, "threads": 14})
     monkeypatch.setattr(fs, "mac_fds", lambda pid: 77)
+    monkeypatch.setattr(fs, "mac_cpu_seconds", lambda pid: 12.5)
     monkeypatch.setattr(fs, "mac_restart_count", lambda label, exe=None: 3)
+    monkeypatch.setattr(fs, "default_log_for", lambda proc, home=None: None)
+    monkeypatch.setattr(fs, "notify", lambda message: (_ for _ in ()).throw(AssertionError(message)))
     monkeypatch.setattr(fs, "derive_scenario",
                         lambda proc, home=None, log_path=None, status_fn=None: "device-connected")
     return fs
@@ -664,3 +667,194 @@ def test_proc_from_label(fs):
     assert fs.proc_from_label("application.io.github.hughesyadaddy.deskflow.406638075.406638081") == "deskflow"
     assert fs.proc_from_label("deskflow-core") == "deskflow-core"
     assert fs.proc_from_label("deskflow-daemon") == "deskflow-daemon"
+
+
+# --------------------------------------------------------------------------
+# cpu_s / cpu_pct, log-tail counters, alerts
+# --------------------------------------------------------------------------
+
+
+def test_derive_fields_cpu_pct_from_previous_sample_of_same_incarnation(fs):
+    prev = {"ts": ts(T0), "pid": 5, "start_time": "s", "cpu_s": 10.0}
+    rec = {"ts": ts(T0 + 60), "pid": 5, "start_time": "s", "cpu_s": 58.0}
+    out = fs.derive_fields(rec, prev, "deskflow", None)
+    assert out["cpu_pct"] == pytest.approx(80.0)
+    # restart (new pid) -> no rate; first sample -> no rate; clock skew -> clamp at 0
+    assert fs.derive_fields(dict(rec, pid=6), prev, "deskflow", None)["cpu_pct"] is None
+    assert fs.derive_fields(rec, None, "deskflow", None)["cpu_pct"] is None
+    assert fs.derive_fields(dict(rec, cpu_s=1.0), prev, "deskflow", None)["cpu_pct"] == 0.0
+    assert "log_offset" not in out  # the GUI has no counters
+
+
+def test_count_log_deltas_offsets_rotation_and_cap(fs, tmp_path):
+    log = tmp_path / "core.log"
+    log.write_text("a promoting to server\nb\nClientProxyUnknown x\n")
+    patterns = fs.LOG_COUNTERS["deskflow-core"]
+    # first sample: history is not this soak's problem -> zeros, cursor at EOF
+    counts, off = fs.count_log_deltas(log, patterns, None)
+    assert counts == {"epoch_flips": 0, "unresponsive": 0} and off == log.stat().st_size
+    # nothing new
+    assert fs.count_log_deltas(log, patterns, off) == ({"epoch_flips": 0, "unresponsive": 0}, off)
+    with log.open("a") as fh:
+        fh.write("promoting to server\npromoting to server\n")
+    counts, off2 = fs.count_log_deltas(log, patterns, off)
+    assert counts == {"epoch_flips": 2, "unresponsive": 0} and off2 > off
+    # rotation: the file shrank below the stored offset -> restart from 0
+    log.write_text("ClientProxyUnknown\n")
+    counts, off3 = fs.count_log_deltas(log, patterns, off2)
+    assert counts == {"epoch_flips": 0, "unresponsive": 1} and off3 == log.stat().st_size
+    # missing file -> zeros, no offset
+    assert fs.count_log_deltas(tmp_path / "nope.log", patterns, None) == ({"epoch_flips": 0, "unresponsive": 0}, None)
+    assert fs.count_log_deltas(None, patterns, None) == ({"epoch_flips": 0, "unresponsive": 0}, None)
+
+
+def test_count_log_deltas_caps_a_huge_delta(fs, tmp_path, monkeypatch):
+    monkeypatch.setattr(fs, "LOG_DELTA_MAX_BYTES", 40)
+    log = tmp_path / "mouser.log"
+    log.write_text("x\n")
+    _, off = fs.count_log_deltas(log, fs.LOG_COUNTERS["mouser"], None)
+    with log.open("a") as fh:
+        fh.write("CGEventTap disabled by system\n" * 5)  # 150 new bytes, only the last 40 are read
+    counts, off2 = fs.count_log_deltas(log, fs.LOG_COUNTERS["mouser"], off)
+    assert counts == {"tap_timeouts": 1} and off2 == 152
+
+
+def test_alerts_fire_exactly_once_per_condition(fs):
+    absent = {"pid": None}
+    present = {"pid": 1}
+    assert fs.alerts_for([], absent, "mouser") == []
+    assert fs.alerts_for([present], absent, "mouser") == []
+    assert fs.alerts_for([present, absent], absent, "mouser") == ["mouser: no process for 2 consecutive samples"]
+    assert fs.alerts_for([absent, absent], absent, "mouser") == []  # steady absence stays quiet
+    assert fs.alerts_for([absent, absent, present], absent, "mouser") == []
+
+    cool = {"pid": 1, "cpu_pct": 5.0}
+    hot = {"pid": 1, "cpu_pct": 97.3}
+    assert fs.alerts_for([hot], hot, "mouser") == []
+    assert fs.alerts_for([cool, hot, hot], hot, "mouser") == ["mouser: cpu 97.3% for 3 consecutive samples"]
+    assert fs.alerts_for([hot, hot, hot], hot, "mouser") == []
+    assert fs.alerts_for([hot, cool, hot], hot, "mouser") == []
+    none = {"pid": 1, "cpu_pct": None}
+    assert fs.alerts_for([hot, hot], none, "mouser") == []
+
+
+def ticking_clock(fs, monkeypatch, step=60):
+    """now_utc() advancing `step` seconds per call, so cpu_pct has a real dt."""
+    import datetime as dt
+    state = {"t": T0}
+
+    def now():
+        state["t"] += step
+        return dt.datetime.fromtimestamp(state["t"], dt.timezone.utc)
+
+    monkeypatch.setattr(fs, "now_utc", now)
+
+
+def test_sampler_notifies_on_second_absent_tick_and_counts_log_deltas(mocked_mac, tmp_path, monkeypatch):
+    fs = mocked_mac
+    ticking_clock(fs, monkeypatch)
+    notes = []
+    monkeypatch.setattr(fs, "notify", lambda message: notes.append(message))
+    log = tmp_path / "mouser.log"
+    log.write_text("boot\nCGEventTap disabled by system (kCGEventTapDisabledByTimeout)\n")
+    monkeypatch.setattr(fs, "default_log_for", lambda proc, home=None: log)
+    out = tmp_path / "m.jsonl"
+    argv = ["sample", "--label", "io.github.hughesyadaddy.mouser",
+            "--exe", "/Applications/Mouser.app/Contents/MacOS/Mouser", "--out", str(out), "--once"]
+
+    assert fs.main(argv) == 0
+    rec1 = json.loads(out.read_text().splitlines()[-1])
+    assert rec1["cpu_s"] == 12.5 and rec1["cpu_pct"] is None
+    assert rec1["tap_timeouts"] == 0 and rec1["log_offset"] == log.stat().st_size
+
+    monkeypatch.setattr(fs, "mac_cpu_seconds", lambda pid: 12.5 + 55.0)
+    with log.open("a") as fh:
+        fh.write("CGEventTap disabled by system\nCGEventTap disabled by system\n")
+    assert fs.main(argv) == 0
+    rec2 = json.loads(out.read_text().splitlines()[-1])
+    assert rec2["tap_timeouts"] == 2
+    assert rec2["cpu_pct"] == pytest.approx(55.0 / 60 * 100, abs=0.01)
+    assert notes == []
+
+    monkeypatch.setattr(fs, "mac_find_pid", lambda exe: (None, None))
+    assert fs.main(argv) == 0
+    assert notes == []
+    assert fs.main(argv) == 0
+    assert notes == ["mouser: no process for 2 consecutive samples"]
+    assert fs.main(argv) == 0
+    assert notes == ["mouser: no process for 2 consecutive samples"]
+    recs = [json.loads(ln) for ln in out.read_text().splitlines()[1:]]
+    assert [r["pid"] for r in recs] == [4242, 4242, None, None, None]
+    assert all(r["tap_timeouts"] == 0 for r in recs[2:])
+
+
+def test_windows_restart_events_accumulate_into_restart_count(fs, tmp_path, monkeypatch):
+    monkeypatch.setattr(fs, "IS_WIN", True)
+    monkeypatch.setattr(fs, "git_sha", lambda: "abc123")
+    monkeypatch.setattr(fs, "seat_name", lambda: "tiny11")
+    monkeypatch.setattr(fs, "default_log_for", lambda proc, home=None: None)
+    monkeypatch.setattr(fs, "notify", lambda message: (_ for _ in ()).throw(AssertionError(message)))
+    ticking_clock(fs, monkeypatch)
+    out = tmp_path / "w.jsonl"
+    base = {"pid": 9, "start_time": "2026-09-16T00:00:00Z", "exe": "C:\\Deskflow\\deskflow-daemon.exe",
+            "private_bytes_mb": 22.5, "rss_mb": 30.0, "handles": 210, "threads": 9, "scenario": "server"}
+    for events, cpu in ((1, 10.0), (0, 10.5), (None, 10.7), (2, 11.0)):
+        probe = tmp_path / "probe.json"
+        probe.write_text(json.dumps(dict(base, restart_events=events, cpu_s=cpu)))
+        assert fs.main(["sample", "--label", "deskflow-daemon", "--exe", base["exe"], "--out", str(out),
+                        "--once", "--probe-json", str(probe)]) == 0
+    recs = [json.loads(ln) for ln in out.read_text().splitlines()[1:]]
+    # a null event query (Get-WinEvent threw) carries the count forward instead of resetting it
+    assert [r["restart_count"] for r in recs] == [1, 1, 1, 3]
+    assert all("restart_events" not in r for r in recs)
+    assert recs[0]["cpu_s"] == 10.0 and recs[1]["cpu_pct"] == pytest.approx(0.5 / 60 * 100, abs=0.01)
+
+
+def test_win_probe_script_bounds_event_query_and_reports_cpu(fs):
+    assert "StartTime=(Get-Date).AddSeconds(-$interval)" in fs.WIN_PROBE_PS
+    assert "-MaxEvents 100" in fs.WIN_PROBE_PS and "-MaxEvents 5000" not in fs.WIN_PROBE_PS
+    assert "cpu_s = [math]::Round($p.TotalProcessorTime.TotalSeconds, 3)" in fs.WIN_PROBE_PS
+    assert "restart_events" in fs.WIN_PROBE_PS
+    ps1 = (TOOL.parent / "fleet-soak-task.ps1").read_text()
+    assert "AddSeconds(-$Interval)" in ps1 and "-MaxEvents 5000" not in ps1
+    assert "restart_events" in ps1 and "TotalProcessorTime" in ps1
+
+
+def test_read_last_samples_skips_header_and_partial_lines(fs, tmp_path):
+    p = tmp_path / "x.jsonl"
+    p.write_text(json.dumps(header()) + "\n" + json.dumps({"ts": "a", "pid": 1}) + "\n"
+                 + json.dumps({"ts": "b", "pid": 2}) + "\n{\"ts\": \"broken\n")
+    assert [s["pid"] for s in fs.read_last_samples(p, 3)] == [1, 2]
+    assert [s["pid"] for s in fs.read_last_samples(p, 1)] == [2]
+    assert fs.read_last_samples(tmp_path / "absent.jsonl", 2) == []
+
+
+def test_report_cpu_runs_and_counter_rates(fs, tmp_path, capsys):
+    s = series(80, 0.0)
+    for x in s:
+        x["cpu_pct"] = 3.0
+        x["tap_timeouts"] = 0
+        x["epoch_flips"] = 0
+        x["unresponsive"] = 0
+    # two hot runs after warm-up: 3 samples and 5 samples; a 2-sample blip does not count
+    for i in (200, 201, 202, 400, 401, 402, 403, 404, 600, 601):
+        s[i]["cpu_pct"] = 95.0
+    s[300]["tap_timeouts"] = 4
+    code, res = report(fs, p := write_jsonl(tmp_path / "cpu.jsonl", header(), s), "--tap-timeouts-max", "0.01",
+                       capsys=capsys)
+    assert code == 1 and res["verdict"] == "FAIL"
+    assert res["cpu_high_runs"] == 2 and res["cpu_high_longest"] == 5
+    assert res["cpu_high_first_at"] == s[202]["ts"]
+    assert res["cpu_pct_max"] == 95.0
+    assert res["tap_timeouts_total"] == 4 and res["tap_timeouts_h"] == pytest.approx(4 / 78, abs=0.01)
+    assert res["epoch_flips_h"] == 0.0 and res["unresponsive_h"] == 0.0
+    assert any(f.startswith("cpu > 80.0% for 3+") for f in res["failures"])
+    assert any(f.startswith("tap_timeouts ") for f in res["failures"])
+
+    # relaxed thresholds pass
+    code, res = report(fs, p, "--cpu-ticks", "6", "--tap-timeouts-max", "10", capsys=capsys)
+    assert code == 0 and res["cpu_high_runs"] == 0
+
+    # samples without the new keys: nothing to judge, no failure
+    code, res = report(fs, write_jsonl(tmp_path / "old.jsonl", header(), series(80, 0.0)), capsys=capsys)
+    assert code == 0 and res["cpu_pct_p95"] is None and res["tap_timeouts_h"] is None

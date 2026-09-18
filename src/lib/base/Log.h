@@ -12,8 +12,11 @@
 
 #include <list>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include <QString>
+#include <QStringList>
 
 #define CLOG (Log::getInstance())
 #define BYE "\nTry `%s --help' for more information."
@@ -91,6 +94,14 @@ public:
   //! Set the minimum priority filter (by ordinal).
   void setFilter(LogLevel::Level);
 
+  //! Categories whose messages pass at DEBUG even when the filter is higher.
+  /*!
+  A category is the message prefix before the first colon, e.g. "coordination"
+  matches "coordination: mesh listening ...". Lets one subsystem be traced
+  without dropping the whole log to DEBUG.
+  */
+  void setDebugCategories(const QStringList &categories);
+
   //@}
   //! @name accessors
   //@{
@@ -120,6 +131,7 @@ public:
 
 private:
   void output(LogLevel::Level priority, const char *msg);
+  bool passesCategoryFilter(LogLevel::Level priority, const char *fmt) const;
 
 private:
   using OutputterList = std::list<ILogOutputter *>;
@@ -130,6 +142,7 @@ private:
   OutputterList m_outputters;
   OutputterList m_alwaysOutputters;
   LogLevel::Level m_maxPriority;
+  std::vector<std::string> m_debugCategories;
 };
 
 /*!

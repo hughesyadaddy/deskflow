@@ -30,7 +30,6 @@ namespace deskflow {
 class Screen;
 }
 
-class FileLogOutputter;
 class IEventQueue;
 class SocketMultiplexer;
 
@@ -87,6 +86,13 @@ public:
 
   void quit() const;
   void setupFileLogging();
+  //! Attach the `[log] file` outputter once per process (idempotent).
+  /*!
+  deskflow-core calls this before the coordinator starts so auto-mode
+  startup and election lines reach the file sink; setupFileLogging() is
+  then a no-op for every epoch.
+  */
+  static void attachFileLogOnce();
   void loggingFilterWarning() const;
   void initApp() override;
 
@@ -142,7 +148,6 @@ private:
   void (*m_bye)(int);
   IEventQueue *m_events = nullptr;
   static App *s_instance;
-  FileLogOutputter *m_fileLog = nullptr;
   ARCH_APP_UTIL m_appUtil;
   std::unique_ptr<SocketMultiplexer> m_socketMultiplexer;
   QString m_pname;

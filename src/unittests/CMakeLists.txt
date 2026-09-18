@@ -119,6 +119,17 @@ create_test(
 )
 target_include_directories(AutoModeRunnerTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-core")
 
+# The periodic `health:` line formatter and the coordinator counters behind it.
+create_test(
+  NAME HealthReportTests
+  DEPENDS coordination
+  LIBS base arch mt
+  SOURCE apps/deskflow-core/HealthReportTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/apps/deskflow-core"
+)
+target_sources(HealthReportTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-core/HealthReport.cpp")
+target_include_directories(HealthReportTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-core")
+
 # deskflow-vhid-bridge pure logic (caps decision table, motion chunking,
 # calibration math) is header-only in BridgeCalibration.h; the bridge itself
 # is macOS-only but the logic is portable, so this test builds everywhere.

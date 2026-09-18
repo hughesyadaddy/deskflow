@@ -12,10 +12,9 @@
 #include <iostream>
 
 #include <QFile>
+#include <QFileInfo>
 #include <QString>
 #include <QTextStream>
-
-constexpr auto s_logFileSizeLimit = 1024 * 1024; //!< Max Log size before rotating (1Mb)
 
 //
 // StopLogOutputter
@@ -124,22 +123,69 @@ FileLogOutputter::FileLogOutputter(const QString &logFile)
 void FileLogOutputter::setLogFilename(const QString &logFile)
 {
   assert(logFile != nullptr);
+  std::scoped_lock lock{m_mutex};
+  m_file.close();
   m_fileName = logFile;
+}
+
+QString FileLogOutputter::generationName(int generation) const
+{
+  return QStringLiteral("%1.%2").arg(m_fileName).arg(generation);
+}
+
+bool FileLogOutputter::ensureOpen()
+{
+  // An external rm/mv/recreate (newsyslog, a human) leaves the open handle
+  // on the old inode; check the path occasionally instead of per line. A
+  // path that is missing or smaller than what this handle wrote was replaced.
+  if (m_file.isOpen() && ++m_writesSinceExistsCheck >= kExistsCheckInterval) {
+    m_writesSinceExistsCheck = 0;
+    const QFileInfo info(m_fileName);
+    if (!info.exists() || info.size() < m_file.size()) {
+      m_file.close();
+    }
+  }
+  if (m_file.isOpen()) {
+    return true;
+  }
+  m_file.setFileName(m_fileName);
+  m_writesSinceExistsCheck = 0;
+  return m_file.open(QFile::WriteOnly | QFile::Append);
+}
+
+void FileLogOutputter::rotate()
+{
+  m_file.close();
+  // The live file is only ever renamed, never removed, and it moves first:
+  // if that fails (a Windows reader without FILE_SHARE_DELETE) the older
+  // generations are untouched, the log keeps growing in place, and the next
+  // attempt waits kRotateRetryInterval writes instead of thrashing per line.
+  const auto staged = QStringLiteral("%1.rotating").arg(m_fileName);
+  QFile::remove(staged);
+  if (!QFile::rename(m_fileName, staged)) {
+    m_writesUntilRotateRetry = kRotateRetryInterval;
+    return;
+  }
+  QFile::remove(generationName(kGenerations));
+  for (int generation = kGenerations - 1; generation >= 1; --generation) {
+    QFile::rename(generationName(generation), generationName(generation + 1));
+  }
+  QFile::rename(staged, generationName(1));
 }
 
 bool FileLogOutputter::write(LogLevel::Level, const QString &message)
 {
-  QFile file(m_fileName);
-  if (!file.open(QFile::WriteOnly | QFile::Append))
+  std::scoped_lock lock{m_mutex};
+  if (!ensureOpen()) {
     return false;
+  }
 
-  QTextStream(&file) << message << Qt::endl;
-  file.close();
+  QTextStream(&m_file) << message << Qt::endl;
 
-  if (file.size() > s_logFileSizeLimit) {
-    const auto oldFile = QStringLiteral("%1.1").arg(m_fileName);
-    QFile::remove(m_fileName);
-    QFile::rename(m_fileName, oldFile);
+  if (m_writesUntilRotateRetry > 0) {
+    --m_writesUntilRotateRetry;
+  } else if (m_file.size() > kSizeLimit) {
+    rotate();
   }
 
   return true;
@@ -152,5 +198,6 @@ void FileLogOutputter::open(const QString &title)
 
 void FileLogOutputter::close()
 {
-  // do nothing
+  std::scoped_lock lock{m_mutex};
+  m_file.close();
 }

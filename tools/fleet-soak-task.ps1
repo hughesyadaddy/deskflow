@@ -5,9 +5,11 @@
 .DESCRIPTION
   Locates the process by executable path with Get-Process, collects
   PrivateMemorySize64 / WorkingSet64 / HandleCount / thread count / GDI+USER
-  object counts and the Service Control Manager "entered the running state"
-  count for the named service (restart_count), then feeds the JSON to
-  `fleet-soak sample --probe-json -` which appends one sample to the JSONL.
+  object counts / CPU seconds and the Service Control Manager "entered the
+  running state" events for the named service in the last -Interval seconds
+  (restart_events; fleet-soak accumulates restart_count), then feeds the JSON
+  to `fleet-soak sample --probe-json -` which appends one sample to the JSONL
+  and raises `msg *` alerts (process absent 2 ticks, CPU > 80% 3 ticks).
 
   Register (per process, run as the logged-in user so GetGuiResources works):
 
@@ -44,9 +46,12 @@ $fleetSoak = Join-Path $here 'fleet-soak'
 
 $p = Get-Process | Where-Object { $_.Path -eq $Exe } | Sort-Object Id | Select-Object -First 1
 
+# Only the last tick's SCM 7036 "running" events: fleet-soak carries the
+# cumulative restart_count forward from the previous JSONL sample, so the
+# event-log scan stays bounded instead of walking 5000 events per minute.
 $restarts = $null
 try {
-  $restarts = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7036 } -MaxEvents 5000 |
+  $restarts = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7036; StartTime = (Get-Date).AddSeconds(-$Interval) } -MaxEvents 100 |
     Where-Object { $_.Message -like "*$Label*" -and $_.Message -like '*running*' }).Count
 } catch { $restarts = $null }
 
@@ -68,6 +73,7 @@ if ($p) {
     rss_mb           = [math]::Round($p.WorkingSet64 / 1MB, 3)
     handles          = $p.HandleCount
     threads          = $p.Threads.Count
+    cpu_s            = [math]::Round($p.TotalProcessorTime.TotalSeconds, 3)
   }
   try {
     Add-Type -Name U -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern int GetGuiResources(IntPtr h, int f);'
@@ -75,7 +81,7 @@ if ($p) {
     $o.user = [W.U]::GetGuiResources($p.Handle, 1)
   } catch { $o.gdi = $null; $o.user = $null }
 }
-$o.restart_count = $restarts
+$o.restart_events = $restarts
 $o.scenario = $scenario
 $json = $o | ConvertTo-Json -Compress
 

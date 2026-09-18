@@ -18,6 +18,12 @@
 //   deskflow-prio <pid> [importance]
 //   deskflow-prio --name <process-name> [importance]   (every matching pid)
 //
+// --name runs every 30 s from launchd, so it only prints when the outcome
+// (which pids, promoted or not) differs from the previous run, remembered in
+// /var/run/deskflow-prio.state (cleared at boot: the first run after boot
+// always prints). A pid that fails to promote is part of that outcome, so a
+// persistent failure prints once, not every 30 s.
+//
 // Historically built out-of-tree from /usr/local/src-deskflow-prio.c and
 // installed ad-hoc/unsigned to /usr/local/bin; it now ships inside
 // Deskflow.app/Contents/MacOS with the org.deskflow.deskflow-prio identifier
@@ -27,31 +33,85 @@
 #include <mach/mach.h>
 #include <mach/task_policy.h>
 #include <mach/thread_policy.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
 
 static const int kDefaultImportance = 16;
+static const char *kStateFile = "/var/run/deskflow-prio.state";
+
+// Summary of this run: one "<pid>:<ok>/<n>" token per matched process,
+// compared against the previous run so a steady state stays silent.
+static char g_summary[4096];
+static char g_detail[4096];
+
+static void appendf(char *buf, size_t cap, const char *fmt, ...)
+{
+  size_t used = strlen(buf);
+  if (used >= cap - 1)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf + used, cap - used, fmt, ap);
+  va_end(ap);
+}
+
+static const char *timestamp(void)
+{
+  static char buf[32];
+  time_t now = time(NULL);
+  struct tm tm;
+  localtime_r(&now, &tm);
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &tm);
+  return buf;
+}
+
+// Prints the run's detail lines only when the summary differs from the
+// previous run's (or no previous run is recorded since boot), then records
+// the summary. Unwritable state (not root) degrades to printing every run.
+static void reportIfChanged(void)
+{
+  char previous[sizeof(g_summary)] = {0};
+  FILE *f = fopen(kStateFile, "r");
+  if (f) {
+    if (!fgets(previous, sizeof(previous), f))
+      previous[0] = '\0';
+    fclose(f);
+  }
+  if (strcmp(previous, g_summary) == 0)
+    return;
+  printf("%s %s", timestamp(), g_detail);
+  fflush(stdout);
+  f = fopen(kStateFile, "w");
+  if (f) {
+    fputs(g_summary, f);
+    fclose(f);
+  }
+}
 
 static int promote(pid_t pid, int importance)
 {
   mach_port_t task;
   kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
   if (kr != KERN_SUCCESS) {
-    fprintf(stderr, "task_for_pid(%d): %s\n", (int)pid, mach_error_string(kr));
+    appendf(g_summary, sizeof(g_summary), "%d:fail ", (int)pid);
+    appendf(g_detail, sizeof(g_detail), "task_for_pid(%d): %s\n", (int)pid, mach_error_string(kr));
     return 1;
   }
   struct task_category_policy tcat = {.role = TASK_FOREGROUND_APPLICATION};
   kr = task_policy_set(task, TASK_CATEGORY_POLICY, (task_policy_t)&tcat, TASK_CATEGORY_POLICY_COUNT);
   if (kr != KERN_SUCCESS)
-    fprintf(stderr, "task role: %s\n", mach_error_string(kr));
+    appendf(g_detail, sizeof(g_detail), "pid %d: task role: %s\n", (int)pid, mach_error_string(kr));
 
   thread_act_array_t threads;
   mach_msg_type_number_t n = 0;
   kr = task_threads(task, &threads, &n);
   if (kr != KERN_SUCCESS) {
-    fprintf(stderr, "task_threads: %s\n", mach_error_string(kr));
+    appendf(g_summary, sizeof(g_summary), "%d:fail ", (int)pid);
+    appendf(g_detail, sizeof(g_detail), "pid %d: task_threads: %s\n", (int)pid, mach_error_string(kr));
     mach_port_deallocate(mach_task_self(), task);
     return 1;
   }
@@ -67,7 +127,8 @@ static int promote(pid_t pid, int importance)
   }
   vm_deallocate(mach_task_self(), (vm_address_t)threads, n * sizeof(thread_act_t));
   mach_port_deallocate(mach_task_self(), task);
-  printf("pid %d: role=foreground, %d/%u threads importance=%d\n", (int)pid, ok, n, importance);
+  appendf(g_summary, sizeof(g_summary), "%d:%s ", (int)pid, ok == (int)n ? "ok" : "partial");
+  appendf(g_detail, sizeof(g_detail), "pid %d: role=foreground, %d/%u threads importance=%d\n", (int)pid, ok, n, importance);
   return 0;
 }
 
@@ -103,10 +164,11 @@ static int promoteByName(const char *name, int importance)
   }
   free(pids);
   if (matched == 0) {
-    printf("no process named %s\n", name);
-    return 0;
+    appendf(g_summary, sizeof(g_summary), "none");
+    appendf(g_detail, sizeof(g_detail), "no process named %s\n", name);
   }
-  return promoted > 0 ? 0 : 1;
+  reportIfChanged();
+  return matched == 0 || promoted > 0 ? 0 : 1;
 }
 
 static int usage(void)
@@ -130,5 +192,7 @@ int main(int argc, char **argv)
   if (pid <= 0)
     return usage();
   int imp = (argc > 2) ? atoi(argv[2]) : kDefaultImportance;
-  return promote(pid, imp);
+  int rc = promote(pid, imp);
+  fputs(g_detail, stdout);
+  return rc;
 }
