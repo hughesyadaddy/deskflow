@@ -198,6 +198,32 @@ build_install_deskflow() {
     fail "codesign --verify --deep --strict $install_app failed — refusing to call this deploy a success"
   fi
   echo "== [$HOST_TAG] codesign verify OK =="
+  verify_login_bridge_plist "$install_app"
+}
+
+# The LoginWindow bridge plist lives in /Library/LaunchAgents (root) and this
+# script never escalates, so it can only be rendered and compared here; a
+# stale one is reported as a root step, never fixed silently.
+verify_login_bridge_plist() {
+  local install_app="$1" renderer="$DESKFLOW_ROOT/scripts/install-login-bridge-macos.sh"
+  local installed="${DESKFLOW_LOGIN_BRIDGE_PLIST:-/Library/LaunchAgents/org.deskflow.vhid-bridge.plist}"
+  local rendered
+  rendered="$(mktemp "${TMPDIR:-/tmp}/vhid-bridge.XXXXXX.plist")"
+  if ! DESKFLOW_INSTALL_APP="$install_app" bash "$renderer" --dry-run >"$rendered" 2>/dev/null; then
+    rm -f "$rendered"
+    echo "== [$HOST_TAG] bridge plist: not rendered (no peers / bridge binary / config); login bridge unchanged =="
+    return 0
+  fi
+  if ! plutil -lint "$rendered" >/dev/null; then
+    rm -f "$rendered"
+    fail "install-login-bridge-macos.sh --dry-run produced a plist that does not lint"
+  fi
+  if [[ -f "$installed" ]] && cmp -s "$rendered" "$installed"; then
+    echo "== [$HOST_TAG] bridge plist up to date: $installed =="
+  else
+    echo "== [$HOST_TAG] bridge plist stale — run root step: sudo env DESKFLOW_INSTALL_APP=$install_app bash $renderer =="
+  fi
+  rm -f "$rendered"
 }
 
 deploy_mouser() {

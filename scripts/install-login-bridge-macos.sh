@@ -10,7 +10,13 @@
 # After install: log out or restart — LoginWindow agents do not hot-load.
 set -euo pipefail
 
-CONF="${DESKFLOW_SETTINGS:-$HOME/Library/Deskflow/Deskflow.conf}"
+# Under `sudo` HOME is root's; the settings belong to the invoking user.
+if [[ -n "${SUDO_USER:-}" && -z "${DESKFLOW_SETTINGS:-}" ]]; then
+  eval "USER_HOME=~$SUDO_USER"
+else
+  USER_HOME="$HOME"
+fi
+CONF="${DESKFLOW_SETTINGS:-$USER_HOME/Library/Deskflow/Deskflow.conf}"
 APP="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
 APP="${APP%/}"
 BRIDGE="$APP/Contents/MacOS/deskflow-vhid-bridge"
