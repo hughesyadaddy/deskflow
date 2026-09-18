@@ -102,6 +102,10 @@ void IpcClient::disconnectFromServer()
 void IpcClient::handleDisconnected()
 {
   if (m_state == State::Connecting) {
+    // Accepted at the socket level, then dropped before the hello reply (a core
+    // that is still shutting down): retry like any other failed attempt.
+    m_state = State::Unconnected;
+    scheduleRetry();
     return;
   }
 
@@ -122,8 +126,8 @@ void IpcClient::handleErrorOccurred()
       qWarning().noquote() << QStringLiteral("%1 ipc client failed to connect (attempt %2): %3")
                                   .arg(m_typeName, QString::number(m_retryCount), m_socket->errorString());
     }
-    m_socket->disconnectFromServer();
     m_state = State::Unconnected;
+    m_socket->disconnectFromServer();
     scheduleRetry();
     return;
   }
