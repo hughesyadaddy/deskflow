@@ -31,8 +31,10 @@ preConnectHostsFromFleet(const FleetState &fleet, const std::string &serverAddre
   using deskflow::common::namesEqual;
   QStringList hosts;
 
+  // fleet.server can still name this seat right after a demotion; walking our
+  // own addresses first costs a connect timeout each.
   for (const auto &peer : fleet.peers) {
-    if (namesEqual(peer.name, fleet.server)) {
+    if (namesEqual(peer.name, fleet.server) && !namesEqual(peer.name, selfName)) {
       addHost(hosts, peer.lan);
       addHost(hosts, peer.ip);
     }

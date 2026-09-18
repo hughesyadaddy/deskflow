@@ -14,6 +14,7 @@ class PreConnectHostsTests : public QObject
 private Q_SLOTS:
   void fleet_serverLanFirstThenStable();
   void fleet_excludesSelfCaseInsensitive();
+  void fleet_excludesSelfWhenStillRecordedAsServer();
   void fleet_dedupesWhenLanEqualsIp();
   void fleet_emptyFleetYieldsServerAddressOnly();
   void defaults_serverAddressFirstThenPeers();

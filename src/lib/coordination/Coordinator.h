@@ -250,6 +250,11 @@ private:
   //! Repeat at or below it is a duplicate/reordered delivery and is dropped.
   //! Forgotten on the sender's hello (its counter restarted with it).
   std::map<std::string, int64_t> m_lastKeySeqBySender;
+  //! Last claim seq seen per sender (guarded by m_mutex): the same line
+  //! delivered twice (older peers send to both ip and lan) is dropped.
+  std::map<std::string, int64_t> m_lastClaimSeqBySender;
+  //! When the last fleet rescue was accepted (guarded by m_mutex).
+  double m_lastRescueAt = -1.0e9;
   std::function<void(const std::string &)> m_keyClearAllHandler; //!< guarded by m_mutex
   EscTapRescue m_escTapRescue;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().

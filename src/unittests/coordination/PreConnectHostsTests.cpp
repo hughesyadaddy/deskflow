@@ -57,6 +57,22 @@ void PreConnectHostsTests::fleet_excludesSelfCaseInsensitive()
   QVERIFY(!hosts.contains(QStringLiteral("macbookpro.ts.net")));
 }
 
+void PreConnectHostsTests::fleet_excludesSelfWhenStillRecordedAsServer()
+{
+  // Right after a demotion the snapshot can still name this seat as server.
+  auto fleet = threeMachineFleet();
+  fleet.server = "macbookpro";
+
+  const auto hosts = preConnectHostsFromFleet(fleet, "192.168.1.10", "macbookpro");
+
+  QCOMPARE(
+      hosts, QStringList(
+                 {QStringLiteral("192.168.1.10"), QStringLiteral("hackintosh.ts.net"), QStringLiteral("192.168.1.100"),
+                  QStringLiteral("tiny11.ts.net")}
+             )
+  );
+}
+
 void PreConnectHostsTests::fleet_dedupesWhenLanEqualsIp()
 {
   FleetState fleet;

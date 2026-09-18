@@ -37,8 +37,11 @@ const double kDiscoveryWindowS = 30.0;
 const double kWorkerTickS = 1.0;
 const int kLanProbeTimeoutMs = 700;
 const int kWedgeProbeTimeoutMs = 1000;
-const int kWedgeProbeEveryTicks = 9;
+const int kWedgeProbeEveryTicks = 30;
 const int kWedgeStrikesToRestart = 2;
+//! Older peers send every mesh line to both ip and lan, and the server has
+//! two Esc counters; a restart takes longer than this anyway.
+const double kRescueDedupeWindowS = 2.0;
 const int kVersionProbeEveryTicks = 15;
 //! How long a key forward may wait for a peer whose reachability is still
 //! Unknown (first send only). Well inside the OS input-hook budget
@@ -358,6 +361,7 @@ void Coordinator::handleHelloMessage(const Message &message, const std::function
     // until it catches up would be judged a duplicate.
     std::scoped_lock lock{m_mutex};
     m_lastKeySeqBySender.erase(message.name);
+    m_lastClaimSeqBySender.erase(message.name);
   }
   LOG_DEBUG("coordination: mesh hello from \"%s\" (v=%d)", message.name.c_str(), message.meshVersion);
   reply(protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token));
@@ -542,6 +546,13 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
     ElectionState::ClaimAction action;
     {
       std::scoped_lock lock{m_mutex};
+      if (message.seq > 0 && !message.name.empty()) {
+        auto &lastSeq = m_lastClaimSeqBySender[message.name];
+        if (lastSeq == message.seq) {
+          break;
+        }
+        lastSeq = message.seq;
+      }
       action = m_election.onClaim(message.name, message.ip, message.lan, message.seq);
     }
     if (action == ElectionState::ClaimAction::FollowSender) {
@@ -555,12 +566,22 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
     promoteSelf("manual promote");
     break;
 
-  case Message::Type::Rescue:
+  case Message::Type::Rescue: {
+    {
+      std::scoped_lock lock{m_mutex};
+      const double now = monotonicSeconds();
+      if (now - m_lastRescueAt < kRescueDedupeWindowS) {
+        LOG_DEBUG("coordination: duplicate fleet rescue ignored");
+        break;
+      }
+      m_lastRescueAt = now;
+    }
     // Never re-broadcast: the originator already fanned out to every peer,
     // so echoing would restart-storm the fleet.
     LOG_INFO("coordination: fleet keyboard rescue received -- restarting local core");
     requestLocalCoreRestart();
     break;
+  }
 
   case Message::Type::Status: {
     std::string snapshot;
@@ -968,6 +989,15 @@ void Coordinator::decide(Role role, const std::string &serverAddress, bool resta
       m_fleetSeq = std::max(m_fleetSeq, m_fleetState.seq);
     } else {
       m_election.becameClient(serverAddress);
+      // Until the new server's first fragment lands the snapshot still names
+      // the previous server (possibly us); pre-connect ordering reads it.
+      m_fleetState.server.clear();
+      for (const auto &peer : m_config.peers) {
+        if (peer.hasAddress(serverAddress)) {
+          m_fleetState.server = peer.name;
+          break;
+        }
+      }
     }
     m_decision = RoleDecision{role, serverAddress, false, restart};
     m_hasDecision = true;
