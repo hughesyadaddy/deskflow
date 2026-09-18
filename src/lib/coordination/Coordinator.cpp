@@ -705,9 +705,18 @@ KeyForwardResult Coordinator::sendKeyForward(
     Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang
 )
 {
-  // Always observe Downs (including when routing is Local) so 5× Esc still
-  // works while the cursor is on this machine. Swallowed = eat this Esc
-  // WITHOUT recording it as held on a peer (its Up then stays local).
+  // The RUNNING app decides, not the election: after a flip the election
+  // says Client up to a dwell before the ServerApp actually stops, and
+  // Server::onKeyDown still owns the keyboard until then -- including the
+  // 5x Esc count, which is why the rescue check sits below this return
+  // (both counting the same taps fired the fleet rescue twice per burst).
+  if (runningRole() != Role::Client) {
+    return KeyForwardResult::Local;
+  }
+
+  // Observe Downs (including when routing is Local) so 5× Esc still works
+  // while the cursor is on this machine. Swallowed = eat this Esc WITHOUT
+  // recording it as held on a peer (its Up then stays local).
   if (phase == Message::KeyPhase::Down) {
     bool triggered = false;
     {
@@ -721,13 +730,6 @@ KeyForwardResult Coordinator::sendKeyForward(
       requestFleetRescue();
       return KeyForwardResult::Swallowed;
     }
-  }
-
-  // The RUNNING app decides, not the election: after a flip the election
-  // says Client up to a dwell before the ServerApp actually stops, and
-  // Server::onKeyDown still owns the keyboard until then.
-  if (runningRole() != Role::Client) {
-    return KeyForwardResult::Local;
   }
 
   PeerOutbox *destination = nullptr;

@@ -11,6 +11,7 @@
 #include "base/EventQueue.h"
 #include "base/Log.h"
 #include "common/Settings.h"
+#include "coordination/KeyboardRescue.h"
 #include "coordination/RelayKeyEvent.h"
 #include "deskflow/PlatformScreen.h"
 #include "deskflow/Screen.h"
@@ -533,6 +534,36 @@ void ServerKeyLedgerTests::forceLeave_sendsBestEffortReleases()
     QVERIFY(remote.findUp(kKeyA) != nullptr);
     QVERIFY(remote.findUp(kKeyShift_L) != nullptr);
     QCOMPARE(server.m_active, f.primary);
+
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerKeyLedgerTests::escRescue_releasesLedger()
+{
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    int restarts = 0;
+    server.m_localCoreRestartHook = [&restarts] { ++restarts; };
+
+    // a key is stuck down on the target; the user mashes Esc
+    server.onKeyDown(kKeyA, 0, kButtonA, "en", nullptr);
+    for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
+      server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+      server.onKeyUp(kKeyEscape, 0, 1, nullptr);
+    }
+    remote.keys.clear();
+    server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+
+    QCOMPARE(restarts, 1);
+    QVERIFY(server.m_keysHeldOnActive.empty());
+    QVERIFY(remote.findUp(kKeyA) != nullptr);
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyEscape), 0);
 
     server.m_clients.erase("remote");
   }

@@ -21,6 +21,7 @@ private Q_SLOTS:
   void ledger_ignoresKeysSentToPrimary();
   void teardown_releasesLedgerAndSendsLeave();
   void forceLeave_sendsBestEffortReleases();
+  void escRescue_releasesLedger();
   void broadcast_keysReleasedPerScreen();
   void broadcast_offReleasesHeldKeys();
   void lockChange_pushesStateToActiveClient();

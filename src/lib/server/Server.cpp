@@ -11,6 +11,7 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "common/Settings.h"
+#include "coordination/KeyboardRescue.h"
 #include "deskflow/AppUtil.h"
 #include "deskflow/DeskflowException.h"
 #include "deskflow/IPlatformScreen.h"
@@ -306,6 +307,18 @@ void Server::flushPendingChordModClear(BaseClientProxy *client)
   LOG_INFO("chord remap: delivering queued mod clear 0x%04x to reconnected \"%s\"", it->second, it->first.c_str());
   client->keyDown(kKeyClearModifiers, it->second, 0, std::string{});
   m_pendingChordModClears.erase(it);
+}
+
+void Server::requestLocalCoreRestart()
+{
+  if (m_localCoreRestartHook) {
+    m_localCoreRestartHook();
+    return;
+  }
+  // Fleet-wide: 5x Esc means input is wedged SOMEWHERE, and the machine
+  // that saw the taps is usually not the broken one. Falls back to a local
+  // restart when no mesh is running.
+  deskflow::coordination::requestFleetRescue();
 }
 
 //
@@ -2199,6 +2212,18 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
       lang.c_str()
   );
   assert(m_active != nullptr);
+
+  // Keyboard rescue: five plain Esc downs within 2s soft-restarts local core.
+  if (m_escTapRescue.noteEscDown(id, mask)) {
+    // The rescue tears this core down: release what we hold on the active
+    // screen first, or the restart strands it there (the one structural
+    // boundary that used to skip the ledger).
+    cancelChordRemapSession();
+    releaseKeysHeldOnActive();
+    releaseKeysHeldOnBroadcast(nullptr);
+    requestLocalCoreRestart();
+    return;
+  }
 
   // Deferred Super (chord screens only): hold back the Super down until we
   // know whether a chord, a real Win combo, or a lone tap follows. A bare
