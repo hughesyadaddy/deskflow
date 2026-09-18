@@ -20,11 +20,10 @@ private Q_SLOTS:
   void queuedSwitch_executesWhenNeighborConnects();
   void requestWakePeer_postsEventOncePerThrottleWindow();
   void requestWakePeer_refiresAfterThrottleWindow();
-  void fiveEsc_requestsLocalCoreRestartAndSwallows();
+  void fiveEsc_isPlainInputForTheServer();
   void chordRemapHoldThrough_superTabKeepsAltUntilSuperUp();
   void chordRemapHoldThrough_relaySuperUpClearsSession();
   void chordRemapHoldThrough_tabRepeatKeepsAltMask();
-  void chordRemapHoldThrough_fiveEscCancelsSession();
   void chordRemapHoldThrough_cancelsOnScreenSwitch();
   void chordRemapPendingClear_flushesOnReconnect();
   void chordRemapSession_clearsOnServerTeardown();

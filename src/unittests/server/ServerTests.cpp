@@ -691,8 +691,10 @@ void ServerTests::requestWakePeer_refiresAfterThrottleWindow()
   }
 }
 
-void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
+void ServerTests::fiveEsc_isPlainInputForTheServer()
 {
+  // The Coordinator's relay owns the 5x Esc rescue; a second counter here fired
+  // the fleet rescue twice per burst during the role-flip dwell.
   LeakedServerFixture fixture;
   QVERIFY(fixture.config.addScreen("server"));
   QVERIFY(fixture.config.addScreen("remote"));
@@ -706,28 +708,16 @@ void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
     server.switchScreen(&remote, 50, 60, false);
     QCOMPARE(server.m_active, &remote);
 
-    int restartCalls = 0;
-    server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
-
-    for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
+    for (int i = 0; i < 6; ++i) {
       server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
-      QCOMPARE(restartCalls, 0);
     }
-    QCOMPARE(remote.keys().size(), static_cast<size_t>(deskflow::coordination::EscTapRescue::kTaps - 1));
+    QCOMPARE(remote.keys().size(), 6u);
     for (const auto &key : remote.keys()) {
       QCOMPARE(key.kind, RecordedKeyEvent::Kind::Down);
       QCOMPARE(key.id, kKeyEscape);
     }
-    remote.clearKeys();
-    server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
-    QCOMPARE(restartCalls, 1);
-    // The fifth Esc is swallowed; the only traffic is the ledger releasing
-    // the Esc still held there (the rescue is a boundary like any other).
-    for (const auto &key : remote.keys()) {
-      QCOMPARE(key.kind, RecordedKeyEvent::Kind::Up);
-      QCOMPARE(key.id, kKeyEscape);
-    }
     QCOMPARE(server.m_active, &remote);
+    QVERIFY(!server.m_keysHeldOnActive.empty());
 
     server.m_clients.erase("remote");
   }
@@ -830,41 +820,6 @@ void ServerTests::chordRemapHoldThrough_tabRepeatKeepsAltMask()
     QCOMPARE(remote.keys()[0].id, kKeyTab);
     QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
     QVERIFY(server.m_chordRemapSession.active);
-
-    server.m_clients.erase("tiny11");
-  }
-}
-
-void ServerTests::chordRemapHoldThrough_fiveEscCancelsSession()
-{
-  LeakedServerFixture fixture;
-  loadConfigWithSuperTabRemap(fixture.config);
-  fixture.init("server");
-  RecordingRemoteClient remote("tiny11");
-
-  {
-    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
-    QVERIFY(server.m_clients.emplace("tiny11", &remote).second);
-    server.switchScreen(&remote, 50, 60, false);
-
-    server.onKeyDown(kKeyTab, KeyModifierSuper, 0, "en", nullptr);
-    QVERIFY(server.m_chordRemapSession.active);
-
-    int restartCalls = 0;
-    server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
-
-    for (int i = 0; i < 4; ++i) {
-      server.onKeyDown(kKeyEscape, 0, 0, "en", nullptr);
-    }
-    remote.clearKeys();
-    server.onKeyDown(kKeyEscape, 0, 0, "en", nullptr);
-
-    QCOMPARE(restartCalls, 1);
-    QVERIFY(!server.m_chordRemapSession.active);
-    QCOMPARE(remote.keys().size(), 1u);
-    QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
-    QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
-    QCOMPARE(server.m_active, &remote);
 
     server.m_clients.erase("tiny11");
   }

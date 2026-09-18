@@ -12,7 +12,6 @@
 #include "base/String.h"
 #include "base/Stopwatch.h"
 #include "common/NetworkProtocol.h"
-#include "coordination/KeyboardRescue.h"
 #include "coordination/RelayKeyEvent.h"
 #include "deskflow/Clipboard.h"
 #include "deskflow/ClipboardTypes.h"
@@ -396,7 +395,6 @@ private:
   void flushPendingChordModClear(BaseClientProxy *client);
   //! Queue the active session's held out-mods for delivery on reconnect.
   void rememberUndeliveredChordModClear();
-  void requestLocalCoreRestart();
   void onMouseDown(ButtonID);
   void onMouseUp(ButtonID);
   bool onMouseMovePrimary(int32_t x, int32_t y);
@@ -668,8 +666,4 @@ private:
   //! chord-remap config's casing but looked up by canonical screen name
   //! (every other chord comparison is CaselessCmp too).
   std::map<std::string, KeyModifierMask, deskflow::string::CaselessCmp> m_pendingChordModClears;
-
-  deskflow::coordination::EscTapRescue m_escTapRescue;
-  //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
-  std::function<void()> m_localCoreRestartHook;
 };
