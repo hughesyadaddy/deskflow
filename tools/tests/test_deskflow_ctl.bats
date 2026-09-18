@@ -212,7 +212,8 @@ DOMAIN="gui/$(id -u)"
   grep -q "<string>$APP/Contents/MacOS/deskflow-core</string>" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
   grep -q "<string>auto</string>" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
   grep -q "<string>/dev/null</string>" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
-  [ "$(grep -c 'Library/Logs/Deskflow/deskflow-core.log' "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist")" = 0 ]
+  # the header comment may mention the old path; only a <string> value would re-enable the second sink
+  [ "$(grep -c '<string>.*Library/Logs/Deskflow/deskflow-core.log</string>' "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist")" = 0 ]
   ! grep -q "__APP__\|__HOME__\|__CTL__" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist" "$DESKFLOW_CTL_AGENT_DIR/$GUI.plist" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
   [ -d "$HOME/Library/Logs/Deskflow" ]
   [[ "$output" == *"started: core pid 300"* ]]
