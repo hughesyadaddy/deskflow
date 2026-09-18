@@ -4,7 +4,7 @@
 Usage:
   tools/fleet-health [--host all|local|<id>]
                      [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|instances|bridge|loginbridge|all]
-                     [--json] [--env PATH]
+                     [--json] [--env PATH] [--watch N]
 
 Reads scripts/fleet.env (same format as fleet-doctor / fleet-deploy.sh):
   FLEET_HOSTS="hackintosh macbookpro tiny11"
@@ -53,6 +53,12 @@ Environment overrides:
   DESKFLOW_EXPECT_AUTHORITY  expected `Authority=` prefix (default "Apple Development")
   DESKFLOW_EXPECT_TEAM       expected `TeamIdentifier=` (default: value on the main binary)
 
+--watch N re-runs the selected checks every N seconds and prints only
+transitions (PASS->FAIL / FAIL->PASS per host+check), each also raised as a
+macOS notification (osascript). A new status must hold for two consecutive
+passes before it counts, so one dropped ssh session does not flap. The first
+pass prints the full table as the baseline. Ctrl-C exits 0.
+
 Exit status is 0 only when every check on every host passes. stdlib only.
 """
 
@@ -67,6 +73,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -817,11 +824,108 @@ def format_table(results: Sequence[Result]) -> str:
     return "\n".join(lines)
 
 
-def main(argv: Optional[Sequence[str]] = None, runner: Runner = subprocess_runner) -> int:
+# ------------------------------------------------------------------- watch
+
+# Consecutive passes a changed status must hold before it is reported.
+WATCH_CONFIRM = 2
+
+
+def fold_status(results: Sequence[Result]) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """Per (host, check): FAIL with the first failing detail if any leg failed, else PASS.
+
+    SKIP-only pairs are left out (nothing to alert on)."""
+    folded: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for r in results:
+        key = (r.host, r.check)
+        if r.status == SKIP:
+            continue
+        cur = folded.get(key)
+        if cur is None or (r.status == FAIL and cur[0] != FAIL):
+            folded[key] = (r.status, r.detail)
+    return folded
+
+
+class WatchState:
+    """Debounced PASS/FAIL tracker: emits a transition once a new status has
+    been observed WATCH_CONFIRM passes in a row."""
+
+    def __init__(self, confirm: int = WATCH_CONFIRM):
+        self.confirm = confirm
+        self.reported: Dict[Tuple[str, str], str] = {}
+        self.pending: Dict[Tuple[str, str], Tuple[str, int, str]] = {}
+
+    def baseline(self, folded: Dict[Tuple[str, str], Tuple[str, str]]) -> None:
+        self.reported = {k: v[0] for k, v in folded.items()}
+        self.pending.clear()
+
+    def observe(self, folded: Dict[Tuple[str, str], Tuple[str, str]]) -> List[Tuple[str, str, str, str, str]]:
+        """Return confirmed transitions as (host, check, old, new, detail)."""
+        transitions = []
+        for key, (status, detail) in folded.items():
+            old = self.reported.get(key)
+            if old is None:
+                self.reported[key] = status
+                continue
+            if status == old:
+                self.pending.pop(key, None)
+                continue
+            prev = self.pending.get(key)
+            count = prev[1] + 1 if prev and prev[0] == status else 1
+            if count >= self.confirm:
+                self.pending.pop(key, None)
+                self.reported[key] = status
+                transitions.append((key[0], key[1], old, status, detail))
+            else:
+                self.pending[key] = (status, count, detail)
+        return transitions
+
+
+def notify_macos(title: str, message: str) -> None:
+    if sys.platform != "darwin":
+        return
+    script = "display notification {} with title {}".format(
+        json.dumps(message[:200]), json.dumps(title))
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def watch(hosts: List[Host], env: Dict[str, str], checks: Sequence[str], explicit: bool,
+          interval: int, runner: Runner, notifier: Callable[[str, str], None] = notify_macos,
+          sleep: Callable[[float], None] = time.sleep) -> int:
+    state = WatchState()
+    first = True
+    while True:
+        results = FleetHealth(hosts, env, runner=runner).run(checks, explicit)
+        folded = fold_status(results)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        if first:
+            print(format_table(results))
+            failed = sum(1 for r in results if not r.ok)
+            print(f"\n{stamp} watching every {interval}s: {len(results)} results, {failed} failed", flush=True)
+            state.baseline(folded)
+            first = False
+        else:
+            for host, check, old, new, detail in state.observe(folded):
+                line = f"{stamp} {host} {check} {old} -> {new}: {detail}"
+                print(line, flush=True)
+                notifier(f"fleet-health {host}", f"{check} {old} -> {new}: {detail}")
+        try:
+            sleep(interval)
+        except KeyboardInterrupt:
+            return 0
+
+
+def main(argv: Optional[Sequence[str]] = None, runner: Runner = subprocess_runner,
+         notifier: Callable[[str, str], None] = notify_macos,
+         sleep: Callable[[float], None] = time.sleep) -> int:
     ap = argparse.ArgumentParser(prog="fleet-health", description=__doc__.split("\n\n")[0])
     ap.add_argument("--host", default="all", help="all | local | <id> (default: all)")
     ap.add_argument("--check", default="all", choices=ALL_CHECKS + ("all",))
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    ap.add_argument("--watch", type=int, metavar="N",
+                    help="re-run every N seconds; print (and notify) only PASS/FAIL transitions")
     # FLEET_ENV_FILE is the controller's (fleet-deploy.sh/.ps1, fleet-doctor) name
     # for the same override; FLEET_ENV is kept for older callers.
     ap.add_argument("--env", default=os.environ.get("FLEET_ENV_FILE") or os.environ.get("FLEET_ENV")
@@ -840,6 +944,11 @@ def main(argv: Optional[Sequence[str]] = None, runner: Runner = subprocess_runne
 
     explicit = args.check != "all"
     checks = list(ALL_CHECKS) if not explicit else [args.check]
+    if args.watch is not None:
+        if args.watch < 1:
+            print("fleet-health: --watch N must be >= 1", file=sys.stderr)
+            return 2
+        return watch(hosts, env, checks, explicit, args.watch, runner, notifier, sleep)
     results = FleetHealth(hosts, env, runner=runner).run(checks, explicit)
 
     ok = all(r.ok for r in results)

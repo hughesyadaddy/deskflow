@@ -809,3 +809,112 @@ def test_format_table_columns():
     lines = text.splitlines()
     assert lines[0].startswith("host       | check | status | detail")
     assert lines[2].startswith("h          | sign  | PASS   | fine")
+
+
+# ------------------------------------------------------------------ --watch
+
+
+def test_fold_status_collapses_mesh_legs_and_drops_skips():
+    results = [
+        fh.Result("a", "mesh", "PASS", "a -> b ok"),
+        fh.Result("a", "mesh", "FAIL", "a -> c rc=1"),
+        fh.Result("a", "mesh", "PASS", "a -> d ok"),
+        fh.Result("a", "tcc", "SKIP", "n/a"),
+        fh.Result("b", "sign", "PASS", "fine"),
+    ]
+    folded = fh.fold_status(results)
+    assert folded == {("a", "mesh"): ("FAIL", "a -> c rc=1"), ("b", "sign"): ("PASS", "fine")}
+
+
+def test_watch_state_debounces_single_pass_blips():
+    st = fh.WatchState(confirm=2)
+    st.baseline({("h", "session"): ("PASS", "ok")})
+    # one failing pass: pending, not reported
+    assert st.observe({("h", "session"): ("FAIL", "gui down")}) == []
+    # back to PASS: pending cleared, nothing reported
+    assert st.observe({("h", "session"): ("PASS", "ok")}) == []
+    # two consecutive FAILs: reported once
+    assert st.observe({("h", "session"): ("FAIL", "gui down")}) == []
+    assert st.observe({("h", "session"): ("FAIL", "gui down")}) == [("h", "session", "PASS", "FAIL", "gui down")]
+    # steady FAIL: silent
+    assert st.observe({("h", "session"): ("FAIL", "gui down")}) == []
+    # recovery also needs two passes
+    assert st.observe({("h", "session"): ("PASS", "ok")}) == []
+    assert st.observe({("h", "session"): ("PASS", "ok")}) == [("h", "session", "FAIL", "PASS", "ok")]
+    # a pair that appears later is adopted silently as its own baseline
+    assert st.observe({("h", "session"): ("PASS", "ok"), ("h", "bridge"): ("FAIL", "x")}) == []
+    assert st.reported[("h", "bridge")] == "FAIL"
+
+
+def test_watch_prints_only_confirmed_transitions_and_notifies(tmp_path, capsys):
+    env_file = write_env(tmp_path)
+    runner = FakeRunner(mac_ok_table())
+    good = runner.table[("macbookpro", fh.deskflow_gui_running_cmd())]
+    bad = (1, "", "")
+    notes = []
+    sleeps = []
+
+    def sleep(n):
+        sleeps.append(n)
+        # pass 1 baseline done. Before pass 2 and 3: GUI gone. Before pass 4/5: back.
+        if len(sleeps) in (1, 2):
+            runner.table[("macbookpro", fh.deskflow_gui_running_cmd())] = bad
+        elif len(sleeps) in (3, 4):
+            runner.table[("macbookpro", fh.deskflow_gui_running_cmd())] = good
+        else:
+            raise KeyboardInterrupt
+
+    rc = fh.main(["--check", "session", "--env", str(env_file), "--watch", "7"], runner=runner,
+                 notifier=lambda title, msg: notes.append((title, msg)), sleep=sleep)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert sleeps == [7, 7, 7, 7, 7]
+    assert "| session" in out.splitlines()[2]  # baseline table printed once
+    assert "watching every 7s" in out
+    transitions = [ln for ln in out.splitlines() if " -> " in ln]
+    assert len(transitions) == 2
+    assert "macbookpro session PASS -> FAIL" in transitions[0]
+    assert "macbookpro session FAIL -> PASS" in transitions[1]
+    assert [n[1][:len("session PASS -> FAIL")] for n in notes] == ["session PASS -> FAIL", "session FAIL -> PASS"]
+    assert notes[0][0] == "fleet-health macbookpro"
+
+
+def test_watch_single_blip_is_silent(tmp_path, capsys):
+    env_file = write_env(tmp_path)
+    runner = FakeRunner(mac_ok_table())
+    good = runner.table[("macbookpro", fh.deskflow_gui_running_cmd())]
+    notes = []
+    sleeps = []
+
+    def sleep(n):
+        sleeps.append(n)
+        if len(sleeps) == 1:
+            runner.table[("macbookpro", fh.deskflow_gui_running_cmd())] = (255, "", "ssh: timed out")
+        elif len(sleeps) == 2:
+            runner.table[("macbookpro", fh.deskflow_gui_running_cmd())] = good
+        else:
+            raise KeyboardInterrupt
+
+    rc = fh.main(["--check", "session", "--env", str(env_file), "--watch", "5"], runner=runner,
+                 notifier=lambda t, m: notes.append(m), sleep=sleep)
+    out = capsys.readouterr().out
+    assert rc == 0 and notes == []
+    assert not [ln for ln in out.splitlines() if " -> " in ln]
+
+
+def test_watch_rejects_zero_interval(tmp_path, capsys):
+    env_file = write_env(tmp_path)
+    rc = fh.main(["--check", "sign", "--env", str(env_file), "--watch", "0"], runner=FakeRunner(mac_ok_table()))
+    assert rc == 2 and "--watch" in capsys.readouterr().err
+
+
+def test_notify_macos_uses_osascript_only_on_darwin(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fh.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(fh.sys, "platform", "linux")
+    fh.notify_macos("t", "m")
+    assert calls == []
+    monkeypatch.setattr(fh.sys, "platform", "darwin")
+    fh.notify_macos("fleet-health macbookpro", 'session PASS -> FAIL: "gui" down')
+    assert calls and calls[0][0] == "osascript"
+    assert 'display notification "session PASS -> FAIL: \\"gui\\" down" with title "fleet-health macbookpro"' in calls[0][2]
