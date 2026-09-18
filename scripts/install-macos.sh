@@ -36,6 +36,9 @@ if [[ -f .env ]]; then
     done
   fi
   unset _env_overrides _env_key _env_kv
+  # Only fleet-deploy-macos.sh consumes the keychain password (it prepares
+  # the keychain before calling us); never let it reach cmake/codesign.
+  unset DESKFLOW_KEYCHAIN_PASSWORD
 fi
 
 BUILD_DIR="${DESKFLOW_BUILD_DIR:-build}"

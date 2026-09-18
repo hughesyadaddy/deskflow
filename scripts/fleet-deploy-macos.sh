@@ -3,10 +3,10 @@
 #
 # No silent success: every step either succeeds or the script exits non-zero.
 # The signing identity comes ONLY from `.env` DESKFLOW_CODESIGN_ID; there is no
-# "any Apple Development cert" fallback and no keychain-password plumbing.
-# Steps that need the login keychain (build/sign/install) are routed through
-# tools/fleet-gui-exec.py when it exists, which execs them in the console GUI
-# session if this shell (e.g. SSH) cannot reach the keychain.
+# "any Apple Development cert" fallback. With `.env` DESKFLOW_KEYCHAIN_PASSWORD
+# (mode 600) the seat signs directly in this shell, SSH included; without it,
+# steps that need the login keychain are routed through tools/fleet-gui-exec.py,
+# which execs them in the console GUI session.
 set -euo pipefail
 
 # Non-interactive SSH shells skip login profiles; Homebrew tools must be on PATH.
@@ -69,19 +69,65 @@ fail() {
 }
 
 # Run a command in a session that can reach the login keychain.
-# tools/fleet-gui-exec.py decides: direct exec when the keychain is reachable,
-# otherwise it drives the console GUI session and propagates the exit code.
+# With DESKFLOW_KEYCHAIN_PASSWORD in the seat's .env, prepare_keychain_for_ssh
+# has already proven codesign works in THIS shell, so commands run directly.
+# Otherwise tools/fleet-gui-exec.py decides: direct exec when the keychain is
+# reachable, else it drives the console GUI session and propagates the exit code.
+KEYCHAIN_SSH_READY=0
 gui_exec() {
   local runner="$DESKFLOW_ROOT/tools/fleet-gui-exec.py"
-  if [[ -x "$runner" ]]; then
-    python3 "$runner" -- "$@"
-  else
+  if [[ "$KEYCHAIN_SSH_READY" == "1" || ! -x "$runner" ]]; then
     "$@"
+  else
+    python3 "$runner" -- "$@"
   fi
 }
 
+# Make the login keychain usable for codesign from a non-GUI (SSH) session.
+# codesign over SSH fails with errSecInternalComponent even on an UNLOCKED
+# keychain: the private key's ACL needs the codesign partition, which in a
+# GUI session is granted through a dialog nobody can click over SSH.
+# `set-key-partition-list` writes that ACL once; `unlock-keychain` covers
+# seats whose keychain auto-locks. Both take the password on argv, so it is
+# briefly visible in `ps` on the seat itself -- the seat owner already holds
+# it. The password is never printed, logged or exported past this function.
+prepare_keychain_for_ssh() {
+  local pw="${DESKFLOW_KEYCHAIN_PASSWORD:-}"
+  [[ -n "$pw" ]] || return 0
+  local envfile="$DESKFLOW_ROOT/.env"
+  local mode
+  mode="$(stat -f %Lp "$envfile")"
+  [[ "$mode" == "600" ]] || fail ".env holds DESKFLOW_KEYCHAIN_PASSWORD but is mode $mode; run: chmod 600 $envfile"
+  local kc="${DESKFLOW_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
+  local id
+  id="$(resolve_codesign_id)"
+  echo "== [$HOST_TAG] preparing $kc for codesign over SSH =="
+  security unlock-keychain -p "$pw" "$kc" >/dev/null 2>&1 \
+    || fail "security unlock-keychain failed for $kc (wrong DESKFLOW_KEYCHAIN_PASSWORD?)"
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" >/dev/null 2>&1 \
+    || fail "security set-key-partition-list failed for $kc"
+  local probe
+  probe="$(mktemp "${TMPDIR:-/tmp}/deskflow-sign-probe.XXXXXX")"
+  cp /bin/ls "$probe"
+  if ! codesign --force --sign "$id" "$probe" >/dev/null 2>&1; then
+    rm -f "$probe"
+    fail "codesign probe with $id failed after keychain preparation; signing over SSH is not usable on this seat"
+  fi
+  rm -f "$probe"
+  # The key ACL is now persistent and the keychain is unlocked; nothing
+  # downstream needs the password, so children must not inherit it.
+  unset DESKFLOW_KEYCHAIN_PASSWORD
+  KEYCHAIN_SSH_READY=1
+  echo "== [$HOST_TAG] codesign verified from this session; not routing through the GUI =="
+}
+
+DOTENV_LOADED=0
 load_dotenv() {
   cd "$DESKFLOW_ROOT"
+  # Once only: re-sourcing would re-export DESKFLOW_KEYCHAIN_PASSWORD after
+  # prepare_keychain_for_ssh deliberately unset it.
+  [[ "$DOTENV_LOADED" == "1" ]] && return 0
+  DOTENV_LOADED=1
   if [[ -f .env ]]; then
     # .env is this seat's persistent config; an explicit environment
     # variable set on invocation (as tests/CI callers do) must win, not get
@@ -266,12 +312,19 @@ deploy_mouser() {
 
   # MOUSER_RESTART=1 is scoped to the Mouser step only: the Mouser installer
   # owns Mouser's restart. The Deskflow step above never touches Mouser.
-  echo "== [$HOST_TAG] Mouser build + install (GUI session, MOUSER_RESTART=1) =="
-  MOUSER_RESTART=1 python3 scripts/build_macos_gui_session.py
+  if [[ "$KEYCHAIN_SSH_READY" == "1" ]]; then
+    echo "== [$HOST_TAG] Mouser build + install (this session, MOUSER_RESTART=1) =="
+    MOUSER_RESTART=1 python3 scripts/build_and_install.py
+  else
+    echo "== [$HOST_TAG] Mouser build + install (GUI session, MOUSER_RESTART=1) =="
+    MOUSER_RESTART=1 python3 scripts/build_macos_gui_session.py
+  fi
 }
 
 main() {
   echo "=== fleet-deploy-macos on $HOST_TAG ==="
+  load_dotenv
+  prepare_keychain_for_ssh
   if [[ "$DEPLOY_DESKFLOW" == "1" ]]; then
     git_pull_deskflow
     configure_deskflow

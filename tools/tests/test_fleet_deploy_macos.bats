@@ -67,10 +67,15 @@ esac
 exit 0
 EOF
 
-  # The identity must come from .env only; the fallback lookup is gone.
+  # The identity must come from .env only; the fallback lookup is gone. The
+  # only permitted verbs are the keychain preparation ones, and only when a
+  # password is configured (SHIM_SECURITY_RC fakes a wrong password).
   make_shim security <<'EOF'
-echo "security $*" >> "$SHIM_LOG"
-echo "security must never be called by fleet-deploy-macos.sh" >&2
+echo "security $1 $2 <redacted> $4 $5 $6 $7 $8" >> "$SHIM_LOG"
+case "${1:-}" in
+  unlock-keychain|set-key-partition-list) exit "${SHIM_SECURITY_RC:-0}" ;;
+esac
+echo "security $1 must never be called by fleet-deploy-macos.sh" >&2
 exit 1
 EOF
 
@@ -98,7 +103,7 @@ EOF
   export FLEET_MOUSER_ROOT="$MOUSER"
   unset FLEET_BRANCH FLEET_DEPLOY_MOUSER FLEET_DEPLOY_DESKFLOW FLEET_RECONFIGURE FLEET_SKIP_GIT_PULL
   unset DESKFLOW_CODESIGN_ID FLEET_KEYCHAIN_PASSWORD
-  unset SHIM_CMAKE_RC SHIM_CODESIGN_VERIFY_RC SHIM_GIT_PULL_RC SHIM_PYTHON_RC
+  unset SHIM_CMAKE_RC SHIM_CODESIGN_VERIFY_RC SHIM_GIT_PULL_RC SHIM_PYTHON_RC SHIM_SECURITY_RC
 }
 
 teardown() {
@@ -112,6 +117,11 @@ make_shim() {
 
 write_env() {
   printf 'DESKFLOW_CODESIGN_ID=%s\n' "$1" >"$FAKE_ROOT/.env"
+}
+
+write_env_with_password() {
+  printf 'DESKFLOW_CODESIGN_ID=%s\nDESKFLOW_KEYCHAIN_PASSWORD=%s\n' "$1" "$2" >"$FAKE_ROOT/.env"
+  chmod "${3:-600}" "$FAKE_ROOT/.env"
 }
 
 log_has() {
@@ -174,10 +184,11 @@ script_lacks() {
   script_lacks 'find-identity.*awk'
 }
 
-@test "no keychain-password plumbing remains" {
-  script_lacks 'unlock_keychain'
-  script_lacks 'KEYCHAIN_PASSWORD'
-  script_lacks 'unlock-keychain'
+@test "the keychain password is read from the seat .env only, never from fleet.env" {
+  script_lacks 'FLEET_KEYCHAIN_PASSWORD'
+  # exactly one consumer: prepare_keychain_for_ssh reads it, then unsets it
+  [ "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'DESKFLOW_KEYCHAIN_PASSWORD')" -le 4 ]
+  grep -q 'unset DESKFLOW_KEYCHAIN_PASSWORD' "$SCRIPT"
 }
 
 @test "every remaining '|| true' is tagged fleet:allow" {
@@ -465,4 +476,87 @@ script_lacks() {
   [[ "$output" == *"is not inside a tmp sandbox"* ]]
   [ ! -e "/Library/Application Support/DeskflowGuardRegressionTest" ]
   [ ! -s "$SHIM_LOG" ]
+}
+
+# --- keychain password: sign from this (SSH) session, never via the GUI -------
+
+gui_runner_present() {
+  mkdir -p "$FAKE_ROOT/tools"; : > "$FAKE_ROOT/tools/fleet-gui-exec.py"; chmod +x "$FAKE_ROOT/tools/fleet-gui-exec.py"
+}
+
+@test "with DESKFLOW_KEYCHAIN_PASSWORD the seat prepares the keychain, proves codesign, and never routes through the GUI" {
+  write_env_with_password "ABCDEF0123456789" "s3cret-pw"
+  gui_runner_present
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_has "security unlock-keychain -p <redacted>"
+  log_has "security set-key-partition-list -S <redacted>"
+  grep -q '^codesign --force --sign ABCDEF0123456789 .*deskflow-sign-probe\.' "$SHIM_LOG"
+  log_lacks "fleet-gui-exec.py"
+  log_has "python3 scripts/build_and_install.py"
+  log_lacks "build_macos_gui_session.py"
+  [[ "$output" != *"s3cret-pw"* ]]
+  [[ "$output" == *"codesign verified from this session"* ]]
+  prep_line="$(grep -n '^security unlock-keychain' "$SHIM_LOG" | cut -d: -f1)"
+  first_cmake="$(grep -n '^cmake' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  [ "$prep_line" -lt "$first_cmake" ]
+}
+
+@test "the password never reaches child processes" {
+  write_env_with_password "ABCDEF0123456789" "s3cret-pw"
+  make_shim cmake <<'EOF'
+echo "cmake $*" >> "$SHIM_LOG"
+[[ -n "${DESKFLOW_KEYCHAIN_PASSWORD:-}" ]] && echo "LEAK: cmake saw the keychain password" >> "$SHIM_LOG"
+if [[ "${1:-}" == "-S" ]]; then mkdir -p build; printf 'APPLE_CODESIGN_DEV:STRING=ABCDEF0123456789\nFLEET_STRICT_SIGNING:BOOL=ON\n' > build/CMakeCache.txt; fi
+exit 0
+EOF
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_lacks "LEAK"
+}
+
+@test "a .env holding the password must be mode 600, checked before any keychain call" {
+  write_env_with_password "ABCDEF0123456789" "s3cret-pw" 644
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"mode 644"* ]]
+  [[ "$output" == *"chmod 600"* ]]
+  log_lacks "security"
+  log_lacks "cmake"
+}
+
+@test "a wrong keychain password fails loudly before building; no GUI fallback" {
+  write_env_with_password "ABCDEF0123456789" "wrong-pw"
+  gui_runner_present
+  SHIM_SECURITY_RC=51 run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unlock-keychain failed"* ]]
+  [[ "$output" != *"wrong-pw"* ]]
+  log_lacks "cmake"
+  log_lacks "fleet-gui-exec.py"
+}
+
+@test "a failed codesign probe after preparation fails loudly; no GUI fallback" {
+  write_env_with_password "ABCDEF0123456789" "s3cret-pw"
+  gui_runner_present
+  make_shim codesign <<'EOF'
+echo "codesign $*" >> "$SHIM_LOG"
+[[ "$*" == *deskflow-sign-probe* ]] && exit 1
+exit 0
+EOF
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"codesign probe"* ]]
+  log_lacks "cmake"
+  log_lacks "fleet-gui-exec.py"
+}
+
+@test "without a password the GUI-session routing is unchanged" {
+  write_env "ABCDEF0123456789"
+  gui_runner_present
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_lacks "security"
+  log_has "fleet-gui-exec.py"
+  log_has "build_macos_gui_session.py"
 }
