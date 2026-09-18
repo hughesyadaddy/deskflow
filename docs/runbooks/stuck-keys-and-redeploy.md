@@ -45,11 +45,30 @@ service restart** — if `deskflow-core` still shows the old StartTime,
 `Stop-Process -Id <pid> -Force`; the watchdog respawns it within 10 s. The new
 build's Job object makes this automatic.
 
-### 1b. A Mac has a key held / types uppercase
+### 1b. A Mac has a key held / types uppercase / menubar icon missing
 
 ```bash
-ssh <mac> 'launchctl kickstart -k gui/$(id -u)/io.github.hughesyadaddy.deskflow-core'   # new build
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl restart'      # kickstart -k core + GUI, clears quit-intent
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl converge'     # report only: what the self-heal tick would do
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl converge --apply'
 ```
+
+`converge` is what `gui/$UID/io.github.hughesyadaddy.deskflow-converge`
+runs every 60 s: it re-renders stale plists, `launchctl enable`s and
+bootstraps unloaded agents, kickstarts loaded-but-dead ones, and never kills
+anything. It stays quiet while any of these hold:
+
+- `~/Library/Application Support/Deskflow/quit-intent` is newer than the last
+  boot (written by tray Quit and `deskflow-ctl stop`; removed by
+  `start`/`restart`; a pre-boot sentinel is discarded). A deliberate quit
+  therefore sticks until re-login or `deskflow-ctl start`.
+- `~/Library/Deskflow/deploy.lock` is younger than 30 min (`install-macos.sh`).
+- 3 start actions already happened in the last hour (report-only after that;
+  `health.json` says `action budget exhausted`, and `converge --apply` exits 1).
+
+State: `~/Library/Application Support/Deskflow/health.json` (counts, plan,
+actions, assert-single) and `~/Library/Logs/Deskflow/converge.log`. A toast
+"Deskflow: converge repaired ..." means it acted.
 
 Old build (core owned by the GUI): quit Deskflow from its menu, then reopen
 it; if uppercase persists, the shadow flags are wedged in the HID system —
@@ -98,11 +117,57 @@ uninstalled. Last line must be `== DEPLOY OK`.
 ssh hackintosh 'cd ~/Desktop/deskflow && git fetch origin && git checkout fleet/memory-program && git pull --ff-only origin fleet/memory-program && FLEET_SKIP_GIT_PULL=1 bash scripts/fleet-deploy-macos.sh'
 ```
 
-`fleet-deploy-macos.sh` builds strict-signed, `deskflow-ctl stop` (launchd
-bootout), swaps the bundle, `deskflow-ctl start` (bootstrap agents), then
-deploys Mouser via its own installer (`mouser-ctl` stop → install → start).
-After the identifier fix, expect **one** Accessibility/Input Monitoring
-re-grant per Mac for `deskflow-core` and the login bridge.
+`fleet-deploy-macos.sh` builds strict-signed, then `install-macos.sh`
+stages the bundle and **verifies its signature first**; only then
+`deskflow-ctl stop` (launchd bootout, writes quit-intent), swap, and
+`deskflow-ctl start` (clears quit-intent, bootstraps core → GUI → converge).
+A rejected build leaves the old bundle running. Mouser follows via its own
+installer. After the identifier fix, expect **one** Accessibility/Input
+Monitoring re-grant per Mac for `deskflow-core` and the login bridge.
+
+The deploy ends with two lines that may need a human with root:
+
+```text
+== deskflow-ctl: prio: system/io.github.hughesyadaddy.deskflow-prio needs root; run once as admin: ==
+== [<seat>] bridge plist stale — run root step: sudo env DESKFLOW_INSTALL_APP=/Applications/Deskflow.app bash ~/Desktop/deskflow/scripts/install-login-bridge-macos.sh ==
+```
+
+Root steps (over ssh, once per seat; nothing in the deploy escalates):
+
+```bash
+# prio LaunchDaemon + /private/var/db/deskflow (1777, machine-scope lock dir) — copy the printed sudo lines, or:
+ssh <mac> 'sudo ~/Desktop/deskflow/scripts/deskflow-ctl prio'
+# LoginWindow bridge plist (hosts from Deskflow.conf peers: ip/lan fields only), log 0600, legacy launchers retired
+ssh <mac> 'sudo env DESKFLOW_INSTALL_APP=/Applications/Deskflow.app bash ~/Desktop/deskflow/scripts/install-login-bridge-macos.sh'
+# preview without installing
+ssh <mac> 'bash ~/Desktop/deskflow/scripts/install-login-bridge-macos.sh --dry-run | plutil -p -'
+```
+
+The bridge agent only loads at the next login window (log out or reboot).
+
+### One-time Login Items (BTM) cleanup per Mac — human step
+
+Older builds registered Deskflow (and Mouser) as Login Items via SMAppService
+on every launch, so login runs both the Login Item and the LaunchAgent and one
+loser exits. The new GUI does not register itself when `DESKFLOW_LAUNCHD=1`
+(set by the rendered plists), but the existing BTM records must be removed
+once by hand. Check first:
+
+```bash
+ssh <mac> 'sfltool dumpbtm | grep -ci deskflow; sfltool dumpbtm | grep -ci mouser'   # want 0 and 0
+```
+
+Either, per Mac:
+
+1. **System Settings → General → Login Items & Extensions**: remove every
+   Deskflow / Mouser entry under "Open at Login" and toggle off any under
+   "Allow in the Background" that points at an old bundle id
+   (`org.deskflow.deskflow`, `io.github.tombadash.mouser`). Precise, no reboot.
+2. **`sudo sfltool resetbtm`** then reboot: wipes *all* Login Items on the
+   Mac (every app, not just ours) and re-prompts them. Use only when the pane
+   is wedged or over ssh with no console access.
+
+Then `deskflow-ctl start` (or wait for converge) and re-check the count.
 
 ### From any seat, whole fleet (once every seat has `scripts/fleet.env`)
 
@@ -119,10 +184,21 @@ tools/fleet-health --check all --host all
 # exactly one of each, right session
 ssh tiny11 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\alexh\Desktop\deskflow\scripts\deskflow-ctl.ps1 assert-single'
 ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl assert-single'
-# signatures + TCC + bridge
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl converge'        # plan must be empty, assert-single OK
+ssh <mac> 'launchctl print gui/$(id -u)/io.github.hughesyadaddy.deskflow-converge | grep -E "state|last exit"'
+# signatures + TCC + Mouser bridge + LoginWindow bridge
 tools/fleet-health --check all --host all
+tools/fleet-health --check loginbridge --host <mac>   # plist lints, program = installed bundle, log 600, 0 keystrokes;
+                                                      # agent pid needs passwordless sudo, else SKIP with reason
+# Windows service recovery
+ssh tiny11 'sc.exe qfailure Deskflow'                 # RESTART actions 1000/5000/30000 ms
+ssh tiny11 'powershell -NoProfile -Command "Test-Path C:\ProgramData\Deskflow"'
 # no key held anywhere (Windows) — rerun 1a and expect all down=False
 ```
+
+Kill test on a Mac: `kill -9 $(pgrep -x Deskflow)` → tray back within ~35 s
+(launchd KeepAlive, throttle 30 s); tray Quit → stays quit (quit-intent) until
+`deskflow-ctl start` or re-login.
 
 Type `aBcD` on each seat and across a screen switch; hold Shift while crossing
 and release on the other side; toggle Caps on one seat and type on another.
@@ -145,7 +221,9 @@ the seat deploy above.
 |---|---|
 | Core/GUI/bridge locks (macOS) | `~/Library/Application Support/Deskflow/*.lock`, `/private/var/db/deskflow/*.machine.lock` |
 | Mouser lock | `~/Library/Application Support/Mouser/mouser.lock`; Windows mutex `Local\MouserSingleInstance` |
-| launchd agents | `~/Library/LaunchAgents/io.github.hughesyadaddy.{deskflow,deskflow-core,mouser}.plist`, `/Library/LaunchAgents/org.deskflow.vhid-bridge.plist`, `/Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist` |
+| launchd agents | `~/Library/LaunchAgents/io.github.hughesyadaddy.{deskflow,deskflow-core,deskflow-converge,mouser}.plist`, `/Library/LaunchAgents/org.deskflow.vhid-bridge.plist`, `/Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist` |
+| converge state | `~/Library/Application Support/Deskflow/{health.json,quit-intent,converge-actions}`, `~/Library/Deskflow/deploy.lock` (install in progress), `~/Library/Logs/Deskflow/converge.log` |
+| Bridge plist generator | `scripts/install-login-bridge-macos.sh` (`--dry-run` prints the plist; run under `sudo` over ssh; the GUI calls the same script) |
 | Windows service | `Deskflow` (`deskflow-daemon.exe`, LocalSystem); GUI + Mouser via HKCU Run |
 | Mouser⇄Deskflow bridge | Mouser listens `127.0.0.1:19795`; token `~/Library/Application Support/Mouser/bridge.token` / `%APPDATA%\Mouser\bridge.token` |
-| Logs | macOS `~/Library/Deskflow/deskflow-core.log`, `~/Library/Logs/Deskflow/`, `/var/log/deskflow-vhid-bridge.log`; Windows `C:\ProgramData\Deskflow\deskflow-daemon.log`; Mouser `~/Library/Logs/Mouser/` |
+| Logs | macOS `~/Library/Deskflow/deskflow-core.log`, `~/Library/Logs/Deskflow/`, `/var/log/deskflow-vhid-bridge.log` (root, 0600); Windows `C:\ProgramData\Deskflow\deskflow-daemon.log` (dir created by `deskflow-ctl.ps1 start`); Mouser `~/Library/Logs/Mouser/` |
