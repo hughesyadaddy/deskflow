@@ -126,6 +126,18 @@ log_lacks_any() { [ ! -s "$SHIM_LOG" ] || { echo "unexpected calls: $(cat "$SHIM
   [ "$status" -eq 1 ]
 }
 
+@test "port is validated and computerName is XML-escaped, so config can never break or inject into the plist" {
+  sed -i '' 's/^port=.*/port=24800; rm -rf \/tmp/' "$DESKFLOW_SETTINGS"
+  run bash "$SCRIPT" --dry-run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"core/port must be 1-65535"* ]]
+  sed -i '' -e 's/^port=.*/port=24800/' -e 's/^computerName=.*/computerName=mac<\&>"pro/' "$DESKFLOW_SETTINGS"
+  run --separate-stderr bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  plutil -lint - <<<"$output" >/dev/null
+  [ "$(plutil -extract ProgramArguments.2 raw -o - - <<<"$output")" = 'mac<&>"pro' ]
+}
+
 @test "the rendered plist is byte-stable across runs (what fleet-deploy and the GUI compare against)" {
   bash "$SCRIPT" --dry-run >"$TMP/a.plist" 2>/dev/null
   bash "$SCRIPT" --dry-run >"$TMP/b.plist" 2>/dev/null
@@ -152,12 +164,25 @@ log_lacks_any() { [ ! -s "$SHIM_LOG" ] || { echo "unexpected calls: $(cat "$SHIM
   [[ "$output" == *"Installed $DESKFLOW_LOGIN_BRIDGE_PLIST"* ]]
 }
 
-@test "root under sudo boots the legacy agent out of the invoking user's domain (SUDO_UID)" {
+@test "root under sudo boots the legacy agent out of the invoking user's domain (SUDO_UID) and reads that user's config via dscl" {
   fake_root
-  SUDO_UID=501 run bash "$SCRIPT"
+  make_shim dscl <<'EOF'
+echo "dscl $*" >> "$SHIM_LOG"
+[[ "$3" == "/Users/alex" ]] && { echo "NFSHomeDirectory: $HOME"; exit 0; }
+exit 1
+EOF
+  cp "$DESKFLOW_SETTINGS" "$TMP/conf.bak"
+  mkdir -p "$HOME/Library/Deskflow"; mv "$DESKFLOW_SETTINGS" "$HOME/Library/Deskflow/Deskflow.conf"
+  unset DESKFLOW_SETTINGS
+  SUDO_UID=501 SUDO_USER=alex run bash "$SCRIPT"
   [ "$status" -eq 0 ]
+  grep -q "dscl . -read /Users/alex NFSHomeDirectory" "$SHIM_LOG"
   grep -q "launchctl print gui/501/com.kvm.autoswitch" "$SHIM_LOG"
   log_lacks "launchctl bootout"
+  # an unresolvable SUDO_USER is an error, not a silent fallback to root's HOME
+  SUDO_UID=501 SUDO_USER=nobody-here run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot resolve home of SUDO_USER=nobody-here"* ]]
 }
 
 log_lacks() { ! grep -qF -- "$1" "$SHIM_LOG" || { echo "unexpected: $1" >&2; return 1; }; }

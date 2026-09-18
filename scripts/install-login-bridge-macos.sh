@@ -11,10 +11,10 @@
 set -euo pipefail
 
 # Under `sudo` HOME is root's; the settings belong to the invoking user.
+USER_HOME="$HOME"
 if [[ -n "${SUDO_USER:-}" && -z "${DESKFLOW_SETTINGS:-}" ]]; then
-  eval "USER_HOME=~$SUDO_USER"
-else
-  USER_HOME="$HOME"
+  USER_HOME="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }' || true)" # fleet:allow unknown user = empty, rejected below
+  [[ -n "$USER_HOME" ]] || { echo "error: cannot resolve home of SUDO_USER=$SUDO_USER; set DESKFLOW_SETTINGS" >&2; exit 1; }
 fi
 CONF="${DESKFLOW_SETTINGS:-$USER_HOME/Library/Deskflow/Deskflow.conf}"
 APP="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
@@ -135,6 +135,12 @@ fi
 if [[ -z "$port" ]]; then
   port=24800
 fi
+if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+  echo "error: core/port must be 1-65535, got '$port'" >&2
+  exit 1
+fi
+
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e "s/'/\&apos;/g" -e 's/"/\&quot;/g'; }
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
@@ -196,9 +202,9 @@ cat >"$staged" <<EOF
   <key>Label</key><string>${AGENT_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${BRIDGE}</string>
-    <string>${hosts_csv}</string>
-    <string>${computer_name}</string>
+    <string>$(xml_escape "$BRIDGE")</string>
+    <string>$(xml_escape "$hosts_csv")</string>
+    <string>$(xml_escape "$computer_name")</string>
     <string>${port}</string>
 ${scale_xml}
   </array>
@@ -206,8 +212,8 @@ ${scale_xml}
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ExitTimeOut</key><integer>3</integer>
-  <key>StandardOutPath</key><string>${LOG_PATH}</string>
-  <key>StandardErrorPath</key><string>${LOG_PATH}</string>
+  <key>StandardOutPath</key><string>$(xml_escape "$LOG_PATH")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$LOG_PATH")</string>
 </dict>
 </plist>
 EOF

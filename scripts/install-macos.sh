@@ -224,12 +224,15 @@ install_bundle() {
 # back in the middle of the swap; it stands down while this lock is younger
 # than 30 min.
 DEPLOY_LOCK="$HOME/Library/Deskflow/deploy.lock"
+LOCK_TAKEN=0
 take_deploy_lock() {
   mkdir -p "$(dirname "$DEPLOY_LOCK")"
   echo "$$" >"$DEPLOY_LOCK"
+  LOCK_TAKEN=1
 }
 cleanup() {
-  rm -f "$DEPLOY_LOCK"
+  # Only this run's lock: a concurrent install's lock must survive our exit.
+  (( LOCK_TAKEN )) && rm -f "$DEPLOY_LOCK"
   [[ -n "$STAGE_TMP" ]] && rm -rf "$STAGE_TMP"
   return 0
 }

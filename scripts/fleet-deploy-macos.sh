@@ -207,13 +207,22 @@ build_install_deskflow() {
 verify_login_bridge_plist() {
   local install_app="$1" renderer="$DESKFLOW_ROOT/scripts/install-login-bridge-macos.sh"
   local installed="${DESKFLOW_LOGIN_BRIDGE_PLIST:-/Library/LaunchAgents/org.deskflow.vhid-bridge.plist}"
-  local rendered
+  local rendered render_err
   rendered="$(mktemp "${TMPDIR:-/tmp}/vhid-bridge.XXXXXX.plist")"
-  if ! DESKFLOW_INSTALL_APP="$install_app" bash "$renderer" --dry-run >"$rendered" 2>/dev/null; then
-    rm -f "$rendered"
-    echo "== [$HOST_TAG] bridge plist: not rendered (no peers / bridge binary / config); login bridge unchanged =="
-    return 0
+  render_err="$(mktemp "${TMPDIR:-/tmp}/vhid-bridge.XXXXXX.err")"
+  if ! DESKFLOW_INSTALL_APP="$install_app" bash "$renderer" --dry-run >"$rendered" 2>"$render_err"; then
+    local reason
+    reason="$(grep -m1 '^error:' "$render_err" || tail -1 "$render_err")"
+    rm -f "$rendered" "$render_err"
+    # A seat with no peers has no bridge to configure; anything else (missing
+    # bridge binary, unreadable config) is a broken install.
+    if [[ "$reason" == *"no coordination peers"* ]]; then
+      echo "== [$HOST_TAG] bridge plist: not rendered ($reason); login bridge unchanged =="
+      return 0
+    fi
+    fail "install-login-bridge-macos.sh --dry-run failed: ${reason:-no output}"
   fi
+  rm -f "$render_err"
   if ! plutil -lint "$rendered" >/dev/null; then
     rm -f "$rendered"
     fail "install-login-bridge-macos.sh --dry-run produced a plist that does not lint"

@@ -505,7 +505,7 @@ healthy() {
   [ "$status" -eq 0 ]
 }
 
-@test "converge re-renders a stale plist (config repair) even when gated, without restarting anything" {
+@test "converge re-renders a stale plist of a LOADED agent even when gated, but reports it as pending, not repaired" {
   healthy
   echo "<plist>stale</plist>" >"$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
   bash "$SCRIPT" stop >/dev/null   # writes quit-intent
@@ -514,12 +514,48 @@ healthy() {
   : >"$SHIM_LOG"
   run bash "$SCRIPT" converge --apply
   [ "$status" -eq 0 ]
-  [[ "$output" == *"acted: render $CORE"* ]]
+  [[ "$output" == *"render $CORE (takes effect at next deskflow-ctl start/restart)"* ]]
+  [[ "$output" != *"acted:"* ]]
   grep -q "<string>$APP/Contents/MacOS/deskflow-core</string>" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
   log_lacks "launchctl kickstart"
   log_lacks "launchctl bootout"
+  log_lacks "osascript"
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['needs_rebootstrap'] is True and d['actions']==[] and d['plan'][0]=='render $CORE (takes effect at next deskflow-ctl start/restart)'" "$STATE/health.json"
   # renders are free: the start budget is untouched
   [ ! -e "$STATE/converge-actions" ]
+}
+
+@test "converge renders the plist of an UNLOADED agent as a completed repair (it is what bootstrap will load)" {
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['needs_rebootstrap'] is False and 'render $CORE' in d['actions'] and 'bootstrap $CORE' in d['actions']" "$STATE/health.json"
+}
+
+@test "a failing launchctl spends budget: 5 ticks make at most 3 attempts, health.json records the error, exit 1 every time" {
+  load_agent $CONVERGE
+  make_shim launchctl <<'EOF'
+echo "launchctl $*" >> "$SHIM_LOG"
+case "$1" in
+  print) label="${2##*/}"; [[ -f "$SHIM_STATE/loaded/$label" ]] || exit 113; exit 0 ;;
+  bootstrap) echo "Bootstrap failed: 5: Input/output error" >&2; exit 5 ;;
+esac
+exit 0
+EOF
+  for i in 1 2 3 4 5; do
+    run bash "$SCRIPT" converge --apply --quiet
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"FAILED: bootstrap $CORE: Bootstrap failed: 5: Input/output error"* ]] || [[ "$output" == *"budget exhausted"* ]]
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert not [a for a in d['actions'] if not a.startswith('render')] and (d['errors'] or d['gate'].startswith('action budget'))" "$STATE/health.json"
+  done
+  [ "$(grep -c "launchctl bootstrap" "$SHIM_LOG")" -eq 3 ]
+  [ "$(wc -l <"$STATE/converge-actions")" -eq 3 ]
+  # tick 1 tries core+GUI, tick 2 the third attempt, ticks 3-5 are gated:
+  # two toasts naming the failure, never "repaired", gated ticks stay silent
+  [ "$(grep -c "osascript" "$SHIM_LOG")" -eq 2 ]
+  log_lacks "converge repaired"
+  log_has "converge FAILED: bootstrap $CORE"
 }
 
 @test "quit-intent from this boot gates every start; a sentinel older than the boot is stale and removed" {

@@ -56,6 +56,7 @@ Describe 'Test-UnderRoot' {
 
 Describe 'Stop-Deskflow' {
   BeforeEach {
+    Mock Suspend-DeskflowServiceRecovery {}
     $script:Killed = [System.Collections.Generic.List[int]]::new()
     Mock Invoke-TaskKillPid { $script:Killed.Add($ProcessId); $script:Table.RemoveAll({ param($p) $p.ProcessId -eq $ProcessId }) | Out-Null }
     Mock Start-Sleep {}
@@ -294,6 +295,29 @@ Describe 'Assert-Elevated' {
     Mock Start-Process {}
     { Assert-Elevated -ForwardArgs @('stop') } | Should -Not -Throw
     Should -Invoke Start-Process -Times 0
+  }
+}
+
+Describe 'Suspend-DeskflowServiceRecovery' {
+  It 'clears the recovery actions so a taskkill during stop cannot restart the service' {
+    $script:ScCalls = [System.Collections.Generic.List[string]]::new()
+    function global:sc.exe { $script:ScCalls.Add(($args -join ' ')); $global:LASTEXITCODE = 0 }
+    try { Suspend-DeskflowServiceRecovery } finally { Remove-Item Function:\global:sc.exe -ErrorAction SilentlyContinue }
+    $script:ScCalls | Should -Contain 'failure Deskflow reset= 0 actions= '
+  }
+  It 'is invoked by Stop-Deskflow before the service is stopped' {
+    $script:Order = [System.Collections.Generic.List[string]]::new()
+    Mock Suspend-DeskflowServiceRecovery { $script:Order.Add('suspend') }
+    Mock Stop-Service { $script:Order.Add('stop') }
+    Mock Get-Service { [pscustomobject]@{ Name = 'Deskflow'; Status = 'Stopped' } }
+    Mock Start-Sleep {}
+    Mock Get-CimInstance {
+      if ($ClassName -eq 'Win32_Service') { return (New-Svc 'Running' 1000) }
+      return @()
+    }
+    Stop-Deskflow -RootDir $script:Root
+    $script:Order[0] | Should -Be 'suspend'
+    $script:Order[1] | Should -Be 'stop'
   }
 }
 

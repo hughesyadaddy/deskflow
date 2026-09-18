@@ -121,8 +121,11 @@ ssh hackintosh 'cd ~/Desktop/deskflow && git fetch origin && git checkout fleet/
 stages the bundle and **verifies its signature first**; only then
 `deskflow-ctl stop` (launchd bootout, writes quit-intent), swap, and
 `deskflow-ctl start` (clears quit-intent, bootstraps core → GUI → converge).
-A rejected build leaves the old bundle running. Mouser follows via its own
-installer. After the identifier fix, expect **one** Accessibility/Input
+A rejected build leaves the old bundle running. If the install dies *after*
+the stop (copy failure, killed mid-swap) the seat is left stopped with
+`quit-intent` set and the old bundle restored from `.bak` where possible:
+run `deskflow-ctl start` by hand — converge will not restart a stopped seat
+on its own. Mouser follows via its own installer. After the identifier fix, expect **one** Accessibility/Input
 Monitoring re-grant per Mac for `deskflow-core` and the login bridge.
 
 The deploy ends with two lines that may need a human with root:
@@ -145,13 +148,17 @@ ssh <mac> 'bash ~/Desktop/deskflow/scripts/install-login-bridge-macos.sh --dry-r
 
 The bridge agent only loads at the next login window (log out or reboot).
 
-### One-time Login Items (BTM) cleanup per Mac — human step
+### One-time Login Items (BTM) cleanup per Mac — human step, FIRST
 
 Older builds registered Deskflow (and Mouser) as Login Items via SMAppService
 on every launch, so login runs both the Login Item and the LaunchAgent and one
-loser exits. The new GUI does not register itself when `DESKFLOW_LAUNCHD=1`
-(set by the rendered plists), but the existing BTM records must be removed
-once by hand. Check first:
+loser exits. The new GUI build (A1: honours `DESKFLOW_LAUNCHD=1` from the
+rendered plists, never registers a Login Item, and when launchd-owned takes
+over from an unmanaged instance instead of exiting 5; tray Quit writes
+`quit-intent`) and the GUI plist change (`KeepAlive` on crash) **must ship
+together**: the plist alone would relaunch an old GUI that exits on the
+single-instance lock every 30 s. Order per seat: (1) this BTM cleanup,
+(2) deploy the branch with the new GUI, (3) `deskflow-ctl start`. Check first:
 
 ```bash
 ssh <mac> 'sfltool dumpbtm | grep -ci deskflow; sfltool dumpbtm | grep -ci mouser'   # want 0 and 0

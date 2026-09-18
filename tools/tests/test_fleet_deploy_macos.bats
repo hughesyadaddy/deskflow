@@ -7,6 +7,17 @@
 
 SCRIPT="$BATS_TEST_DIRNAME/../../scripts/fleet-deploy-macos.sh"
 
+BRIDGE_PLIST='<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>org.deskflow.vhid-bridge</string></dict></plist>'
+
+stub_bridge_renderer() {
+  # Stand-in for scripts/install-login-bridge-macos.sh --dry-run: logs its
+  # argv + env and prints $1 (a plist) on stdout.
+  printf '#!/usr/bin/env bash\necho "install-login-bridge-macos.sh $* APP=${DESKFLOW_INSTALL_APP:-unset}" >> "$SHIM_LOG"\n[[ "$*" == *--dry-run* ]] || { echo "must be dry-run" >&2; exit 99; }\ncat <<'"'"'PL'"'"'\n%s\nPL\n' "$1" >"$FAKE_ROOT/scripts/install-login-bridge-macos.sh"
+}
+
+
 setup() {
   TMP="$(mktemp -d "${BATS_TEST_TMPDIR:-${TMPDIR:-/tmp}}/fleet-deploy.XXXXXX")"
   SHIMS="$TMP/bin"
@@ -19,6 +30,10 @@ setup() {
 
   # The deploy script calls the repo's install script; stub it inside the fake root.
   printf '#!/usr/bin/env bash\necho "install-macos.sh $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"\n' >"$FAKE_ROOT/scripts/install-macos.sh"
+  # ... and the login-bridge renderer (--dry-run); the installed plist is a tmp path.
+  export DESKFLOW_LOGIN_BRIDGE_PLIST="$TMP/org.deskflow.vhid-bridge.plist"
+  stub_bridge_renderer "$BRIDGE_PLIST"
+  printf '%s\n' "$BRIDGE_PLIST" >"$DESKFLOW_LOGIN_BRIDGE_PLIST"
   : >"$MOUSER/scripts/build_macos_gui_session.py"
 
   make_shim cmake <<'EOF'
@@ -244,16 +259,6 @@ script_lacks() {
 
 # --- login bridge plist ---------------------------------------------------------
 
-BRIDGE_PLIST='<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>Label</key><string>org.deskflow.vhid-bridge</string></dict></plist>'
-
-stub_bridge_renderer() {
-  # Stand-in for scripts/install-login-bridge-macos.sh --dry-run: logs its
-  # argv + env and prints $1 (a plist) on stdout.
-  printf '#!/usr/bin/env bash\necho "install-login-bridge-macos.sh $* APP=${DESKFLOW_INSTALL_APP:-unset}" >> "$SHIM_LOG"\n[[ "$*" == *--dry-run* ]] || { echo "must be dry-run" >&2; exit 99; }\ncat <<'"'"'PL'"'"'\n%s\nPL\n' "$1" >"$FAKE_ROOT/scripts/install-login-bridge-macos.sh"
-}
-
 @test "after install the bridge plist is rendered via --dry-run, linted, and compared: up to date is reported" {
   write_env "ABCDEF0123456789"
   stub_bridge_renderer "$BRIDGE_PLIST"
@@ -298,10 +303,19 @@ stub_bridge_renderer() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"does not lint"* ]]
 
-  printf '#!/usr/bin/env bash\necho "error: no coordination peers configured" >&2; exit 1\n' >"$FAKE_ROOT/scripts/install-login-bridge-macos.sh"
+  printf '#!/usr/bin/env bash\necho "error: no coordination peers configured (excluding macbookpro)" >&2; exit 1\n' >"$FAKE_ROOT/scripts/install-login-bridge-macos.sh"
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"bridge plist: not rendered"* ]]
+  [[ "$output" == *"bridge plist: not rendered (error: no coordination peers configured"* ]]
+}
+
+@test "a renderer failing for any other reason (missing bridge binary, bad config) fails the deploy with the reason" {
+  write_env "ABCDEF0123456789"
+  printf '#!/usr/bin/env bash\necho "error: bridge binary not found at /Applications/Deskflow.app/Contents/MacOS/deskflow-vhid-bridge" >&2; exit 1\n' >"$FAKE_ROOT/scripts/install-login-bridge-macos.sh"
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--dry-run failed: error: bridge binary not found"* ]]
+  log_lacks "build_macos_gui_session.py"
 }
 
 # --- GUI-session exec ---------------------------------------------------------

@@ -5,8 +5,8 @@
 
 .DESCRIPTION
   Verbs:
-    stop           Stop-Service Deskflow (poll <=10 s), taskkill the service PID
-                   if the SCM hangs, then taskkill /F /T every process whose
+    stop           suspend the service's recovery actions, Stop-Service Deskflow
+                   (poll <=30 s), taskkill the service PID if the SCM hangs, then taskkill /F /T every process whose
                    ExecutablePath is under the install root (ALL sessions).
                    Loops <=25 s; throws if anything remains. Never touches Mouser.
     start          sign (scripts/sign-windows.ps1) -> sc create/config ->
@@ -169,6 +169,10 @@ function Stop-Deskflow {
 
   $svc = Get-DeskflowService
   if ($svc) {
+    # A taskkill of the daemon below would otherwise trip the SCM recovery
+    # actions and restart the service we are stopping. Suspend them for the
+    # duration; ctl start (Register-DeskflowService) restores them.
+    Suspend-DeskflowServiceRecovery
     if ($svc.State -ne 'Stopped') {
       Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
     }
@@ -239,6 +243,11 @@ function Register-DeskflowService {
   }
   Set-DeskflowServiceRecovery
   New-DeskflowProgramData
+}
+
+function Suspend-DeskflowServiceRecovery {
+  sc.exe failure $ServiceName reset= 0 actions= "" | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "sc.exe failure (suspend) failed ($LASTEXITCODE)" }
 }
 
 function Set-DeskflowServiceRecovery {

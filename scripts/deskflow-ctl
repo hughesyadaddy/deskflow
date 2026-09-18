@@ -74,7 +74,7 @@ DOMAIN="gui/$(id -u)"
 # PATH shim can observe the escalation in tests.
 enable -n kill 2>/dev/null || true # fleet:allow builtin may already be disabled
 
-usage() { sed -n '2,45p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,/^set -euo pipefail/p' "${BASH_SOURCE[0]}" | sed '$d'; }
 die() { echo "deskflow-ctl: $*" >&2; exit 1; }
 log() { echo "== deskflow-ctl: $* =="; }
 
@@ -394,22 +394,33 @@ json_list() {
 
 CONVERGE_PLAN=()
 CONVERGE_DONE=()
+CONVERGE_ERRORS=()
 CONVERGE_GATE=""
+CONVERGE_NEEDS_REBOOTSTRAP=0
 
 converge_agent() {
   # $1 = label, $2 = apply (0/1), $3 = starts allowed (0/1), $4 = kickstart
   # when loaded-but-dead (0/1: a StartInterval job is idle between runs, so
   # "no pid" is its normal state).
   local label="$1" apply="$2" starts_ok="$3" kick_dead="$4"
+  local loaded=0
+  agent_loaded "$label" && loaded=1
   if agent_plist_stale "$label"; then
-    CONVERGE_PLAN+=("render $label")
+    local render="render $label"
+    # launchd keeps the definition it loaded; a re-rendered file only takes
+    # effect at the next bootstrap, so this is a pending change, not a repair.
+    if (( loaded )); then
+      render="render $label (takes effect at next deskflow-ctl start/restart)"
+      CONVERGE_NEEDS_REBOOTSTRAP=1
+    fi
+    CONVERGE_PLAN+=("$render")
     if (( apply )); then
       render_agent "$label" >/dev/null
-      CONVERGE_DONE+=("render $label")
+      (( loaded )) || CONVERGE_DONE+=("$render")
     fi
   fi
   local want=""
-  if ! agent_loaded "$label"; then
+  if (( ! loaded )); then
     want="bootstrap $label"
   elif (( kick_dead )) && [[ -z "$(agent_pid "$label")" ]]; then
     want="kickstart $label"
@@ -423,13 +434,19 @@ converge_agent() {
   fi
   # Never `kickstart -k`: converge repairs absence, it does not restart the living.
   [[ -f "$AGENT_DIR/$label.plist" ]] || render_agent "$label" >/dev/null
-  launchctl enable "$DOMAIN/$label"
-  if [[ "$want" == bootstrap* ]]; then
-    launchctl bootstrap "$DOMAIN" "$AGENT_DIR/$label.plist"
-  else
-    launchctl kickstart "$DOMAIN/$label"
-  fi
+  # Every attempt spends budget, successful or not: a launchctl that keeps
+  # failing must not be retried every 60 s forever.
   budget_record
+  local err=""
+  if ! err="$(launchctl enable "$DOMAIN/$label" 2>&1)"; then
+    CONVERGE_ERRORS+=("enable $label: ${err:-rc $?}")
+    return 0
+  fi
+  if [[ "$want" == bootstrap* ]]; then
+    err="$(launchctl bootstrap "$DOMAIN" "$AGENT_DIR/$label.plist" 2>&1)" || { CONVERGE_ERRORS+=("$want: ${err:-failed}"); return 0; }
+  else
+    err="$(launchctl kickstart "$DOMAIN/$label" 2>&1)" || { CONVERGE_ERRORS+=("$want: ${err:-failed}"); return 0; }
+  fi
   CONVERGE_DONE+=("$want")
 }
 
@@ -456,6 +473,8 @@ write_health_json() {
   "agents": {$agents},
   "plan": $(json_list ${CONVERGE_PLAN[@]+"${CONVERGE_PLAN[@]}"}),
   "actions": $(json_list ${CONVERGE_DONE[@]+"${CONVERGE_DONE[@]}"}),
+  "errors": $(json_list ${CONVERGE_ERRORS[@]+"${CONVERGE_ERRORS[@]}"}),
+  "needs_rebootstrap": $([[ $CONVERGE_NEEDS_REBOOTSTRAP -eq 1 ]] && echo true || echo false),
   "budget": {"used": $4, "max": $CONVERGE_BUDGET, "window_seconds": $CONVERGE_BUDGET_WINDOW},
   "assert_single": "$(json_escape "$3")"
 }
@@ -512,12 +531,17 @@ cmd_converge() {
 
   # A quit-intent or deploy-lock gate makes a failing assert-single expected;
   # a run that was free to act (or is out of budget) and still fails is not.
+  # A launchctl failure is always a failure.
   local failing=0
   (( apply && assert_rc != 0 && ! intended )) && failing=1
+  (( ${#CONVERGE_ERRORS[@]} )) && failing=1
   local verbose=1
   (( quiet )) && (( ! failing )) && verbose=0
 
-  if (( ${#CONVERGE_DONE[@]} )); then
+  if (( ${#CONVERGE_ERRORS[@]} )); then
+    log "converge: FAILED: $(printf '%s; ' "${CONVERGE_ERRORS[@]}")"
+    notify "converge FAILED: $(printf '%s; ' "${CONVERGE_ERRORS[@]}")"
+  elif (( ${#CONVERGE_DONE[@]} )); then
     log "converge: acted: $(printf '%s; ' "${CONVERGE_DONE[@]}")"
     notify "converge repaired: $(printf '%s; ' "${CONVERGE_DONE[@]}")"
   elif (( verbose )); then
