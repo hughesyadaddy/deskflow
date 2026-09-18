@@ -11,6 +11,9 @@
 #include "common/Coordinate.h"
 #include "common/Settings.h"
 #include "deskflow/MouseTypes.h"
+#include "deskflow/ProtocolTypes.h"
+
+#include <cmath>
 
 //! Secondary screen interface
 /*!
@@ -58,6 +61,24 @@ public:
   virtual void fakeMouseWheel(ScrollDelta delta) const = 0;
 
   /**
+   * @brief Synthesize an extended (sub-notch / pixel / phased) wheel event
+   * Platforms without a native precision path inherit this: motion is banked
+   * in 120-per-notch units and only whole notches reach fakeMouseWheel, so a
+   * notch-quantizing injector (X11 button clicks) neither loses nor doubles
+   * motion. Phase-only messages are dropped.
+   * @param ex the decoded DMWX payload
+   */
+  virtual void fakeMouseWheelEx(const WheelEx &ex) const
+  {
+    m_wheelBankX += WheelEx::fixedToNotchUnits(ex.xDelta, ex.continuous);
+    m_wheelBankY += WheelEx::fixedToNotchUnits(ex.yDelta, ex.continuous);
+    const ScrollDelta delta{WheelEx::takeWholeNotches(m_wheelBankX), WheelEx::takeWholeNotches(m_wheelBankY)};
+    if (delta.x != 0 || delta.y != 0) {
+      fakeMouseWheel(delta);
+    }
+  }
+
+  /**
    * @brief Applies any scroll modfifers to the provided delta, This should only be done inside the subclasses
    * fakeMouseWheel impl
    * @param delta a ScrollDelta to be modified
@@ -68,6 +89,18 @@ public:
     delta.y = static_cast<int32_t>(m_invertYScroll ? delta.y * -m_yScrollScale : delta.y * m_yScrollScale);
     delta.x = static_cast<int32_t>(m_invertXScroll ? delta.x * -m_xScrollScale : delta.x * m_xScrollScale);
     return delta;
+  }
+
+  /**
+   * @brief Inversion and scale for 16.16 fixed-point deltas, without an integer round trip
+   * @param ex the DMWX payload to modify in place (only the deltas change)
+   */
+  void applyScrollModifierFixed(WheelEx &ex) const
+  {
+    const double yScale = m_invertYScroll ? -m_yScrollScale : m_yScrollScale;
+    const double xScale = m_invertXScroll ? -m_xScrollScale : m_xScrollScale;
+    ex.yDelta = static_cast<int32_t>(std::lround(ex.yDelta * yScale));
+    ex.xDelta = static_cast<int32_t>(std::lround(ex.xDelta * xScale));
   }
 
 private:
@@ -94,5 +127,8 @@ private:
    * It is used in the applyScrollModifier method
    */
   double m_xScrollScale = 1.0;
+
+  mutable int32_t m_wheelBankX = 0;
+  mutable int32_t m_wheelBankY = 0;
   //@}
 };

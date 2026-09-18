@@ -371,6 +371,9 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
   m_events->addHandler(EventTypes::PrimaryScreenWheel, m_primaryClient->getEventTarget(), [this](const auto &e) {
     handleWheelEvent(e);
   });
+  m_events->addHandler(EventTypes::PrimaryScreenWheelEx, m_primaryClient->getEventTarget(), [this](const auto &e) {
+    handleWheelExEvent(e);
+  });
   m_events->addHandler(
       EventTypes::PrimaryScreenSaverActivated, m_primaryClient->getEventTarget(),
       [this](const auto &) { onScreensaver(true); }
@@ -445,6 +448,7 @@ Server::~Server()
   m_events->removeHandler(PrimaryScreenMotionOnPrimary, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenMotionOnSecondary, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenWheel, m_primaryClient->getEventTarget());
+  m_events->removeHandler(PrimaryScreenWheelEx, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenSaverActivated, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenSaverDeactivated, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenFakeInputBegin, m_inputFilter);
@@ -467,6 +471,7 @@ Server::~Server()
   if (m_active != nullptr && m_active != m_primaryClient) {
     try {
       LOG_DEBUG("teardown: leaving active client \"%s\"", getName(m_active).c_str());
+      closeOpenWheelGesture();
       m_active->leave();
     } catch (const std::exception &e) { // NOSONAR
       LOG_WARN("teardown: could not leave \"%s\": %s", getName(m_active).c_str(), e.what());
@@ -784,6 +789,7 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     // left. Only once the leave is agreed do we release what we hold there
     // -- while m_active still points at it, so the release cannot land on
     // the next screen (the stuck-Win bug).
+    closeOpenWheelGesture();
     if (!m_active->leave()) {
       // cannot leave screen
       LOG_WARN("can't leave screen");
@@ -1865,6 +1871,12 @@ void Server::handleWheelEvent(const Event &event)
   onMouseWheel(info->m_xDelta, info->m_yDelta);
 }
 
+void Server::handleWheelExEvent(const Event &event)
+{
+  const auto *info = static_cast<IPlatformScreen::WheelExInfo *>(event.getData());
+  onMouseWheelEx(info->m_ex);
+}
+
 void Server::handleSwitchWaitTimeout()
 {
   // ignore if mouse is locked to screen
@@ -2780,6 +2792,42 @@ void Server::onMouseWheel(int32_t xDelta, int32_t yDelta)
   m_active->mouseWheel(xDelta, yDelta);
 }
 
+void Server::onMouseWheelEx(const WheelEx &ex)
+{
+  LOG_VERBOSE(
+      "onMouseWheelEx %+d,%+d cont=%d phase=%d momentum=%d", ex.xDelta, ex.yDelta, ex.continuous,
+      static_cast<int>(ex.phase), static_cast<int>(ex.momentum)
+  );
+  assert(m_active != nullptr);
+
+  if (ex.phase != ScrollPhase::None) {
+    m_wheelPhaseOpen = ex.phase == ScrollPhase::Began || ex.phase == ScrollPhase::Changed;
+  }
+  if (ex.momentum != MomentumPhase::None) {
+    m_wheelMomentumOpen = ex.momentum == MomentumPhase::Began || ex.momentum == MomentumPhase::Changed;
+  }
+  m_active->mouseWheelEx(ex);
+}
+
+void Server::closeOpenWheelGesture()
+{
+  // a finger still down is cancelled (releases rubber-banding); a coasting
+  // flick is ended
+  WheelEx terminal;
+  terminal.continuous = true;
+  if (m_wheelPhaseOpen) {
+    terminal.phase = ScrollPhase::Cancelled;
+  }
+  if (m_wheelMomentumOpen) {
+    terminal.momentum = MomentumPhase::Ended;
+  }
+  m_wheelPhaseOpen = false;
+  m_wheelMomentumOpen = false;
+  if (!terminal.isEmpty()) {
+    m_active->mouseWheelEx(terminal);
+  }
+}
+
 bool Server::addClient(BaseClientProxy *client)
 {
   std::string name = getName(client);
@@ -2965,6 +3013,8 @@ void Server::forceLeaveClient(const BaseClientProxy *client)
 
     // cut over
     m_active = m_primaryClient;
+    m_wheelPhaseOpen = false;
+    m_wheelMomentumOpen = false;
 
     updateMouserVirtualHost(m_active);
 

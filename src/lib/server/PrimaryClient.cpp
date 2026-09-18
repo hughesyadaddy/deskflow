@@ -214,6 +214,11 @@ void PrimaryClient::mouseWheel(int32_t, int32_t)
   // ignore
 }
 
+void PrimaryClient::mouseWheelEx(const WheelEx &)
+{
+  // ignore
+}
+
 void PrimaryClient::screensaver(bool)
 {
   // ignore

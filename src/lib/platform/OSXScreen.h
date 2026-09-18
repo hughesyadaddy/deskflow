@@ -48,6 +48,20 @@ public:
   // heavy PasteboardSynchronize path. Pure helper so the gating rule is unit
   // testable without AppKit: returns true (and updates `last`) only when the
   // change count moved since the previous tick.
+  // Lines to put on the wire for one non-continuous (wheel) scroll event.
+  // macOS reports a slow notch as FixedPt 0.1 but DeltaAxis 1: the integer
+  // is the line count apps scroll by, so it wins whenever it is set. FixedPt
+  // only fills in the two cases it is better at -- a fast notch that carries
+  // a fraction (>= 1 line) and a hi-res sub-notch tick the integer rounds
+  // to zero.
+  static double wheelLinesFromEvent(double fixedPtLines, int64_t wholeLines)
+  {
+    if (fixedPtLines >= 1.0 || fixedPtLines <= -1.0) {
+      return fixedPtLines;
+    }
+    return wholeLines != 0 ? static_cast<double>(wholeLines) : fixedPtLines;
+  }
+
   static bool clipboardChangeCountAdvanced(long &last, long current)
   {
     if (current == last) {
@@ -89,6 +103,7 @@ public:
   void fakeMouseMove(int32_t x, int32_t y) override;
   void fakeMouseRelativeMove(int32_t dx, int32_t dy) const override;
   void fakeMouseWheel(ScrollDelta delta) const override;
+  void fakeMouseWheelEx(const WheelEx &ex) const override;
 
   // IPlatformScreen overrides
   void enable() override;
@@ -131,6 +146,7 @@ private:
   // of the button pressed using the mac button mapping.
   bool onMouseButton(bool pressed, uint16_t macButton);
   bool onMouseWheel(int32_t xDelta, int32_t yDelta) const;
+  bool onMouseWheelEx(const WheelEx &ex) const;
 
   void constructMouseButtonEventMap();
 
@@ -152,6 +168,10 @@ private:
 
   // map mac scroll wheel value to a deskflow scroll wheel value
   int32_t mapScrollWheelToDeskflow(int32_t) const;
+
+  // decode a Quartz scroll event into the DMWX payload (device lines via
+  // wheelLinesFromEvent, or pixels; no extra sender-side acceleration)
+  WheelEx decodeScrollEvent(CGEventRef event) const;
 
   // Resolution switch callback
   static void displayReconfigurationCallback(CGDirectDisplayID, CGDisplayChangeSummaryFlags, void *);

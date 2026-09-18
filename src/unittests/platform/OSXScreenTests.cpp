@@ -22,4 +22,18 @@ void OSXScreenTests::clipboardChangeCountGate()
   QCOMPARE(last, 3L);
 }
 
+void OSXScreenTests::wheelLinesFromEvent_integerWinsBelowOneLine()
+{
+  // a slow notch on a plain wheel: FixedPt 0.1 but DeltaAxis 1 -> one line
+  QCOMPARE(OSXScreen::wheelLinesFromEvent(0.1, 1), 1.0);
+  QCOMPARE(OSXScreen::wheelLinesFromEvent(-0.1, -1), -1.0);
+  // fast notch carries a fraction worth keeping
+  QCOMPARE(OSXScreen::wheelLinesFromEvent(2.5, 3), 2.5);
+  QCOMPARE(OSXScreen::wheelLinesFromEvent(-1.0, -1), -1.0);
+  // hi-res sub-notch tick: integer rounds to zero, the fraction survives
+  QCOMPARE(OSXScreen::wheelLinesFromEvent(0.0125, 0), 0.0125);
+  QCOMPARE(OSXScreen::wheelLinesFromEvent(-0.0125, 0), -0.0125);
+  QCOMPARE(OSXScreen::wheelLinesFromEvent(0.0, 0), 0.0);
+}
+
 QTEST_MAIN(OSXScreenTests)

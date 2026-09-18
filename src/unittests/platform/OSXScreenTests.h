@@ -13,4 +13,5 @@ class OSXScreenTests : public QObject
   Q_OBJECT
 private Q_SLOTS:
   void clipboardChangeCountGate();
+  void wheelLinesFromEvent_integerWinsBelowOneLine();
 };
