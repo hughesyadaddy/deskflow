@@ -28,6 +28,7 @@
 #include "mt/Thread.h"
 #include "platform/OSXClipboard.h"
 #include "platform/OSXEventQueueBuffer.h"
+#include "platform/OSXInjectedEvent.h"
 #include "platform/OSXKeyState.h"
 #include "platform/OSXMediaKeySupport.h"
 #include "platform/OSXPasteboardPeeker.h"
@@ -577,6 +578,7 @@ void OSXScreen::postMouseEvent(CGPoint &pos) const
   CGEventSetDoubleValueField(event, kCGMouseEventDeltaX, deltaFX);
   CGEventSetDoubleValueField(event, kCGMouseEventDeltaY, deltaFY);
 
+  deskflow::platform::markInjectedEvent(event);
   CGEventPost(kCGHIDEventTap, event);
 
   CFRelease(event);
@@ -645,6 +647,7 @@ void OSXScreen::fakeMouseButton(ButtonID id, bool press)
   CGEventSetFlags(event, modifiers);
 
   m_buttonState.set(index, state);
+  deskflow::platform::markInjectedEvent(event);
   CGEventPost(kCGHIDEventTap, event);
 
   CFRelease(event);
@@ -688,25 +691,45 @@ void OSXScreen::fakeMouseRelativeMove(int32_t dx, int32_t dy) const
   m_cursorPosValid = false;
 }
 
+namespace {
+
+//! Whole lines from a wire delta, carrying the sub-line remainder forward
+//! (hi-res wheels send < 120; YScrollScale < 1 shrinks a notch below one line).
+int32_t takeWheelLines(double &carry, int32_t delta, int32_t notch)
+{
+  if (delta == 0) {
+    return 0;
+  }
+  if ((delta < 0) != (carry < 0)) {
+    carry = 0.0; // a reversal must not be eaten by the previous direction's remainder
+  }
+  carry += static_cast<double>(delta) / notch;
+  const auto lines = static_cast<int32_t>(std::trunc(carry));
+  carry -= lines;
+  return lines;
+}
+
+} // namespace
+
 void OSXScreen::fakeMouseWheel(ScrollDelta delta) const
 {
-  if (delta.x != 0 || delta.y != 0) {
-    // use server's acceleration with a little boost since other platforms
-    // take one wheel step as a larger step than the mac does.
-    delta = applyScrollModifier(
-        {static_cast<int32_t>(3.0 * delta.x / s_scrollDelta), static_cast<int32_t>(3.0 * delta.y / s_scrollDelta)}
-    );
-    // create a scroll event, post it and release it.  not sure if kCGScrollEventUnitLine
-    // is the right choice here over kCGScrollEventUnitPixel
-    CGEventRef scrollEvent = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, delta.y, delta.x);
-
-    // Fix for sticky keys
-    CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
-    CGEventSetFlags(scrollEvent, modifiers);
-
-    CGEventPost(kCGHIDEventTap, scrollEvent);
-    CFRelease(scrollEvent);
+  // One wire notch (120) is one line here; the receiver's own OS acceleration
+  // applies once on post. Speed is the client YScrollScale setting (default 1.0).
+  delta = applyScrollModifier(delta);
+  const int32_t linesX = takeWheelLines(m_wheelCarryX, delta.x, s_scrollDelta);
+  const int32_t linesY = takeWheelLines(m_wheelCarryY, delta.y, s_scrollDelta);
+  if (linesX == 0 && linesY == 0) {
+    return;
   }
+  CGEventRef scrollEvent = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, linesY, linesX);
+
+  // Fix for sticky keys
+  CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
+  CGEventSetFlags(scrollEvent, modifiers);
+
+  deskflow::platform::markInjectedEvent(scrollEvent);
+  CGEventPost(kCGHIDEventTap, scrollEvent);
+  CFRelease(scrollEvent);
 }
 
 void OSXScreen::showCursor()
@@ -1194,6 +1217,9 @@ bool OSXScreen::onMouseButton(bool pressed, uint16_t macButton)
 
 bool OSXScreen::onMouseWheel(int32_t xDelta, int32_t yDelta) const
 {
+  if (xDelta == 0 && yDelta == 0) {
+    return true;
+  }
   LOG_VERBOSE("event: button wheel delta=%+d,%+d", xDelta, yDelta);
   sendEvent(EventTypes::PrimaryScreenWheel, WheelInfo::alloc(xDelta, yDelta));
   return true;
@@ -1406,35 +1432,11 @@ ButtonID OSXScreen::mapMacButtonToDeskflow(uint16_t macButton) const
   }
 }
 
-int32_t OSXScreen::mapScrollWheelToDeskflow(int32_t x) const
+int32_t OSXScreen::mapScrollWheelToDeskflow(int32_t lines) const
 {
-  // return accelerated scrolling
-  double d = (1.0 + getScrollSpeed()) * x;
-  return static_cast<int32_t>(120.0 * d);
-}
-
-double OSXScreen::getScrollSpeed() const
-{
-  double scaling = 0.0;
-
-  CFPropertyListRef pref = ::CFPreferencesCopyValue(
-      CFSTR("com.apple.scrollwheel.scaling"), kCFPreferencesAnyApplication, kCFPreferencesCurrentUser,
-      kCFPreferencesAnyHost
-  );
-  if (pref != nullptr) {
-    CFTypeID id = CFGetTypeID(pref);
-    if (id == CFNumberGetTypeID()) {
-      CFNumberRef value = static_cast<CFNumberRef>(pref);
-      if (CFNumberGetValue(value, kCFNumberDoubleType, &scaling)) {
-        if (scaling < 0.0) {
-          scaling = 0.0;
-        }
-      }
-    }
-    CFRelease(pref);
-  }
-
-  return scaling;
+  // Send raw notches; the sender's scroll-speed pref must not stack with the
+  // receiver's own acceleration.
+  return s_scrollDelta * lines;
 }
 
 void OSXScreen::updateButtons()

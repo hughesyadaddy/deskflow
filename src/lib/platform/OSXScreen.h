@@ -153,9 +153,6 @@ private:
   // map mac scroll wheel value to a deskflow scroll wheel value
   int32_t mapScrollWheelToDeskflow(int32_t) const;
 
-  // get the current scroll wheel speed
-  double getScrollSpeed() const;
-
   // Resolution switch callback
   static void displayReconfigurationCallback(CGDirectDisplayID, CGDisplayChangeSummaryFlags, void *);
 
@@ -252,6 +249,9 @@ private:
   // mouse state
   mutable int32_t m_xCursor, m_yCursor;
   mutable bool m_cursorPosValid;
+  //! Sub-line wheel remainder (client event thread only; fakeMouseWheel is const).
+  mutable double m_wheelCarryX = 0.0;
+  mutable double m_wheelCarryY = 0.0;
 
   /* FIXME: this data structure is explicitly marked mutable due
      to a need to track the state of buttons since the remote

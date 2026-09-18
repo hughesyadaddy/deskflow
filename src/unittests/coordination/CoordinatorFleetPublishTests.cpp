@@ -314,6 +314,46 @@ void CoordinatorFleetPublishTests::serverTakeover_continuesFleetSeq()
   coordinator.stop();
 }
 
+void CoordinatorFleetPublishTests::followPeer_acceptsItsFirstFragmentAtAnySeq()
+{
+  auto config = testConfig();
+  config.selfName = "macbookpro";
+  config.peers.push_back({"hackintosh", "hackintosh.test.example", "hackintosh.test.example"});
+  config.peers.push_back({"macbookpro", "macbookpro.test.example", "macbookpro.test.example"});
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start());
+
+  // We were server up to seq 9, then followed hackintosh.
+  coordinator.decide(Role::Server, {});
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_fleetState.server = "macbookpro";
+    coordinator.m_fleetState.seq = 9;
+  }
+  coordinator.decide(Role::Client, "hackintosh.test.example");
+  QCOMPARE(coordinator.fleetSnapshot().server, std::string("hackintosh"));
+
+  // decide() pre-names the followed peer for pre-connect ordering; that
+  // must not turn its first (low-seq) fragment into a "stale same author".
+  FleetFragment inbound;
+  inbound.server = "hackintosh";
+  inbound.seq = 1;
+  inbound.cursorHost = "hackintosh";
+  inbound.links = {FleetLink{"hackintosh", "macbookpro", "left"}};
+  inbound.screens = {FleetScreen{"hackintosh"}, FleetScreen{"macbookpro"}};
+  coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
+
+  const auto snapshot = coordinator.fleetSnapshot();
+  QCOMPARE(snapshot.seq, static_cast<int64_t>(1));
+  QCOMPARE(snapshot.cursorHost, std::string("hackintosh"));
+  QCOMPARE(snapshot.links.size(), static_cast<size_t>(1));
+
+  coordinator.stop();
+}
+
 void CoordinatorFleetPublishTests::wakePeer_rateLimitsPerPeer()
 {
   auto config = testConfig();

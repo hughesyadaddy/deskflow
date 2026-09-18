@@ -52,14 +52,35 @@ void ElectionStateTests::initialRoleIsInit()
 void ElectionStateTests::inputBurstPromotes()
 {
   Fixture f;
-  QVERIFY(f.feedInput(4, 0.05));
+  QVERIFY(f.feedInput(8, 0.05));
+}
+
+void ElectionStateTests::shortBurstNeverPromotes()
+{
+  // A bumped desk or a relayed wheel echo yields a handful of events; only
+  // a sustained grab (8 within 0.5 s) may flip the fleet.
+  Fixture f;
+  QVERIFY(!f.feedInput(7, 0.05));
+  f.now += 1.0;
+  QVERIFY(!f.feedInput(8, 0.08)); // 8 events spread over 0.64 s
+  f.now += 1.0;
+  QVERIFY(f.feedInput(8, 0.05));
+}
+
+void ElectionStateTests::burstThresholdIsTunable()
+{
+  ElectionTuning tuning;
+  tuning.burstCount = 3;
+  tuning.burstWindowS = 0.2;
+  Fixture f("self", tuning);
+  QVERIFY(f.feedInput(3, 0.05));
 }
 
 void ElectionStateTests::sparsePhantomDriftNeverPromotes()
 {
   Fixture f;
-  // Idle optical-sensor drift: single events ~0.3s apart never fill the
-  // 6-in-0.60s burst, no matter how long it goes on.
+  // Idle optical-sensor drift: single events ~0.5s apart never fill the
+  // 8-in-0.50s burst, no matter how long it goes on.
   QVERIFY(!f.feedInput(100, 0.5));
 }
 
@@ -69,7 +90,7 @@ void ElectionStateTests::escalatingCooldownDampsFlapWar()
   // First flip: base cooldown applies.
   f.state.becameClient("10.0.0.2");
   f.now += 3.0; // past base 2.5s
-  QVERIFY(f.feedInput(6, 0.05));
+  QVERIFY(f.feedInput(8, 0.05));
 
   // War: two more flips inside the 30s flap window.
   f.state.becameServer();
@@ -78,17 +99,17 @@ void ElectionStateTests::escalatingCooldownDampsFlapWar()
   // Escalated cooldown (3 flips -> 2.5 * 2^2 = 10s): input shortly after
   // the flip must NOT promote, however vigorous.
   f.now += 3.0;
-  QVERIFY(!f.feedInput(4, 0.05));
+  QVERIFY(!f.feedInput(8, 0.05));
 
   // After the escalated window passes, promotion works again.
   f.now += 9.0;
-  QVERIFY(f.feedInput(4, 0.05));
+  QVERIFY(f.feedInput(8, 0.05));
 }
 
 void ElectionStateTests::slowInputNeverPromotes()
 {
   Fixture f;
-  // Each tick 0.5s apart: the 6-in-0.60s burst never fills.
+  // Each tick 0.5s apart: the 8-in-0.50s burst never fills.
   QVERIFY(!f.feedInput(50, 0.5));
 }
 
@@ -102,7 +123,7 @@ void ElectionStateTests::selfCooldownBlocksPromotion()
 
   // After the cooldown, a burst promotes again.
   f.now += 3.0;
-  QVERIFY(f.feedInput(4, 0.05));
+  QVERIFY(f.feedInput(8, 0.05));
 }
 
 void ElectionStateTests::serverNeverPromotesAgain()
@@ -120,7 +141,7 @@ void ElectionStateTests::cursorHereRaisesThreshold()
   f.now += 3.0;
   f.state.setCursorHere(true);
 
-  // The normal threshold (4) must not promote while the cursor is here.
+  // The normal threshold (8) must not promote while the cursor is here.
   QVERIFY(!f.feedInput(8, 0.05));
   // But a sustained 12-within-0.80s burst must.
   QVERIFY(f.feedInput(12, 0.05));
@@ -129,11 +150,11 @@ void ElectionStateTests::cursorHereRaisesThreshold()
 void ElectionStateTests::cursorToggleClearsBurst()
 {
   Fixture f;
-  // 3 fast ticks, then the cursor regime changes: stale ticks must not
+  // 7 fast ticks, then the cursor regime changes: stale ticks must not
   // count toward the next threshold.
-  QVERIFY(!f.feedInput(3, 0.01));
+  QVERIFY(!f.feedInput(7, 0.01));
   f.state.setCursorHere(true);
-  QVERIFY(!f.feedInput(8, 0.01));
+  QVERIFY(!f.feedInput(11, 0.01));
 }
 
 void ElectionStateTests::claimFromSelfIgnored()
@@ -262,11 +283,11 @@ void ElectionStateTests::resetCursorScreenClearsInputBurst()
   Fixture f;
   f.state.becameClient("10.0.0.2");
   f.now += 3.0;
-  f.feedInput(3, 0.01);
+  f.feedInput(7, 0.01);
   f.state.resetCursorScreen();
   f.now += 3.0;
-  QVERIFY(!f.feedInput(3, 0.01));
-  QVERIFY(f.feedInput(4, 0.05));
+  QVERIFY(!f.feedInput(7, 0.01));
+  QVERIFY(f.feedInput(1, 0.05));
 }
 
 void ElectionStateTests::resetCursorScreenClearsKnownState()

@@ -28,6 +28,7 @@ private Q_SLOTS:
   void followClaim_resolvesEmptyAddressFromPeers();
   void followClaim_dropsUnknownClaimWithoutAddress();
   void serverTakeover_continuesFleetSeq();
+  void followPeer_acceptsItsFirstFragmentAtAnySeq();
   void wakePeer_rateLimitsPerPeer();
   void wakePeer_refiresAfterRateLimitWindow();
   void wakePeer_ignoredForClientsAndPeersWithoutHints();

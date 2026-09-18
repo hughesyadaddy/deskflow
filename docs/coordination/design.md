@@ -55,7 +55,7 @@ Implemented exactly per `behavior-spec.md` §3–§4, all constants in one
 header (`ElectionTuning`):
 
 - `kSelfCooldown` 2.5 s, `kClaimCooldown` 1.5 s, heartbeat 3 s
-- burst: 4 events / 0.40 s normally; 12 / 0.80 s while the shared cursor
+- burst: 8 events / 0.50 s normally; 12 / 0.80 s while the shared cursor
   is on this screen (the server tells us via enter/leave, which in-process
   are real events rather than parsed log lines)
 - same-host heartbeat claims are no-ops
@@ -81,7 +81,7 @@ A 3 s `EventQueueTimer` on the coordinator:
 - client link health from real connection events
   (`ClientConnected` / `ClientConnectionFailed` / `ClientDisconnected`)
   with the 10 s grace, then targeted relaunch, then rediscovery
-- server wedge probe (`127.0.0.1:<port>` connect, 2 strikes ≈ 18 s)
+- server wedge probe (`127.0.0.1:<port>` connect + RST, 2 strikes ≈ 60 s)
 - startup discovery window (30 s of 1 s `status` polls while `init`)
 
 ## Settings

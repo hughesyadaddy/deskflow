@@ -8,6 +8,7 @@
 
 #include "deskflow/ClientApp.h"
 
+#include "arch/Arch.h"
 #include "base/Event.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
@@ -42,7 +43,37 @@
 #include "platform/OSXScreen.h"
 #endif
 
+#include <QHostAddress>
+#include <QNetworkInterface>
+
 #include <memory>
+
+namespace {
+
+// Fleet snapshots exclude self by name only; a stale fleet.server or a peer
+// entry that resolves to one of our own interfaces still costs a connect
+// timeout per address on every reconnect.
+bool resolvesToLocalInterface(const NetworkAddress &address)
+{
+  if (!address.isValid()) {
+    return false;
+  }
+  const QHostAddress resolved(QString::fromStdString(ARCH->addrToString(address.getAddress())));
+  if (resolved.isNull()) {
+    return false;
+  }
+  if (resolved.isLoopback()) {
+    return true;
+  }
+  for (const QHostAddress &local : QNetworkInterface::allAddresses()) {
+    if (resolved.isEqual(local, QHostAddress::TolerantConversion)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
 
 ClientApp::ClientApp(IEventQueue *events, const QString &processName) : App(events, processName)
 {
@@ -55,6 +86,7 @@ void ClientApp::parseArgs()
   if (const auto addressList = Settings::value(Settings::Client::RemoteHost).toString(); !addressList.isEmpty()) {
     const int port = Settings::value(Settings::Core::Port).toInt();
     const QStringList addresses = addressList.split(',', Qt::SkipEmptyParts);
+    QList<NetworkAddress> selfAddresses;
 
     for (const QString &addr : addresses) {
       const QString trimmedAddr = addr.trimmed();
@@ -65,6 +97,11 @@ void ClientApp::parseArgs()
       try {
         NetworkAddress netAddr(trimmedAddr.toStdString(), port);
         netAddr.resolve();
+        if (resolvesToLocalInterface(netAddr)) {
+          LOG_DEBUG("deferring server address that is this machine: %s", qPrintable(trimmedAddr));
+          selfAddresses.append(netAddr);
+          continue;
+        }
         m_serverAddresses.append(netAddr);
         LOG_DEBUG("added server address: %s", qPrintable(trimmedAddr));
       } catch (SocketAddressException &e) {
@@ -81,6 +118,11 @@ void ClientApp::parseArgs()
           LOG_WARN("could not resolve address '%s': %s (will retry later)", qPrintable(trimmedAddr), e.what());
         }
       }
+    }
+
+    if (m_serverAddresses.isEmpty()) {
+      // A deliberate same-machine config keeps working; only fleet lists drop self.
+      m_serverAddresses = selfAddresses;
     }
 
     if (m_serverAddresses.isEmpty()) {
@@ -460,6 +502,10 @@ void ClientApp::appendPreConnectHosts(const QStringList &hosts)
         netAddr.resolve();
       } catch (SocketAddressException &) {
         LOG_DEBUG("keeping unresolved fleet pre-connect address: %s", hostStd.c_str());
+      }
+      if (resolvesToLocalInterface(netAddr)) {
+        LOG_DEBUG("skipping fleet pre-connect address that is this machine: %s", hostStd.c_str());
+        continue;
       }
       m_serverAddresses.append(netAddr);
       added = true;
