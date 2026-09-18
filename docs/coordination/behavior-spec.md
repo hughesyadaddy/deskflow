@@ -70,7 +70,7 @@ wire format but should add an optional shared token (documented in
 
 - `SELF_COOLDOWN = 2.5 s`: ignore local promotion triggers right after a
   role change.
-- Input burst to promote: >= 4 genuine events within 0.40 s normally; when
+- Input burst to promote: >= 8 genuine events within 0.50 s normally; when
   the shared cursor is currently ON this screen (entered via KVM),
   >= 12 events within 0.80 s (prevents forwarded-motion misfires).
 - Cursor-on-this-screen is tracked from the client's own "entering
@@ -117,9 +117,10 @@ start client transport towards X, persist state.
 - Client down < 10 s: grace. Beyond that: relaunch towards the same host;
   after >= 2 direct retries, re-run discovery (`status` to peers) and
   repoint if the server is reachable at an alternate address.
-- **Server wedge probe**: every ~9 s, connect to `127.0.0.1:24800` with a
-  1 s timeout; two consecutive failures (~18 s) => the server is alive but
-  not accepting => restart server transport.
+- **Server wedge probe**: every ~30 s, connect to `127.0.0.1:24800` with a
+  1 s timeout and reset the connection (RST) so the server's unknown-client
+  proxy is torn down at once; two consecutive failures (~60 s) => the
+  server is alive but not accepting => restart server transport.
 - **Startup discovery**: for 30 s while `init`, query peers' `status`
   every 1 s; converge to an active server immediately when found.
 

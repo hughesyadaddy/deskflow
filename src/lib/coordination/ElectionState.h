@@ -33,12 +33,11 @@ struct ElectionTuning
   //! Claim heartbeat cadence while server.
   double heartbeatIntervalS = 3.0;
   //! Genuine-input burst to promote: count within window.
-  //! Responsiveness wins: this is the gesture a user makes to take their
-  //! cursor back, and a threshold tuned to exclude phantom drift made
-  //! reclaiming the cursor feel impossible. Drift is handled by the
-  //! escalating cooldown below, not by making the human work harder.
-  int burstCount = 4;
-  double burstWindowS = 0.40;
+  //! A deliberate grab of the mouse produces far more than 8 reports in
+  //! 0.5 s; 4 was reachable by a bumped desk or a wheel echo, and every
+  //! such promotion tears down and rebuilds the epoch on every seat.
+  int burstCount = 8;
+  double burstWindowS = 0.50;
   //! Anti-war escalation: each role flip within \c flapWindowS doubles the
   //! LOCAL promotion cooldown (base selfCooldownS) up to \c maxSelfCooldownS.
   //! Following a claim stays at base cooldown -- yielding is always safe;
