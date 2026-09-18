@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Self-healing tick: `deskflow-ctl converge --apply --quiet` once a minute in
+  the user session. Report-and-repair only: it re-renders stale plists and
+  bootstraps/kickstarts agents that are unloaded or dead. It never kills a
+  process and stays silent while a quit-intent sentinel from this boot or a
+  fresh deploy lock exists.
+
+  Rendered into ~/Library/LaunchAgents by `scripts/deskflow-ctl start`
+  (__CTL__ -> this checkout's scripts/deskflow-ctl, __APP__ -> the bundle,
+  __HOME__ -> $HOME). `scripts/deskflow-ctl stop` boots it out.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.hughesyadaddy.deskflow-converge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__CTL__</string>
+    <string>converge</string>
+    <string>--apply</string>
+    <string>--quiet</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DESKFLOW_INSTALL_APP</key>
+    <string>__APP__</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/Deskflow/converge.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/Deskflow/converge.log</string>
+</dict>
+</plist>

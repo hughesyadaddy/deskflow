@@ -149,26 +149,70 @@ log_lacks() {
   fi
 }
 
-@test "signed bundle installs, verifies, and restarts through launchd (ctl stop -> swap -> ctl start)" {
+@test "signed bundle installs, verifies, and restarts through launchd (verify staged -> ctl stop -> swap -> ctl start)" {
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Codesign verify OK"* ]]
   [[ "$output" == *"Authority=Apple Development"* ]]
   [[ "$output" == *"TeamIdentifier=ABCDE12345"* ]]
   [ -f "$APP/Contents/MacOS/deskflow-core" ]
-  log_has "codesign --verify --deep --strict $APP"
-  log_has "codesign -dvvv $APP/Contents/MacOS/deskflow-core"
+  # The signature is checked on the STAGED bundle, never on the live path.
+  log_has "codesign --verify --deep --strict "
+  log_lacks "codesign --verify --deep --strict $APP"
+  log_lacks "codesign -dvvv $APP/Contents/MacOS/deskflow-core"
+  grep -q '^codesign -dvvv .*/deskflow-install\..*/Deskflow.app/Contents/MacOS/deskflow-core$' "$SHIM_LOG"
   log_has "launchctl bootstrap gui/$(id -u) $DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow-core.plist"
   log_has "launchctl bootstrap gui/$(id -u) $DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow.plist"
-  # stop (ps inventory) happens before the bundle swap, start after verify
-  stop_line="$(grep -n '^ps ' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  # verify happens BEFORE stop (ps inventory), start after the swap
   verify_line="$(grep -n '^codesign --verify' "$SHIM_LOG" | cut -d: -f1)"
+  stop_line="$(grep -n '^ps ' "$SHIM_LOG" | head -1 | cut -d: -f1)"
   start_line="$(grep -n 'launchctl bootstrap' "$SHIM_LOG" | head -1 | cut -d: -f1)"
-  [ "$stop_line" -lt "$verify_line" ]
-  [ "$verify_line" -lt "$start_line" ]
+  [ "$verify_line" -lt "$stop_line" ]
+  [ "$stop_line" -lt "$start_line" ]
   log_lacks "open "
   log_lacks "pkill"
   log_lacks "osascript"
+  # the deploy lock and the stage dir are gone once the install finished
+  [ ! -e "$HOME/Library/Deskflow/deploy.lock" ]
+  stage="$(grep -o 'deskflow-install\.[A-Za-z0-9]*' "$SHIM_LOG" | head -1)"
+  [ -n "$stage" ]
+  [ ! -e "${TMPDIR:-/tmp}/$stage" ]
+}
+
+@test "a rejected build never touches the running seat: no bootout, no .bak, live bundle intact" {
+  mkdir -p "$APP/Contents/MacOS"; echo live >"$APP/Contents/MacOS/deskflow-core"
+  SHIM_CODESIGN_VERIFY_RC=1 run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  log_lacks "launchctl bootout"
+  log_lacks "ps "
+  [ ! -e "$APP.bak" ]
+  [ "$(cat "$APP/Contents/MacOS/deskflow-core")" = "live" ]
+  [[ "$output" != *"Stopping Deskflow"* ]]
+  [[ "$output" != *"Installing to"* ]]
+  [ ! -e "$HOME/Library/Deskflow/deploy.lock" ]
+}
+
+@test "the deploy lock (pid) exists from before ctl stop until after ctl start, then is removed" {
+  # ps is called by ctl stop; launchctl bootstrap by ctl start. Record the
+  # lock state at both moments.
+  make_shim ps <<'EOF'
+echo "ps $*" >> "$SHIM_LOG"
+[[ -f "$HOME/Library/Deskflow/deploy.lock" ]] && echo "lock-at-stop pid=$(cat "$HOME/Library/Deskflow/deploy.lock")" >> "$SHIM_LOG"
+exit 0
+EOF
+  make_shim launchctl <<'EOF'
+echo "launchctl $*" >> "$SHIM_LOG"
+case "${1:-}" in
+  print) [[ -f "$SHIM_STATE/loaded-${2##*/}" ]] || exit 113; echo "	pid = 4242" ;;
+  bootstrap) touch "$SHIM_STATE/loaded-$(basename "$3" .plist)"; [[ -f "$HOME/Library/Deskflow/deploy.lock" ]] && echo "lock-at-start" >> "$SHIM_LOG" ;;
+esac
+exit 0
+EOF
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  grep -qE '^lock-at-stop pid=[0-9]+$' "$SHIM_LOG"
+  log_has "lock-at-start"
+  [ ! -e "$HOME/Library/Deskflow/deploy.lock" ]
 }
 
 @test "no pkill/pgrep/open/osascript and no Mouser reference remain in the script" {

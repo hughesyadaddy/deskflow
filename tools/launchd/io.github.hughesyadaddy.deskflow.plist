@@ -5,9 +5,13 @@
   `open`. Rendered into ~/Library/LaunchAgents by `scripts/deskflow-ctl start`
   (__APP__ -> the installed bundle, __HOME__ -> $HOME).
 
-  RunAtLoad starts it at bootstrap/login; KeepAlive is false so a user quit
-  from the tray sticks. `scripts/deskflow-ctl restart` relaunches it with
-  `launchctl kickstart -k`.
+  RunAtLoad starts it at bootstrap/login; KeepAlive/SuccessfulExit=false
+  relaunches it after a crash or non-zero exit (ThrottleInterval bounds the
+  loop), while a clean tray Quit (exit 0) sticks: the GUI also writes the
+  quit-intent sentinel that keeps `deskflow-ctl converge` from bootstrapping
+  it back until the next `deskflow-ctl start` or reboot.
+  DESKFLOW_LAUNCHD=1 tells the GUI it is launchd-owned: it must not register
+  itself as a Login Item nor spawn its own core.
 -->
 <plist version="1.0">
 <dict>
@@ -20,7 +24,17 @@
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <false/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DESKFLOW_LAUNCHD</key>
+    <string>1</string>
+  </dict>
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>LimitLoadToSessionType</key>

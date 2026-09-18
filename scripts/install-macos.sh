@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Stop Deskflow via launchd, install the built .app to /Applications, start it again.
+# Stage + verify the built .app, then stop Deskflow via launchd, swap it into
+# /Applications and start it again. Verification happens BEFORE the running
+# seat is touched, so a rejected build never leaves agents booted out.
 #
 # Process lifecycle goes through scripts/deskflow-ctl only (launchctl
 # bootout / bootstrap): no pattern kills, no `open`. This script touches
@@ -71,10 +73,13 @@ usage() {
   cat <<'EOF'
 Usage: scripts/install-macos.sh [--no-restart] [--install-app PATH]
 
-Stops Deskflow through scripts/deskflow-ctl (launchctl bootout), installs the
-built bundle to /Applications/Deskflow.app (or DESKFLOW_INSTALL_APP), clears
-quarantine, verifies codesign (fatal on failure), and starts it again through
+Stages the built bundle, verifies codesign on the STAGED copy (fatal on
+failure, nothing touched yet), then stops Deskflow through scripts/deskflow-ctl
+(launchctl bootout), swaps the bundle into /Applications/Deskflow.app (or
+DESKFLOW_INSTALL_APP), clears quarantine, and starts it again through
 scripts/deskflow-ctl (launchctl bootstrap). --no-restart leaves it stopped.
+A deploy lock (~/Library/Deskflow/deploy.lock) keeps `deskflow-ctl converge`
+from bootstrapping agents mid-swap.
 
 The deskflow-prio LaunchDaemon (system/io.github.hughesyadaddy.deskflow-prio,
 root: task_for_pid) is rendered by `deskflow-ctl prio`; this script never
@@ -148,66 +153,95 @@ verify_signature() {
   grep -E '^(Authority|TeamIdentifier)=' <<<"$info"
 }
 
+# Stage the new bundle somewhere it can be verified in full BEFORE the running
+# seat is touched. Sets STAGED_APP; STAGE_TMP is the mktemp dir to remove
+# afterwards (empty when the build tree is used in place).
+STAGE_TMP=""
+STAGED_APP=""
+stage_bundle() {
+  if [[ -d "$BUILD_DIR" ]] && [[ -f "$BUILD_DIR/cmake_install.cmake" ]]; then
+    STAGE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/deskflow-install.XXXXXX")"
+    echo "Using staged cmake --install (macdeployqt + bundle layout)"
+    cmake --install "$BUILD_DIR" --prefix "$STAGE_TMP"
+    if [[ ! -d "$STAGE_TMP/Deskflow.app" ]]; then
+      echo "error: staged install did not produce Deskflow.app" >&2
+      exit 1
+    fi
+    STAGED_APP="$STAGE_TMP/Deskflow.app"
+  elif [[ -d "$SOURCE_APP" ]]; then
+    echo "Using build tree copy from $SOURCE_APP"
+    STAGED_APP="$SOURCE_APP"
+  else
+    echo "error: no install source — build first (missing $SOURCE_APP and $BUILD_DIR/cmake_install.cmake)" >&2
+    exit 1
+  fi
+}
+
+# Everything that can reject a bundle runs here, against the staged copy,
+# while the old install is still running. A rejected build must never leave
+# the seat with its agents booted out and no bundle to bootstrap.
+verify_staged() {
+  local app="$1"
+  verify_signature "$app"
+  # The login-bridge installer is bundled into Contents/Resources by CMake
+  # (src/apps/deskflow-gui/CMakeLists.txt, MACOSX_PACKAGE_LOCATION) BEFORE the
+  # bundle is signed, so it is covered by the seal. Never copy files into the
+  # bundle after verify_signature: that invalidates the signature just checked.
+  if [[ ! -f "$app/Contents/Resources/install-login-bridge-macos.sh" ]]; then
+    echo "error: $app/Contents/Resources/install-login-bridge-macos.sh missing — the bundle was built without the login bridge helper (rebuild; do not copy it in post-sign)" >&2
+    exit 1
+  fi
+  # libqsvgicon.dylib needs QtSvg.framework; without it tray/menu SVG icons are blank
+  # in Release installs while Debug (Homebrew Qt) still works.
+  if [[ -f "$app/Contents/PlugIns/iconengines/libqsvgicon.dylib" ]] &&
+     [[ ! -d "$app/Contents/Frameworks/QtSvg.framework" ]]; then
+    echo "error: libqsvgicon.dylib is present but QtSvg.framework is missing — rebuild with Qt6::Svg linked" >&2
+    exit 1
+  fi
+}
+
 install_bundle() {
+  local staged="$1"
   echo "== Installing to $INSTALL_APP =="
   if [[ -e "$INSTALL_APP" ]]; then
     rm -rf "${INSTALL_APP}.bak"
     mv "$INSTALL_APP" "${INSTALL_APP}.bak"
     echo "Backed up previous install to ${INSTALL_APP}.bak"
   fi
-
-  if [[ -d "$BUILD_DIR" ]] && [[ -f "$BUILD_DIR/cmake_install.cmake" ]]; then
-    local stage
-    stage="$(mktemp -d "${TMPDIR:-/tmp}/deskflow-install.XXXXXX")"
-    echo "Using staged cmake --install (macdeployqt + bundle layout)"
-    cmake --install "$BUILD_DIR" --prefix "$stage"
-    if [[ ! -d "$stage/Deskflow.app" ]]; then
-      rm -rf "$stage"
-      echo "error: staged install did not produce Deskflow.app" >&2
-      exit 1
+  if ! cp -R "$staged" "$INSTALL_APP" || [[ ! -d "$INSTALL_APP" ]]; then
+    echo "error: copying $staged to $INSTALL_APP failed" >&2
+    if [[ -d "${INSTALL_APP}.bak" ]]; then
+      rm -rf "$INSTALL_APP"
+      mv "${INSTALL_APP}.bak" "$INSTALL_APP"
+      echo "restored previous install from ${INSTALL_APP}.bak" >&2
     fi
-    cp -R "$stage/Deskflow.app" "$INSTALL_APP"
-    rm -rf "$stage"
-  elif [[ -d "$SOURCE_APP" ]]; then
-    echo "Using build tree copy from $SOURCE_APP"
-    cp -R "$SOURCE_APP" "$INSTALL_APP"
-  else
-    echo "error: no install source — build first (missing $SOURCE_APP and $BUILD_DIR/cmake_install.cmake)" >&2
     exit 1
   fi
-
-  if [[ ! -d "$INSTALL_APP" ]]; then
-    echo "error: install failed — $INSTALL_APP not found" >&2
-    exit 1
-  fi
-
   xattr -cr "$INSTALL_APP" 2>/dev/null || true # fleet:allow quarantine attrs may simply not exist
-
-  verify_signature "$INSTALL_APP"
-
-  # libqsvgicon.dylib needs QtSvg.framework; without it tray/menu SVG icons are blank
-  # in Release installs while Debug (Homebrew Qt) still works.
-  if [[ -f "$INSTALL_APP/Contents/PlugIns/iconengines/libqsvgicon.dylib" ]] &&
-     [[ ! -d "$INSTALL_APP/Contents/Frameworks/QtSvg.framework" ]]; then
-    echo "error: libqsvgicon.dylib is present but QtSvg.framework is missing — rebuild with Qt6::Svg linked" >&2
-    exit 1
-  fi
 }
 
-# The login-bridge installer is bundled into Contents/Resources by CMake
-# (src/apps/deskflow-gui/CMakeLists.txt, MACOSX_PACKAGE_LOCATION) BEFORE the
-# bundle is signed, so it is covered by the seal. Never copy files into the
-# bundle after verify_signature: that invalidates the signature we just checked.
-verify_login_bridge_bundled() {
-  local dest="$INSTALL_APP/Contents/Resources/install-login-bridge-macos.sh"
-  if [[ ! -f "$dest" ]]; then
-    echo "error: $dest missing — the bundle was built without the login bridge helper (rebuild; do not copy it in post-sign)" >&2
-    exit 1
-  fi
+# `deskflow-ctl converge` (a 60 s launchd tick) must not bootstrap agents
+# back in the middle of the swap; it stands down while this lock is younger
+# than 30 min.
+DEPLOY_LOCK="$HOME/Library/Deskflow/deploy.lock"
+LOCK_TAKEN=0
+take_deploy_lock() {
+  mkdir -p "$(dirname "$DEPLOY_LOCK")"
+  echo "$$" >"$DEPLOY_LOCK"
+  LOCK_TAKEN=1
 }
+cleanup() {
+  # Only this run's lock: a concurrent install's lock must survive our exit.
+  (( LOCK_TAKEN )) && rm -f "$DEPLOY_LOCK"
+  [[ -n "$STAGE_TMP" ]] && rm -rf "$STAGE_TMP"
+  return 0
+}
+trap cleanup EXIT
 
+stage_bundle
+verify_staged "$STAGED_APP"
+take_deploy_lock
 quit_deskflow
-install_bundle
-verify_login_bridge_bundled
+install_bundle "$STAGED_APP"
 start_deskflow
 echo "== Done: $INSTALL_APP =="

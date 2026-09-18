@@ -5,11 +5,12 @@
 
 .DESCRIPTION
   Verbs:
-    stop           Stop-Service Deskflow (poll <=10 s), taskkill the service PID
-                   if the SCM hangs, then taskkill /F /T every process whose
+    stop           suspend the service's recovery actions, Stop-Service Deskflow
+                   (poll <=30 s), taskkill the service PID if the SCM hangs, then taskkill /F /T every process whose
                    ExecutablePath is under the install root (ALL sessions).
                    Loops <=25 s; throws if anything remains. Never touches Mouser.
     start          sign (scripts/sign-windows.ps1) -> sc create/config ->
+                   sc failure (restart 1s/5s/30s) + C:\ProgramData\Deskflow ->
                    Start-Service -> wait <=15 s for a deskflow-core.exe whose
                    ParentProcessId is the service PID -> launch the GUI into the
                    interactive console session via a scheduled task.
@@ -168,6 +169,10 @@ function Stop-Deskflow {
 
   $svc = Get-DeskflowService
   if ($svc) {
+    # A taskkill of the daemon below would otherwise trip the SCM recovery
+    # actions and restart the service we are stopping. Suspend them for the
+    # duration; ctl start (Register-DeskflowService) restores them.
+    Suspend-DeskflowServiceRecovery
     if ($svc.State -ne 'Stopped') {
       Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
     }
@@ -235,6 +240,34 @@ function Register-DeskflowService {
     Write-Host "== sc create $ServiceName =="
     sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= $ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed ($LASTEXITCODE)" }
+  }
+  Set-DeskflowServiceRecovery
+  New-DeskflowProgramData
+}
+
+function Suspend-DeskflowServiceRecovery {
+  sc.exe failure $ServiceName reset= 0 actions= "" | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "sc.exe failure (suspend) failed ($LASTEXITCODE)" }
+}
+
+function Set-DeskflowServiceRecovery {
+  # A daemon crash used to stay down until someone ran ctl start: the service
+  # was registered with no recovery actions. failureflag=1 also counts a
+  # non-zero exit (not only an SCM-detected crash) as a failure.
+  Write-Host "== sc failure $ServiceName (restart 1s/5s/30s, reset 24h) =="
+  sc.exe failure $ServiceName reset= 86400 actions= restart/1000/restart/5000/restart/30000 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "sc.exe failure failed ($LASTEXITCODE)" }
+  sc.exe failureflag $ServiceName 1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "sc.exe failureflag failed ($LASTEXITCODE)" }
+}
+
+function New-DeskflowProgramData {
+  # The daemon log lives here and the daemon never creates the directory, so a
+  # fresh seat silently logs nothing (LogOutputters.cpp) until it exists.
+  $dir = Join-Path $env:ProgramData 'Deskflow'
+  if (-not (Test-Path -LiteralPath $dir)) {
+    Write-Host "== creating $dir =="
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
   }
 }
 

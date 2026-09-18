@@ -3,7 +3,7 @@
 
 Usage:
   tools/fleet-health [--host all|local|<id>]
-                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|instances|bridge|all]
+                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|instances|bridge|loginbridge|all]
                      [--json] [--env PATH]
 
 Reads scripts/fleet.env (same format as fleet-doctor / fleet-deploy.sh):
@@ -41,6 +41,13 @@ Checks:
                              peer:"deskflow-core" (macOS: nc -w2; Windows: the
                              ps1 collector via .NET TcpClient). Catches a core
                              that is running but silently in legacy/off mode.
+  loginbridge                the LoginWindow bridge agent (macOS): the plist
+                             exists and lints, its program is the installed
+                             bundle's deskflow-vhid-bridge, the log is mode 600
+                             and holds no keystrokes, and -- when passwordless
+                             sudo is available -- launchctl reports the agent
+                             in the loginwindow domain (else that part is SKIP
+                             with the reason).
 
 Environment overrides:
   DESKFLOW_EXPECT_AUTHORITY  expected `Authority=` prefix (default "Apple Development")
@@ -69,8 +76,9 @@ REPO_ROOT = TOOLS_DIR.parent
 DEFAULT_ENV_FILE = REPO_ROOT / "scripts" / "fleet.env"
 IDENTIFIERS_FILE = TOOLS_DIR / "fleet-health.identifiers"
 
-ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh", "instances", "bridge")
-MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc"}
+ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh", "instances", "bridge",
+              "loginbridge")
+MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc", "loginbridge"}
 WIN_ONLY = {"authenticode"}
 
 MAC_APPS = ("/Applications/Deskflow.app", "/Applications/Mouser.app")
@@ -93,6 +101,12 @@ DEFAULT_MESH_PORT = 24851
 BRIDGE_PORT = 19795
 BRIDGE_PEER = "deskflow-core"
 DEFAULT_AUTHORITY = "Apple Development"
+# LoginWindow bridge (scripts/install-login-bridge-macos.sh renders the plist).
+LOGIN_BRIDGE_LABEL = "org.deskflow.vhid-bridge"
+LOGIN_BRIDGE_PLIST = f"/Library/LaunchAgents/{LOGIN_BRIDGE_LABEL}.plist"
+LOGIN_BRIDGE_BIN = "/Applications/Deskflow.app/Contents/MacOS/deskflow-vhid-bridge"
+LOGIN_BRIDGE_LOG = "/var/log/deskflow-vhid-bridge.log"
+LOGIN_BRIDGE_KEYSTROKE_MARK = "key down id="
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
@@ -356,6 +370,30 @@ def ctl_assert_single_cmd(root: str = MAC_DESKFLOW_ROOT) -> str:
     else:
         root = shlex.quote(root)
     return f"{root}/scripts/deskflow-ctl assert-single"
+
+
+def login_bridge_plist_cmd(plist: str = LOGIN_BRIDGE_PLIST) -> str:
+    """Lint the bridge plist and print its program path (ProgramArguments[0])."""
+    q = shlex.quote(plist)
+    return f"test -f {q} && plutil -lint {q} >/dev/null && plutil -extract ProgramArguments.0 raw -o - {q}"
+
+
+def login_bridge_log_mode_cmd(log: str = LOGIN_BRIDGE_LOG) -> str:
+    return f"stat -f %Lp {shlex.quote(log)}"
+
+
+def sudo_probe_cmd() -> str:
+    return "sudo -n true"
+
+
+def login_bridge_agent_cmd(label: str = LOGIN_BRIDGE_LABEL) -> str:
+    return f"sudo -n launchctl print loginwindow/{label}"
+
+
+def login_bridge_keystroke_cmd(log: str = LOGIN_BRIDGE_LOG, mark: str = LOGIN_BRIDGE_KEYSTROKE_MARK) -> str:
+    # The log is root:0600, so the grep needs sudo too. grep -c exits 1 on zero
+    # matches; the count on stdout is what matters.
+    return f"sudo -n grep -c {shlex.quote(mark)} {shlex.quote(log)}"
 
 
 def ps1_cmd(root: str, checks: Sequence[str], thumbprint: str, port: int, peers: Sequence[str]) -> str:
@@ -645,6 +683,43 @@ class FleetHealth:
         ok, detail = parse_bridge_status(out)
         self._add(host, "bridge", PASS if ok else FAIL, detail)
 
+    def check_login_bridge_mac(self, host: Host) -> None:
+        problems: List[str] = []
+        rc, out, err = self.runner(host, login_bridge_plist_cmd())
+        if rc != 0:
+            problems.append(f"{LOGIN_BRIDGE_PLIST} missing or does not lint: {(err or out).strip()[:120] or f'rc={rc}'}")
+        elif out.strip() != LOGIN_BRIDGE_BIN:
+            problems.append(f"plist program {out.strip() or '?'} != {LOGIN_BRIDGE_BIN}")
+        rc, out, err = self.runner(host, login_bridge_log_mode_cmd())
+        if rc != 0:
+            problems.append(f"{LOGIN_BRIDGE_LOG} missing (rc={rc})")
+        elif out.strip() != "600":
+            problems.append(f"{LOGIN_BRIDGE_LOG} mode {out.strip() or '?'} (want 600; it holds login-window keystrokes)")
+        rc, _, _ = self.runner(host, sudo_probe_cmd())
+        sudo_ok = rc == 0
+        agent = ""
+        if sudo_ok:
+            rc, out, err = self.runner(host, login_bridge_agent_cmd())
+            if rc != 0:
+                problems.append(f"loginwindow/{LOGIN_BRIDGE_LABEL} not loaded (launchctl rc={rc})")
+            else:
+                m = re.search(r"^\s*pid = (\d+)", out, re.M)
+                agent = f"agent pid {m.group(1)}" if m else "agent loaded, no pid (normal outside the login window)"
+            rc, out, err = self.runner(host, login_bridge_keystroke_cmd())
+            count = out.strip().splitlines()[-1] if out.strip() else ""
+            if not count.isdigit():
+                problems.append(f"keystroke grep failed: {(err or out).strip()[:80] or f'rc={rc}'}")
+            elif int(count) > 0:
+                problems.append(f"{count} '{LOGIN_BRIDGE_KEYSTROKE_MARK}' lines in {LOGIN_BRIDGE_LOG} (keystrokes logged)")
+        if problems:
+            self._add(host, "loginbridge", FAIL, "; ".join(problems))
+        elif not sudo_ok:
+            self._add(host, "loginbridge", SKIP,
+                      "plist lints + program ok, log mode 600; agent state and keystroke grep need "
+                      "passwordless sudo (sudo -n failed)")
+        else:
+            self._add(host, "loginbridge", PASS, f"plist lints, program ok, log 600 with 0 keystrokes, {agent}")
+
     def check_mesh_leg_mac(self, src: Host, dst: Host) -> None:
         rc, out, err = self.runner(src, nc_cmd(dst.addr, self.mesh_port))
         status = PASS if rc == 0 else FAIL
@@ -713,6 +788,8 @@ class FleetHealth:
                     self.check_instances_mac(host)
                 elif c == "bridge":
                     self.check_bridge_mac(host)
+                elif c == "loginbridge":
+                    self.check_login_bridge_mac(host)
                 elif c == "mesh":
                     if not peers:
                         self._add(host, "mesh", SKIP, "no peers")

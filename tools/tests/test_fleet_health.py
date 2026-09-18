@@ -70,6 +70,11 @@ CTL_FAIL = ("deskflow-ctl assert-single: FAIL\n"
 # Mouser's reply to {"t":"status"} on 127.0.0.1:19795 when deskflow-core is attached.
 BRIDGE_OK = '{"t":"status","attached":true,"peer":"deskflow-core","session":"a1b2","proto":2}'
 
+# `sudo -n launchctl print loginwindow/org.deskflow.vhid-bridge` at a login window.
+LOGIN_BRIDGE_PRINT = ("loginwindow/org.deskflow.vhid-bridge = {\n\tactive count = 1\n\tpath = /Library/LaunchAgents/"
+                      "org.deskflow.vhid-bridge.plist\n\tstate = running\n\n\tprogram = /Applications/Deskflow.app/"
+                      "Contents/MacOS/deskflow-vhid-bridge\n\tpid = 611\n}\n")
+
 # Fixture JSON as emitted by tools/fleet-health.ps1 for --check instances.
 WIN_INSTANCES_PASS = [{"check": "instances", "status": "PASS",
                        "detail": "deskflow-ctl assert-single: OK (daemon=1 session 0 pid 1000; core=1 child of service in session 1; gui=1; bridge=0)"}]
@@ -115,6 +120,11 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.mouser_running_cmd()): (0, "4243\n", ""),
         (hid, fh.ctl_assert_single_cmd()): (0, CTL_OK + "\n", ""),
         (hid, fh.bridge_status_cmd()): (0, BRIDGE_OK + "\n", ""),
+        (hid, fh.login_bridge_plist_cmd()): (0, fh.LOGIN_BRIDGE_BIN + "\n", ""),
+        (hid, fh.login_bridge_log_mode_cmd()): (0, "600\n", ""),
+        (hid, fh.sudo_probe_cmd()): (0, "", ""),
+        (hid, fh.login_bridge_agent_cmd()): (0, LOGIN_BRIDGE_PRINT, ""),
+        (hid, fh.login_bridge_keystroke_cmd()): (1, "0\n", ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, fh.DEFAULT_MESH_PORT))] = (0, "", "")
@@ -532,6 +542,90 @@ def test_bridge_is_included_in_all(tmp_path, capsys):
     assert ("macbookpro", fh.bridge_status_cmd()) in runner.calls
 
 
+# ----------------------------------------------------------- loginbridge
+
+
+def test_loginbridge_cmds_target_root_paths_and_use_sudo_n_only():
+    assert "loginbridge" in fh.ALL_CHECKS and "loginbridge" in fh.MAC_ONLY
+    assert fh.login_bridge_plist_cmd().startswith("test -f /Library/LaunchAgents/org.deskflow.vhid-bridge.plist && plutil -lint")
+    assert "ProgramArguments.0" in fh.login_bridge_plist_cmd()
+    assert fh.login_bridge_log_mode_cmd() == "stat -f %Lp /var/log/deskflow-vhid-bridge.log"
+    assert fh.sudo_probe_cmd() == "sudo -n true"
+    assert fh.login_bridge_agent_cmd() == "sudo -n launchctl print loginwindow/org.deskflow.vhid-bridge"
+    assert fh.login_bridge_keystroke_cmd() == "sudo -n grep -c 'key down id=' /var/log/deskflow-vhid-bridge.log"
+    # never an interactive sudo in any command string the tool ships
+    import re as _re
+    for m in _re.finditer(r'f?"([^"\n]*sudo[^"\n]*)"', TOOL.read_text()):
+        assert "sudo -n" in m.group(1), m.group(1)
+
+
+def test_loginbridge_pass_reports_pid_and_zero_keystrokes():
+    results, runner = run_checks([mac()], mac_ok_table(), ["loginbridge"])
+    assert [r.check for r in results] == ["loginbridge"]
+    assert results[0].status == "PASS", results[0].detail
+    assert "agent pid 611" in results[0].detail and "0 keystrokes" in results[0].detail
+    assert ("macbookpro", fh.login_bridge_keystroke_cmd()) in runner.calls
+
+
+def test_loginbridge_skips_privileged_parts_without_passwordless_sudo():
+    t = mac_ok_table()
+    t[("macbookpro", fh.sudo_probe_cmd())] = (1, "", "sudo: a password is required")
+    results, runner = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "SKIP" and results[0].ok
+    assert "passwordless sudo" in results[0].detail and "log mode 600" in results[0].detail
+    assert ("macbookpro", fh.login_bridge_agent_cmd()) not in runner.calls
+    assert ("macbookpro", fh.login_bridge_keystroke_cmd()) not in runner.calls
+    # unprivileged problems still FAIL even without sudo
+    t[("macbookpro", fh.login_bridge_log_mode_cmd())] = (0, "644\n", "")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "mode 644" in results[0].detail
+
+
+def test_loginbridge_fails_on_missing_plist_wrong_program_or_agent_not_loaded():
+    t = mac_ok_table()
+    t[("macbookpro", fh.login_bridge_plist_cmd())] = (1, "", "")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "missing or does not lint" in results[0].detail
+
+    t = mac_ok_table()
+    t[("macbookpro", fh.login_bridge_plist_cmd())] = (0, "/usr/local/bin/deskflow-vhid-bridge\n", "")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "plist program /usr/local/bin/deskflow-vhid-bridge !=" in results[0].detail
+
+    t = mac_ok_table()
+    t[("macbookpro", fh.login_bridge_agent_cmd())] = (113, "", "Could not find service")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "not loaded" in results[0].detail
+
+
+def test_loginbridge_fails_when_the_log_holds_keystrokes_or_grep_breaks():
+    t = mac_ok_table()
+    t[("macbookpro", fh.login_bridge_keystroke_cmd())] = (0, "641\n", "")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "641 'key down id=' lines" in results[0].detail
+    t[("macbookpro", fh.login_bridge_keystroke_cmd())] = (2, "", "grep: /var/log/deskflow-vhid-bridge.log: No such file")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "keystroke grep failed" in results[0].detail
+
+
+def test_loginbridge_agent_loaded_without_pid_is_fine_outside_the_login_window():
+    t = mac_ok_table()
+    t[("macbookpro", fh.login_bridge_agent_cmd())] = (0, LOGIN_BRIDGE_PRINT.replace("\tpid = 611\n", ""), "")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "PASS" and "no pid" in results[0].detail
+
+
+def test_loginbridge_is_mac_only_and_included_in_all(tmp_path, capsys):
+    results, runner = run_checks([win()], {}, ["loginbridge"])
+    assert results[0].status == "SKIP" and runner.calls == []
+    env_file = write_env(tmp_path)
+    runner = FakeRunner(mac_ok_table())
+    rc = fh.main(["--json", "--env", str(env_file)], runner=runner)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert [r for r in out["results"] if r["check"] == "loginbridge"][0]["status"] == "PASS"
+
+
 def test_bridge_ps1_collector_declares_the_check():
     ps1 = (Path(fh.__file__).parent / "fleet-health.ps1").read_text()
     assert '"bridge"       { $results += Test-Bridge $BridgePort }' in ps1
@@ -654,7 +748,7 @@ def test_main_all_checks_single_mac_host(tmp_path, capsys):
     rc = fh.main(["--env", str(env_file)], runner=FakeRunner(mac_ok_table()))
     text = capsys.readouterr().out
     assert rc == 0
-    for check in ("sign", "no-adhoc", "identifiers", "tcc", "session", "mesh", "instances", "bridge"):
+    for check in ("sign", "no-adhoc", "identifiers", "tcc", "session", "mesh", "instances", "bridge", "loginbridge"):
         assert f"| {check}" in text
     assert "authenticode" not in text  # windows-only, not shown for a mac unless explicit
 

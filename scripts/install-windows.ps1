@@ -168,6 +168,8 @@ if (Test-Path $InstallDir) {
   Remove-Item -LiteralPath $InstallDir -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+# The daemon logs to C:\ProgramData\Deskflow and never creates it.
+New-Item -ItemType Directory -Force -Path (Join-Path $env:ProgramData 'Deskflow') | Out-Null
 
 Write-Host "Copying runtime from $releaseDir..."
 Copy-Item -Path (Join-Path $releaseDir '*') -Destination $InstallDir -Recurse -Force

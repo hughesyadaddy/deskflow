@@ -34,6 +34,11 @@
   </dict>
   <key>ThrottleInterval</key>
   <integer>5</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DESKFLOW_LAUNCHD</key>
+    <string>1</string>
+  </dict>
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>LimitLoadToSessionType</key>

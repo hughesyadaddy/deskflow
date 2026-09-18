@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
 # Install the Deskflow login-window LaunchAgent (org.deskflow.vhid-bridge).
-# Reads coordination settings from ~/Library/Deskflow/Deskflow.conf, stages the
-# plist, and installs it with an admin prompt. Retires the legacy kvm-autoswitch
-# login-window agent if present.
+# Reads coordination settings from ~/Library/Deskflow/Deskflow.conf, renders
+# the plist, and installs it: directly when already root (ssh + sudo), via an
+# admin prompt otherwise. Retires the legacy kvm-autoswitch launchers.
+#
+# This is the ONLY generator of the bridge plist; the GUI (LoginBridgeManager)
+# calls it with --dry-run to compare and without to install.
 #
 # After install: log out or restart — LoginWindow agents do not hot-load.
 set -euo pipefail
 
-CONF="${DESKFLOW_SETTINGS:-$HOME/Library/Deskflow/Deskflow.conf}"
-BRIDGE="/Applications/Deskflow.app/Contents/MacOS/deskflow-vhid-bridge"
+# Under `sudo` HOME is root's; the settings belong to the invoking user.
+USER_HOME="$HOME"
+if [[ -n "${SUDO_USER:-}" && -z "${DESKFLOW_SETTINGS:-}" ]]; then
+  USER_HOME="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }' || true)" # fleet:allow unknown user = empty, rejected below
+  [[ -n "$USER_HOME" ]] || { echo "error: cannot resolve home of SUDO_USER=$SUDO_USER; set DESKFLOW_SETTINGS" >&2; exit 1; }
+fi
+CONF="${DESKFLOW_SETTINGS:-$USER_HOME/Library/Deskflow/Deskflow.conf}"
+APP="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
+APP="${APP%/}"
+BRIDGE="$APP/Contents/MacOS/deskflow-vhid-bridge"
 AGENT_LABEL="org.deskflow.vhid-bridge"
-AGENT_PLIST="/Library/LaunchAgents/${AGENT_LABEL}.plist"
-LEGACY_PLIST="/Library/LaunchAgents/com.kvm.autoswitch.loginwindow.plist"
-LOG_PATH="/var/log/deskflow-vhid-bridge.log"
+AGENT_PLIST="${DESKFLOW_LOGIN_BRIDGE_PLIST:-/Library/LaunchAgents/${AGENT_LABEL}.plist}"
+LEGACY_PLIST="$(dirname "$AGENT_PLIST")/com.kvm.autoswitch.loginwindow.plist"
+LEGACY_USER_LABEL="com.kvm.autoswitch"
+LOG_PATH="${DESKFLOW_LOGIN_BRIDGE_LOG:-/var/log/deskflow-vhid-bridge.log}"
+MACHINE_LOCK_DIR="${DESKFLOW_MACHINE_LOCK_DIR:-/private/var/db/deskflow}"
 SCALE="${DESKFLOW_LOGIN_BRIDGE_SCALE:-}"
 SCALE_FIXED=0
 
@@ -23,13 +36,21 @@ Usage: scripts/install-login-bridge-macos.sh [--scale N] [--scale-fixed] [--dry-
 Installs /Library/LaunchAgents/org.deskflow.vhid-bridge.plist from Deskflow.conf.
 Requires Karabiner DriverKit VirtualHIDDevice and deskflow-vhid-bridge in the app bundle.
 
+--dry-run writes the rendered plist to stdout (the summary goes to stderr)
+and installs nothing; callers compare it against the installed file.
+
 By default the bridge is started with --calibrate: it measures its own
 counts-per-point at startup and corrects every move against the real cursor,
 so no --scale is passed. --scale N (or loginBridgeScale in config) is only a
 seed unless --scale-fixed is given, which disables calibration entirely.
 
+Server hosts come from [coordination] peers: only the address and LAN
+fields of each `name=address|lan|mac|wakeCommand` entry; MAC addresses and
+wake commands are never used as hosts.
+
 Environment:
   DESKFLOW_SETTINGS              Path to Deskflow.conf (default: ~/Library/Deskflow/Deskflow.conf)
+  DESKFLOW_INSTALL_APP           Bundle holding deskflow-vhid-bridge (default: /Applications/Deskflow.app)
   DESKFLOW_LOGIN_BRIDGE_SCALE    Seed scale (only authoritative with --scale-fixed)
 EOF
 }
@@ -38,12 +59,26 @@ dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --scale) SCALE="$2"; shift 2 ;;
+    --scale=*) SCALE="${1#--scale=}"; shift ;;
     --scale-fixed) SCALE_FIXED=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+# Hard structural guard (same class as install-macos.sh): under bats every
+# path this script would write must live in a tmp sandbox.
+if [[ -n "${BATS_TEST_FILENAME:-}" && "$dry_run" -eq 0 ]]; then
+  for _p in "$AGENT_PLIST" "$LOG_PATH" "$MACHINE_LOCK_DIR"; do
+    case "$_p" in
+      "$TMPDIR"*|/tmp/*|/private/tmp/*|/private/var/folders/*|"${BATS_TMPDIR:-__unset__}"*|\
+      "${BATS_RUN_TMPDIR:-__unset__}"*|"${BATS_TEST_TMPDIR:-__unset__}"*|"${BATS_FILE_TMPDIR:-__unset__}"*) ;;
+      *) echo "FATAL: running under bats but '$_p' is not inside a tmp sandbox. Aborting." >&2; exit 90 ;;
+    esac
+  done
+  unset _p
+fi
 
 if [[ ! -f "$CONF" ]]; then
   echo "error: settings not found at $CONF" >&2
@@ -74,8 +109,10 @@ peers_raw="$(read_ini coordination peers)"
 if [[ -z "$SCALE" ]]; then
   SCALE="$(read_ini coordination loginBridgeScale)"
 fi
-# No default scale: the bridge self-calibrates. A configured scale is passed as
-# a seed; --scale-fixed makes it authoritative (legacy behaviour).
+if [[ -n "$SCALE" ]] && ! [[ "$SCALE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "error: --scale must be a positive number, got '$SCALE'" >&2
+  exit 1
+fi
 scale_args=()
 if [[ -n "$SCALE" ]]; then
   scale_args+=("<string>--scale=${SCALE}</string>")
@@ -98,41 +135,51 @@ fi
 if [[ -z "$port" ]]; then
   port=24800
 fi
+if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+  echo "error: core/port must be 1-65535, got '$port'" >&2
+  exit 1
+fi
 
-# Peer entries: name or name=addr[|addr...]. Exclude self; collect host candidates.
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e "s/'/\&apos;/g" -e 's/"/\&quot;/g'; }
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
+
+# A host is a hostname or IP: never a MAC (six hex pairs) and never anything
+# with whitespace or shell metacharacters (a wake command).
+host_ok() {
+  [[ -n "$1" ]] || return 1
+  [[ "$1" =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]] && return 1
+  [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]
+}
+
 hosts=()
-IFS=',' read -r -a peer_entries <<< "${peers_raw// /}"
-for entry in "${peer_entries[@]}"; do
-  entry="${entry#"${entry%%[![:space:]]*}"}"
-  entry="${entry%"${entry##*[![:space:]]}"}"
+add_host() {
+  local h="$1" existing
+  host_ok "$h" || return 0
+  for existing in ${hosts[@]+"${hosts[@]}"}; do
+    [[ "$existing" == "$h" ]] && return 0
+  done
+  hosts+=("$h")
+}
+
+# Peer syntax (src/lib/coordination/Peer.h): `name=address[|lan[|mac[|wakeCommand]]]`
+# or a bare name/address. Only fields 1-2 after `=` are hosts.
+IFS=',' read -r -a peer_entries <<< "$peers_raw"
+for entry in ${peer_entries[@]+"${peer_entries[@]}"}; do
+  entry="$(trim "$entry")"
   [[ -z "$entry" ]] && continue
   if [[ "$entry" == *=* ]]; then
-    name="${entry%%=*}"
-    name="${name%"${name##*[![:space:]]}"}"
-    addrs="${entry#*=}"
-    if [[ "$name" == "$computer_name" ]] || [[ "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$computer_name" | tr '[:upper:]' '[:lower:]')" ]]; then
-      continue
-    fi
-    IFS='|' read -r -a addr_list <<< "$addrs"
-    for addr in "${addr_list[@]}"; do
-      addr="${addr#"${addr%%[![:space:]]*}"}"
-      addr="${addr%"${addr##*[![:space:]]}"}"
-      [[ -z "$addr" ]] && continue
-      found=0
-      for h in "${hosts[@]:-}"; do
-        [[ "$h" == "$addr" ]] && found=1 && break
-      done
-      [[ "$found" -eq 0 ]] && hosts+=("$addr")
-    done
+    name="$(trim "${entry%%=*}")"
+    [[ "$(lower "$name")" == "$(lower "$computer_name")" ]] && continue
+    IFS='|' read -r addr lan _ <<< "${entry#*=}"
+    add_host "$(trim "${addr:-}")"
+    add_host "$(trim "${lan:-}")"
   else
-    if [[ "$entry" == "$computer_name" ]] || [[ "$(printf '%s' "$entry" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$computer_name" | tr '[:upper:]' '[:lower:]')" ]]; then
-      continue
-    fi
-    found=0
-    for h in "${hosts[@]:-}"; do
-      [[ "$h" == "$entry" ]] && found=1 && break
-    done
-    [[ "$found" -eq 0 ]] && hosts+=("$entry")
+    [[ "$(lower "$entry")" == "$(lower "$computer_name")" ]] && continue
+    add_host "$entry"
+    # Bare machine name: the core also tries <name>.local as the LAN candidate.
+    [[ "$entry" == *.* ]] || add_host "$entry.local"
   fi
 done
 
@@ -145,6 +192,8 @@ hosts_csv="$(IFS=,; echo "${hosts[*]}")"
 staged="$(mktemp "${TMPDIR:-/tmp}/deskflow-login-bridge.XXXXXX.plist")"
 trap 'rm -f "$staged"' EXIT
 
+# ExitTimeOut 3: launchd SIGKILLs the bridge 3 s after SIGTERM at session
+# handoff so the user core is not refused (kMsgEBusy) for the default 20 s.
 cat >"$staged" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -153,58 +202,70 @@ cat >"$staged" <<EOF
   <key>Label</key><string>${AGENT_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${BRIDGE}</string>
-    <string>${hosts_csv}</string>
-    <string>${computer_name}</string>
+    <string>$(xml_escape "$BRIDGE")</string>
+    <string>$(xml_escape "$hosts_csv")</string>
+    <string>$(xml_escape "$computer_name")</string>
     <string>${port}</string>
 ${scale_xml}
   </array>
   <key>LimitLoadToSessionType</key><string>LoginWindow</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${LOG_PATH}</string>
-  <key>StandardErrorPath</key><string>${LOG_PATH}</string>
+  <key>ExitTimeOut</key><integer>3</integer>
+  <key>StandardOutPath</key><string>$(xml_escape "$LOG_PATH")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$LOG_PATH")</string>
 </dict>
 </plist>
 EOF
 
-echo "== Login bridge agent =="
-echo "  Bridge:  $BRIDGE"
-echo "  Screen:  $computer_name"
-echo "  Port:    $port"
-if [[ "$SCALE_FIXED" -eq 1 ]]; then
-  echo "  Scale:   $SCALE (fixed, no calibration)"
-else
-  echo "  Scale:   self-calibrating${SCALE:+ (seed $SCALE)}"
-fi
-echo "  Servers: $hosts_csv"
-echo "  Plist:   $AGENT_PLIST"
-echo
-echo "Plist preview:"
-plutil -p "$staged"
-echo
+{
+  echo "== Login bridge agent =="
+  echo "  Bridge:  $BRIDGE"
+  echo "  Screen:  $computer_name"
+  echo "  Port:    $port"
+  if [[ "$SCALE_FIXED" -eq 1 ]]; then
+    echo "  Scale:   $SCALE (fixed, no calibration)"
+  else
+    echo "  Scale:   self-calibrating${SCALE:+ (seed $SCALE)}"
+  fi
+  echo "  Servers: $hosts_csv"
+  echo "  Plist:   $AGENT_PLIST"
+} >&2
 
 if [[ "$dry_run" -eq 1 ]]; then
-  echo "(dry run — not installing)"
+  cat "$staged"
   exit 0
 fi
 
-escaped_staged="${staged//\\/\\\\}"
-escaped_staged="${escaped_staged//\"/\\\"}"
-escaped_agent="${AGENT_PLIST//\\/\\\\}"
-escaped_agent="${escaped_agent//\"/\\\"}"
-escaped_legacy="${LEGACY_PLIST//\\/\\\\}"
-escaped_legacy="${escaped_legacy//\"/\\\"}"
+# The log holds relayed input from the login window; only root may read it.
+# The machine lock dir is where every core/bridge takes the machine-scope lock;
+# nothing non-root creates it otherwise (SingleInstanceLock falls back to /tmp).
+install_cmd="install -d '$(dirname "$AGENT_PLIST")' && \
+install -m 644 '$staged' '$AGENT_PLIST' && \
+rm -f '$LEGACY_PLIST' && \
+touch '$LOG_PATH' && chmod 600 '$LOG_PATH' && \
+install -d -m 1777 '$MACHINE_LOCK_DIR'"
 
-install_cmd="install -d /Library/LaunchAgents && install -m 644 -o root -g wheel '${escaped_staged}' '${escaped_agent}' && rm -f '${escaped_legacy}'; pkill -f '.kvm-autoswitch/coordinator.py' || true"
-
-osascript -e "do shell script \"${install_cmd}\" with administrator privileges"
+if [[ "$(id -u)" -eq 0 ]]; then
+  bash -c "$install_cmd"
+else
+  escaped="${install_cmd//\\/\\\\}"
+  escaped="${escaped//\"/\\\"}"
+  osascript -e "do shell script \"${escaped}\" with administrator privileges"
+fi
 
 echo "== Installed $AGENT_PLIST =="
+
+# The legacy per-user launcher used to pkill deskflow-core and spawn its own;
+# it must not survive next to launchd-owned agents. ~/.kvm-autoswitch stays
+# on disk for the operator to delete.
+legacy_uid="${SUDO_UID:-$(id -u)}"
+if launchctl print "gui/$legacy_uid/$LEGACY_USER_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$legacy_uid/$LEGACY_USER_LABEL" || true # fleet:allow best effort; reported below
+  echo "Retired legacy gui/$legacy_uid/$LEGACY_USER_LABEL (delete ~/.kvm-autoswitch by hand)."
+fi
 if [[ -f "$LEGACY_PLIST" ]]; then
   echo "warning: legacy plist still present at $LEGACY_PLIST" >&2
-else
-  echo "Retired legacy kvm-autoswitch login-window agent."
 fi
 echo
 echo "Next: log out or restart, then test from your elected server Mac."
