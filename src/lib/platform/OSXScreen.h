@@ -153,9 +153,6 @@ private:
   // map mac scroll wheel value to a deskflow scroll wheel value
   int32_t mapScrollWheelToDeskflow(int32_t) const;
 
-  // get the current scroll wheel speed
-  double getScrollSpeed() const;
-
   // Resolution switch callback
   static void displayReconfigurationCallback(CGDirectDisplayID, CGDisplayChangeSummaryFlags, void *);
 

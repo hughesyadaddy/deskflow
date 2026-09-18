@@ -10,6 +10,7 @@
 #include "coordination/KeyboardRelayMap.h"
 
 #include "base/Log.h"
+#include "platform/OSXInjectedEvent.h"
 
 #include <ApplicationServices/ApplicationServices.h>
 #include <Carbon/Carbon.h>
@@ -25,7 +26,8 @@ namespace {
 
 bool relayEventIsInjected(CGEventRef event)
 {
-  return CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid();
+  return CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid() ||
+         deskflow::platform::isInjectedEvent(event);
 }
 
 CGEventRef relaySwallowDecision(CGEventRef event, bool passLocal, bool isInjected, bool mapped, bool forwarded)

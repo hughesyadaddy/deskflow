@@ -8,6 +8,7 @@
 #include "platform/OSXKeyState.h"
 #include "arch/Arch.h"
 #include "base/Log.h"
+#include "platform/OSXInjectedEvent.h"
 #include "platform/OSXMainQueue.h"
 #include "platform/OSXMediaKeySupport.h"
 #include "platform/OSXUchrKeyResource.h"
@@ -919,6 +920,7 @@ void OSXKeyState::postKeyboardKey(CGKeyCode virtualKey, bool keyDown)
   CGEventRef event = CGEventCreateKeyboardEvent(nullptr, virtualKey, keyDown);
   if (event) {
     CGEventSetFlags(event, getKeyboardEventFlags());
+    deskflow::platform::markInjectedEvent(event);
     CGEventPost(kCGHIDEventTap, event);
     CFRelease(event);
   } else {

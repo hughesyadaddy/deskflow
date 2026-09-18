@@ -7,6 +7,7 @@
 #include "coordination/LocalInputMonitor.h"
 
 #include "base/Log.h"
+#include "platform/OSXInjectedEvent.h"
 
 #include <ApplicationServices/ApplicationServices.h>
 
@@ -22,7 +23,9 @@ namespace {
 /*!
 Genuine hardware events carry an event-source unix PID of 0; anything
 injected by deskflow (or any other process) carries the injector's PID
-and is ignored. Replaces the external inputmon.swift helper.
+and is ignored. The DSKF user-data marker is checked too so an event a
+relaying deskflow posted through another process's tap can never count
+as local input and promote this seat. Replaces the external inputmon.swift helper.
 */
 class OSXLocalInputMonitor : public ILocalInputMonitor
 {
@@ -81,7 +84,7 @@ private:
     }
 
     const auto sourcePid = CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID);
-    if (sourcePid == 0 && self->m_callback) {
+    if (sourcePid == 0 && !deskflow::platform::isInjectedEvent(event) && self->m_callback) {
       self->m_callback();
     }
     return event;
