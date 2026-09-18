@@ -14,6 +14,7 @@
 #include <QRegularExpression>
 #include <QSystemTrayIcon>
 
+#include "InstanceHandoff.h"
 #include "VersionChecker.h"
 #include "config/ServerConfig.h"
 #include "gui/core/CoreProcess.h"
@@ -26,7 +27,6 @@
 
 class QAction;
 class QMenu;
-class QLocalServer;
 
 class DeskflowApplication;
 class LogDock;
@@ -211,7 +211,8 @@ private:
   QSystemTrayIcon *m_trayIcon = nullptr;
   int m_trayRetries = 0;
   bool m_awaitingAccessibility = false;
-  QLocalServer *m_guiDupeChecker = nullptr;
+  deskflow::gui::InstanceHandoffServer *m_guiDupeChecker = nullptr;
+  bool m_handingOff = false;
   deskflow::gui::ipc::DaemonIpcClient *m_daemonIpcClient = nullptr;
 
   LogDock *m_logDock;

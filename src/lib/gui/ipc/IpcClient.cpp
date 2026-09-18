@@ -32,6 +32,7 @@ IpcClient::IpcClient(QObject *parent, const QString &socketName, const QString &
 
 void IpcClient::connectToServer()
 {
+  m_retryTimer.stop();
   if (m_state == State::Connecting) {
     qWarning().noquote() << QStringLiteral("%1 ipc client already connecting to server").arg(m_typeName);
     return;

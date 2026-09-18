@@ -14,6 +14,7 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QDateTime>
 #include <QProcess>
 #include <QProcessEnvironment>
 
@@ -22,6 +23,16 @@ namespace deskflow::gui {
 namespace {
 
 const auto kAgentLabel = QStringLiteral("org.deskflow.vhid-bridge");
+constexpr int kRenderTimeoutMs = 15000;
+
+struct RenderCache
+{
+  double scale = 0;
+  QDateTime settingsModified;
+  QString plist;
+  bool valid = false;
+};
+RenderCache g_renderCache;
 const auto kBridgeLogPath = QStringLiteral("/var/log/deskflow-vhid-bridge.log");
 const auto kDaemonAppPath = QStringLiteral(
     "/Library/Application Support/org.pqrs/Karabiner-DriverKit-VirtualHIDDevice/"
@@ -101,7 +112,15 @@ bool runBridgeScript(double scale, bool dryRun, QString *output, QString *error)
   env.insert(QStringLiteral("DESKFLOW_SETTINGS"), Settings::settingsFile());
   proc.setProcessEnvironment(env);
   proc.start(QStringLiteral("/bin/bash"), args);
-  if (!waitForProcessWithEvents(proc, dryRun ? 15000 : 120000, error)) {
+  if (dryRun) {
+    // No event pumping: a render is called from widget slots and must not re-enter them.
+    if (!proc.waitForFinished(kRenderTimeoutMs)) {
+      proc.kill();
+      if (error)
+        *error = QObject::tr("install script did not render the agent plist within %1 s").arg(kRenderTimeoutMs / 1000);
+      return false;
+    }
+  } else if (!waitForProcessWithEvents(proc, 120000, error)) {
     return false;
   }
   const auto stderrText = QString::fromUtf8(proc.readAllStandardError()).trimmed();
@@ -202,7 +221,23 @@ bool LoginBridgeManager::canInstall(QString *reason)
 
 bool LoginBridgeManager::renderAgentPlist(double scale, QString *plist, QString *error)
 {
-  return runBridgeScript(scale, true, plist, error);
+  // The script reads Deskflow.conf, so (scale, conf mtime) identifies a render;
+  // the settings tab asks several times per refresh and must not fork each time.
+  Settings::save(false);
+  const auto modified = QFileInfo(Settings::settingsFile()).lastModified();
+  if (g_renderCache.valid && g_renderCache.scale == scale && g_renderCache.settingsModified == modified) {
+    if (plist)
+      *plist = g_renderCache.plist;
+    return true;
+  }
+  QString rendered;
+  if (!runBridgeScript(scale, true, &rendered, error)) {
+    return false;
+  }
+  g_renderCache = {scale, modified, rendered, true};
+  if (plist)
+    *plist = rendered;
+  return true;
 }
 
 bool LoginBridgeManager::runInstallScript(double scale, QString *error)
@@ -224,10 +259,15 @@ bool LoginBridgeManager::apply(bool enabled, double scale, QString *error)
     return true;
 
   if (!enabled) {
-    // bootout by label: SIGTERM lets the bridge release its keys and say goodbye
-    // to the server; pkill -f matched any command line containing the name.
-    const auto command = QStringLiteral("rm -f '%1'; launchctl bootout loginwindow/%2 2>/dev/null || true")
-                             .arg(agentPlistPath(), kAgentLabel);
+    // Unload the LoginWindow-session job by its plist (SIGTERM: the bridge
+    // releases its keys and exits at once), then remove the plist. pkill -f
+    // matched any command line containing the name. An unload failure is
+    // reported, not swallowed: the plist is still removed so the agent cannot
+    // come back at the next login window.
+    const auto plist = agentPlistPath();
+    const auto command = QStringLiteral("if launchctl unload -S LoginWindow '%1'; then rm -f '%1'; else rm -f '%1'; "
+                                        "echo 'launchctl unload -S LoginWindow failed (plist removed)' >&2; exit 1; fi")
+                             .arg(plist);
     return runPrivileged(command, error);
   }
 

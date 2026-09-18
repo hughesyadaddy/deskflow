@@ -14,6 +14,7 @@
 #include "common/UrlConstants.h"
 #include "common/VersionInfo.h"
 #include "gui/Diagnostic.h"
+#include "gui/InstanceHandoff.h"
 #include "gui/MainWindow.h"
 #include "gui/Messages.h"
 #include "gui/StyleUtils.h"
@@ -24,11 +25,11 @@
 
 #include <QApplication>
 #include <QCommandLineParser>
-#include <QLocalSocket>
 #include <QMessageBox>
 
 #if defined(Q_OS_MACOS)
 #include <Carbon/Carbon.h>
+#include <chrono>
 #include <cstdlib>
 #endif
 
@@ -109,18 +110,33 @@ int main(int argc, char *argv[])
   // launch. MainWindow only removes/relistens the "raise window" QLocalServer
   // after this point, i.e. only once we are provably the sole instance.
   using deskflow::SingleInstanceLock;
-  const auto instanceLock = SingleInstanceLock::tryAcquire(SingleInstanceLock::Role::Gui, SingleInstanceLock::Scope::Session);
+  using deskflow::gui::InstanceHandoffServer;
+  const auto socketName = QStringLiteral("%1-gui").arg(kAppId);
+  auto instanceLock = SingleInstanceLock::tryAcquire(SingleInstanceLock::Role::Gui, SingleInstanceLock::Scope::Session);
+#if defined(Q_OS_MACOS)
+  if (!instanceLock && macLaunchdOwnsGui()) {
+    // launchd's copy is canonical. Exit 5 here would make a KeepAlive agent relaunch
+    // us every 30 s for as long as an unmanaged (Login Item) copy lives; instead ask
+    // that copy to quit and take its place. Exit 0 keeps launchd quiet if it will not.
+    if (InstanceHandoffServer::requestQuit(socketName)) {
+      instanceLock = SingleInstanceLock::tryAcquire(
+          SingleInstanceLock::Role::Gui, SingleInstanceLock::Scope::Session, std::chrono::milliseconds(5000)
+      );
+    }
+    if (!instanceLock) {
+      qWarning("another gui instance holds the lock and would not hand over; exiting quietly");
+      return s_exitSuccess;
+    }
+    qInfo("took over from an unmanaged gui instance");
+  }
+#endif
   if (!instanceLock) {
     // Ping the running instance to have it show itself
-    const auto socketName = QStringLiteral("%1-gui").arg(kAppId);
-    QLocalSocket socket;
-    socket.connectToServer(socketName, QLocalSocket::ReadOnly);
-    if (!socket.waitForConnected()) {
+    if (!InstanceHandoffServer::requestShow(socketName)) {
       // If we can't connect to the other instance tell the user its running.
       // This should never happen but just incase we should show something
       QMessageBox::information(nullptr, kAppName, QObject::tr("%1 is already running").arg(kAppName));
     }
-    socket.disconnectFromServer();
     return s_exitDuplicate;
   }
 

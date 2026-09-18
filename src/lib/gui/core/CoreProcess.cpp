@@ -275,11 +275,12 @@ bool CoreProcess::spawnCoreProcess(QProcess *process, const QString &program, co
 
 bool CoreProcess::hasExternalSupervisor() const
 {
-  // macOS: launchd is the only thing that may spawn a core. A GUI-spawned core at a
-  // login storm (launchctl slow to answer) used to leave launchd's agent looping on
-  // exit 5 forever, so there is no probe to get wrong any more.
+  // macOS with the fleet core agent installed: launchd is the only thing that may
+  // spawn a core. The old `launchctl print` probe timed out at login storms and the
+  // GUI then spawned its own core, leaving launchd's agent looping on exit 5; a
+  // file stat cannot time out. Without the agent (dev machines) the GUI spawns.
 #ifdef Q_OS_MACOS
-  return true;
+  return macLaunchdOwnsCore();
 #else
   return false;
 #endif
@@ -291,11 +292,19 @@ void CoreProcess::kickstartExternalCore()
   const auto target = launchdCoreTarget();
   qInfo("restarting launchd-managed core: launchctl kickstart -k %s", qPrintable(target));
   auto *launchctl = new QProcess(this);
-  connect(launchctl, &QProcess::finished, this, [launchctl](int exitCode, QProcess::ExitStatus status) {
+  connect(launchctl, &QProcess::finished, this, [this, launchctl](int exitCode, QProcess::ExitStatus status) {
+    launchctl->deleteLater();
     if (status != QProcess::NormalExit || exitCode != 0) {
       qWarning("launchctl kickstart failed with exit code %d", exitCode);
+      kickstartFailed();
     }
-    launchctl->deleteLater();
+  });
+  connect(launchctl, &QProcess::errorOccurred, this, [this, launchctl](QProcess::ProcessError) {
+    if (launchctl->state() == QProcess::NotRunning) {
+      qWarning("launchctl kickstart could not run: %s", qPrintable(launchctl->errorString()));
+      launchctl->deleteLater();
+      kickstartFailed();
+    }
   });
   launchctl->start(QStringLiteral("/bin/launchctl"), {QStringLiteral("kickstart"), QStringLiteral("-k"), target});
 #endif
@@ -724,6 +733,15 @@ void CoreProcess::doRestart()
   }
 
   start();
+}
+
+void CoreProcess::kickstartFailed()
+{
+  // launchd could not bounce the core: there is nothing to attach to, say so.
+  releaseCoreIpcClient();
+  setProcessState(ProcessState::Stopped);
+  setConnectionState(ConnectionState::Disconnected);
+  Q_EMIT error(Error::StartFailed);
 }
 
 void CoreProcess::releaseCoreIpcClient()

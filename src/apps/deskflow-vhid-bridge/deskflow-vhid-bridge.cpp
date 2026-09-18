@@ -14,8 +14,9 @@
 //
 // The bridge only injects while the console user is loginwindow. When a user
 // session takes the console (login, fast user switch) it releases every key,
-// sends CBYE, disconnects and waits; SIGTERM drains the same way and exits 0
-// at once instead of after the next message or socket timeout.
+// closes the socket (the FIN is the goodbye; the server has no CBYE handler)
+// and waits; SIGTERM drains the same way and exits 0 at once instead of after
+// the next message or socket timeout.
 //
 // Pointer scale: by default the bridge self-calibrates (slam to a corner, emit
 // a known delta, read the cursor back -> counts per point) and then runs every
@@ -1188,13 +1189,6 @@ public:
       warn_stuck_keys();
     }
     release_all();
-    if (must_pause()) {
-      // Leaving on purpose: tell the server so it drops us now rather than at
-      // its keep-alive timeout, then the user-session core can take the screen.
-      std::vector<uint8_t> bye;
-      append_bytes(bye, proto::kClose, sizeof(proto::kClose));
-      socket.write_message(bye);
-    }
   }
 
 private:

@@ -150,6 +150,24 @@ bool macStartAtLoginEnabled()
   return false;
 }
 
+namespace {
+bool launchAgentInstalled(const char *label)
+{
+  return QFile::exists(QDir::homePath() + QStringLiteral("/Library/LaunchAgents/%1.plist").arg(QLatin1String(label)));
+}
+} // namespace
+
+bool macLaunchdOwnsGui()
+{
+  return launchAgentInstalled("io.github.hughesyadaddy.deskflow") ||
+         qEnvironmentVariable("DESKFLOW_LAUNCHD") == QLatin1String("1");
+}
+
+bool macLaunchdOwnsCore()
+{
+  return launchAgentInstalled("io.github.hughesyadaddy.deskflow-core");
+}
+
 QString macQuitIntentPath()
 {
   return QDir::homePath() + QStringLiteral("/Library/Application Support/Deskflow/quit-intent");

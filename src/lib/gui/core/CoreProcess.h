@@ -162,6 +162,7 @@ private:
   void stopProcessFromDaemon();
   void releaseProcess();
   void releaseCoreIpcClient();
+  void kickstartFailed();
   void scheduleCoreIpcReattach();
   void scheduleRetry(int delayMs);
   void doRestart();

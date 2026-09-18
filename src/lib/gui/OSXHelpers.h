@@ -30,6 +30,15 @@ bool macSetStartAtLogin(bool enable);
 //! source of truth, like the login-window bridge).
 bool macStartAtLoginEnabled();
 
+//! True when the fleet LaunchAgent for the GUI is installed
+//! (~/Library/LaunchAgents/io.github.hughesyadaddy.deskflow.plist), or the agent
+//! passed DESKFLOW_LAUNCHD=1: launchd owns the launch, the app must not add a
+//! Login Item and must not exit 5 to launchd on a lost instance lock.
+bool macLaunchdOwnsGui();
+//! True when the fleet LaunchAgent for the core is installed
+//! (~/Library/LaunchAgents/io.github.hughesyadaddy.deskflow-core.plist).
+bool macLaunchdOwnsCore();
+
 //! Path of the quit-intent sentinel: present = the user quit the GUI on purpose,
 //! so launchd's KeepAlive and the converge agent must leave it down until the
 //! next explicit start (deskflow-ctl start/restart remove it).

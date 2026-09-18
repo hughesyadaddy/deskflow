@@ -40,7 +40,6 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QHideEvent>
-#include <QLocalServer>
 #include <QLocalSocket>
 #include <QMenu>
 #include <QMenuBar>
@@ -70,7 +69,7 @@ MainWindow::MainWindow()
     : ui{std::make_unique<Ui::MainWindow>()},
       m_coreProcess(m_serverConfig),
       m_trayIcon{new QSystemTrayIcon(this)},
-      m_guiDupeChecker{new QLocalServer(this)},
+      m_guiDupeChecker{new deskflow::gui::InstanceHandoffServer(this)},
       m_daemonIpcClient{new ipc::DaemonIpcClient(this)},
       m_logDock{new LogDock(this)},
       m_statusBar{new StatusBar(this)},
@@ -135,9 +134,11 @@ MainWindow::MainWindow()
   m_actionReportBug->setMenuRole(QAction::NoRole);
 
   // Setup the Instance Checking
-  // In case of a previous crash remove first
-  QLocalServer::removeServer(m_guiSocketName);
   m_guiDupeChecker->listen(m_guiSocketName);
+#if defined(Q_OS_MACOS)
+  // The launchd-owned instance is the canonical one: it never steps aside for a peer.
+  m_guiDupeChecker->setHonoursQuit(!macLaunchdOwnsGui());
+#endif
 
   createMenuBar();
   setupControls();
@@ -169,12 +170,11 @@ MainWindow::MainWindow()
   restoreWindow();
 
 #if defined(Q_OS_MACOS)
-  // Under the fleet LaunchAgent (DESKFLOW_LAUNCHD=1 in its plist) launchd owns the
-  // launch; a Login Item as well means two GUIs race at login and one exits 5.
-  // Otherwise the app registers itself on every launch: replacing the bundle
-  // (fleet deploys re-sign /Applications/Deskflow.app) invalidates the record.
-  const bool launchdOwned = qEnvironmentVariable("DESKFLOW_LAUNCHD") == QLatin1String("1");
-  if (launchdOwned) {
+  // With the fleet LaunchAgent installed launchd owns the launch; a Login Item
+  // as well means two GUIs race at login and one exits 5. Otherwise the app
+  // registers itself on every launch: replacing the bundle (fleet deploys
+  // re-sign /Applications/Deskflow.app) invalidates the record.
+  if (macLaunchdOwnsGui()) {
     if (macStartAtLoginEnabled()) {
       qInfo("launchd owns the gui launch, unregistering the login item");
       macSetStartAtLogin(false);
@@ -403,7 +403,13 @@ void MainWindow::connectSlots()
   connect(m_statusBar, &StatusBar::requestUpdateVersion, this, &MainWindow::openGetNewVersionUrl);
   connect(&m_versionChecker, &VersionChecker::updateFound, m_statusBar, &StatusBar::updateFound);
 
-  connect(m_guiDupeChecker, &QLocalServer::newConnection, this, &MainWindow::showAndActivate);
+  connect(m_guiDupeChecker, &deskflow::gui::InstanceHandoffServer::showRequested, this, &MainWindow::showAndActivate);
+  connect(m_guiDupeChecker, &deskflow::gui::InstanceHandoffServer::quitRequested, this, [this] {
+    // Stepping aside for the launchd-owned copy is not a user quit: no quit-intent
+    // sentinel, or the takeover would look like a deliberate stop.
+    m_handingOff = true;
+    close();
+  });
 
   connect(ui->btnEditName, &QPushButton::clicked, this, &MainWindow::showHostNameEditor);
 
@@ -1115,7 +1121,8 @@ void MainWindow::closeEvent(QCloseEvent *event)
   }
   qDebug() << "quitting application";
 #if defined(Q_OS_MACOS)
-  macWriteQuitIntent();
+  if (!m_handingOff)
+    macWriteQuitIntent();
 #endif
 
   // any connected dock view acitons will be triggered
@@ -1136,6 +1143,8 @@ void MainWindow::showFirstConnectedMessage()
 
 void MainWindow::updateStatus()
 {
+  if (m_awaitingAccessibility)
+    return;
   using enum ProcessState;
   const auto connection = m_coreProcess.connectionState();
   const auto process = m_coreProcess.processState();
@@ -1438,6 +1447,8 @@ void MainWindow::daemonIpcClientConnectionFailed()
 
 void MainWindow::toggleCanRunCore(bool enableButtons)
 {
+  if (m_awaitingAccessibility)
+    enableButtons = false;
   const bool isStarted = m_coreProcess.isStarted();
   ui->btnToggleCore->setEnabled(enableButtons);
   ui->btnRestartCore->setEnabled(enableButtons && isStarted);

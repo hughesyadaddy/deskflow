@@ -39,3 +39,10 @@ create_test(
   SOURCE SettingsDialogTabTests.cpp
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/gui"
 )
+
+create_test(
+  NAME InstanceHandoffTests
+  DEPENDS gui
+  SOURCE InstanceHandoffTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/gui"
+)
