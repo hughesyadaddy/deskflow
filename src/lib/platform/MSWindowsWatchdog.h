@@ -34,12 +34,8 @@ mutex) was respawned every ~100 ms and the storm choked the machine. These
 constants and nextRestartDelayMs() bound that.
 */
 
-//! nextRestartDelayMs() result meaning "do not restart until a config change / IPC start".
-constexpr int kRestartGiveUp = -1;
 //! An exit this soon after launch is a "fast exit" (crash loop candidate).
 constexpr long long kFastExitUptimeMs = 2000;
-//! After this many consecutive fast exits the watchdog stops relaunching.
-constexpr int kMaxConsecutiveFastExits = 5;
 //! Delay before retrying when another core instance owns the machine (exit 5).
 constexpr int kDuplicateInstanceDelayMs = 30000;
 //! First fast-exit backoff step; doubles per consecutive fast exit.
@@ -62,27 +58,22 @@ constexpr bool isFastExit(int exitCode, long long uptimeMs)
 \param exitCode              the core's process exit code
 \param consecutiveFastExits  fast exits in a row *including* this one (see isFastExit)
 \param uptimeMs              how long this instance ran before exiting
-\return 0 = restart now; > 0 = restart after that many ms; kRestartGiveUp = stop.
+\return 0 = restart now; > 0 = restart after that many ms. The watchdog never
+gives up: with no GUI running nothing would ever ask it to try again, and a
+core that is down forever is worse than one retried every kMaxBackoffMs.
 
 Rules, in priority order:
- - >= kMaxConsecutiveFastExits fast exits in a row: give up (the caller logs
-   an error and waits for a config change / IPC start).
  - exit 5: another core owns the machine; wait kDuplicateInstanceDelayMs.
  - uptime < kFastExitUptimeMs: exponential backoff 1 s, 2 s, 4 s ... capped
-   at kMaxBackoffMs.
+   at kMaxBackoffMs for as long as the fast exits continue.
  - otherwise: the core ran for a while and died; relaunch immediately.
 */
 constexpr int nextRestartDelayMs(int exitCode, int consecutiveFastExits, long long uptimeMs)
 {
-  if (consecutiveFastExits >= kMaxConsecutiveFastExits) {
-    return kRestartGiveUp;
-  }
   if (exitCode == s_exitDuplicate) {
     return kDuplicateInstanceDelayMs;
   }
   if (uptimeMs < kFastExitUptimeMs) {
-    // Shift is bounded well below 31 by kMaxConsecutiveFastExits, but clamp
-    // anyway so a raised threshold can never overflow the int.
     const int step = std::clamp(consecutiveFastExits - 1, 0, 20);
     return (std::min)(kBaseBackoffMs << step, kMaxBackoffMs);
   }

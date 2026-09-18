@@ -117,10 +117,10 @@ void DaemonApp::clearWatchdogCommand()
 {
   LOG_DEBUG("clearing watchdog command");
 
-  // Clear the persisted config path so the daemon does not auto-start the core on next boot.
-  m_configFile.clear();
-  Settings::setValue(Settings::Daemon::ConfigFile);
-
+  // Only the running core stops. daemon/configFile stays persisted: every GUI stop
+  // (including the auto-stop on an untrusted fingerprint) used to wipe it, after
+  // which the daemon silently launched nothing at boot. Uninstall (clearSettings)
+  // is the one path that forgets the config.
 #if defined(Q_OS_WIN)
   m_pWatchdog->setProcessConfig("", false);
 #else
