@@ -123,6 +123,7 @@ FileLogOutputter::FileLogOutputter(const QString &logFile)
 void FileLogOutputter::setLogFilename(const QString &logFile)
 {
   assert(logFile != nullptr);
+  std::scoped_lock lock{m_mutex};
   m_file.close();
   m_fileName = logFile;
 }
@@ -134,11 +135,13 @@ QString FileLogOutputter::generationName(int generation) const
 
 bool FileLogOutputter::ensureOpen()
 {
-  // An external mv/rm (newsyslog, a human) leaves the open handle pointing at
-  // the old inode; check the path occasionally instead of stat-ing per line.
+  // An external rm/mv/recreate (newsyslog, a human) leaves the open handle
+  // on the old inode; check the path occasionally instead of per line. A
+  // path that is missing or smaller than what this handle wrote was replaced.
   if (m_file.isOpen() && ++m_writesSinceExistsCheck >= kExistsCheckInterval) {
     m_writesSinceExistsCheck = 0;
-    if (!QFileInfo::exists(m_fileName)) {
+    const QFileInfo info(m_fileName);
+    if (!info.exists() || info.size() < m_file.size()) {
       m_file.close();
     }
   }
@@ -153,25 +156,35 @@ bool FileLogOutputter::ensureOpen()
 void FileLogOutputter::rotate()
 {
   m_file.close();
+  // The live file is only ever renamed, never removed, and it moves first:
+  // if that fails (a Windows reader without FILE_SHARE_DELETE) the older
+  // generations are untouched, the log keeps growing in place, and the next
+  // attempt waits kRotateRetryInterval writes instead of thrashing per line.
+  const auto staged = QStringLiteral("%1.rotating").arg(m_fileName);
+  QFile::remove(staged);
+  if (!QFile::rename(m_fileName, staged)) {
+    m_writesUntilRotateRetry = kRotateRetryInterval;
+    return;
+  }
   QFile::remove(generationName(kGenerations));
   for (int generation = kGenerations - 1; generation >= 1; --generation) {
     QFile::rename(generationName(generation), generationName(generation + 1));
   }
-  // The live file is only ever renamed, never removed: if the rename fails
-  // (a Windows handle without FILE_SHARE_DELETE) the log keeps growing in
-  // place rather than losing what was already written.
-  QFile::rename(m_fileName, generationName(1));
+  QFile::rename(staged, generationName(1));
 }
 
 bool FileLogOutputter::write(LogLevel::Level, const QString &message)
 {
+  std::scoped_lock lock{m_mutex};
   if (!ensureOpen()) {
     return false;
   }
 
   QTextStream(&m_file) << message << Qt::endl;
 
-  if (m_file.size() > kSizeLimit) {
+  if (m_writesUntilRotateRetry > 0) {
+    --m_writesUntilRotateRetry;
+  } else if (m_file.size() > kSizeLimit) {
     rotate();
   }
 
@@ -185,5 +198,6 @@ void FileLogOutputter::open(const QString &title)
 
 void FileLogOutputter::close()
 {
+  std::scoped_lock lock{m_mutex};
   m_file.close();
 }

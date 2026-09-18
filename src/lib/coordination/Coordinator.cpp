@@ -1015,7 +1015,7 @@ void Coordinator::decide(Role role, const std::string &serverAddress, bool resta
     if (m_quit) {
       return;
     }
-    if (m_election.role() != role) {
+    if (m_election.role() != role && m_election.role() != Role::Init) {
       m_flipTimes.push_back(std::chrono::steady_clock::now());
     }
     if (role == Role::Server) {

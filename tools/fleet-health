@@ -896,25 +896,25 @@ def watch(hosts: List[Host], env: Dict[str, str], checks: Sequence[str], explici
           sleep: Callable[[float], None] = time.sleep) -> int:
     state = WatchState()
     first = True
-    while True:
-        results = FleetHealth(hosts, env, runner=runner).run(checks, explicit)
-        folded = fold_status(results)
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-        if first:
-            print(format_table(results))
-            failed = sum(1 for r in results if not r.ok)
-            print(f"\n{stamp} watching every {interval}s: {len(results)} results, {failed} failed", flush=True)
-            state.baseline(folded)
-            first = False
-        else:
-            for host, check, old, new, detail in state.observe(folded):
-                line = f"{stamp} {host} {check} {old} -> {new}: {detail}"
-                print(line, flush=True)
-                notifier(f"fleet-health {host}", f"{check} {old} -> {new}: {detail}")
-        try:
+    try:
+        while True:
+            results = FleetHealth(hosts, env, runner=runner).run(checks, explicit)
+            folded = fold_status(results)
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+            if first:
+                print(format_table(results))
+                failed = sum(1 for r in results if not r.ok)
+                print(f"\n{stamp} watching every {interval}s: {len(results)} results, {failed} failed", flush=True)
+                state.baseline(folded)
+                first = False
+            else:
+                for host, check, old, new, detail in state.observe(folded):
+                    line = f"{stamp} {host} {check} {old} -> {new}: {detail}"
+                    print(line, flush=True)
+                    notifier(f"fleet-health {host}", f"{check} {old} -> {new}: {detail}")
             sleep(interval)
-        except KeyboardInterrupt:
-            return 0
+    except KeyboardInterrupt:
+        return 0
 
 
 def main(argv: Optional[Sequence[str]] = None, runner: Runner = subprocess_runner,

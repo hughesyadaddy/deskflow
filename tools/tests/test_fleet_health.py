@@ -902,6 +902,22 @@ def test_watch_single_blip_is_silent(tmp_path, capsys):
     assert not [ln for ln in out.splitlines() if " -> " in ln]
 
 
+def test_watch_ctrl_c_during_checks_exits_zero(tmp_path, capsys):
+    env_file = write_env(tmp_path)
+    runner = FakeRunner(mac_ok_table())
+    calls = {"n": 0}
+
+    def interrupting_runner(host, cmd):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise KeyboardInterrupt
+        return runner(host, cmd)
+
+    rc = fh.main(["--check", "session", "--env", str(env_file), "--watch", "1"], runner=interrupting_runner,
+                 notifier=lambda t, m: None, sleep=lambda n: None)
+    assert rc == 0 and "watching every 1s" in capsys.readouterr().out
+
+
 def test_watch_rejects_zero_interval(tmp_path, capsys):
     env_file = write_env(tmp_path)
     rc = fh.main(["--check", "sign", "--env", str(env_file), "--watch", "0"], runner=FakeRunner(mac_ok_table()))

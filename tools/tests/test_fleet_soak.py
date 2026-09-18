@@ -690,8 +690,9 @@ def test_count_log_deltas_offsets_rotation_and_cap(fs, tmp_path):
     log = tmp_path / "core.log"
     log.write_text("a promoting to server\nb\nClientProxyUnknown x\n")
     patterns = fs.LOG_COUNTERS["deskflow-core"]
+    # first sample: history is not this soak's problem -> zeros, cursor at EOF
     counts, off = fs.count_log_deltas(log, patterns, None)
-    assert counts == {"epoch_flips": 1, "unresponsive": 1} and off == log.stat().st_size
+    assert counts == {"epoch_flips": 0, "unresponsive": 0} and off == log.stat().st_size
     # nothing new
     assert fs.count_log_deltas(log, patterns, off) == ({"epoch_flips": 0, "unresponsive": 0}, off)
     with log.open("a") as fh:
@@ -707,12 +708,15 @@ def test_count_log_deltas_offsets_rotation_and_cap(fs, tmp_path):
     assert fs.count_log_deltas(None, patterns, None) == ({"epoch_flips": 0, "unresponsive": 0}, None)
 
 
-def test_count_log_deltas_caps_first_read(fs, tmp_path, monkeypatch):
+def test_count_log_deltas_caps_a_huge_delta(fs, tmp_path, monkeypatch):
     monkeypatch.setattr(fs, "LOG_DELTA_MAX_BYTES", 40)
     log = tmp_path / "mouser.log"
-    log.write_text("CGEventTap disabled by system\n" * 5)  # 150 bytes, only the last 40 are read
-    counts, off = fs.count_log_deltas(log, fs.LOG_COUNTERS["mouser"], None)
-    assert counts == {"tap_timeouts": 1} and off == 150
+    log.write_text("x\n")
+    _, off = fs.count_log_deltas(log, fs.LOG_COUNTERS["mouser"], None)
+    with log.open("a") as fh:
+        fh.write("CGEventTap disabled by system\n" * 5)  # 150 new bytes, only the last 40 are read
+    counts, off2 = fs.count_log_deltas(log, fs.LOG_COUNTERS["mouser"], off)
+    assert counts == {"tap_timeouts": 1} and off2 == 152
 
 
 def test_alerts_fire_exactly_once_per_condition(fs):
@@ -761,7 +765,7 @@ def test_sampler_notifies_on_second_absent_tick_and_counts_log_deltas(mocked_mac
     assert fs.main(argv) == 0
     rec1 = json.loads(out.read_text().splitlines()[-1])
     assert rec1["cpu_s"] == 12.5 and rec1["cpu_pct"] is None
-    assert rec1["tap_timeouts"] == 1 and rec1["log_offset"] == log.stat().st_size
+    assert rec1["tap_timeouts"] == 0 and rec1["log_offset"] == log.stat().st_size
 
     monkeypatch.setattr(fs, "mac_cpu_seconds", lambda pid: 12.5 + 55.0)
     with log.open("a") as fh:
@@ -794,15 +798,16 @@ def test_windows_restart_events_accumulate_into_restart_count(fs, tmp_path, monk
     out = tmp_path / "w.jsonl"
     base = {"pid": 9, "start_time": "2026-09-16T00:00:00Z", "exe": "C:\\Deskflow\\deskflow-daemon.exe",
             "private_bytes_mb": 22.5, "rss_mb": 30.0, "handles": 210, "threads": 9, "scenario": "server"}
-    for events, cpu in ((1, 10.0), (0, 10.5), (2, 11.0)):
+    for events, cpu in ((1, 10.0), (0, 10.5), (None, 10.7), (2, 11.0)):
         probe = tmp_path / "probe.json"
         probe.write_text(json.dumps(dict(base, restart_events=events, cpu_s=cpu)))
         assert fs.main(["sample", "--label", "deskflow-daemon", "--exe", base["exe"], "--out", str(out),
                         "--once", "--probe-json", str(probe)]) == 0
     recs = [json.loads(ln) for ln in out.read_text().splitlines()[1:]]
-    assert [r["restart_count"] for r in recs] == [1, 1, 3]
+    # a null event query (Get-WinEvent threw) carries the count forward instead of resetting it
+    assert [r["restart_count"] for r in recs] == [1, 1, 1, 3]
     assert all("restart_events" not in r for r in recs)
-    assert recs[0]["cpu_s"] == 10.0 and recs[2]["cpu_pct"] == pytest.approx(0.5 / 60 * 100, abs=0.01)
+    assert recs[0]["cpu_s"] == 10.0 and recs[1]["cpu_pct"] == pytest.approx(0.5 / 60 * 100, abs=0.01)
 
 
 def test_win_probe_script_bounds_event_query_and_reports_cpu(fs):

@@ -104,9 +104,10 @@ void HealthReportTests::coordinatorCountsFlipsRescuesAndMesh()
   QCOMPARE(stats.flipsLastHour, 0);
   QCOMPARE(stats.rescuesLastHour, 0);
 
-  coordinator.decide(Role::Server, "");
+  coordinator.decide(Role::Server, ""); // first decision after start: not a flip
   coordinator.decide(Role::Server, "", true); // same role: a restart, not a flip
   coordinator.decide(Role::Client, "127.0.0.2");
+  coordinator.decide(Role::Server, "");
   stats = coordinator.healthStats();
   QCOMPARE(stats.flipsLastHour, 2);
 

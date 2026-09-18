@@ -15,6 +15,7 @@
 #include <clocale>
 #include <iostream>
 #include <sstream>
+#include <thread>
 
 #define LEVEL_PRINT "%z\057"
 #define LEVEL_ERR "%z\061"
@@ -222,6 +223,99 @@ void LogTests::fileOutputterReopensAfterExternalRemove()
   QVERIFY(QFile::exists(path));
   QVERIFY(lineCount(path) > 0);
   QVERIFY(lineCount(path) < 200);
+}
+
+void LogTests::fileOutputterReopensAfterExternalRecreate()
+{
+  QTemporaryDir dir;
+  QVERIFY(dir.isValid());
+  const auto path = dir.filePath(QStringLiteral("core.log"));
+  FileLogOutputter out(path);
+
+  const QString line(200, QLatin1Char('y'));
+  for (int i = 0; i < 10; ++i) {
+    QVERIFY(out.write(LogLevel::Level::Info, line));
+  }
+  // newsyslog-style: rename the live file away and create an empty one
+  QVERIFY(QFile::rename(path, dir.filePath(QStringLiteral("core.log.0"))));
+  {
+    QFile fresh(path);
+    QVERIFY(fresh.open(QFile::WriteOnly));
+  }
+  for (int i = 0; i < 200; ++i) {
+    QVERIFY(out.write(LogLevel::Level::Info, QStringLiteral("after")));
+  }
+  QVERIFY(lineCount(path) > 0);
+  QVERIFY(lineCount(path) < 200);
+}
+
+void LogTests::fileOutputterKeepsGenerationsWhenLiveRenameFails()
+{
+  QTemporaryDir dir;
+  QVERIFY(dir.isValid());
+  // A directory the process cannot rename out of: the live rename fails,
+  // so the existing generations must be left exactly as they were.
+  const auto sub = dir.filePath(QStringLiteral("locked"));
+  QVERIFY(QDir().mkpath(sub));
+  const auto path = QStringLiteral("%1/core.log").arg(sub);
+  FileLogOutputter out(path);
+  {
+    QFile gen1(out.generationName(1));
+    QVERIFY(gen1.open(QFile::WriteOnly));
+    gen1.write("older generation\n");
+  }
+
+  const QString line(1023, QLatin1Char('x'));
+  const int linesToLimit = static_cast<int>(FileLogOutputter::kSizeLimit / 1024) + 1;
+  for (int i = 0; i < linesToLimit - 1; ++i) {
+    QVERIFY(out.write(LogLevel::Level::Info, line));
+  }
+  out.close();
+  QVERIFY(QFile::setPermissions(sub, QFile::ReadOwner | QFile::ExeOwner));
+  const bool wrote = out.write(LogLevel::Level::Info, line);
+  QVERIFY(QFile::setPermissions(sub, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+  QVERIFY(wrote);
+  QVERIFY(QFile::exists(path));
+  QVERIFY(lineCount(path) >= linesToLimit);
+  QFile gen1(out.generationName(1));
+  QVERIFY(gen1.open(QFile::ReadOnly));
+  QCOMPARE(QString::fromUtf8(gen1.readAll()), QStringLiteral("older generation\n"));
+  QVERIFY(!QFile::exists(out.generationName(2)));
+  QVERIFY(!QFile::exists(QStringLiteral("%1.rotating").arg(path)));
+}
+
+void LogTests::fileOutputterSerialisesConcurrentWriters()
+{
+  QTemporaryDir dir;
+  QVERIFY(dir.isValid());
+  const auto path = dir.filePath(QStringLiteral("daemon.log"));
+  FileLogOutputter out(path);
+
+  constexpr int kThreads = 4;
+  constexpr int kLines = 2000;
+  std::vector<std::thread> writers;
+  for (int t = 0; t < kThreads; ++t) {
+    writers.emplace_back([&out, t] {
+      const QString line = QStringLiteral("writer%1 ").arg(t) + QString(120, QLatin1Char('a' + t));
+      for (int i = 0; i < kLines; ++i) {
+        out.write(LogLevel::Level::Info, line);
+      }
+    });
+  }
+  for (auto &w : writers) {
+    w.join();
+  }
+  out.close();
+
+  QFile file(path);
+  QVERIFY(file.open(QFile::ReadOnly));
+  int lines = 0;
+  while (!file.atEnd()) {
+    const auto raw = QString::fromUtf8(file.readLine()).trimmed();
+    QVERIFY2(raw.startsWith(QStringLiteral("writer")) && raw.size() == 8 + 120, qPrintable(raw.left(40)));
+    ++lines;
+  }
+  QCOMPARE(lines, kThreads * kLines);
 }
 
 QTEST_MAIN(LogTests)

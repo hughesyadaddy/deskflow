@@ -618,7 +618,7 @@ def win_probe(label: str, exe: str, interval: int = 60) -> dict:
 
 
 def win_record_from_probe(probe: dict, exe: str, proc: str) -> dict:
-    return {
+    rec = {
         "pid": probe.get("pid"),
         "start_time": probe.get("start_time"),
         "exe": probe.get("exe") or exe,
@@ -635,8 +635,10 @@ def win_record_from_probe(probe: dict, exe: str, proc: str) -> dict:
         "cpu_s": probe.get("cpu_s"),
         "scenario": probe.get("scenario") or "unknown",
         "restart_count": probe.get("restart_count"),
-        "restart_events": probe.get("restart_events"),
     }
+    if "restart_events" in probe:
+        rec["restart_events"] = probe["restart_events"]
+    return rec
 
 
 # --------------------------------------------------------------------------
@@ -715,8 +717,10 @@ def start_soak(base: Path, date: str | None = None) -> Path:
 def count_log_deltas(path: Path | None, patterns: dict[str, str],
                      prev_offset: int | None) -> tuple[dict[str, int], int | None]:
     """Occurrences of each pattern in ``path`` after ``prev_offset``; returns
-    (counts, new_offset). A shrunken file (rotation) restarts from 0; a huge
-    first delta is capped at LOG_DELTA_MAX_BYTES from the end."""
+    (counts, new_offset). With no previous offset (first sample of a soak)
+    nothing is counted and the cursor starts at EOF, so history before the
+    soak never lands in its rates. A shrunken file (rotation) restarts from
+    0; a delta larger than LOG_DELTA_MAX_BYTES is counted from the end only."""
     counts = {k: 0 for k in patterns}
     if path is None:
         return counts, None
@@ -724,7 +728,9 @@ def count_log_deltas(path: Path | None, patterns: dict[str, str],
         size = path.stat().st_size
     except OSError:
         return counts, None
-    start = prev_offset if prev_offset is not None and 0 <= prev_offset <= size else 0
+    if prev_offset is None:
+        return counts, size
+    start = prev_offset if 0 <= prev_offset <= size else 0
     start = max(start, size - LOG_DELTA_MAX_BYTES)
     if size > start:
         try:
@@ -778,9 +784,11 @@ def derive_fields(rec: dict, prev: dict | None, proc: str, log_path: Path | None
         counts, offset = count_log_deltas(log_path, patterns, prev_offset)
         rec.update(counts)
         rec["log_offset"] = offset
-    if rec.get("restart_events") is not None:
+    if "restart_events" in rec:
         base = prev.get("restart_count") if prev and prev.get("restart_count") is not None else 0
-        rec["restart_count"] = base + int(rec["restart_events"])
+        events = rec["restart_events"]
+        # a failed event query keeps the count where it was rather than resetting it
+        rec["restart_count"] = base + (int(events) if events is not None else 0)
     rec.pop("restart_events", None)
     return rec
 

@@ -12,6 +12,8 @@
 
 #include <QFile>
 #include <QString>
+
+#include <mutex>
 //! Stop traversing log chain outputter
 /*!
 This outputter performs no output and returns false from \c write(),
@@ -53,7 +55,8 @@ public:
 This outputter writes output to the file.  The level for each
 message is ignored.  The file is kept open across writes and rotated
 (renamed to \c .1 .. \c .N, oldest dropped) once it exceeds \c kSizeLimit.
-Not thread-safe on its own: \c Log serialises \c write() under its mutex.
+Thread-safe: the Windows watchdog writes the core's piped output straight
+into the daemon's outputter while the daemon logs through \c Log.
 */
 
 class FileLogOutputter : public ILogOutputter
@@ -77,13 +80,16 @@ public:
 
 private:
   static constexpr int kExistsCheckInterval = 64;
+  static constexpr int kRotateRetryInterval = 256;
 
   bool ensureOpen();
   void rotate();
 
+  std::mutex m_mutex;
   QString m_fileName;
   QFile m_file;
   int m_writesSinceExistsCheck = 0;
+  int m_writesUntilRotateRetry = 0;
 };
 
 //! Write log to system log

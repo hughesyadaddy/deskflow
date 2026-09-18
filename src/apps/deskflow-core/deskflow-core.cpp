@@ -83,13 +83,13 @@ void qtMessageHandler(QtMsgType type, const QMessageLogContext &context, const Q
 // Runs on the main (Qt) thread: IpcServer::hasClients() is only safe there;
 // the coordinator reads are mutex/atomic-guarded.
 void logHealthLine(
-    const AutoModeRunner &runner, const deskflow::core::ipc::CoreIpcServer &ipcServer,
+    const AutoModeRunner &runner, const deskflow::core::ipc::CoreIpcServer &ipcServer, const std::string &seat,
     std::chrono::steady_clock::time_point startedAt
 )
 {
   using deskflow::coordination::Role;
   deskflow::core::health::Snapshot snapshot;
-  snapshot.seat = Settings::value(Settings::Core::ComputerName).toString().toStdString();
+  snapshot.seat = seat;
   snapshot.epoch = runner.epochCount();
   snapshot.upSeconds = static_cast<long>(
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startedAt).count()
@@ -236,6 +236,16 @@ int main(int argc, char **argv)
   const auto processName = QFileInfo(argv[0]).fileName();
 
   if (parser.autoMode()) {
+    // The file sink and filter would otherwise only attach with the first
+    // App epoch, losing every startup, election and early-exit line (launchd
+    // no longer captures stdout on macOS).
+    CLOG->setFilter(Settings::logLevelText());
+    CLOG->setDebugCategories(Settings::value(Settings::Log::Categories).toString().split(QLatin1Char(',')));
+    App::attachFileLogOnce();
+    // Read once here: Settings is a shared QSettings that the core thread
+    // writes to, so the main-thread health timer must not touch it.
+    const std::string seat = Settings::value(Settings::Core::ComputerName).toString().toStdString();
+
     // Coordinated mode: the epoch loop elects and runs the role in-process.
     AutoModeRunner runner(events, processName);
 
@@ -251,8 +261,8 @@ int main(int argc, char **argv)
 
     const auto startedAt = std::chrono::steady_clock::now();
     auto *healthTimer = new QTimer(&app); // NOSONAR - Qt managed
-    QObject::connect(healthTimer, &QTimer::timeout, &app, [&runner, ipcServer, startedAt] {
-      logHealthLine(runner, *ipcServer, startedAt);
+    QObject::connect(healthTimer, &QTimer::timeout, &app, [&runner, ipcServer, seat, startedAt] {
+      logHealthLine(runner, *ipcServer, seat, startedAt);
     });
     healthTimer->start(std::chrono::duration_cast<std::chrono::milliseconds>(deskflow::core::health::kInterval));
 

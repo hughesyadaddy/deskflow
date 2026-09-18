@@ -24,6 +24,9 @@ private Q_SLOTS:
   void debugCategoryPassesInfoFilter();
   void fileOutputterRotatesKeepingGenerations();
   void fileOutputterReopensAfterExternalRemove();
+  void fileOutputterReopensAfterExternalRecreate();
+  void fileOutputterKeepsGenerationsWhenLiveRenameFails();
+  void fileOutputterSerialisesConcurrentWriters();
 
 private:
   Log m_log;
