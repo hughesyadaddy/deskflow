@@ -254,6 +254,36 @@ FleetState Coordinator::fleetSnapshot() const
   return m_fleetState;
 }
 
+namespace {
+int countWithinLastHour(std::deque<std::chrono::steady_clock::time_point> &times)
+{
+  const auto cutoff = std::chrono::steady_clock::now() - std::chrono::hours(1);
+  while (!times.empty() && times.front() < cutoff) {
+    times.pop_front();
+  }
+  return static_cast<int>(times.size());
+}
+} // namespace
+
+Coordinator::HealthStats Coordinator::healthStats() const
+{
+  HealthStats stats;
+  stats.meshRx = m_meshRx.load();
+  stats.meshDup = m_meshDup.load();
+  stats.relayRunning = m_keyboardRelay && m_keyboardRelay->running();
+  for (const auto &[name, outbox] : m_outboxes) {
+    ++stats.peersTotal;
+    if (outbox->state() == PeerOutbox::State::Reachable) {
+      ++stats.peersReachable;
+    }
+  }
+  std::scoped_lock lock{m_mutex};
+  stats.links = static_cast<int>(m_fleetState.links.size());
+  stats.flipsLastHour = countWithinLastHour(m_flipTimes);
+  stats.rescuesLastHour = countWithinLastHour(m_rescueTimes);
+  return stats;
+}
+
 void Coordinator::postFleetStateEvents(IEventQueue *events, const FleetMergeResult &merge)
 {
   if (events == nullptr || !merge.changed) {
@@ -541,6 +571,7 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
 
 void Coordinator::onMessage(const Message &message, const std::function<void(const std::string &)> &reply)
 {
+  ++m_meshRx;
   switch (message.type) {
   case Message::Type::Claim: {
     ElectionState::ClaimAction action;
@@ -696,6 +727,7 @@ void Coordinator::handleKeyForwardMessage(const Message &message)
           "coordination: dropping duplicate relay key from \"%s\" (seq %lld <= %lld)", message.name.c_str(),
           static_cast<long long>(message.seq), static_cast<long long>(lastSeq)
       );
+      ++m_meshDup;
       return;
     }
     lastSeq = std::max(lastSeq, message.seq);
@@ -875,6 +907,7 @@ void Coordinator::requestFleetRescue()
       return;
     }
     line = protocol::encodeRescue(m_config.token);
+    m_rescueTimes.push_back(std::chrono::steady_clock::now());
   }
   // Boundary (I4): nothing forwarded before the rescue is worth delivering
   // after it. Queued keys would land on a restarting peer as phantom
@@ -981,6 +1014,9 @@ void Coordinator::decide(Role role, const std::string &serverAddress, bool resta
     std::scoped_lock lock{m_mutex};
     if (m_quit) {
       return;
+    }
+    if (m_election.role() != role) {
+      m_flipTimes.push_back(std::chrono::steady_clock::now());
     }
     if (role == Role::Server) {
       m_election.becameServer();

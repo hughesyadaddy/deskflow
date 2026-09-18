@@ -182,6 +182,19 @@ public:
     return m_exitCode;
   }
 
+  //! Coordinator for read-only health reads (null until the epoch loop has
+  //! started it; the object outlives every reader on the main thread).
+  const deskflow::coordination::Coordinator *healthCoordinator() const
+  {
+    return m_healthCoordinator.load();
+  }
+
+  //! App epochs started since launch.
+  int epochCount() const
+  {
+    return m_epochCount.load();
+  }
+
   //! Backoff after an epoch ends with a failure code (hot-loop guard).
   static constexpr std::chrono::milliseconds kFailureBackoff{500};
 
@@ -233,6 +246,8 @@ private:
   std::atomic<bool> m_appRunning{false};
   std::atomic<int> m_exitCode{0};
   std::atomic<bool> m_quitRequested{false};
+  std::atomic<const deskflow::coordination::Coordinator *> m_healthCoordinator{nullptr};
+  std::atomic<int> m_epochCount{0};
 
   // Everything below is guarded by m_gateMutex.
   std::mutex m_gateMutex;

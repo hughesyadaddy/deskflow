@@ -142,6 +142,7 @@ void AutoModeRunner::epochLoop()
     return;
   }
   m_coordinator->setEventQueue(&m_events);
+  m_healthCoordinator = m_coordinator.get();
   m_coordinator->setKeyClearAllHandler([this](const std::string &sender) {
     m_events.addEvent(
         Event(EventTypes::CoordinationKeyClearAll, m_events.getSystemTarget(), new CoordinationKeyClearAllInfo(sender))
@@ -185,6 +186,7 @@ void AutoModeRunner::epochLoop()
   }
 
   stopDeferredThread();
+  m_healthCoordinator = nullptr;
   m_coordinator->stop();
   LOG_INFO("auto mode stopped");
 }
@@ -301,6 +303,7 @@ void AutoModeRunner::stopDeferredThread()
 
 int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
 {
+  ++m_epochCount;
   const std::string selfName = Settings::value(Settings::Core::ComputerName).toString().toStdString();
   if (role == Role::Client) {
     QStringList hosts = settingsPreConnectHosts(serverAddress, selfName);

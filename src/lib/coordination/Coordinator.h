@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -31,6 +32,7 @@ class IEventQueue;
 
 class CoordinatorFleetPublishTests;
 class CoordinatorTests;
+class HealthReportTests;
 
 namespace deskflow::coordination {
 
@@ -72,6 +74,7 @@ class Coordinator
 {
   friend class ::CoordinatorFleetPublishTests;
   friend class ::CoordinatorTests;
+  friend class ::HealthReportTests;
 
 public:
   explicit Coordinator(CoordinatorConfig config);
@@ -144,6 +147,20 @@ public:
 
   //! Mutex-guarded copy of the merged fleet snapshot (mesh v2).
   FleetState fleetSnapshot() const;
+
+  //! Counters behind the periodic `health:` line (deskflow-core HealthReport).
+  struct HealthStats
+  {
+    int peersReachable = 0;
+    int peersTotal = 0;
+    int links = 0;
+    uint64_t meshRx = 0;
+    uint64_t meshDup = 0;
+    int flipsLastHour = 0;
+    int rescuesLastHour = 0;
+    bool relayRunning = false;
+  };
+  HealthStats healthStats() const;
 
   //! Fleet-wide keyboard rescue: restart the local core AND tell every peer
   //! to restart theirs. The 5-Esc gesture means "the fleet's input is
@@ -262,6 +279,12 @@ private:
   std::set<std::string> m_versionMismatchPeers;
   //! Last wake action per peer (rate limit; guarded by m_mutex).
   std::map<std::string, std::chrono::steady_clock::time_point> m_lastWakeAt;
+  std::atomic<uint64_t> m_meshRx{0};
+  std::atomic<uint64_t> m_meshDup{0};
+  //! Role flips / fleet rescues in the last hour (guarded by m_mutex;
+  //! mutable so the const health read can drop expired entries).
+  mutable std::deque<std::chrono::steady_clock::time_point> m_flipTimes;
+  mutable std::deque<std::chrono::steady_clock::time_point> m_rescueTimes;
 };
 
 } // namespace deskflow::coordination

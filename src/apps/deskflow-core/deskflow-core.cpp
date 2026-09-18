@@ -7,6 +7,7 @@
  */
 
 #include "AutoModeRunner.h"
+#include "HealthReport.h"
 #if SYSAPI_WIN32
 #include "deskflow/win32/AppUtilWindows.h"
 #endif
@@ -25,11 +26,13 @@
 #include "base/Log.h"
 #include "common/Constants.h"
 #include "common/ExitCodes.h"
+#include "common/Settings.h"
 #include "common/SingleInstanceLock.h"
 #include "coordination/KeyboardRescue.h"
 #include "deskflow/App.h"
 #include "deskflow/ClientApp.h"
 #include "deskflow/ServerApp.h"
+#include "deskflow/MouserLink.h"
 #include "deskflow/ipc/CoreIpc.h"
 #include "deskflow/ipc/CoreIpcServer.h"
 
@@ -45,6 +48,7 @@
 #include <QFileInfo>
 #include <QTextStream>
 #include <QThread>
+#include <QTimer>
 
 #include <chrono>
 #include <iostream>
@@ -74,6 +78,40 @@ void qtMessageHandler(QtMsgType type, const QMessageLogContext &context, const Q
   if (type == QtFatalMsg) {
     abort();
   }
+}
+
+// Runs on the main (Qt) thread: IpcServer::hasClients() is only safe there;
+// the coordinator reads are mutex/atomic-guarded.
+void logHealthLine(
+    const AutoModeRunner &runner, const deskflow::core::ipc::CoreIpcServer &ipcServer,
+    std::chrono::steady_clock::time_point startedAt
+)
+{
+  using deskflow::coordination::Role;
+  deskflow::core::health::Snapshot snapshot;
+  snapshot.seat = Settings::value(Settings::Core::ComputerName).toString().toStdString();
+  snapshot.epoch = runner.epochCount();
+  snapshot.upSeconds = static_cast<long>(
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startedAt).count()
+  );
+  Role role = Role::Init;
+  if (const auto *coordinator = runner.healthCoordinator()) {
+    role = coordinator->runningRole();
+    snapshot.stats = coordinator->healthStats();
+  }
+  snapshot.role = deskflow::coordination::roleName(role);
+  snapshot.tap = deskflow::core::health::tapState(role, snapshot.stats.relayRunning);
+#if defined(Q_OS_MAC)
+  snapshot.ax = AXIsProcessTrusted() ? "trusted" : "no";
+#else
+  snapshot.ax = "n/a";
+#endif
+  snapshot.guiIpc = ipcServer.hasClients();
+  const auto &mouser = deskflow::MouserLink::shared();
+  snapshot.mouserBridge = deskflow::core::health::mouserBridgeState(
+      mouser.connected(), mouser.mode() == deskflow::MouserLink::Mode::Legacy
+  );
+  LOG_INFO("%s", deskflow::core::health::formatLine(snapshot).c_str());
 }
 
 void showHelp(const CoreArgParser &parser)
@@ -210,6 +248,13 @@ int main(int argc, char **argv)
     AppUtilWindows::setProcessQuitHandler([&runner] { runner.requestQuit(); });
 #endif
     ipcServer->listen();
+
+    const auto startedAt = std::chrono::steady_clock::now();
+    auto *healthTimer = new QTimer(&app); // NOSONAR - Qt managed
+    QObject::connect(healthTimer, &QTimer::timeout, &app, [&runner, ipcServer, startedAt] {
+      logHealthLine(runner, *ipcServer, startedAt);
+    });
+    healthTimer->start(std::chrono::duration_cast<std::chrono::milliseconds>(deskflow::core::health::kInterval));
 
     QThread coreThread;
     QObject::connect(&coreThread, &QThread::finished, &app, &QApplication::quit);

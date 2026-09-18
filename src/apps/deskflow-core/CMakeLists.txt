@@ -25,6 +25,8 @@ add_executable(${target}
   "${target}.cpp"
   AutoModeRunner.cpp
   AutoModeRunner.h
+  HealthReport.cpp
+  HealthReport.h
   CoreArgs.h
   CoreArgParser.h
   CoreArgParser.cpp
