@@ -60,8 +60,15 @@ public:
   /// True when driver, bridge binary, and peers are present.
   static bool canInstall(QString *reason = nullptr);
 
-  /// True when the installed LaunchAgent plist matches current coordination/core settings.
+  /// True when the installed LaunchAgent plist matches what the install script renders now.
   static bool installedAgentMatchesCurrentSettings(double scale);
+
+  /**
+   * @brief Render the agent plist exactly as the install script would install it.
+   * Runs `install-login-bridge-macos.sh --dry-run --scale N` (stdout = plist, nothing
+   * installed), so there is one generator for peers, ports and wake syntax.
+   */
+  static bool renderAgentPlist(double scale, QString *plist, QString *error);
 
   /// Last lines from `/var/log/deskflow-vhid-bridge.log` for operator diagnostics.
   static QString recentLogText(int maxLines = 20);
@@ -69,9 +76,6 @@ public:
 private:
   static QString bridgePath();
   static QString agentPlistPath();
-  static QString plistContent(double scale);
-  /// Server-candidate hosts derived from coordination/peers, excluding self.
-  static QStringList serverCandidates();
 };
 
 } // namespace deskflow::gui
