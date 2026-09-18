@@ -21,6 +21,14 @@
 
     sudo launchctl bootout system/io.github.hughesyadaddy.deskflow-prio
     sudo rm /Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist
+
+  Log volume: the helper prints only when the outcome changes (state in
+  /var/run/deskflow-prio.state, see deskflow-prio.c), and /var/log/deskflow-prio.log
+  is rotated by newsyslog. Install the rotation rule once per seat (root):
+
+    sudo install -m 644 -o root -g wheel \
+      tools/newsyslog.d/deskflow.conf /etc/newsyslog.d/deskflow.conf
+    sudo chmod 600 /var/log/deskflow-vhid-bridge.log
 -->
 <plist version="1.0">
 <dict>
