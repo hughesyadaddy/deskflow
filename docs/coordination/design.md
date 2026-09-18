@@ -55,7 +55,7 @@ Implemented exactly per `behavior-spec.md` §3–§4, all constants in one
 header (`ElectionTuning`):
 
 - `kSelfCooldown` 2.5 s, `kClaimCooldown` 1.5 s, heartbeat 3 s
-- burst: 4 events / 0.40 s normally; 12 / 0.80 s while the shared cursor
+- burst: 8 events / 0.50 s normally; 12 / 0.80 s while the shared cursor
   is on this screen (the server tells us via enter/leave, which in-process
   are real events rather than parsed log lines)
 - same-host heartbeat claims are no-ops

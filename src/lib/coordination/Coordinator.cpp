@@ -991,12 +991,18 @@ void Coordinator::decide(Role role, const std::string &serverAddress, bool resta
       m_election.becameClient(serverAddress);
       // Until the new server's first fragment lands the snapshot still names
       // the previous server (possibly us); pre-connect ordering reads it.
-      m_fleetState.server.clear();
+      // Naming the new author here would make its first fragment "same
+      // author" for the seq check, so the merged seq is dropped with it.
+      std::string server;
       for (const auto &peer : m_config.peers) {
         if (peer.hasAddress(serverAddress)) {
-          m_fleetState.server = peer.name;
+          server = peer.name;
           break;
         }
+      }
+      if (!namesEqual(server, m_fleetState.server)) {
+        m_fleetState.server = server;
+        m_fleetState.seq = 0;
       }
     }
     m_decision = RoleDecision{role, serverAddress, false, restart};

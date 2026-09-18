@@ -8,6 +8,8 @@
 
 #include <ApplicationServices/ApplicationServices.h>
 
+#include <cstdint>
+
 namespace deskflow::platform {
 
 //! 'DSKF' in kCGEventSourceUserData; Mouser's tap early-returns on it.

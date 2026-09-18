@@ -154,6 +154,9 @@ bool fakeNativeMediaKey(KeyID id)
                                          data2:-1];
   CGEventRef upEvent = [upRef CGEvent];
 
+  // 'DSKF' marker (OSXInjectedEvent.h is C++-only): Mouser's tap early-returns on it.
+  CGEventSetIntegerValueField(downEvent, kCGEventSourceUserData, 0x44534B46);
+  CGEventSetIntegerValueField(upEvent, kCGEventSourceUserData, 0x44534B46);
   CGEventPost(0, downEvent);
   CGEventPost(0, upEvent);
 

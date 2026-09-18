@@ -691,25 +691,45 @@ void OSXScreen::fakeMouseRelativeMove(int32_t dx, int32_t dy) const
   m_cursorPosValid = false;
 }
 
+namespace {
+
+//! Whole lines from a wire delta, carrying the sub-line remainder forward
+//! (hi-res wheels send < 120; YScrollScale < 1 shrinks a notch below one line).
+int32_t takeWheelLines(double &carry, int32_t delta, int32_t notch)
+{
+  if (delta == 0) {
+    return 0;
+  }
+  if ((delta < 0) != (carry < 0)) {
+    carry = 0.0; // a reversal must not be eaten by the previous direction's remainder
+  }
+  carry += static_cast<double>(delta) / notch;
+  const auto lines = static_cast<int32_t>(std::trunc(carry));
+  carry -= lines;
+  return lines;
+}
+
+} // namespace
+
 void OSXScreen::fakeMouseWheel(ScrollDelta delta) const
 {
-  if (delta.x != 0 || delta.y != 0) {
-    // One wire notch (120) = one line here; the receiver's own OS acceleration
-    // applies once on post. Speed is the client YScrollScale setting (default 1.0).
-    delta = applyScrollModifier({delta.x / s_scrollDelta, delta.y / s_scrollDelta});
-    if (delta.x == 0 && delta.y == 0) {
-      return;
-    }
-    CGEventRef scrollEvent = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, delta.y, delta.x);
-
-    // Fix for sticky keys
-    CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
-    CGEventSetFlags(scrollEvent, modifiers);
-
-    deskflow::platform::markInjectedEvent(scrollEvent);
-    CGEventPost(kCGHIDEventTap, scrollEvent);
-    CFRelease(scrollEvent);
+  // One wire notch (120) is one line here; the receiver's own OS acceleration
+  // applies once on post. Speed is the client YScrollScale setting (default 1.0).
+  delta = applyScrollModifier(delta);
+  const int32_t linesX = takeWheelLines(m_wheelCarryX, delta.x, s_scrollDelta);
+  const int32_t linesY = takeWheelLines(m_wheelCarryY, delta.y, s_scrollDelta);
+  if (linesX == 0 && linesY == 0) {
+    return;
   }
+  CGEventRef scrollEvent = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, linesY, linesX);
+
+  // Fix for sticky keys
+  CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
+  CGEventSetFlags(scrollEvent, modifiers);
+
+  deskflow::platform::markInjectedEvent(scrollEvent);
+  CGEventPost(kCGHIDEventTap, scrollEvent);
+  CFRelease(scrollEvent);
 }
 
 void OSXScreen::showCursor()
