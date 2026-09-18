@@ -3,6 +3,7 @@
 
 add_subdirectory(config)
 add_subdirectory(core)
+add_subdirectory(ipc)
 
 create_test(
   NAME LoggerTests
@@ -36,5 +37,12 @@ create_test(
   NAME SettingsDialogTabTests
   DEPENDS gui
   SOURCE SettingsDialogTabTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/gui"
+)
+
+create_test(
+  NAME InstanceHandoffTests
+  DEPENDS gui
+  SOURCE InstanceHandoffTests.cpp
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/gui"
 )

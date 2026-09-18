@@ -172,7 +172,6 @@ void SettingsDialog::initConnections() const
   connect(ui->btnInstallLoginBridge, &QPushButton::clicked, this, &SettingsDialog::installLoginBridgeAgent);
   connect(ui->btnReapplyLoginBridge, &QPushButton::clicked, this, &SettingsDialog::reapplyLoginBridgeAgent);
   connect(ui->groupLoginBridge, &QGroupBox::toggled, this, &SettingsDialog::updateLoginBridgePanel);
-  connect(ui->sbBridgeScale, &QDoubleSpinBox::valueChanged, this, &SettingsDialog::updateLoginBridgePanel);
 #endif
   connect(ui->lineLogFilename, &QLineEdit::textChanged, this, &SettingsDialog::setButtonBoxEnabledButtons);
   connect(ui->lineTlsCertPath, &QLineEdit::textChanged, this, &SettingsDialog::setButtonBoxEnabledButtons);

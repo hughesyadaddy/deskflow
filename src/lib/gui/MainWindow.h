@@ -14,6 +14,7 @@
 #include <QRegularExpression>
 #include <QSystemTrayIcon>
 
+#include "InstanceHandoff.h"
 #include "VersionChecker.h"
 #include "config/ServerConfig.h"
 #include "gui/core/CoreProcess.h"
@@ -26,7 +27,6 @@
 
 class QAction;
 class QMenu;
-class QLocalServer;
 
 class DeskflowApplication;
 class LogDock;
@@ -70,6 +70,15 @@ public:
     return m_coreProcess.mode();
   }
   void open(bool showWindow = false);
+#ifdef Q_OS_MACOS
+  /**
+   * @brief Show the tray in a "grant Accessibility" state and call open() once the
+   * process becomes trusted (polled every @c kAccessibilityPollMs). A freshly
+   * re-signed bundle is untrusted at every deploy; exiting instead left no tray at all.
+   */
+  void openWhenAccessibilityGranted(bool showWindow);
+  static constexpr int kAccessibilityPollMs = 5000;
+#endif
   ServerConfig &serverConfig()
   {
     return m_serverConfig;
@@ -201,7 +210,9 @@ private:
   QStringList m_checkedServers;
   QSystemTrayIcon *m_trayIcon = nullptr;
   int m_trayRetries = 0;
-  QLocalServer *m_guiDupeChecker = nullptr;
+  bool m_awaitingAccessibility = false;
+  deskflow::gui::InstanceHandoffServer *m_guiDupeChecker = nullptr;
+  bool m_handingOff = false;
   deskflow::gui::ipc::DaemonIpcClient *m_daemonIpcClient = nullptr;
 
   LogDock *m_logDock;

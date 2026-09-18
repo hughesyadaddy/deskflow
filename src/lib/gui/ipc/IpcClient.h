@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <QElapsedTimer>
 #include <QObject>
+#include <QTimer>
 
 class QLocalSocket;
 
@@ -26,13 +28,30 @@ class IpcClient : public QObject
   };
 
 public:
-  explicit IpcClient(QObject *parent, const QString &socketName, const QString &typeName);
+  //! @c maxAttempts of @c kRetryForever keeps retrying (with backoff) until connected or disconnectFromServer().
+  static constexpr int kRetryForever = 0;
+  static constexpr int kFirstRetryDelayMs = 250;
+  static constexpr int kMaxRetryDelayMs = 4000;
+  //! While retrying, the failure is logged at most this often (the first failure is always logged).
+  static constexpr int kRetryLogIntervalMs = 60000;
+
+  explicit IpcClient(QObject *parent, const QString &socketName, const QString &typeName, int maxAttempts);
   void connectToServer();
   void disconnectFromServer();
 
   bool isConnected() const
   {
     return m_state == State::Connected;
+  }
+  //! Connect attempts made since the last connectToServer().
+  int attemptCount() const
+  {
+    return m_retryCount;
+  }
+  //! Delay of the pending retry in ms, or -1 when none is scheduled.
+  int pendingRetryDelayMs() const
+  {
+    return m_retryTimer.isActive() ? m_retryTimer.interval() : -1;
   }
 
 Q_SIGNALS:
@@ -45,6 +64,7 @@ private Q_SLOTS:
   void handleDisconnected();
   void handleErrorOccurred();
   void handleReadyRead();
+  void sendHello();
 
 protected:
   virtual void processCommand(const QString &command, const QStringList &parts)
@@ -57,6 +77,7 @@ protected:
 
 private:
   void attemptConnection();
+  void scheduleRetry();
   void handleHandshakeMessage(const QStringList &parts);
 
   QLocalSocket *m_socket;
@@ -64,6 +85,9 @@ private:
   QString m_socketName;
   QByteArray m_readBuffer;
   int m_retryCount{0};
+  int m_maxAttempts;
+  QTimer m_retryTimer;
+  QElapsedTimer m_lastRetryLog;
   QString m_typeName;
 };
 

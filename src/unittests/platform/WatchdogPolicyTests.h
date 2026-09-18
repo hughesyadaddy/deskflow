@@ -19,7 +19,6 @@ private Q_SLOTS:
   void nextRestartDelay_duplicateInstanceWaits30s();
   void nextRestartDelay_fastExitsBackOffExponentially();
   void nextRestartDelay_backoffIsCapped();
-  void nextRestartDelay_givesUpAfterMaxFastExits();
-  void nextRestartDelay_giveUpBeatsDuplicateInstance();
+  void nextRestartDelay_neverGivesUp();
   void nextRestartDelay_isConstexpr();
 };

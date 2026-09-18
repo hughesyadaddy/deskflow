@@ -17,6 +17,9 @@ class DaemonIpcClient : public IpcClient
   Q_OBJECT
 
 public:
+  //! The daemon is a local service: when it is not there after a short burst, the user is told.
+  static constexpr int kMaxAttempts = 3;
+
   explicit DaemonIpcClient(QObject *parent = nullptr);
   void sendLogLevel(const QString &logLevel);
   void sendConfigFile(const QString &configFile);

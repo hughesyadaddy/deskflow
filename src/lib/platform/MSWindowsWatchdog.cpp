@@ -662,16 +662,6 @@ MSWindowsWatchdog::ProcessState MSWindowsWatchdog::handleProcessExit()
 
   const int delayMs = policy::nextRestartDelayMs(static_cast<int>(exitCode), m_consecutiveFastExits, uptimeMs);
 
-  if (delayMs == policy::kRestartGiveUp) {
-    LOG_ERR(
-        "core exited %d times in a row within %llds of launch; not restarting it again until the config changes or "
-        "a start is requested",
-        m_consecutiveFastExits, policy::kFastExitUptimeMs / 1000
-    );
-    m_nextStartTime.reset();
-    return ProcessState::Idle;
-  }
-
   if (delayMs > 0) {
     m_nextStartTime = Arch::time() + delayMs / 1000.0;
     if (exitCode == static_cast<DWORD>(s_exitDuplicate)) {

@@ -40,7 +40,6 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QHideEvent>
-#include <QLocalServer>
 #include <QLocalSocket>
 #include <QMenu>
 #include <QMenuBar>
@@ -55,6 +54,7 @@
 #include <QSettings>
 #include <QShortcut>
 #include <QShowEvent>
+#include <QTimer>
 
 #include <memory>
 
@@ -69,7 +69,7 @@ MainWindow::MainWindow()
     : ui{std::make_unique<Ui::MainWindow>()},
       m_coreProcess(m_serverConfig),
       m_trayIcon{new QSystemTrayIcon(this)},
-      m_guiDupeChecker{new QLocalServer(this)},
+      m_guiDupeChecker{new deskflow::gui::InstanceHandoffServer(this)},
       m_daemonIpcClient{new ipc::DaemonIpcClient(this)},
       m_logDock{new LogDock(this)},
       m_statusBar{new StatusBar(this)},
@@ -134,9 +134,11 @@ MainWindow::MainWindow()
   m_actionReportBug->setMenuRole(QAction::NoRole);
 
   // Setup the Instance Checking
-  // In case of a previous crash remove first
-  QLocalServer::removeServer(m_guiSocketName);
   m_guiDupeChecker->listen(m_guiSocketName);
+#if defined(Q_OS_MACOS)
+  // The launchd-owned instance is the canonical one: it never steps aside for a peer.
+  m_guiDupeChecker->setHonoursQuit(!macLaunchdOwnsGui());
+#endif
 
   createMenuBar();
   setupControls();
@@ -168,15 +170,16 @@ MainWindow::MainWindow()
   restoreWindow();
 
 #if defined(Q_OS_MACOS)
-  // Self-managed launch: verify the SMAppService login registration on EVERY
-  // launch and repair it when missing. Replacing the app bundle (fleet
-  // deploys re-sign and overwrite /Applications/Deskflow.app) invalidates
-  // the registration, and the old one-time flag then left the app
-  // permanently unregistered -- machines silently stopped auto-starting
-  // after login. Deliberate tradeoff: disabling the login item in System
-  // Settings gets re-enabled on the next app launch; this fleet requires
-  // hands-off recovery after login above opt-out ergonomics.
-  if (!macStartAtLoginEnabled()) {
+  // With the fleet LaunchAgent installed launchd owns the launch; a Login Item
+  // as well means two GUIs race at login and one exits 5. Otherwise the app
+  // registers itself on every launch: replacing the bundle (fleet deploys
+  // re-sign /Applications/Deskflow.app) invalidates the record.
+  if (macLaunchdOwnsGui()) {
+    if (macStartAtLoginEnabled()) {
+      qInfo("launchd owns the gui launch, unregistering the login item");
+      macSetStartAtLogin(false);
+    }
+  } else if (!macStartAtLoginEnabled()) {
     macSetStartAtLogin(true);
     Settings::setValue(Settings::Gui::LoginItemConfigured, true);
     Settings::save();
@@ -316,6 +319,8 @@ void MainWindow::connectSlots()
         if (!fleetGraph.isEmpty()) {
           text += QStringLiteral(" · %1").arg(fleetGraph);
         }
+        if (m_awaitingAccessibility)
+          return;
         m_statusBar->setMessage(text);
         if (m_trayIcon)
           m_trayIcon->setToolTip(QStringLiteral("%1 — %2").arg(kAppName, text));
@@ -398,7 +403,13 @@ void MainWindow::connectSlots()
   connect(m_statusBar, &StatusBar::requestUpdateVersion, this, &MainWindow::openGetNewVersionUrl);
   connect(&m_versionChecker, &VersionChecker::updateFound, m_statusBar, &StatusBar::updateFound);
 
-  connect(m_guiDupeChecker, &QLocalServer::newConnection, this, &MainWindow::showAndActivate);
+  connect(m_guiDupeChecker, &deskflow::gui::InstanceHandoffServer::showRequested, this, &MainWindow::showAndActivate);
+  connect(m_guiDupeChecker, &deskflow::gui::InstanceHandoffServer::quitRequested, this, [this] {
+    // Stepping aside for the launchd-owned copy is not a user quit: no quit-intent
+    // sentinel, or the takeover would look like a deliberate stop.
+    m_handingOff = true;
+    close();
+  });
 
   connect(ui->btnEditName, &QPushButton::clicked, this, &MainWindow::showHostNameEditor);
 
@@ -802,6 +813,34 @@ void MainWindow::open(bool showWindow)
   }
 }
 
+#ifdef Q_OS_MACOS
+void MainWindow::openWhenAccessibilityGranted(bool showWindow)
+{
+  m_awaitingAccessibility = true;
+  const auto text = tr("Grant Accessibility: System Settings > Privacy & Security > Accessibility > Deskflow");
+  m_statusBar->setMessage(text);
+  if (m_trayIcon)
+    m_trayIcon->setToolTip(QStringLiteral("%1 — %2").arg(kAppName, text));
+  toggleCanRunCore(false);
+  qWarning("accessibility not granted; tray is up, waiting for the grant");
+
+  auto *poll = new QTimer(this);
+  poll->setInterval(kAccessibilityPollMs);
+  connect(poll, &QTimer::timeout, this, [this, poll, showWindow] {
+    if (!isOSXAccessibilityGranted(false))
+      return;
+    poll->stop();
+    poll->deleteLater();
+    m_awaitingAccessibility = false;
+    qInfo("accessibility granted, starting normally");
+    toggleCanRunCore(canRunCore());
+    updateStatus();
+    open(showWindow);
+  });
+  poll->start();
+}
+#endif
+
 void MainWindow::createMenuBar()
 {
   m_menuFile->addAction(m_actionStartCore);
@@ -1081,6 +1120,10 @@ void MainWindow::closeEvent(QCloseEvent *event)
     Settings::setValue(Settings::Gui::AutoStartCore, m_coreProcess.isStarted());
   }
   qDebug() << "quitting application";
+#if defined(Q_OS_MACOS)
+  if (!m_handingOff)
+    macWriteQuitIntent();
+#endif
 
   // any connected dock view acitons will be triggered
   // disconnect them before accepting the event
@@ -1100,6 +1143,8 @@ void MainWindow::showFirstConnectedMessage()
 
 void MainWindow::updateStatus()
 {
+  if (m_awaitingAccessibility)
+    return;
   using enum ProcessState;
   const auto connection = m_coreProcess.connectionState();
   const auto process = m_coreProcess.processState();
@@ -1402,6 +1447,8 @@ void MainWindow::daemonIpcClientConnectionFailed()
 
 void MainWindow::toggleCanRunCore(bool enableButtons)
 {
+  if (m_awaitingAccessibility)
+    enableButtons = false;
   const bool isStarted = m_coreProcess.isStarted();
   ui->btnToggleCore->setEnabled(enableButtons);
   ui->btnRestartCore->setEnabled(enableButtons && isStarted);

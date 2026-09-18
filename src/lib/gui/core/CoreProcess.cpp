@@ -46,7 +46,6 @@ const auto kLineSplitRegex = QRegularExpression("\r|\n|\r\n");
 #ifdef Q_OS_MACOS
 //! launchd label of the user-domain core agent installed by the macOS installer.
 const auto kLaunchdCoreLabel = QStringLiteral("io.github.hughesyadaddy.deskflow-core");
-const int kLaunchctlTimeoutMs = 3000;
 
 QString launchdCoreTarget()
 {
@@ -209,20 +208,9 @@ void CoreProcess::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatu
   const auto wasStarted = m_processState == Started;
   releaseProcess();
 
-  // Another core already owns this machine (a launchd agent, the service's core, or a
-  // second GUI).
+  // Another core already owns this machine (the service's core or a second GUI).
   if (exitCode == s_exitDuplicate && exitStatus == QProcess::NormalExit) {
     m_consecutiveCrashes = 0;
-    // The owner may be our own launchd agent that came up between the probe in start()
-    // and the spawn (or that the installer just loaded). Attach to it via IPC rather
-    // than showing Stopped for a core that is actually running. start() re-probes and
-    // takes the externally-supervised path, so nothing is spawned again.
-    if (wasStarted && probeExternalSupervisor()) {
-      qInfo("another core owns this machine (exit code %d) and the launchd agent is loaded, attaching", exitCode);
-      setProcessState(Stopped);
-      start();
-      return;
-    }
     // Never stop or kill the other core and never retry: retrying would just re-collide,
     // and stopping it via IPC makes its supervisor respawn it, which ping-pongs forever.
     qWarning("another core owns this machine (exit code %d), leaving it running and not retrying", exitCode);
@@ -285,36 +273,40 @@ bool CoreProcess::spawnCoreProcess(QProcess *process, const QString &program, co
   return process->waitForStarted();
 }
 
-bool CoreProcess::probeExternalSupervisor() const
+bool CoreProcess::hasExternalSupervisor() const
 {
+  // macOS with the fleet core agent installed: launchd is the only thing that may
+  // spawn a core. The old `launchctl print` probe timed out at login storms and the
+  // GUI then spawned its own core, leaving launchd's agent looping on exit 5; a
+  // file stat cannot time out. Without the agent (dev machines) the GUI spawns.
 #ifdef Q_OS_MACOS
-  QProcess launchctl;
-  launchctl.setProcessChannelMode(QProcess::MergedChannels);
-  launchctl.start(QStringLiteral("/bin/launchctl"), {QStringLiteral("print"), launchdCoreTarget()});
-  if (!launchctl.waitForFinished(kLaunchctlTimeoutMs)) {
-    launchctl.kill();
-    qWarning("launchctl print timed out, assuming no launchd-managed core");
-    return false;
-  }
-  return launchctl.exitStatus() == QProcess::NormalExit && launchctl.exitCode() == 0;
+  return macLaunchdOwnsCore();
 #else
   return false;
 #endif
 }
 
-void CoreProcess::kickstartExternalCore() const
+void CoreProcess::kickstartExternalCore()
 {
 #ifdef Q_OS_MACOS
   const auto target = launchdCoreTarget();
   qInfo("restarting launchd-managed core: launchctl kickstart -k %s", qPrintable(target));
-  QProcess launchctl;
-  launchctl.start(QStringLiteral("/bin/launchctl"), {QStringLiteral("kickstart"), QStringLiteral("-k"), target});
-  if (!launchctl.waitForFinished(kLaunchctlTimeoutMs)) {
-    launchctl.kill();
-    qWarning("launchctl kickstart timed out");
-  } else if (launchctl.exitCode() != 0) {
-    qWarning("launchctl kickstart failed with exit code %d", launchctl.exitCode());
-  }
+  auto *launchctl = new QProcess(this);
+  connect(launchctl, &QProcess::finished, this, [this, launchctl](int exitCode, QProcess::ExitStatus status) {
+    launchctl->deleteLater();
+    if (status != QProcess::NormalExit || exitCode != 0) {
+      qWarning("launchctl kickstart failed with exit code %d", exitCode);
+      kickstartFailed();
+    }
+  });
+  connect(launchctl, &QProcess::errorOccurred, this, [this, launchctl](QProcess::ProcessError) {
+    if (launchctl->state() == QProcess::NotRunning) {
+      qWarning("launchctl kickstart could not run: %s", qPrintable(launchctl->errorString()));
+      launchctl->deleteLater();
+      kickstartFailed();
+    }
+  });
+  launchctl->start(QStringLiteral("/bin/launchctl"), {QStringLiteral("kickstart"), QStringLiteral("-k"), target});
 #endif
 }
 
@@ -527,8 +519,8 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
     }
   }
 
-  // Probed once per start(): an externally supervised core (launchd) is attached to via IPC only.
-  m_externallySupervised = processMode == ProcessMode::Desktop && probeExternalSupervisor();
+  // An externally supervised core (launchd on macOS) is attached to via IPC only.
+  m_externallySupervised = processMode == ProcessMode::Desktop && hasExternalSupervisor();
 
   qInfo().noquote() << QString("starting %1 process (%2 mode%3)")
                            .arg(
@@ -592,17 +584,23 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
             return;
           }
 
+          releaseCoreIpcClient();
           m_coreIpcClient = new ipc::CoreIpcClient(this);
           connect(m_coreIpcClient, &ipc::CoreIpcClient::commandReceived, this, &CoreProcess::onCoreIpcMessageReceived);
           connect(m_coreIpcClient, &ipc::CoreIpcClient::connected, this, [this] {
             qDebug("connected to core ipc server");
             m_consecutiveCrashes = 0;
           });
-          connect(m_coreIpcClient, &ipc::CoreIpcClient::connectionFailed, this, [] {
-            qWarning("failed to establish core ipc connection");
+          // The client retries a fresh connect forever, so these only fire once a
+          // connection is lost (kickstart, core crash, core stop): re-attach while the
+          // core is still meant to be running.
+          connect(m_coreIpcClient, &ipc::CoreIpcClient::connectionFailed, this, [this] {
+            qWarning("core ipc connection lost, re-attaching");
+            scheduleCoreIpcReattach();
           });
-          connect(m_coreIpcClient, &ipc::CoreIpcClient::serverShutdown, this, [] {
-            qDebug("core ipc server shut down cleanly");
+          connect(m_coreIpcClient, &ipc::CoreIpcClient::serverShutdown, this, [this] {
+            qDebug("core ipc server shut down cleanly, re-attaching");
+            scheduleCoreIpcReattach();
           });
 
           m_coreIpcClient->connectToServer();
@@ -637,11 +635,7 @@ void CoreProcess::stop(std::optional<ProcessMode> processModeOption)
     m_retryTimer.stop();
   }
 
-  if (m_coreIpcClient) {
-    m_coreIpcClient->disconnectFromServer();
-    m_coreIpcClient->deleteLater();
-    m_coreIpcClient = nullptr;
-  }
+  releaseCoreIpcClient();
 
   if (m_processState == ProcessState::Starting) {
     qDebug("core process is starting, cancelling");
@@ -716,11 +710,10 @@ void CoreProcess::doRestart()
   qDebug("restarting core process");
   m_lastRestart.restart();
 
-  if (m_externallySupervised) {
-    // launchd owns the process: never kill+spawn, ask launchd to bounce it and re-attach.
-    stop();
+  if (m_externallySupervised && m_processState == ProcessState::Started) {
+    // launchd owns the process: one kickstart, and the IPC client re-attaches with backoff.
+    setConnectionState(ConnectionState::Connecting);
     kickstartExternalCore();
-    start();
     return;
   }
 
@@ -740,6 +733,35 @@ void CoreProcess::doRestart()
   }
 
   start();
+}
+
+void CoreProcess::kickstartFailed()
+{
+  // launchd could not bounce the core: there is nothing to attach to, say so.
+  releaseCoreIpcClient();
+  setProcessState(ProcessState::Stopped);
+  setConnectionState(ConnectionState::Disconnected);
+  Q_EMIT error(Error::StartFailed);
+}
+
+void CoreProcess::releaseCoreIpcClient()
+{
+  if (!m_coreIpcClient) {
+    return;
+  }
+  disconnect(m_coreIpcClient, nullptr, this, nullptr);
+  m_coreIpcClient->disconnectFromServer();
+  m_coreIpcClient->deleteLater();
+  m_coreIpcClient = nullptr;
+}
+
+void CoreProcess::scheduleCoreIpcReattach()
+{
+  QTimer::singleShot(kRetryDelay, this, [this] {
+    if (m_processState == ProcessState::Started && m_coreIpcClient && !m_coreIpcClient->isConnected()) {
+      m_coreIpcClient->connectToServer();
+    }
+  });
 }
 
 void CoreProcess::cleanup()

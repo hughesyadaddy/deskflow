@@ -27,6 +27,8 @@ add_library(${target} STATIC
   FileTail.h
   Hotkey.cpp
   Hotkey.h
+  InstanceHandoff.cpp
+  InstanceHandoff.h
   ChordRemap.cpp
   ChordRemap.h
   KeySequence.cpp

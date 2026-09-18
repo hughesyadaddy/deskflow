@@ -59,6 +59,7 @@ target_link_libraries(${target} PRIVATE
   "-framework CoreGraphics"
   "-framework Foundation"
   "-framework IOKit"
+  "-framework SystemConfiguration"
 )
 
 install(

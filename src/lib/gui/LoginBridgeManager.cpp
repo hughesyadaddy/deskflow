@@ -14,18 +14,26 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QDateTime>
 #include <QProcess>
-#include <QTemporaryFile>
+#include <QProcessEnvironment>
 
 namespace deskflow::gui {
 
 namespace {
 
 const auto kAgentLabel = QStringLiteral("org.deskflow.vhid-bridge");
+constexpr int kRenderTimeoutMs = 15000;
+
+struct RenderCache
+{
+  double scale = 0;
+  QDateTime settingsModified;
+  QString plist;
+  bool valid = false;
+};
+RenderCache g_renderCache;
 const auto kBridgeLogPath = QStringLiteral("/var/log/deskflow-vhid-bridge.log");
-// Retired pre-native-mode login-window coordinator. Enabling the bridge
-// removes it so the two never both run at the login screen.
-const auto kLegacyAgentPlist = QStringLiteral("/Library/LaunchAgents/com.kvm.autoswitch.loginwindow.plist");
 const auto kDaemonAppPath = QStringLiteral(
     "/Library/Application Support/org.pqrs/Karabiner-DriverKit-VirtualHIDDevice/"
     "Applications/Karabiner-VirtualHIDDevice-Daemon.app"
@@ -61,21 +69,6 @@ bool waitForProcessWithEvents(QProcess &proc, int timeoutMs, QString *error)
 
 /// Run a shell command with an admin prompt (osascript). Returns true on
 /// success; fills @p error with stderr / cancellation reason otherwise.
-bool runPrivileged(const QString &shellCommand, QString *error);
-
-/// Install the staged LaunchAgent plist (admin prompt).
-bool installAgentPlist(const QString &stagedPath, QString *error)
-{
-  const auto agentPlist = QStringLiteral("/Library/LaunchAgents/%1.plist").arg(kAgentLabel);
-  const auto command =
-      QStringLiteral("install -d /Library/LaunchAgents && install -m 644 -o root -g wheel '%1' '%2' && "
-                     "rm -f '%3'; pkill -f '.kvm-autoswitch/coordinator.py' || true")
-          .arg(stagedPath, agentPlist, kLegacyAgentPlist);
-  return runPrivileged(command, error);
-}
-
-/// Run a shell command with an admin prompt (osascript). Returns true on
-/// success; fills @p error with stderr / cancellation reason otherwise.
 bool runPrivileged(const QString &shellCommand, QString *error)
 {
   const QString script = QStringLiteral("do shell script \"%1\" with administrator privileges")
@@ -94,6 +87,53 @@ bool runPrivileged(const QString &shellCommand, QString *error)
     }
     return false;
   }
+  return true;
+}
+
+/// Run the bundled install script. With @p dryRun the script renders the plist
+/// to stdout and installs nothing; otherwise it installs behind its own admin
+/// prompt. Settings are flushed first: the script reads Deskflow.conf, not memory.
+bool runBridgeScript(double scale, bool dryRun, QString *output, QString *error)
+{
+  const auto script = LoginBridgeManager::installScriptPath();
+  if (script.isEmpty()) {
+    if (error)
+      *error = QObject::tr("install-login-bridge-macos.sh is not bundled with this build");
+    return false;
+  }
+  Settings::save(false);
+
+  QStringList args = {script, QStringLiteral("--scale"), QString::number(scale)};
+  if (dryRun)
+    args.append(QStringLiteral("--dry-run"));
+
+  QProcess proc;
+  auto env = QProcessEnvironment::systemEnvironment();
+  env.insert(QStringLiteral("DESKFLOW_SETTINGS"), Settings::settingsFile());
+  proc.setProcessEnvironment(env);
+  proc.start(QStringLiteral("/bin/bash"), args);
+  if (dryRun) {
+    // No event pumping: a render is called from widget slots and must not re-enter them.
+    if (!proc.waitForFinished(kRenderTimeoutMs)) {
+      proc.kill();
+      if (error)
+        *error = QObject::tr("install script did not render the agent plist within %1 s").arg(kRenderTimeoutMs / 1000);
+      return false;
+    }
+  } else if (!waitForProcessWithEvents(proc, 120000, error)) {
+    return false;
+  }
+  const auto stderrText = QString::fromUtf8(proc.readAllStandardError()).trimmed();
+  if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
+    if (error) {
+      *error = stderrText.contains(QStringLiteral("User cancelled"), Qt::CaseInsensitive)
+          ? QStringLiteral("the administrator prompt was cancelled")
+          : (stderrText.isEmpty() ? QStringLiteral("install script exited %1").arg(proc.exitCode()) : stderrText);
+    }
+    return false;
+  }
+  if (output)
+    *output = QString::fromUtf8(proc.readAllStandardOutput());
   return true;
 }
 
@@ -145,68 +185,6 @@ QString LoginBridgeManager::agentPlistPath()
   return QStringLiteral("/Library/LaunchAgents/%1.plist").arg(kAgentLabel);
 }
 
-QStringList LoginBridgeManager::serverCandidates()
-{
-  const auto selfName = Settings::value(Settings::Core::ComputerName).toString().trimmed();
-  const auto peersValue = Settings::value(Settings::Coordination::Peers).toStringList().join(',');
-
-  QStringList hosts;
-  // Peer entries: `name` or `name=address[|lanAddress]`. Any peer can be the
-  // elected server; collect every address form (the bridge cycles them).
-  for (const auto &rawEntry : peersValue.split(',', Qt::SkipEmptyParts)) {
-    const auto entry = rawEntry.trimmed();
-    if (entry.isEmpty())
-      continue;
-    const auto eq = entry.indexOf('=');
-    const auto name = (eq < 0 ? entry : entry.left(eq)).trimmed();
-    if (name.compare(selfName, Qt::CaseInsensitive) == 0)
-      continue;
-    if (eq < 0) {
-      hosts.append(name);
-      continue;
-    }
-    for (const auto &addr : entry.mid(eq + 1).split('|', Qt::SkipEmptyParts)) {
-      const auto trimmed = addr.trimmed();
-      if (!trimmed.isEmpty() && !hosts.contains(trimmed))
-        hosts.append(trimmed);
-    }
-  }
-  return hosts;
-}
-
-QString LoginBridgeManager::plistContent(double scale)
-{
-  const auto hosts = serverCandidates();
-  const auto screenName = Settings::value(Settings::Core::ComputerName).toString();
-  const auto port = Settings::value(Settings::Core::Port).toInt();
-
-  // LimitLoadToSessionType=LoginWindow scopes the agent to login-window
-  // sessions only: launchd starts it at the login screen and tears it down
-  // when a user session takes over (where deskflow-core handles input).
-  return QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>%1</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>%2</string>
-    <string>%3</string>
-    <string>%4</string>
-    <string>%5</string>
-    <string>--scale=%6</string>
-  </array>
-  <key>LimitLoadToSessionType</key><string>LoginWindow</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/var/log/deskflow-vhid-bridge.log</string>
-  <key>StandardErrorPath</key><string>/var/log/deskflow-vhid-bridge.log</string>
-</dict>
-</plist>
-)")
-      .arg(kAgentLabel, bridgePath(), hosts.join(','), screenName, QString::number(port), QString::number(scale));
-}
-
 QString LoginBridgeManager::installScriptPath()
 {
   const QFileInfo bundled(
@@ -237,11 +215,28 @@ bool LoginBridgeManager::canInstall(QString *reason)
       *reason = QObject::tr("bridge binary not found at %1").arg(bridgePath());
     return false;
   }
-  if (serverCandidates().isEmpty()) {
-    if (reason)
-      *reason = QObject::tr("no coordination peers configured — add the other computers first");
+  // The script owns peer parsing; a render that fails (no peers, missing name) is the reason.
+  return renderAgentPlist(Settings::value(Settings::Coordination::LoginBridgeScale).toDouble(), nullptr, reason);
+}
+
+bool LoginBridgeManager::renderAgentPlist(double scale, QString *plist, QString *error)
+{
+  // The script reads Deskflow.conf, so (scale, conf mtime) identifies a render;
+  // the settings tab asks several times per refresh and must not fork each time.
+  Settings::save(false);
+  const auto modified = QFileInfo(Settings::settingsFile()).lastModified();
+  if (g_renderCache.valid && g_renderCache.scale == scale && g_renderCache.settingsModified == modified) {
+    if (plist)
+      *plist = g_renderCache.plist;
+    return true;
+  }
+  QString rendered;
+  if (!runBridgeScript(scale, true, &rendered, error)) {
     return false;
   }
+  g_renderCache = {scale, modified, rendered, true};
+  if (plist)
+    *plist = rendered;
   return true;
 }
 
@@ -252,17 +247,8 @@ bool LoginBridgeManager::runInstallScript(double scale, QString *error)
 
   Settings::setValue(Settings::Coordination::LoginBridgeScale, scale);
   Settings::setValue(Settings::Coordination::LoginBridgeEnabled, true);
-  Settings::save(false);
 
-  QTemporaryFile staged;
-  if (!staged.open() || staged.write(plistContent(scale).toUtf8()) < 0) {
-    if (error)
-      *error = QObject::tr("could not stage the agent plist");
-    return false;
-  }
-  staged.flush();
-
-  if (!installAgentPlist(staged.fileName(), error))
+  if (!runBridgeScript(scale, false, nullptr, error))
     return false;
   return agentInstalled();
 }
@@ -273,7 +259,15 @@ bool LoginBridgeManager::apply(bool enabled, double scale, QString *error)
     return true;
 
   if (!enabled) {
-    const auto command = QStringLiteral("rm -f '%1'; pkill -f deskflow-vhid-bridge || true").arg(agentPlistPath());
+    // Unload the LoginWindow-session job by its plist (SIGTERM: the bridge
+    // releases its keys and exits at once), then remove the plist. pkill -f
+    // matched any command line containing the name. An unload failure is
+    // reported, not swallowed: the plist is still removed so the agent cannot
+    // come back at the next login window.
+    const auto plist = agentPlistPath();
+    const auto command = QStringLiteral("if launchctl unload -S LoginWindow '%1'; then rm -f '%1'; else rm -f '%1'; "
+                                        "echo 'launchctl unload -S LoginWindow failed (plist removed)' >&2; exit 1; fi")
+                             .arg(plist);
     return runPrivileged(command, error);
   }
 
@@ -289,7 +283,11 @@ bool LoginBridgeManager::installedAgentMatchesCurrentSettings(double scale)
   if (!onDisk.open(QIODevice::ReadOnly)) {
     return false;
   }
-  return QString::fromUtf8(onDisk.readAll()).simplified() == plistContent(scale).simplified();
+  QString rendered;
+  if (!renderAgentPlist(scale, &rendered, nullptr)) {
+    return false;
+  }
+  return QString::fromUtf8(onDisk.readAll()).simplified() == rendered.simplified();
 }
 
 QString LoginBridgeManager::recentLogText(int maxLines)

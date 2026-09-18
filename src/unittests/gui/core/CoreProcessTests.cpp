@@ -9,6 +9,9 @@
 #include "common/Settings.h"
 #include "gui/config/ServerConfig.h"
 #include "gui/core/CoreProcess.h"
+#ifdef Q_OS_MACOS
+#include "gui/OSXHelpers.h"
+#endif
 
 #include <QCoreApplication>
 #include <QDir>
@@ -35,7 +38,7 @@ public:
   int spawnCount = 0;
   bool supervised = false;
   bool windowsService = false;
-  mutable int kickstarts = 0;
+  int kickstarts = 0;
 
   //! Simulate the child process ending, exactly as QProcess::finished would deliver it.
   void finish(int exitCode, QProcess::ExitStatus status)
@@ -54,17 +57,42 @@ protected:
     ++spawnCount;
     return true;
   }
-  bool probeExternalSupervisor() const override
+  bool hasExternalSupervisor() const override
   {
     return supervised;
   }
-  void kickstartExternalCore() const override
+  void kickstartExternalCore() override
   {
     ++kickstarts;
   }
   bool isWindowsServiceInstalled() const override
   {
     return windowsService;
+  }
+};
+
+//! Real platform supervision answer; only the process boundary itself is faked.
+class PlatformCoreProcess : public CoreProcess
+{
+public:
+  explicit PlatformCoreProcess(const ServerConfig &config)
+      : CoreProcess(config, QStringLiteral("/nonexistent/fake-deskflow-core"))
+  {
+    setMode(Settings::CoreMode::Client);
+  }
+
+  int spawnCount = 0;
+  int kickstarts = 0;
+
+protected:
+  bool spawnCoreProcess(QProcess *, const QString &, const QStringList &) override
+  {
+    ++spawnCount;
+    return true;
+  }
+  void kickstartExternalCore() override
+  {
+    ++kickstarts;
   }
 };
 
@@ -176,23 +204,6 @@ void CoreProcessTests::duplicate_exit_stops_without_retry()
   QTest::qWait(1200);
   QCOMPARE(core.spawnCount, 1);
   QCOMPARE(core.processState(), ProcessState::Stopped);
-
-  // Exit 5 while our own launchd agent is loaded means the agent won the race: attach to it
-  // via IPC (externally supervised) instead of reporting Stopped for a core that is running.
-  FakeCoreProcess attached(config);
-  attached.start(ProcessMode::Desktop);
-  QCOMPARE(attached.spawnCount, 1);
-  QVERIFY(!attached.isExternallySupervised());
-  attached.supervised = true; // the agent came up between the probe and the spawn
-  attached.finish(5, QProcess::NormalExit);
-  QCOMPARE(attached.processState(), ProcessState::Started);
-  QVERIFY(attached.isExternallySupervised());
-  QCOMPARE(attached.spawnCount, 1);
-  flushDeferredDeletes();
-  QCOMPARE(attached.processObjects(), 0);
-  QCOMPARE(attached.pendingRetryDelayMs(), -1);
-  attached.stop();
-  QCOMPARE(attached.processState(), ProcessState::Stopped);
 }
 
 void CoreProcessTests::normal_exit_while_started_retries_after_base_delay()
@@ -286,21 +297,61 @@ void CoreProcessTests::externally_supervised_core_attaches_via_ipc_and_kickstart
   ServerConfig config;
   FakeCoreProcess core(config);
   core.supervised = true;
+  QSignalSpy stateSpy(&core, &CoreProcess::processStateChanged);
 
   core.start(ProcessMode::Desktop);
   QVERIFY(core.isExternallySupervised());
   QCOMPARE(core.processState(), ProcessState::Started);
   QCOMPARE(core.spawnCount, 0);
   QCOMPARE(core.processObjects(), 0);
+  stateSpy.clear();
 
+  // Restart is one kickstart: no stop()/start() bounce, so the state never leaves
+  // Started and the IPC client (not a respawn) is what re-attaches.
   core.restart();
   QCOMPARE(core.kickstarts, 1);
   QCOMPARE(core.spawnCount, 0);
   QCOMPARE(core.processState(), ProcessState::Started);
+  QCOMPARE(stateSpy.count(), 0);
+  QCOMPARE(core.connectionState(), deskflow::core::ConnectionState::Connecting);
 
   core.stop();
   QCOMPARE(core.processState(), ProcessState::Stopped);
   QCOMPARE(core.kickstarts, 1);
+
+  // Restart from Stopped is a plain attach, never a kickstart of a core the user stopped.
+  FakeCoreProcess stopped(config);
+  stopped.supervised = true;
+  stopped.start(ProcessMode::Desktop);
+  stopped.stop();
+  QCOMPARE(stopped.processState(), ProcessState::Stopped);
+  stopped.restart();
+  QCOMPARE(stopped.kickstarts, 0);
+  QCOMPARE(stopped.spawnCount, 0);
+  QCOMPARE(stopped.processState(), ProcessState::Started);
+  stopped.stop();
+}
+
+void CoreProcessTests::macos_gui_never_spawns_a_core()
+{
+  ServerConfig config;
+  PlatformCoreProcess core(config);
+
+  core.start(ProcessMode::Desktop);
+  QCOMPARE(core.processState(), ProcessState::Started);
+#ifdef Q_OS_MACOS
+  // Decided by the fleet core agent plist on this machine, never by a launchctl probe.
+  const bool launchdOwned = macLaunchdOwnsCore();
+#else
+  const bool launchdOwned = false;
+#endif
+  QCOMPARE(core.isExternallySupervised(), launchdOwned);
+  QCOMPARE(core.spawnCount, launchdOwned ? 0 : 1);
+  core.restart();
+  QCOMPARE(core.kickstarts, launchdOwned ? 1 : 0);
+  QCOMPARE(core.spawnCount, launchdOwned ? 0 : 2);
+  core.stop();
+  QCOMPARE(core.processState(), ProcessState::Stopped);
 }
 
 void CoreProcessTests::stop_releases_process_object()

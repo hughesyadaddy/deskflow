@@ -69,31 +69,24 @@ void WatchdogPolicyTests::nextRestartDelay_fastExitsBackOffExponentially()
 
 void WatchdogPolicyTests::nextRestartDelay_backoffIsCapped()
 {
-  // The cap is only reachable if kMaxConsecutiveFastExits is raised, but the
-  // arithmetic must stay bounded (no overflow) for any counter value.
   QCOMPARE(kMaxBackoffMs, 30000);
-  // Only counters below the give-up threshold reach the backoff branch.
-  for (int n = 1; n < kMaxConsecutiveFastExits; ++n) {
+  QCOMPARE(nextRestartDelayMs(s_exitFailed, 5, 100), 16000);
+  QCOMPARE(nextRestartDelayMs(s_exitFailed, 6, 100), kMaxBackoffMs);
+  for (int n = 1; n < 2000; ++n) {
     const int delay = nextRestartDelayMs(s_exitFailed, n, 100);
     QVERIFY(delay >= kBaseBackoffMs);
     QVERIFY(delay <= kMaxBackoffMs);
   }
 }
 
-void WatchdogPolicyTests::nextRestartDelay_givesUpAfterMaxFastExits()
+void WatchdogPolicyTests::nextRestartDelay_neverGivesUp()
 {
-  QCOMPARE(kMaxConsecutiveFastExits, 5);
-  QVERIFY(nextRestartDelayMs(s_exitFailed, kMaxConsecutiveFastExits - 1, 100) > 0);
-  QCOMPARE(nextRestartDelayMs(s_exitFailed, kMaxConsecutiveFastExits, 100), kRestartGiveUp);
-  QCOMPARE(nextRestartDelayMs(s_exitFailed, kMaxConsecutiveFastExits + 3, 100), kRestartGiveUp);
-  QCOMPARE(nextRestartDelayMs(s_exitFailed, 1000, 100), kRestartGiveUp);
-}
-
-void WatchdogPolicyTests::nextRestartDelay_giveUpBeatsDuplicateInstance()
-{
-  // Five exit-5s in a row (2.5 min of "another core owns the machine") stop
-  // the relaunching entirely until a config change / IPC start.
-  QCOMPARE(nextRestartDelayMs(s_exitDuplicate, kMaxConsecutiveFastExits, 100), kRestartGiveUp);
+  // With no GUI around nothing would ever re-request a start, so a crash loop
+  // keeps retrying at the cap rather than parking the core forever.
+  QCOMPARE(nextRestartDelayMs(s_exitFailed, 5, 100), 16000);
+  QCOMPARE(nextRestartDelayMs(s_exitFailed, 1000, 100), kMaxBackoffMs);
+  QCOMPARE(nextRestartDelayMs(s_exitDuplicate, 1000, 100), kDuplicateInstanceDelayMs);
+  QCOMPARE(nextRestartDelayMs(s_exitFailed, 1000, 60 * 1000), 0);
 }
 
 void WatchdogPolicyTests::nextRestartDelay_isConstexpr()
@@ -102,7 +95,7 @@ void WatchdogPolicyTests::nextRestartDelay_isConstexpr()
   static_assert(nextRestartDelayMs(s_exitFailed, 0, 100000) == 0);
   static_assert(nextRestartDelayMs(s_exitDuplicate, 1, 0) == kDuplicateInstanceDelayMs);
   static_assert(nextRestartDelayMs(s_exitFailed, 3, 0) == 4000);
-  static_assert(nextRestartDelayMs(s_exitFailed, kMaxConsecutiveFastExits, 0) == kRestartGiveUp);
+  static_assert(nextRestartDelayMs(s_exitFailed, 1000, 0) == kMaxBackoffMs);
   static_assert(isFastExit(s_exitDuplicate, 1000000));
   QVERIFY(true);
 }

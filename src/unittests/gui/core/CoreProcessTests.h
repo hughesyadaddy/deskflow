@@ -23,6 +23,7 @@ private Q_SLOTS:
   void restart_coalesces_within_window();
   void windows_service_forces_service_mode();
   void externally_supervised_core_attaches_via_ipc_and_kickstarts_on_restart();
+  void macos_gui_never_spawns_a_core();
   void stop_releases_process_object();
 
 private:

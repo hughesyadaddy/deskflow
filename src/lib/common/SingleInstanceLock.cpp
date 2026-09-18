@@ -159,6 +159,13 @@ int openLockFile(SingleInstanceLock::Role role, SingleInstanceLock::Scope scope,
     fd = ::open(outPath.c_str(), O_RDONLY | cloexec);
   }
   if (fd >= 0) {
+    // Machine scope only: the file must stay world-readable whatever the creator's
+    // umask (the root login-window bridge runs with 077), or user-session cores
+    // could not open it read-only to flock and would fall back to /tmp.
+    struct stat st{};
+    if (::fstat(fd, &st) == 0 && st.st_uid == geteuid() && (st.st_mode & 0444) != 0444) {
+      ::fchmod(fd, 0644);
+    }
     return fd;
   }
   const int primaryErrno = errno;
