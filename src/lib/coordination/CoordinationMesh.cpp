@@ -274,6 +274,12 @@ bool CoordinationMesh::probeDeskflowPort(int port, int timeoutMs)
   if (fd < 0) {
     return false;
   }
+  // Reset instead of FIN: a half-closed probe left the server's
+  // ClientProxyUnknown holding the accepted fd until its 30 s timeout.
+  linger abort{};
+  abort.l_onoff = 1;
+  abort.l_linger = 0;
+  ::setsockopt(fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char *>(&abort), sizeof(abort));
   platformCloseSocket(fd);
   return true;
 }

@@ -74,6 +74,8 @@ private Q_SLOTS:
   void keyLaneFailure_resyncsLedgerAndPostsStickyClearAll();
   void relayStop_forwardedHoldsAreReleasedOnTheKeyLane();
   void rescue_discardsQueuedKeysAndResyncsLedger();
+  void rescue_duplicateDeliveryRestartsOnce();
+  void claim_duplicateDeliveryEvaluatedOnce();
   void heartbeat_doesNotBlockOnUnreachablePeers();
   void keyForward_returnsWithinGraceWhenPeerUnreachable();
   void keyForward_followsRunningRoleNotElection();
@@ -1000,6 +1002,64 @@ void CoordinatorTests::rescue_discardsQueuedKeysAndResyncsLedger()
       coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Swallowed
   );
   QCOMPARE(relayPtr->resyncs.load(), 1);
+}
+
+void CoordinatorTests::rescue_duplicateDeliveryRestartsOnce()
+{
+  // A-8: the server has two Esc counters and older peers send every line to
+  // both ip and lan, so the same rescue lands twice in the same millisecond.
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "test-token";
+  config.peers = deskflow::coordination::parsePeerList(std::string("hackintosh=") + kBlackholeA);
+
+  Coordinator coordinator(config);
+  int restarts = 0;
+  coordinator.m_localCoreRestartHook = [&restarts] { ++restarts; };
+  const auto reply = [](const std::string &) {};
+  const std::string line = protocol::encodeRescue("test-token");
+
+  coordinator.onMessage(protocol::decode(line), reply);
+  coordinator.onMessage(protocol::decode(line), reply);
+  QCOMPARE(restarts, 1);
+
+  coordinator.m_lastRescueAt = -1.0e9; // window elapsed
+  coordinator.onMessage(protocol::decode(line), reply);
+  QCOMPARE(restarts, 2);
+}
+
+void CoordinatorTests::claim_duplicateDeliveryEvaluatedOnce()
+{
+  using deskflow::coordination::Role;
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "test-token";
+  config.peers = deskflow::coordination::parsePeerList("hackintosh=10.0.0.2,macbookpro=10.0.0.3");
+
+  Coordinator coordinator(config);
+  const auto reply = [](const std::string &) {};
+  const auto claim = [](const char *from, const char *ip, int64_t seq) {
+    return protocol::decode(protocol::encodeClaim(from, ip, ip, seq, "test-token"));
+  };
+
+  coordinator.onMessage(claim("hackintosh", "10.0.0.2", 7), reply);
+  QCOMPARE(coordinator.m_election.role(), Role::Client);
+  QCOMPARE(coordinator.m_election.serverAddress(), std::string("10.0.0.2"));
+  // decide() names the followed peer so pre-connect ordering never walks
+  // our own addresses first.
+  QCOMPARE(coordinator.m_fleetState.server, std::string("hackintosh"));
+
+  // Same (peer, seq) again is dropped before the election sees it (not even
+  // the seq merge runs); a new seq from the same peer is evaluated as usual.
+  coordinator.onMessage(claim("hackintosh", "10.0.0.2", 7), reply);
+  QCOMPARE(coordinator.m_election.seq(), 7);
+  coordinator.m_lastClaimSeqBySender["hackintosh"] = 9;
+  coordinator.onMessage(claim("hackintosh", "10.0.0.2", 9), reply);
+  QCOMPARE(coordinator.m_election.seq(), 7);
+  coordinator.onMessage(claim("hackintosh", "10.0.0.2", 10), reply);
+  QCOMPARE(coordinator.m_election.seq(), 10);
 }
 
 void CoordinatorTests::relayReconciler_followsRunningRoleNotElection()
