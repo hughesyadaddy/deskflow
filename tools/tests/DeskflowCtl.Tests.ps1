@@ -297,6 +297,26 @@ Describe 'Assert-Elevated' {
   }
 }
 
+Describe 'Register-DeskflowService recovery' {
+  It 'registers restart-on-failure actions (1s/5s/30s, reset 24h) with failureflag and creates ProgramData\Deskflow' {
+    $script:ScCalls = [System.Collections.Generic.List[string]]::new()
+    Mock Test-Path { $true } -ParameterFilter { $Path -like '*deskflow-daemon.exe' }
+    Mock Test-Path { $false } -ParameterFilter { $LiteralPath -like '*Deskflow' }
+    Mock Get-Service { [pscustomobject]@{ Name = 'Deskflow'; Status = 'Stopped' } }
+    Mock New-Item {}
+    function global:sc.exe { $script:ScCalls.Add(($args -join ' ')); $global:LASTEXITCODE = 0 }
+    try {
+      Register-DeskflowService -DaemonPath 'C:\Program Files\Deskflow\deskflow-daemon.exe'
+    } finally {
+      Remove-Item Function:\global:sc.exe -ErrorAction SilentlyContinue
+    }
+    $script:ScCalls | Should -Contain 'config Deskflow binPath= "C:\Program Files\Deskflow\deskflow-daemon.exe" start= auto'
+    $script:ScCalls | Should -Contain 'failure Deskflow reset= 86400 actions= restart/1000/restart/5000/restart/30000'
+    $script:ScCalls | Should -Contain 'failureflag Deskflow 1'
+    Should -Invoke New-Item -Times 1 -ParameterFilter { $Path -like '*Deskflow' -and $ItemType -eq 'Directory' }
+  }
+}
+
 Describe 'script hygiene' {
   It 'never kills by image name and never references Mouser as a target' {
     $text = Get-Content -LiteralPath $script:Script -Raw
