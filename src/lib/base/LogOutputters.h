@@ -10,6 +10,7 @@
 
 #include "base/ILogOutputter.h"
 
+#include <QFile>
 #include <QString>
 //! Stop traversing log chain outputter
 /*!
@@ -50,12 +51,17 @@ public:
 //! Write log to file
 /*!
 This outputter writes output to the file.  The level for each
-message is ignored.
+message is ignored.  The file is kept open across writes and rotated
+(renamed to \c .1 .. \c .N, oldest dropped) once it exceeds \c kSizeLimit.
+Not thread-safe on its own: \c Log serialises \c write() under its mutex.
 */
 
 class FileLogOutputter : public ILogOutputter
 {
 public:
+  static constexpr qint64 kSizeLimit = 5 * 1024 * 1024;
+  static constexpr int kGenerations = 3;
+
   explicit FileLogOutputter(const QString &logFile);
   ~FileLogOutputter() override = default;
 
@@ -66,8 +72,18 @@ public:
 
   void setLogFilename(const QString &title);
 
+  //! Path of rotated generation \p generation (1 = newest).
+  QString generationName(int generation) const;
+
 private:
+  static constexpr int kExistsCheckInterval = 64;
+
+  bool ensureOpen();
+  void rotate();
+
   QString m_fileName;
+  QFile m_file;
+  int m_writesSinceExistsCheck = 0;
 };
 
 //! Write log to system log

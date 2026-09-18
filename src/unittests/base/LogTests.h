@@ -21,6 +21,9 @@ private Q_SLOTS:
   void printLevelToHigh();
   void printInfoWithFileAndLine();
   void printErrWithFileAndLine();
+  void debugCategoryPassesInfoFilter();
+  void fileOutputterRotatesKeepingGenerations();
+  void fileOutputterReopensAfterExternalRemove();
 
 private:
   Log m_log;

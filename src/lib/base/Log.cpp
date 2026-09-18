@@ -148,7 +148,7 @@ void Log::print(const char *file, int line, const char *fmt, ...)
   const auto priority = getPriority(fmt);
   fmt += kPriorityPrefixLength;
 
-  if (priority > getFilter()) {
+  if (priority > getFilter() && !passesCategoryFilter(priority, fmt)) {
     return;
   }
 
@@ -227,6 +227,31 @@ LogLevel::Level Log::getFilter() const
 {
   std::scoped_lock lock{m_mutex};
   return m_maxPriority;
+}
+
+void Log::setDebugCategories(const QStringList &categories)
+{
+  std::scoped_lock lock{m_mutex};
+  m_debugCategories.clear();
+  for (const auto &category : categories) {
+    if (const auto name = category.trimmed(); !name.isEmpty()) {
+      m_debugCategories.push_back(name.toStdString() + ":");
+    }
+  }
+}
+
+bool Log::passesCategoryFilter(LogLevel::Level priority, const char *fmt) const
+{
+  if (priority > LogLevel::Level::Debug) {
+    return false;
+  }
+  std::scoped_lock lock{m_mutex};
+  for (const auto &prefix : m_debugCategories) {
+    if (strncmp(fmt, prefix.c_str(), prefix.size()) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void Log::output(LogLevel::Level priority, const char *msg)

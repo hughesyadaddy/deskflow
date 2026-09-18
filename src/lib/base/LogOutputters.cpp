@@ -12,10 +12,9 @@
 #include <iostream>
 
 #include <QFile>
+#include <QFileInfo>
 #include <QString>
 #include <QTextStream>
-
-constexpr auto s_logFileSizeLimit = 1024 * 1024; //!< Max Log size before rotating (1Mb)
 
 //
 // StopLogOutputter
@@ -124,22 +123,56 @@ FileLogOutputter::FileLogOutputter(const QString &logFile)
 void FileLogOutputter::setLogFilename(const QString &logFile)
 {
   assert(logFile != nullptr);
+  m_file.close();
   m_fileName = logFile;
+}
+
+QString FileLogOutputter::generationName(int generation) const
+{
+  return QStringLiteral("%1.%2").arg(m_fileName).arg(generation);
+}
+
+bool FileLogOutputter::ensureOpen()
+{
+  // An external mv/rm (newsyslog, a human) leaves the open handle pointing at
+  // the old inode; check the path occasionally instead of stat-ing per line.
+  if (m_file.isOpen() && ++m_writesSinceExistsCheck >= kExistsCheckInterval) {
+    m_writesSinceExistsCheck = 0;
+    if (!QFileInfo::exists(m_fileName)) {
+      m_file.close();
+    }
+  }
+  if (m_file.isOpen()) {
+    return true;
+  }
+  m_file.setFileName(m_fileName);
+  m_writesSinceExistsCheck = 0;
+  return m_file.open(QFile::WriteOnly | QFile::Append);
+}
+
+void FileLogOutputter::rotate()
+{
+  m_file.close();
+  QFile::remove(generationName(kGenerations));
+  for (int generation = kGenerations - 1; generation >= 1; --generation) {
+    QFile::rename(generationName(generation), generationName(generation + 1));
+  }
+  // The live file is only ever renamed, never removed: if the rename fails
+  // (a Windows handle without FILE_SHARE_DELETE) the log keeps growing in
+  // place rather than losing what was already written.
+  QFile::rename(m_fileName, generationName(1));
 }
 
 bool FileLogOutputter::write(LogLevel::Level, const QString &message)
 {
-  QFile file(m_fileName);
-  if (!file.open(QFile::WriteOnly | QFile::Append))
+  if (!ensureOpen()) {
     return false;
+  }
 
-  QTextStream(&file) << message << Qt::endl;
-  file.close();
+  QTextStream(&m_file) << message << Qt::endl;
 
-  if (file.size() > s_logFileSizeLimit) {
-    const auto oldFile = QStringLiteral("%1.1").arg(m_fileName);
-    QFile::remove(m_fileName);
-    QFile::rename(m_fileName, oldFile);
+  if (m_file.size() > kSizeLimit) {
+    rotate();
   }
 
   return true;
@@ -152,5 +185,5 @@ void FileLogOutputter::open(const QString &title)
 
 void FileLogOutputter::close()
 {
-  // do nothing
+  m_file.close();
 }
