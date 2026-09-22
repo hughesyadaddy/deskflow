@@ -75,6 +75,24 @@ LOGIN_BRIDGE_PRINT = ("loginwindow/org.deskflow.vhid-bridge = {\n\tactive count 
                       "org.deskflow.vhid-bridge.plist\n\tstate = running\n\n\tprogram = /Applications/Deskflow.app/"
                       "Contents/MacOS/deskflow-vhid-bridge\n\tpid = 611\n}\n")
 
+# Tail of /var/log/deskflow-vhid-bridge.log from a K3 bridge: a stale run, then
+# a clean start that reaches the daemon in 7 s.
+LOGIN_BRIDGE_LOG_OK = (
+    "2026-09-22T08:00:00-0400 [bridge] starting pid=400\n"
+    "2026-09-22T08:00:01-0400 [bridge] vhid connect_failed: 61\n"
+    "2026-09-22T08:00:05-0400 [bridge] waiting for virtual HID daemon (5s)\n"
+    "2026-09-22T08:00:09-0400 [bridge] virtual HID ready; server candidates: hackintosh, 10.0.0.5 port 24800\n"
+    "2026-09-22T08:00:10-0400 [bridge] stopping (signal)\n"
+    "2026-09-22T09:00:00-0400 [bridge] another deskflow-vhid-bridge is already running: lock held\n"
+    "2026-09-22T09:00:02-0400 [bridge] starting pid=611\n"
+    "2026-09-22T09:00:02-0400 [bridge] vhid connect_failed: 61\n"
+    "2026-09-22T09:00:07-0400 [bridge] waiting for virtual HID daemon (5s)\n"
+    "2026-09-22T09:00:09-0400 [bridge] virtual HID ready; server candidates: hackintosh, 10.0.0.5 port 24800\n"
+    "2026-09-22T09:00:09-0400 [bridge] motion scale seed 8.000000 (backing 2.000000 x factor 4.000000)\n"
+    "2026-09-22T09:00:10-0400 [bridge] connected to host hackintosh\n"
+    "2026-09-22T09:01:00-0400 [bridge] enter 10,20 of 2560x1440; [keys] session letters shifted=0 unshifted=0 caps-edges=0\n"
+)
+
 # Fixture JSON as emitted by tools/fleet-health.ps1 for --check instances.
 WIN_INSTANCES_PASS = [{"check": "instances", "status": "PASS",
                        "detail": "deskflow-ctl assert-single: OK (daemon=1 session 0 pid 1000; core=1 child of service in session 1; gui=1; bridge=0)"}]
@@ -125,6 +143,8 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.sudo_probe_cmd()): (0, "", ""),
         (hid, fh.login_bridge_agent_cmd()): (0, LOGIN_BRIDGE_PRINT, ""),
         (hid, fh.login_bridge_keystroke_cmd()): (1, "0\n", ""),
+        (hid, fh.login_bridge_calibrate_cmd()): (0, "1\n", ""),
+        (hid, fh.login_bridge_log_tail_cmd()): (0, LOGIN_BRIDGE_LOG_OK, ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, fh.DEFAULT_MESH_PORT))] = (0, "", "")
@@ -553,6 +573,8 @@ def test_loginbridge_cmds_target_root_paths_and_use_sudo_n_only():
     assert fh.sudo_probe_cmd() == "sudo -n true"
     assert fh.login_bridge_agent_cmd() == "sudo -n launchctl print loginwindow/org.deskflow.vhid-bridge"
     assert fh.login_bridge_keystroke_cmd() == "sudo -n grep -c 'key down id=' /var/log/deskflow-vhid-bridge.log"
+    assert fh.login_bridge_calibrate_cmd() == "grep -c -- --calibrate /Library/LaunchAgents/org.deskflow.vhid-bridge.plist"
+    assert fh.login_bridge_log_tail_cmd() == "sudo -n tail -n 400 /var/log/deskflow-vhid-bridge.log"
     # never an interactive sudo in any command string the tool ships
     import re as _re
     for m in _re.finditer(r'f?"([^"\n]*sudo[^"\n]*)"', TOOL.read_text()):
@@ -564,7 +586,66 @@ def test_loginbridge_pass_reports_pid_and_zero_keystrokes():
     assert [r.check for r in results] == ["loginbridge"]
     assert results[0].status == "PASS", results[0].detail
     assert "agent pid 611" in results[0].detail and "0 keystrokes" in results[0].detail
+    assert "--calibrate" in results[0].detail and "virtual HID ready 7s after start" in results[0].detail
     assert ("macbookpro", fh.login_bridge_keystroke_cmd()) in runner.calls
+    assert ("macbookpro", fh.login_bridge_log_tail_cmd()) in runner.calls
+
+
+def test_parse_login_bridge_log_uses_newest_start_and_ready_pair():
+    ok, detail = fh.parse_login_bridge_log(LOGIN_BRIDGE_LOG_OK)
+    assert ok and detail == "virtual HID ready 7s after start, no connect_failed since"
+    # the connect_failed BEFORE ready (daemon not up yet) is the normal cold-boot path
+    assert "connect_failed" not in detail.split("no ")[0]
+
+
+def test_parse_login_bridge_log_fails_on_slow_ready_or_connect_failed_after_ready():
+    slow = LOGIN_BRIDGE_LOG_OK.replace("2026-09-22T09:00:09-0400 [bridge] virtual HID ready",
+                                       "2026-09-22T09:00:33-0400 [bridge] virtual HID ready")
+    ok, detail = fh.parse_login_bridge_log(slow)
+    assert not ok and "31s after start (want <= 30s)" in detail
+    ok, _ = fh.parse_login_bridge_log(slow, max_ready_s=40)
+    assert ok
+
+    broken = LOGIN_BRIDGE_LOG_OK + "2026-09-22T09:02:00-0400 [bridge] vhid connect_failed: 61\n"
+    ok, detail = fh.parse_login_bridge_log(broken)
+    assert not ok and "1 'vhid connect_failed' line(s) after virtual HID ready" in detail
+
+
+def test_parse_login_bridge_log_fails_when_never_ready_or_untimestamped():
+    waiting = LOGIN_BRIDGE_LOG_OK.split("2026-09-22T09:00:09-0400 [bridge] virtual HID ready")[0] + \
+        "2026-09-22T09:00:42-0400 [bridge] waiting for virtual HID daemon (40s)\n"
+    ok, detail = fh.parse_login_bridge_log(waiting)
+    assert not ok and "still waiting for the virtual HID daemon (40s)" in detail
+
+    ok, detail = fh.parse_login_bridge_log("")
+    assert not ok and "no '[bridge] starting' line" in detail
+
+    # a pre-K3 bridge: no timestamps, no start line at all
+    old = "[bridge] vhid connect_failed: 61\n[bridge] virtual HID device not ready (is the Karabiner daemon running?)\n"
+    ok, detail = fh.parse_login_bridge_log(old)
+    assert not ok and "pre-K3 build" in detail
+
+    untimestamped_start = "[bridge] starting pid=1\n[bridge] virtual HID ready; server candidates: x port 24800\n"
+    ok, detail = fh.parse_login_bridge_log(untimestamped_start)
+    assert not ok and "no timestamp" in detail
+
+
+def test_loginbridge_fails_when_plist_lacks_calibrate_or_log_shows_slow_daemon():
+    t = mac_ok_table()
+    t[("macbookpro", fh.login_bridge_calibrate_cmd())] = (1, "0\n", "")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "plist lacks --calibrate" in results[0].detail
+
+    t = mac_ok_table()
+    t[("macbookpro", fh.login_bridge_log_tail_cmd())] = (
+        0, LOGIN_BRIDGE_LOG_OK + "2026-09-22T09:03:00-0400 [bridge] vhid connect_failed: 61\n", "")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "after virtual HID ready" in results[0].detail
+
+    t = mac_ok_table()
+    t[("macbookpro", fh.login_bridge_log_tail_cmd())] = (1, "", "tail: /var/log/deskflow-vhid-bridge.log: No such file")
+    results, _ = run_checks([mac()], t, ["loginbridge"])
+    assert results[0].status == "FAIL" and "log tail failed" in results[0].detail
 
 
 def test_loginbridge_skips_privileged_parts_without_passwordless_sudo():
@@ -575,6 +656,9 @@ def test_loginbridge_skips_privileged_parts_without_passwordless_sudo():
     assert "passwordless sudo" in results[0].detail and "log mode 600" in results[0].detail
     assert ("macbookpro", fh.login_bridge_agent_cmd()) not in runner.calls
     assert ("macbookpro", fh.login_bridge_keystroke_cmd()) not in runner.calls
+    assert ("macbookpro", fh.login_bridge_log_tail_cmd()) not in runner.calls
+    # the unprivileged --calibrate check still ran
+    assert ("macbookpro", fh.login_bridge_calibrate_cmd()) in runner.calls
     # unprivileged problems still FAIL even without sudo
     t[("macbookpro", fh.login_bridge_log_mode_cmd())] = (0, "644\n", "")
     results, _ = run_checks([mac()], t, ["loginbridge"])
