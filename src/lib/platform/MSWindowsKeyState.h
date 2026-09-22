@@ -33,17 +33,19 @@ public:
   //! DOWN (or repeat) that has not been followed by an injected UP.
   using InjectedModifierMap = std::map<WORD, ULONGLONG>;
 
-  //! How long an injected DOWN vouches for a physically held modifier.
+  //! How long an injected DOWN vouches for a physically held modifier AT A
+  //! BOUNDARY (screen not entered).
   /*!
   The 1 s audit skips modifiers in the ledger so a chord the server is
-  deliberately holding is not released under it. But a DOWN whose UP never
-  arrives (server gone mid-chord, epoch restart, desk switch dropping the
-  UP) would otherwise be protected forever -- the ledger would defend the
-  very stranded key the audit exists to release. After this grace the audit
-  stops trusting the entry. Repeats refresh the stamp, so a held modifier
-  that the server keeps repeating stays protected; a modifier held longer
-  than this WITHOUT repeats (e.g. a macOS server, which sends none for
-  modifiers) may be released early by the audit -- a known trade-off.
+  deliberately holding is not released under it. While the screen is
+  ENTERED every ledger entry vouches, however old: a macOS server never
+  repeats modifiers, so Ctrl/Alt/Win held for more than a couple of seconds
+  used to be released under the user (K4 audit MED-1). The grace applies
+  only at boundaries (enable, desk switch, wake), where the server holds
+  nothing here and a DOWN whose UP never arrived (server gone mid-chord,
+  epoch restart, desk switch dropping the UP) must not be protected forever
+  -- the ledger would defend the very stranded key the audit exists to
+  release.
   */
   static constexpr ULONGLONG kInjectedModifierGraceMs = 2000;
 
@@ -51,14 +53,16 @@ public:
   /*!
   Derived only from injection outcomes, never from the OS -- reading the OS
   back would let a stuck modifier certify itself as intended. Bit order
-  matches the table in MSWindowsDesks' stale-modifier audit. Entries older
-  than kInjectedModifierGraceMs are excluded (see there).
+  matches the table in MSWindowsDesks' stale-modifier audit. With
+  \p entered false, entries older than kInjectedModifierGraceMs are
+  excluded (see there); while entered, every entry vouches.
   */
-  uint32_t injectedModifierBits() const;
+  uint32_t injectedModifierBits(bool entered) const;
 
   //! Pure form of injectedModifierBits() for unit tests: bits of \p ledger
-  //! entries stamped within the grace window of \p nowMs.
-  static uint32_t injectedModifierBits(const InjectedModifierMap &ledger, ULONGLONG nowMs);
+  //! entries, all of them while \p entered, else only those stamped within
+  //! the grace window of \p nowMs.
+  static uint32_t injectedModifierBits(const InjectedModifierMap &ledger, ULONGLONG nowMs, bool entered);
 
   //! Candidate VKs for sanitizeInjectedKeys(): every VK in \p ledger plus
   //! VK_LSHIFT/VK_RSHIFT, ascending. The desk thread probes and releases

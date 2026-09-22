@@ -253,7 +253,7 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
   if (m_isPrimary) {
     return;
   }
-  m_desks->sanitizeStaleModifiers(m_keyState != nullptr ? m_keyState->injectedModifierBits() : 0);
+  m_desks->sanitizeStaleModifiers(m_keyState != nullptr ? m_keyState->injectedModifierBits(false) : 0);
   if (m_keyState != nullptr) {
     // Second sweep from the other direction: the audit above skips what the
     // ledger says WE hold, but at this boundary the server holds nothing, so
@@ -1555,7 +1555,9 @@ void MSWindowsScreen::auditStaleModifiers()
   // injection reports its failures instead of dropping events silently,
   // should never happen. Correct it and say so loudly: a line here is a real
   // bug worth chasing, not routine housekeeping.
-  m_desks->sanitizeStaleModifiers(m_keyState->injectedModifierBits());
+  // Entered: every ledger entry vouches, however old (a macOS server never
+  // repeats modifiers); the grace window applies only at boundaries.
+  m_desks->sanitizeStaleModifiers(m_keyState->injectedModifierBits(m_isOnScreen));
 }
 
 void MSWindowsScreen::fixClipboardViewer()

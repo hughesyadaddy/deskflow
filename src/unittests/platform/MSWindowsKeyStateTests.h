@@ -28,6 +28,7 @@ private Q_SLOTS:
   void audit_freshEntry_isProtected();
   void audit_entryAtGrace_isStillProtected();
   void audit_entryPastGrace_isNoLongerProtected();
+  void audit_entryPastGrace_stillVouchesWhileEntered();
   void audit_shiftNeverReachesAuditTable();
   void audit_bitOrderMatchesDeskTable();
 };
