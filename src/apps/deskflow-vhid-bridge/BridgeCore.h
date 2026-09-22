@@ -203,6 +203,11 @@ public:
   // The main display in points + its backing scale; false leaves the
   // arguments untouched (the caller keeps its fallback).
   virtual bool main_display(int16_t &width, int16_t &height, double &backing_scale) = 0;
+  // Blocks until every report posted so far has left this process's
+  // queues (bounded); false when that could not be confirmed in time. The
+  // bridge calls it after the release report on Leave, CBYE/disconnect and
+  // the keyboard rescue (A-4).
+  virtual bool flush(milliseconds bound) = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -287,7 +292,9 @@ private:
   void emit_counts(int dx, int dy);
   void emit_slam(int dx, int dy);
   void emit_relative(int dx, int dy);
-  void release_all();
+  // Clears the ledger and posts the empty reports; with `flush` also waits
+  // (bounded) until they have left the process's queues.
+  void release_all(bool flush);
 
   static int8_t clamp_to_i8(int v);
   static uint8_t synergy_button_to_hid(uint8_t synergy_button);

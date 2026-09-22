@@ -36,6 +36,11 @@
 // the next message or socket timeout. The 4x Esc keyboard rescue ends the
 // connection the same way (release reports, then main unwinds and the sink
 // is destroyed) so the daemon always sees the release before we are gone.
+// Every such release is FLUSHED (VirtualHidSink::flush: a marker behind the
+// report on the pqrs dispatcher, waited on for <= 250 ms) because the
+// dispatcher's terminate() drops queued jobs; whether the Karabiner daemon
+// itself releases a virtual keyboard's keys when a client socket closes is
+// NOT verified, so the bridge never relies on it.
 //
 // Pointer scale: by default the bridge self-calibrates (slam to a corner, emit
 // a known delta, read the cursor back -> counts per point) and then runs every
@@ -627,6 +632,10 @@ public:
   VirtualHidSink &operator=(const VirtualHidSink &) = delete;
   ~VirtualHidSink() override
   {
+    // Anything still queued (a release the bridge posted) must reach the
+    // dispatcher before terminate() drops the queue.
+    flush(milliseconds(bridge_logic::kReportDrainBoundMs));
+    drain_client_.detach_from_dispatcher();
     if (client_)
       client_->async_stop();
     pqrs::dispatcher::extra::terminate_shared_dispatcher();
@@ -760,8 +769,26 @@ public:
     return query_main_display(width, height, backing_scale);
   }
 
+  // Marker drain on the shared dispatcher (see bridge_logic::enqueue_drain_marker
+  // for why two hops). Returns false when the dispatcher refused the marker
+  // (already terminating) or it did not come back within `bound`.
+  bool flush(milliseconds bound) override
+  {
+    auto gate = std::make_shared<bridge_logic::DrainGate>();
+    const bool queued = bridge_logic::enqueue_drain_marker(
+        [this](std::function<void()> fn) { return drain_client_.enqueue_to_dispatcher(std::move(fn)); },
+        bridge_logic::kReportDrainHops, [gate] { gate->complete(); }
+    );
+    if (!queued)
+      return false;
+    return gate->wait(bound.count()) == bridge_logic::DrainOutcome::Drained;
+  }
+
 private:
   std::unique_ptr<pqrs::karabiner::driverkit::virtual_hid_device_service::client> client_;
+  // Our own dispatcher client, so the drain marker rides the same queue as
+  // the pqrs client's report jobs. Detached in the destructor.
+  pqrs::dispatcher::extra::dispatcher_client drain_client_;
   std::atomic<bool> keyboard_ready_{false};
   std::atomic<bool> pointing_ready_{false};
   std::atomic<bool> connected_before_{false};

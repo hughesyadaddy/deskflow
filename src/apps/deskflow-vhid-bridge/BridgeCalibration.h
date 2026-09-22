@@ -17,9 +17,13 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -187,6 +191,11 @@ Letters:
   'k' | 0 | 1 |     0     |   1   | local != 1
   'k' | 1 | 1 |     0     |   1   | local != 1   (caps+shift+k -> 'k')
 
+The 'K' | S=1 | M=1 row is unreachable from a macOS or Windows server (both
+compose Shift+Caps+k as lowercase 'k', so they send 'k'); if a server ever
+sent it, a relayed Shift key-down entry in the bridge's ledger would OR
+Shift back into the report through collect_held() and type 'k' anyway.
+
 Non-letters: unchanged behaviour -- the mask's modifier bits, plus Shift
 when the KeyID itself is a shifted character (keyid_requires_shift); never
 a caps edge. Caps Lock's own KeyID yields no modifier bits (it is an edge,
@@ -303,6 +312,74 @@ constexpr CapsAssumption resolve_caps_assumption(
     return CapsAssumption::Expired;
   return CapsAssumption::Hold;
 }
+
+// Bounded drain of an asynchronous report queue (K4 review, A-4).
+/*!
+The bridge posts HID reports through a queue it does not own (the pqrs
+dispatcher, then an asio thread). A release report posted just before the
+process unwinds is only QUEUED: the dispatcher's terminate() exits without
+draining, so the empty report could be lost and the last key stay held on
+the virtual keyboard. The sink therefore enqueues a MARKER behind the
+report and the caller waits for it, bounded.
+
+The report's journey is nested: the first dispatcher job enqueues a second
+one (the local_datagram client's own hop) and only that one hands the
+bytes to the asio thread, whose teardown does drain. A marker enqueued
+once would run BEFORE the nested job (FIFO: [report1, marker] -> report1
+runs and appends report2 -> [marker, report2]). So the marker re-enqueues
+itself `hops` times; with kReportDrainHops = 2 it lands behind report2.
+enqueue_drain_marker is pure over an `enqueue` callback so that reasoning
+is unit-tested with a simulated FIFO; DrainGate is the bounded wait.
+*/
+constexpr int kReportDrainHops = 2;
+constexpr int64_t kReportDrainBoundMs = 250;
+
+// Enqueues a marker that re-enqueues itself until `hops` queue passes have
+// elapsed, then calls `done`. Returns false (and never calls `done`) when
+// `enqueue` refuses the marker (queue gone).
+inline bool enqueue_drain_marker(
+    const std::function<bool(std::function<void()>)> &enqueue, int hops, const std::function<void()> &done
+)
+{
+  if (hops <= 0) {
+    done();
+    return true;
+  }
+  return enqueue([enqueue, hops, done] { enqueue_drain_marker(enqueue, hops - 1, done); });
+}
+
+enum class DrainOutcome
+{
+  Drained,
+  TimedOut
+};
+
+// One-shot completion the marker signals from the queue thread; the caller
+// waits at most `bound_ms`. Shared between the two threads (hold it in a
+// shared_ptr when the queue may outlive the waiter).
+class DrainGate
+{
+public:
+  void complete()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!done_) {
+      done_ = true;
+      cv_.notify_all();
+    }
+  }
+  DrainOutcome wait(int64_t bound_ms)
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const bool ok = cv_.wait_for(lock, std::chrono::milliseconds(bound_ms), [this] { return done_; });
+    return ok ? DrainOutcome::Drained : DrainOutcome::TimedOut;
+  }
+
+private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool done_ = false;
+};
 
 // Relative motion chunking. Splits a delta into steps of at most max_chunk
 // counts each, preserving sign; 0 yields no steps. 400 -> 50 x 8.

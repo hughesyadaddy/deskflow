@@ -8,9 +8,14 @@
 
 #include <QTest>
 
+#include <chrono>
 #include <cstdlib>
+#include <deque>
+#include <functional>
+#include <memory>
 #include <numeric>
 #include <optional>
+#include <thread>
 
 using namespace bridge_logic;
 
@@ -38,6 +43,11 @@ private Q_SLOTS:
   void capsAssumptionResolution_data();
   void capsAssumptionResolution();
   void derivedShiftIsNotHeld();
+
+  // -- report drain (A-4) --------------------------------------------------
+  void drainMarkerLandsBehindNestedJob();
+  void drainMarkerRefusedQueue();
+  void drainGateBounded();
 
   // -- chunking ------------------------------------------------------------
   void chunk400Is50x8();
@@ -316,6 +326,73 @@ void BridgeCalibrationTests::derivedShiftIsNotHeld()
   }
   QCOMPARE(resolve_caps_assumption(assumed, true, 100, 0), CapsAssumption::Confirmed);
   QCOMPARE(edges, 1);
+}
+
+// Simulated pqrs dispatcher: a FIFO whose report job appends a second job
+// (the local_datagram hop) that finally "sends". One hop is not enough;
+// kReportDrainHops (2) puts the marker behind the send.
+void BridgeCalibrationTests::drainMarkerLandsBehindNestedJob()
+{
+  for (int hops : {1, kReportDrainHops}) {
+    std::deque<std::function<void()>> fifo;
+    auto enqueue = [&fifo](std::function<void()> fn) {
+      fifo.push_back(std::move(fn));
+      return true;
+    };
+    bool sent = false;
+    bool sentWhenMarkerFired = false;
+    bool fired = false;
+    enqueue([&] { enqueue([&] { sent = true; }); }); // report: job 1 enqueues job 2
+    QVERIFY(enqueue_drain_marker(enqueue, hops, [&] {
+      fired = true;
+      sentWhenMarkerFired = sent;
+    }));
+    while (!fifo.empty()) {
+      auto job = std::move(fifo.front());
+      fifo.pop_front();
+      job();
+    }
+    QVERIFY(fired);
+    QVERIFY(sent);
+    QCOMPARE(sentWhenMarkerFired, hops >= kReportDrainHops);
+  }
+}
+
+void BridgeCalibrationTests::drainMarkerRefusedQueue()
+{
+  bool fired = false;
+  auto refuse = [](std::function<void()>) { return false; };
+  QVERIFY(!enqueue_drain_marker(refuse, kReportDrainHops, [&] { fired = true; }));
+  QVERIFY(!fired);
+  // zero hops completes synchronously without touching the queue
+  QVERIFY(enqueue_drain_marker(refuse, 0, [&] { fired = true; }));
+  QVERIFY(fired);
+}
+
+void BridgeCalibrationTests::drainGateBounded()
+{
+  {
+    DrainGate gate;
+    gate.complete();
+    QCOMPARE(gate.wait(kReportDrainBoundMs), DrainOutcome::Drained);
+  }
+  {
+    DrainGate gate;
+    const auto t0 = std::chrono::steady_clock::now();
+    QCOMPARE(gate.wait(30), DrainOutcome::TimedOut);
+    QVERIFY(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(30));
+  }
+  {
+    auto gate = std::make_shared<DrainGate>();
+    std::thread worker([gate] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      gate->complete();
+    });
+    QCOMPARE(gate->wait(kReportDrainBoundMs), DrainOutcome::Drained);
+    worker.join();
+    gate->complete(); // idempotent
+    QCOMPARE(gate->wait(1), DrainOutcome::Drained);
+  }
 }
 
 void BridgeCalibrationTests::chunk400Is50x8()

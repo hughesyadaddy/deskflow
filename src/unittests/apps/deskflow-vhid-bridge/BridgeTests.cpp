@@ -68,6 +68,13 @@ public:
   {
     return false;
   }
+  bool flushResult = true;
+  std::vector<int> flushedAtOrder; // `order` at each flush() call
+  bool flush(milliseconds) override
+  {
+    flushedAtOrder.push_back(order);
+    return flushResult;
+  }
 
   int capsEdges() const
   {
@@ -150,6 +157,7 @@ private Q_SLOTS:
   void capsAssumptionExpiresWithDisagreementLine();
   void cheapSpecialKeysAreMapped();
   void unmappedKeyPostsNothing();
+  void leaveFlushesAndUnconfirmedFlushWarns();
   void physicalShiftRolloverWithShiftEntry();
   void physicalShiftRolloverMaskOnly();
 
@@ -332,7 +340,27 @@ void BridgeTests::escapeBurstReleasesBeforeStop()
   QVERIFY(f.sink.pt.back().buttons.empty());
   QCOMPARE(int(f.sink.pt.back().dx), 0);
   QVERIFY(f.bridge.held_keys_.empty());
+  // ... and the release was flushed AFTER both empty reports were posted
+  QCOMPARE(f.sink.flushedAtOrder.size(), size_t(1));
+  QCOMPARE(f.sink.flushedAtOrder[0], f.sink.order);
   g_stop.store(false);
+}
+
+// A-4: Leave flushes too, and a flush that cannot be confirmed is a
+// WARNING (never silent), while the run-start release is not flushed.
+void BridgeTests::leaveFlushesAndUnconfirmedFlushWarns()
+{
+  Fixture f;
+  FramedSocket noSocket(-1);
+  const std::vector<uint8_t> leave(proto::kLeave, proto::kLeave + 4);
+  QVERIFY(f.bridge.dispatch(noSocket, leave));
+  QCOMPARE(f.sink.flushedAtOrder.size(), size_t(1));
+  QCOMPARE(f.sink.flushedAtOrder[0], f.sink.order);
+
+  f.sink.flushResult = false;
+  LogCapture log;
+  QVERIFY(f.bridge.dispatch(noSocket, leave));
+  QVERIFY(log.any("WARNING: release report not confirmed sent within 250 ms"));
 }
 
 // A-5: after an emitted caps edge the bridge assumes the state it set until

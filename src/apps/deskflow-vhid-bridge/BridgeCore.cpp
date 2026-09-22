@@ -481,7 +481,7 @@ void Bridge::run(FramedSocket &socket)
   if (!handshake(socket))
     return;
   letters_shifted_ = letters_unshifted_ = caps_edges_ = 0;
-  release_all();
+  release_all(false);
   while (!must_pause()) {
     std::optional<std::vector<uint8_t>> message = socket.read_message();
     if (!message)
@@ -492,8 +492,8 @@ void Bridge::run(FramedSocket &socket)
   }
   // Also the keyboard-rescue path (A-4): on_key_down returned false with
   // g_stop set, and THIS release is the empty report that must reach the
-  // daemon before main unwinds and destroys the sink.
-  release_all();
+  // daemon before main unwinds and destroys the sink -- hence flushed.
+  release_all(true);
   log_line("disconnect; " + keys_summary());
 }
 
@@ -576,7 +576,7 @@ bool Bridge::dispatch(FramedSocket &socket, const std::vector<uint8_t> &body)
   if (body_has_code(body, proto::kEnter))
     return on_enter(body);
   if (body_has_code(body, proto::kLeave)) {
-    release_all();
+    release_all(true);
     log_line("leave; " + keys_summary());
     return true;
   }
@@ -917,7 +917,8 @@ CapsTruth Bridge::read_caps_truth()
   // Never the values: whether the two disagreed is diagnosable, which way
   // is the lock state of a password being typed.
   log_line(
-      std::string("caps: OS reader (") + os.source + ") did not confirm the last emitted edge within " +
+      std::string("caps: OS reader (") + (os.state ? os.source : "unreadable") +
+      ") did not confirm the last emitted edge within " +
       std::to_string(bridge_logic::kCapsAssumeMaxMs) + " ms (source disagreement); trusting the reader"
   );
   return os;
@@ -1058,13 +1059,19 @@ void Bridge::emit_relative(int dx, int dy)
   emit_counts(cx, cy);
 }
 
-void Bridge::release_all()
+void Bridge::release_all(bool flush)
 {
   held_keys_.clear();
   mouse_buttons_.clear();
   have_last_abs_ = false;
   sink_.post_keyboard(0, {});
   sink_.post_pointing({}, 0, 0, 0, 0);
+  if (flush && !sink_.flush(milliseconds(bridge_logic::kReportDrainBoundMs))) {
+    log_line(
+        "WARNING: release report not confirmed sent within " + std::to_string(bridge_logic::kReportDrainBoundMs) +
+        " ms (daemon queue stalled?); keys may remain held on the virtual keyboard"
+    );
+  }
 }
 
 int8_t Bridge::clamp_to_i8(int v)

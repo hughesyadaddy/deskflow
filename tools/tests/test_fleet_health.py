@@ -91,7 +91,7 @@ LOGIN_BRIDGE_LOG_OK = (
     "2026-09-22T09:00:09-0400 [bridge] virtual HID ready; server candidates: hackintosh, 10.0.0.5 port 24800\n"
     "2026-09-22T09:00:09-0400 [bridge] motion scale seed 8.000000 (backing 2.000000 x factor 4.000000)\n"
     "2026-09-22T09:00:10-0400 [bridge] connected to host hackintosh\n"
-    "2026-09-22T09:01:00-0400 [bridge] enter 10,20 of 2560x1440; [keys] session letters shifted=0 unshifted=0 caps-edges=0\n"
+    "2026-09-22T09:01:00-0400 [bridge] enter 10,20 of 2560x1440; [keys] session caps-edges=0 case-applied=no\n"
 )
 
 # Fixture JSON as emitted by tools/fleet-health.ps1 for --check instances.
@@ -658,7 +658,7 @@ def test_login_bridge_since_start_awk_cuts_at_newest_start_and_keeps_late_connec
     import subprocess
     log = tmp_path / "bridge.log"
     body = LOGIN_BRIDGE_LOG_OK + "".join(
-        f"2026-09-22T09:0{1 + i // 60}:{i % 60:02d}-0400 [bridge] enter 1,1 of 2x2; [keys] session letters shifted=0 unshifted=0 caps-edges=0\n"
+        f"2026-09-22T09:0{1 + i // 60}:{i % 60:02d}-0400 [bridge] enter 1,1 of 2x2; [keys] session caps-edges=0 case-applied=no\n"
         for i in range(500)) + "2026-09-22T10:00:00-0400 [bridge] vhid connect_failed: 61\n"
     log.write_text(body)
     cmd = fh.login_bridge_log_since_start_cmd(str(log), max_lines=20).replace("sudo -n ", "", 1)
