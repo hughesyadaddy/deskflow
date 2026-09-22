@@ -214,6 +214,19 @@ constexpr KeyButton buttonFor(uint32_t virtualKey)
   return static_cast<KeyButton>(virtualKey + 1);
 }
 
+//! Exposes the protected fakeKey() so a test can inject a virtual key that
+//! no KeyID maps to (Fn/Globe) exactly as the relay path would.
+struct InjectingKeyState : OSXKeyState
+{
+  using OSXKeyState::OSXKeyState;
+  using OSXKeyState::fakeKey;
+};
+
+deskflow::KeyMap::Keystroke stroke(uint32_t virtualKey, bool press)
+{
+  return deskflow::KeyMap::Keystroke(buttonFor(virtualKey), press, false, 0);
+}
+
 } // namespace
 
 void OSXKeyStateTests::shadowFlagsReseedFromOsOnUpdateKeyState()
@@ -380,6 +393,81 @@ void OSXKeyStateTests::sanitizeKeepsModifiersBackedByRecentHardwarePress()
   os.now += 5.0;
   keyState.sanitizeInjectedKeys();
   QCOMPARE(os.posted.size(), size_t(2));
+}
+
+void OSXKeyStateTests::sanitizeReleasesInjectedFnAndCaps()
+{
+  // K2 gap b2: Fn/Globe and Caps Lock held across a switch used to have no
+  // release path at all. Both were posted Down by us (in the ledger); the
+  // sweep must post the Up for each.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  keyState.fakeKey(stroke(kVK_Function, true));
+  keyState.fakeKey(stroke(kVK_CapsLock, true));
+  QCOMPARE(keyState.injectedModifiers().size(), size_t(2));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Function));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_CapsLock));
+  QVERIFY((keyState.getModifierStateAsOSXFlags() & kCGEventFlagMaskSecondaryFn) != 0);
+  QCOMPARE(os.posted.size(), size_t(2));
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskSecondaryFn) != 0);
+  os.posted.clear();
+
+  // the OS: Fn held, and our Caps down toggled the lock ON
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskAlphaShift;
+  keyState.sanitizeInjectedKeys();
+
+  QCOMPARE(os.posted.size(), size_t(2));
+  std::set<int> released;
+  for (const auto &p : os.posted) {
+    QVERIFY(!p.down);
+    released.insert(p.virtualKey);
+    if (p.virtualKey == kVK_CapsLock) {
+      // the caps key-up carries the lock state, it does not clear it
+      QVERIFY((p.flags & kCGEventFlagMaskAlphaShift) != 0);
+    }
+  }
+  QVERIFY(released.contains(kVK_Function));
+  QVERIFY(released.contains(kVK_CapsLock));
+  QVERIFY(keyState.injectedModifiers().empty());
+  // Fn is off in the shadow; the caps LOCK the OS reports is kept
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlphaShift));
+
+  // the OS honoured the Fn release: nothing left to do
+  os.osFlags = kCGEventFlagMaskAlphaShift;
+  keyState.sanitizeInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(2));
+}
+
+void OSXKeyStateTests::sanitizeLeavesOsCapsLockAlone()
+{
+  // Caps lock ON in the OS with nothing injected is the user's lock state:
+  // never a candidate for a synthetic key-up, whatever the freshness clock
+  // says (there is no hardware press to back a lock).
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  QVERIFY(keyState.injectedModifiers().empty());
+
+  os.osFlags = kCGEventFlagMaskAlphaShift;
+  keyState.sanitizeInjectedKeys();
+  QVERIFY(os.posted.empty());
+  QVERIFY(keyState.injectedModifiers().empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlphaShift));
+
+  // a caps we pressed AND released (a toggle tap) leaves nothing to sweep
+  keyState.fakeKey(stroke(kVK_CapsLock, true));
+  keyState.fakeKey(stroke(kVK_CapsLock, false));
+  QVERIFY(keyState.injectedModifiers().empty());
+  os.posted.clear();
+  keyState.sanitizeInjectedKeys();
+  QVERIFY(os.posted.empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlphaShift));
 }
 
 void OSXKeyStateTests::setToggleStateNoOpsWhenCapsMatches()

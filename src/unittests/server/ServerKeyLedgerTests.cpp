@@ -9,6 +9,7 @@
 #include "../deskflow/MockKeyState.h"
 #include "arch/Arch.h"
 #include "base/EventQueue.h"
+#include "base/ILogOutputter.h"
 #include "base/Log.h"
 #include "common/Settings.h"
 #include "coordination/KeyboardRescue.h"
@@ -24,6 +25,7 @@
 #include <QCoreApplication>
 #include <QTemporaryDir>
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
@@ -215,6 +217,74 @@ private:
   MockKeyState m_keyState;
 };
 
+//! The same platform screen in the client role, counting the sweeps the
+//! Screen layer asks for.
+class SecondaryPlatformScreen : public TestPlatformScreen
+{
+public:
+  using TestPlatformScreen::TestPlatformScreen;
+
+  int sanitizeCalls = 0;
+
+  bool isPrimary() const override
+  {
+    return false;
+  }
+  void sanitizeInjectedKeys() override
+  {
+    ++sanitizeCalls;
+    TestPlatformScreen::sanitizeInjectedKeys();
+  }
+};
+
+//! Counts log lines containing a needle (the fleet-health grep contract).
+//! Registers itself with the live Log on construction and unregisters on
+//! destruction, so a failed assertion cannot leave a dangling outputter.
+class NeedleOutputter : public ILogOutputter
+{
+public:
+  explicit NeedleOutputter(QString needle) : m_needle(std::move(needle))
+  {
+    CLOG->insert(this);
+  }
+  ~NeedleOutputter() override
+  {
+    CLOG->remove(this);
+  }
+  void open(const QString &) override
+  {
+  }
+  void close() override
+  {
+  }
+  bool write(LogLevel::Level, const QString &message) override
+  {
+    if (message.contains(m_needle)) {
+      ++hits;
+    }
+    // Log::output() stops the chain on FALSE (despite the interface doc):
+    // keep passing the line on so the other needle and the console see it.
+    return true;
+  }
+  int hits = 0;
+
+private:
+  QString m_needle;
+};
+
+//! Pump \p events until \p done() or \p seconds elapse (timers fire from
+//! getEvent(); dispatchEvent() runs their handlers).
+template <typename Done> void pumpUntil(EventQueue &events, double seconds, Done done)
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+  while (!done() && std::chrono::steady_clock::now() < deadline) {
+    Event event;
+    if (events.getEvent(event, 0.05)) {
+      events.dispatchEvent(event);
+    }
+  }
+}
+
 struct RecordedKey
 {
   enum class Kind
@@ -240,6 +310,9 @@ public:
   std::vector<RecordedKey> keys;
   int enterCalls = 0;
   int leaveCalls = 0;
+  //! keys.size() at the moment of each leave(): keys[i] with i below it
+  //! went out before kMsgCLeave, at or above it after.
+  std::vector<size_t> leaveAtKeyIndex;
 
   void *getEventTarget() const override
   {
@@ -268,6 +341,7 @@ public:
   bool leave() override
   {
     ++leaveCalls;
+    leaveAtKeyIndex.push_back(keys.size());
     return true;
   }
   void setClipboard(ClipboardID, const IClipboard *) override
@@ -811,4 +885,95 @@ void ServerKeyLedgerTests::clearAll_withoutSenderReleasesEveryRelayedKey()
 
     server.m_clients.erase("remote");
   }
+}
+
+void ServerKeyLedgerTests::switch_releasesBeforeLeave()
+{
+  // K2 gap a: a client that tears down on kMsgCLeave discards whatever
+  // follows it, so every kMsgDKeyUp for the screen being abandoned has to
+  // hit the wire BEFORE the leave (a proxy leave never refuses).
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    server.onKeyDown(kKeyA, 0, kButtonA, "en", nullptr);
+    server.onKeyDown(kKeyShift_L, KeyModifierShift, kButtonShift, "en", nullptr);
+    remote.keys.clear();
+    remote.leaveAtKeyIndex.clear();
+
+    server.switchScreen(f.primary, 512, 384, false);
+
+    QCOMPARE(remote.leaveAtKeyIndex.size(), size_t(1));
+    const size_t leaveAt = remote.leaveAtKeyIndex[0];
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyA), 1);
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyShift_L), 1);
+    for (size_t i = 0; i < remote.keys.size(); ++i) {
+      if (remote.keys[i].kind == RecordedKey::Kind::Up) {
+        QVERIFY2(i < leaveAt, qPrintable(QStringLiteral("key up #%1 sent after leave (at %2)").arg(i).arg(leaveAt)));
+      }
+    }
+    // and nothing at all trails the leave
+    QCOMPARE(leaveAt, remote.keys.size());
+    QVERIFY(server.m_keysHeldOnActive.empty());
+
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerKeyLedgerTests::enterSecondary_logsStuckReleaseWhenModifierPersists()
+{
+  // Client role. The OS still holds Shift after we entered and nobody has
+  // typed here: the verifier notes it at the first check, confirms it at
+  // the second and sweeps it, logging the line fleet-health greps for.
+  EventQueue events;
+  auto *platform = new SecondaryPlatformScreen(&events); // owned by the Screen
+  deskflow::Screen screen(platform, &events);
+
+  // the held= line is INFO, stuck-release is WARNING; the LOG macros write
+  // to the singleton (CLOG), which is what fleet-health's grep sees
+  struct FilterGuard
+  {
+    LogLevel::Level previous = CLOG->getFilter();
+    ~FilterGuard()
+    {
+      CLOG->setFilter(previous);
+    }
+  } filterGuard;
+  CLOG->setFilter(LogLevel::Level::Info);
+  NeedleOutputter held(QStringLiteral("[keys] post-switch held="));
+  NeedleOutputter stuck(QStringLiteral("[keys] stuck-release"));
+
+  screen.enable();
+  const int afterEnable = platform->sanitizeCalls; // enable() sweeps once itself
+  platform->osModifiers = KeyModifierShift;
+  screen.enter(0);
+
+  pumpUntil(events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 3.0, [&] {
+    return platform->sanitizeCalls > afterEnable;
+  });
+  QCOMPARE(platform->sanitizeCalls, afterEnable + 1);
+  QCOMPARE(held.hits, 1);
+  QCOMPARE(stuck.hits, 1);
+
+  // Leave (sweeps again, cancels any timer) and come back; this time the
+  // server types here before the first check: the held Shift is the
+  // user's chord, not a leftover -- no release, no line.
+  QVERIFY(screen.leave());
+  const int afterLeave = platform->sanitizeCalls;
+  QCOMPARE(afterLeave, afterEnable + 2);
+  screen.enter(0);
+  screen.keyDown(kKeyA, KeyModifierShift, kButtonA, "en");
+  pumpUntil(events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 0.5, [] {
+    return false;
+  });
+  QCOMPARE(platform->sanitizeCalls, afterLeave);
+  QCOMPARE(held.hits, 1);
+  QCOMPARE(stuck.hits, 1);
+
+  QVERIFY(screen.leave());
+  screen.disable();
 }

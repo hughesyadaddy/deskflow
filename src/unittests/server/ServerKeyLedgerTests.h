@@ -27,4 +27,6 @@ private Q_SLOTS:
   void lockChange_pushesStateToActiveClient();
   void clearAll_releasesOnlyThatSendersKeysOnTheActiveClient();
   void clearAll_withoutSenderReleasesEveryRelayedKey();
+  void switch_releasesBeforeLeave();
+  void enterSecondary_logsStuckReleaseWhenModifierPersists();
 };

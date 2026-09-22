@@ -14,6 +14,47 @@
 #include "MockKeyMap.h"
 #include "MockKeyState.h"
 
+#include <vector>
+
+namespace {
+
+//! KeyState whose OS reports Shift physically held and whose injections
+//! are recorded instead of posted; presses go through the real
+//! KeyState::fakeKeyDown so they land in the synthetic ledger.
+class ShiftHeldKeyState : public MockKeyState
+{
+public:
+  using MockKeyState::MockKeyState;
+
+  struct Posted
+  {
+    KeyButton button;
+    bool press;
+  };
+  std::vector<Posted> posted;
+
+  KeyModifierMask pollActiveModifiers() const override
+  {
+    return KeyModifierShift;
+  }
+  void fakeKey(const Keystroke &keystroke) override
+  {
+    if (keystroke.m_type == Keystroke::KeyType::Button) {
+      posted.push_back({keystroke.m_data.m_button.m_button, keystroke.m_data.m_button.m_press});
+    }
+  }
+  void fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton serverID, const std::string &lang) override
+  {
+    KeyState::fakeKeyDown(id, mask, serverID, lang);
+  }
+  bool isKeyDown(KeyButton button) const override
+  {
+    return KeyState::isKeyDown(button);
+  }
+};
+
+} // namespace
+
 void KeyStateTests::initTestCase()
 {
   m_arch.init();
@@ -146,6 +187,45 @@ void KeyStateTests::updateKeyState_pollInsertsSingleKey_keyIsDown()
 
   keyState.updateKeyState();
   QVERIFY(keyState.isKeyDown(1));
+}
+
+void KeyStateTests::fakeAllKeysUp_releasesOnlySyntheticThenReseeds()
+{
+  // K2: leave releases what WE pressed and nothing the user physically
+  // holds, then re-reads the OS so the tracked mask does not go stale.
+  deskflow::KeyMap keyMap;
+  deskflow::KeyMap::KeyItem a;
+  a.m_id = static_cast<KeyID>('a');
+  a.m_button = 1;
+  a.m_group = 0;
+  keyMap.addKeyEntry(a);
+  keyMap.finish();
+  MockEventQueue eventQueue;
+  ShiftHeldKeyState keyState(eventQueue, keyMap);
+
+  // a synthetic 'a' from the server
+  keyState.fakeKeyDown(a.m_id, 0, 7, "en");
+  QVERIFY(keyState.isKeyDown(1));
+  QCOMPARE(keyState.posted.size(), size_t(1));
+  QVERIFY(keyState.posted[0].press);
+  keyState.posted.clear();
+
+  // the OS holds Shift (the user's) which never entered the ledger
+  keyState.fakeAllKeysUp();
+
+  // exactly one release, for 'a'; Shift is untouched ...
+  QCOMPARE(keyState.posted.size(), size_t(1));
+  QCOMPARE(keyState.posted[0].button, KeyButton(1));
+  QVERIFY(!keyState.posted[0].press);
+  QVERIFY(!keyState.isKeyDown(1));
+  // ... and the tracked mask is reseeded from OS truth
+  QCOMPARE(keyState.getActiveModifiers(), KeyModifierShift);
+
+  // with an empty ledger nothing is posted at all, mask still OS truth
+  keyState.posted.clear();
+  keyState.fakeAllKeysUp();
+  QVERIFY(keyState.posted.empty());
+  QCOMPARE(keyState.getActiveModifiers(), KeyModifierShift);
 }
 
 QTEST_MAIN(KeyStateTests)

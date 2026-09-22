@@ -28,6 +28,8 @@ private Q_SLOTS:
   void sanitizeSkipsModifiersOsReportsUp();
   void sanitizeReleasesStaleModifiersWithoutRecentHardwarePress();
   void sanitizeKeepsModifiersBackedByRecentHardwarePress();
+  void sanitizeReleasesInjectedFnAndCaps();
+  void sanitizeLeavesOsCapsLockAlone();
   void setToggleStateNoOpsWhenCapsMatches();
   void setToggleStateDrivesCapsViaLockStateApi();
   void setToggleStateFallsBackToFakeCapsPress();
