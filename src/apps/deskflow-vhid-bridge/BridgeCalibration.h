@@ -40,6 +40,10 @@ constexpr uint8_t kHidLeftControl = 0x01;
 constexpr uint8_t kHidLeftShift = 0x02;
 constexpr uint8_t kHidLeftOption = 0x04;
 constexpr uint8_t kHidLeftCommand = 0x08;
+constexpr uint8_t kHidRightControl = 0x10;
+constexpr uint8_t kHidRightShift = 0x20;
+constexpr uint8_t kHidRightOption = 0x40;
+constexpr uint8_t kHidRightCommand = 0x80;
 
 // Deskflow KeyID and HID usage of Caps Lock.
 constexpr uint16_t kKeyIdCapsLock = 0xEFE5;
