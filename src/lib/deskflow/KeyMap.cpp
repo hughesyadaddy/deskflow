@@ -981,8 +981,10 @@ void KeyMap::addKeystrokes(
   case kKeystrokeModify:
   case kKeystrokeUnmodify:
     if (keyItem.m_lock) {
-      // we assume there's just one button for this modifier
-      if (m_halfDuplex.contains(button)) {
+      // we assume there's just one button for this modifier. Half-duplex is
+      // configured either by button (detected by deskflow) or by KeyID (the
+      // user's halfDuplexCapsLock/NumLock/ScrollLock options): honour both.
+      if (isHalfDuplex(keyItem.m_id, button)) {
         if (type == kKeystrokeModify) {
           // turn half-duplex toggle on (press)
           keystrokes.push_back(Keystroke(button, true, false, data));

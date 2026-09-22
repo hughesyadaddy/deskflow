@@ -375,6 +375,84 @@ void KeyMapTests::mapKey_capsInsensitiveKeyWithCapsMaskMismatch_noCapsStrokes()
   QCOMPARE(currentState & KeyModifierCapsLock, capsBefore);
 }
 
+// K4 audit B-4: a lock modifier configured half-duplex by the USER (KeyID,
+// via halfDuplexCapsLock -> addHalfDuplexModifier) must be driven as
+// press-to-turn-on / release-to-turn-off, exactly like one deskflow
+// detected by button. Before the fix only the button set was consulted, so
+// the KeyID configuration produced a full click (press+release) on the way
+// in and another on the way out -- which on a half-duplex keyboard toggles
+// the lock twice.
+void KeyMapTests::mapKey_halfDuplexCapsByKeyId_pressThenReleaseAroundKey()
+{
+  auto layout = [](KeyMap &map) {
+    KeyMap::KeyItem caps;
+    caps.m_id = kKeyCapsLock;
+    caps.m_group = 0;
+    caps.m_button = kCapsButton;
+    caps.m_generates = KeyModifierCapsLock;
+    caps.m_lock = true;
+    map.addKeyEntry(caps);
+    // 'K' reachable only through Caps Lock on this layout
+    KeyMap::KeyItem k;
+    k.m_id = 'K';
+    k.m_group = 0;
+    k.m_button = kKButton;
+    k.m_required = KeyModifierCapsLock;
+    k.m_sensitive = KeyModifierCapsLock;
+    map.addKeyEntry(k);
+    map.finish();
+  };
+  auto capsStrokesAroundKey = [](const KeyMap::Keystrokes &keys, std::vector<ButtonStroke> &before,
+                                 std::vector<ButtonStroke> &after) {
+    bool seenKey = false;
+    for (const auto &s : buttonStrokes(keys)) {
+      if (s.button == kKButton && s.press) {
+        seenKey = true;
+        continue;
+      }
+      if (s.button == kCapsButton) {
+        (seenKey ? after : before).push_back(s);
+      }
+    }
+    return seenKey;
+  };
+
+  // Baseline: no half-duplex -> click Caps on (press, release) before the
+  // key and click it off (press, release) after.
+  {
+    KeyMap keyMap;
+    layout(keyMap);
+    KeyMap::Keystrokes keys;
+    KeyMap::ModifierToKeys activeModifiers;
+    KeyModifierMask currentState = 0;
+    QVERIFY(keyMap.mapKey(keys, 'K', 0, activeModifiers, currentState, 0, false, "en") != nullptr);
+    std::vector<ButtonStroke> before, after;
+    QVERIFY(capsStrokesAroundKey(keys, before, after));
+    QCOMPARE(before.size(), size_t(2));
+    QVERIFY(before[0].press && !before[1].press);
+    QCOMPARE(after.size(), size_t(2));
+    QVERIFY(after[0].press && !after[1].press);
+  }
+
+  // Half-duplex by KeyID -> press only before the key, release only after.
+  {
+    KeyMap keyMap;
+    layout(keyMap);
+    keyMap.addHalfDuplexModifier(kKeyCapsLock);
+    QVERIFY(keyMap.isHalfDuplex(kKeyCapsLock, 0));
+    KeyMap::Keystrokes keys;
+    KeyMap::ModifierToKeys activeModifiers;
+    KeyModifierMask currentState = 0;
+    QVERIFY(keyMap.mapKey(keys, 'K', 0, activeModifiers, currentState, 0, false, "en") != nullptr);
+    std::vector<ButtonStroke> before, after;
+    QVERIFY(capsStrokesAroundKey(keys, before, after));
+    QCOMPARE(before.size(), size_t(1));
+    QVERIFY(before[0].press);
+    QCOMPARE(after.size(), size_t(1));
+    QVERIFY(!after[0].press);
+  }
+}
+
 void KeyMapTests::parseModifiers_plusKey_keepsPlusAsKey()
 {
   std::string keystroke = "Control+Shift++";
