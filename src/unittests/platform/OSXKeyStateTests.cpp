@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 
+#include <QtCore/qglobal.h>
 #include "OSXKeyStateTests.h"
 
 #include "base/EventQueue.h"
@@ -67,6 +68,11 @@ void OSXKeyStateTests::mapModifiersFromOSX_OSXMask()
 
 void OSXKeyStateTests::fakePollShift()
 {
+  // These cases CGEventPost real keystrokes into the login session and steal
+  // focus from whoever is using the Mac. They are opt-in only.
+  if (qEnvironmentVariableIsEmpty("DESKFLOW_HID_INJECTION_TESTS")) {
+    QSKIP("set DESKFLOW_HID_INJECTION_TESTS=1 to run HID-injecting tests");
+  }
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -87,6 +93,11 @@ void OSXKeyStateTests::fakePollShift()
 
 void OSXKeyStateTests::fakePollChar()
 {
+  // These cases CGEventPost real keystrokes into the login session and steal
+  // focus from whoever is using the Mac. They are opt-in only.
+  if (qEnvironmentVariableIsEmpty("DESKFLOW_HID_INJECTION_TESTS")) {
+    QSKIP("set DESKFLOW_HID_INJECTION_TESTS=1 to run HID-injecting tests");
+  }
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -106,6 +117,11 @@ void OSXKeyStateTests::fakePollChar()
 
 void OSXKeyStateTests::fakePollCharWithModifier()
 {
+  // These cases CGEventPost real keystrokes into the login session and steal
+  // focus from whoever is using the Mac. They are opt-in only.
+  if (qEnvironmentVariableIsEmpty("DESKFLOW_HID_INJECTION_TESTS")) {
+    QSKIP("set DESKFLOW_HID_INJECTION_TESTS=1 to run HID-injecting tests");
+  }
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
