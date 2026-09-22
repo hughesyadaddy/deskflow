@@ -538,9 +538,12 @@ void Screen::enterPrimary() const
 {
   // Coming back to the primary means the server holds nothing here any
   // more, yet relayed keys ARE injected into its OS (PrimaryClient::
-  // injectForwardedKey). Anything still down that no hardware press backs
-  // is stale; sweep it before the user's first real key lands on top.
-  m_screen->sanitizeInjectedKeys();
+  // injectForwardedKey). Close what WE still hold before the user's first
+  // real key lands on top. Ledger-only on purpose: the user may well be
+  // mid-gesture at this keyboard (shift-dragging back onto the primary),
+  // and the full sanitize sweep judges an OS-held modifier by freshness --
+  // a hold emits one flagsChanged, so a >2 s shift-drag would be swept.
+  m_screen->releaseInjectedKeys();
 }
 
 void Screen::enterSecondary(KeyModifierMask mask)
@@ -579,11 +582,11 @@ void Screen::enterSecondary(KeyModifierMask mask)
   }
 
   // 3. Verify. Whatever leave() and the server's release batch missed (a
-  //    CLeave that raced the key-ups, a modifier the platform ledger never
-  //    saw) shows up as a modifier the OS still holds while nothing has
-  //    been typed here. Look once the dust settles, then once more before
-  //    sweeping, so a user genuinely holding Shift at the crossing is
-  //    never touched.
+  //    CLeave that raced the key-ups) shows up as a modifier the OS still
+  //    holds while nothing has been typed here. Look once the dust settles,
+  //    then once more before closing what our ledger still holds. The OS
+  //    view is logged for the fleet; only the ledger is ever released, so
+  //    a modifier held on this machine's own keyboard is never touched.
   m_enteredAt = std::chrono::steady_clock::now();
   m_postSwitchPass = 0;
   armPostSwitchVerifier(kPostSwitchFirstCheckS);
@@ -601,15 +604,13 @@ void Screen::leaveSecondary()
 {
   cancelPostSwitchVerifier();
   // release any keys we think are still down (including modifiers
-  // re-asserted on enter; fakeAllKeysUp covers every synthetic key)
+  // re-asserted on enter; fakeAllKeysUp covers every synthetic key AND,
+  // per platform, whatever its injected-modifier ledger still holds beyond
+  // the synthetic set -- K2 gap b1: OSXKeyState used to clear that ledger
+  // here without releasing it). Deliberately no sanitize sweep: a modifier
+  // held on this machine's own keyboard must survive the crossing.
   m_reassertedModifiers.clear();
   m_screen->fakeAllKeysUp();
-  // ... then let the platform sweep what the ledger did not know about:
-  // fakeAllKeysUp() releases only m_syntheticKeys, so a modifier the OS
-  // holds that never made it into that ledger (K2 gap b1) would be
-  // forgotten, not released. Windows already does this in its own leave();
-  // the macOS path had no release for it anywhere.
-  m_screen->sanitizeInjectedKeys();
 }
 
 void Screen::armPostSwitchVerifier(double delayS)
@@ -666,7 +667,7 @@ void Screen::handlePostSwitchVerifier()
     return;
   }
   LOG_WARN("[keys] stuck-release 0x%04x", held);
-  m_screen->sanitizeInjectedKeys();
+  m_screen->releaseInjectedKeys();
 }
 
 std::string Screen::getSecureInputApp() const

@@ -98,6 +98,11 @@ void PlatformScreen::sanitizeInjectedKeys()
   getKeyState()->sanitizeInjectedKeys();
 }
 
+void PlatformScreen::releaseInjectedKeys()
+{
+  getKeyState()->releaseInjectedKeys();
+}
+
 std::string PlatformScreen::sidesMaskToString(uint32_t sides)
 {
   using enum DirectionMask;

@@ -78,10 +78,22 @@ public:
   }
 
   KeyModifierMask osModifiers = 0;
+  int sanitizeCalls = 0; // full freshness sweep (boundary-only)
+  int releaseCalls = 0;  // ledger-only release (enter/verifier)
 
   void *getEventTarget() const override
   {
     return const_cast<TestPlatformScreen *>(this);
+  }
+  void sanitizeInjectedKeys() override
+  {
+    ++sanitizeCalls;
+    PlatformScreen::sanitizeInjectedKeys();
+  }
+  void releaseInjectedKeys() override
+  {
+    ++releaseCalls;
+    PlatformScreen::releaseInjectedKeys();
   }
   bool getClipboard(ClipboardID, IClipboard *) const override
   {
@@ -217,23 +229,15 @@ private:
   MockKeyState m_keyState;
 };
 
-//! The same platform screen in the client role, counting the sweeps the
-//! Screen layer asks for.
+//! The same platform screen in the client role.
 class SecondaryPlatformScreen : public TestPlatformScreen
 {
 public:
   using TestPlatformScreen::TestPlatformScreen;
 
-  int sanitizeCalls = 0;
-
   bool isPrimary() const override
   {
     return false;
-  }
-  void sanitizeInjectedKeys() override
-  {
-    ++sanitizeCalls;
-    TestPlatformScreen::sanitizeInjectedKeys();
   }
 };
 
@@ -924,11 +928,38 @@ void ServerKeyLedgerTests::switch_releasesBeforeLeave()
   }
 }
 
+void ServerKeyLedgerTests::enterPrimary_releasesOnlyInjectedLedger()
+{
+  // Server role. The user comes back onto the primary shift-dragging (the
+  // OS holds Shift, no hardware flagsChanged for seconds): enter must close
+  // what the platform ledger holds and NEVER run the freshness sweep,
+  // which would post a Shift UP mid-gesture.
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    const int sanitizeBefore = f.platform->sanitizeCalls;
+    const int releaseBefore = f.platform->releaseCalls;
+
+    f.platform->osModifiers = KeyModifierShift;
+    server.switchScreen(f.primary, 512, 384, false);
+
+    QCOMPARE(f.platform->releaseCalls, releaseBefore + 1);
+    QCOMPARE(f.platform->sanitizeCalls, sanitizeBefore);
+    server.m_clients.erase("remote");
+  }
+}
+
 void ServerKeyLedgerTests::enterSecondary_logsStuckReleaseWhenModifierPersists()
 {
   // Client role. The OS still holds Shift after we entered and nobody has
   // typed here: the verifier notes it at the first check, confirms it at
-  // the second and sweeps it, logging the line fleet-health greps for.
+  // the second and closes the ledger (never the freshness sweep -- that
+  // Shift may be held on this machine's own keyboard), logging the line
+  // fleet-health greps for.
   EventQueue events;
   auto *platform = new SecondaryPlatformScreen(&events); // owned by the Screen
   deskflow::Screen screen(platform, &events);
@@ -948,29 +979,31 @@ void ServerKeyLedgerTests::enterSecondary_logsStuckReleaseWhenModifierPersists()
   NeedleOutputter stuck(QStringLiteral("[keys] stuck-release"));
 
   screen.enable();
-  const int afterEnable = platform->sanitizeCalls; // enable() sweeps once itself
+  const int sanitizeAfterEnable = platform->sanitizeCalls; // enable() sweeps once itself
+  QCOMPARE(platform->releaseCalls, 0);
   platform->osModifiers = KeyModifierShift;
   screen.enter(0);
 
   pumpUntil(events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 3.0, [&] {
-    return platform->sanitizeCalls > afterEnable;
+    return platform->releaseCalls > 0;
   });
-  QCOMPARE(platform->sanitizeCalls, afterEnable + 1);
+  QCOMPARE(platform->releaseCalls, 1);
+  QCOMPARE(platform->sanitizeCalls, sanitizeAfterEnable);
   QCOMPARE(held.hits, 1);
   QCOMPARE(stuck.hits, 1);
 
-  // Leave (sweeps again, cancels any timer) and come back; this time the
-  // server types here before the first check: the held Shift is the
-  // user's chord, not a leftover -- no release, no line.
+  // Leave (cancels any timer; no sweep of its own) and come back; this
+  // time the server types here before the first check: the held Shift is
+  // the user's chord, not a leftover -- no release, no line.
   QVERIFY(screen.leave());
-  const int afterLeave = platform->sanitizeCalls;
-  QCOMPARE(afterLeave, afterEnable + 2);
+  QCOMPARE(platform->sanitizeCalls, sanitizeAfterEnable);
   screen.enter(0);
   screen.keyDown(kKeyA, KeyModifierShift, kButtonA, "en");
   pumpUntil(events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 0.5, [] {
     return false;
   });
-  QCOMPARE(platform->sanitizeCalls, afterLeave);
+  QCOMPARE(platform->releaseCalls, 1);
+  QCOMPARE(platform->sanitizeCalls, sanitizeAfterEnable);
   QCOMPARE(held.hits, 1);
   QCOMPARE(stuck.hits, 1);
 

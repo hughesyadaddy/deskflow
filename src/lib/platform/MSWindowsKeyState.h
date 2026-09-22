@@ -61,10 +61,8 @@ public:
   static uint32_t injectedModifierBits(const InjectedModifierMap &ledger, ULONGLONG nowMs);
 
   //! Candidate VKs for sanitizeInjectedKeys(): every VK in \p ledger plus
-  //! VK_LSHIFT/VK_RSHIFT and VK_LWIN/VK_RWIN always, and VK_CAPITAL only
-  //! when the ledger holds it (a toggle key is never swept on OS state
-  //! alone), ascending. The desk thread probes and releases these (it is
-  //! the only thread bound to the input desktop).
+  //! VK_LSHIFT/VK_RSHIFT, ascending. The desk thread probes and releases
+  //! these (it is the only thread bound to the input desktop).
   static std::vector<WORD> injectedKeyCandidates(const InjectedModifierMap &ledger);
 
   //! Pure decision logic for sanitizeInjectedKeys(): the VKs to release.
@@ -191,6 +189,7 @@ public:
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
   void setToggleState(KeyModifierMask bit, bool on) override;
   void sanitizeInjectedKeys() override;
+  void releaseInjectedKeys() override;
 
   // KeyState overrides
   void onKey(KeyButton button, bool down, KeyModifierMask newState) override;

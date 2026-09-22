@@ -31,10 +31,9 @@ static const uint32_t s_controlVK = kVK_Control;
 static const uint32_t s_altVK = kVK_Option;
 static const uint32_t s_superVK = kVK_Command;
 static const uint32_t s_capsLockVK = kVK_CapsLock;
-// Fn/Globe (0x3F): a flagsChanged key like the others, driving
-// kCGEventFlagMaskSecondaryFn. Not in any key map, but a relayed or
-// crashed-incarnation hold has to have a release path (K2 gap b2).
-static const uint32_t s_fnVK = kVK_Function;
+// Fn/Globe (kVK_Function) is deliberately NOT tracked: no KeyID in the key
+// map resolves to it, so this process can never post it and there is
+// nothing to release. Revisit only if a Globe KeyID is ever added.
 static const uint32_t s_numLockVK = kVK_ANSI_KeypadClear; // 71
 
 static const uint32_t s_brightnessUp = 144;
@@ -177,7 +176,7 @@ io_connect_t getEventDriver()
 
 bool isModifier(uint8_t virtualKey)
 {
-  static std::set<uint8_t> modifiers{s_shiftVK, s_superVK, s_altVK, s_controlVK, s_capsLockVK, s_fnVK};
+  static std::set<uint8_t> modifiers{s_shiftVK, s_superVK, s_altVK, s_controlVK, s_capsLockVK};
 
   return (modifiers.find(virtualKey) != modifiers.end());
 }
@@ -210,7 +209,6 @@ void OSXKeyState::init()
   m_altPressed = false;
   m_superPressed = false;
   m_capsPressed = false;
-  m_fnPressed = false;
 
   // build virtual key map
   for (size_t i = 0; i < sizeof(s_controlKeys) / sizeof(s_controlKeys[0]); ++i) {
@@ -438,10 +436,6 @@ CGEventFlags OSXKeyState::getModifierStateAsOSXFlags() const
     modifiers |= kCGEventFlagMaskAlphaShift;
   }
 
-  if (m_fnPressed) {
-    modifiers |= kCGEventFlagMaskSecondaryFn;
-  }
-
   return modifiers;
 }
 
@@ -636,8 +630,6 @@ CGEventFlags OSXKeyState::modifierFlagForVirtualKey(uint8_t virtualKey)
     return kCGEventFlagMaskCommand;
   case s_capsLockVK:
     return kCGEventFlagMaskAlphaShift;
-  case s_fnVK:
-    return kCGEventFlagMaskSecondaryFn;
   default:
     return 0;
   }
@@ -669,7 +661,6 @@ void OSXKeyState::reseedShadowFlagsFromOS()
   m_altPressed = (os & kCGEventFlagMaskAlternate) != 0;
   m_superPressed = (os & kCGEventFlagMaskCommand) != 0;
   m_capsPressed = (os & kCGEventFlagMaskAlphaShift) != 0;
-  m_fnPressed = (os & kCGEventFlagMaskSecondaryFn) != 0;
   LOG_DEBUG("reseeded shadow modifier flags from os: 0x%llx", static_cast<unsigned long long>(os));
 }
 
@@ -806,13 +797,8 @@ void OSXKeyState::noteHardwareModifierFlags(CGEventFlags flags, double now)
   }
 }
 
-void OSXKeyState::sanitizeInjectedKeys()
+void OSXKeyState::releaseLedgeredModifiers(CGEventFlags os)
 {
-  // Start from OS truth so the release we post below carries the real
-  // global flags for every other modifier.
-  reseedShadowFlagsFromOS();
-  const CGEventFlags os = osModifierFlags();
-
   const std::set<uint8_t> injected = m_injectedModifiers;
   for (uint8_t virtualKey : injected) {
     const CGEventFlags flag = modifierFlagForVirtualKey(virtualKey);
@@ -846,6 +832,25 @@ void OSXKeyState::sanitizeInjectedKeys()
     m_injectedModifiers.erase(virtualKey);
     LOG_INFO("released injected modifier 0x%02x", virtualKey);
   }
+}
+
+void OSXKeyState::releaseInjectedKeys()
+{
+  // Ledger only -- the strict subset of sanitizeInjectedKeys() that can
+  // never touch a modifier the user is physically holding, whatever the
+  // freshness clock says. Reseed first so the release carries real flags.
+  reseedShadowFlagsFromOS();
+  releaseLedgeredModifiers(osModifierFlags());
+}
+
+void OSXKeyState::sanitizeInjectedKeys()
+{
+  // Start from OS truth so the release we post below carries the real
+  // global flags for every other modifier.
+  reseedShadowFlagsFromOS();
+  const CGEventFlags os = osModifierFlags();
+  const std::set<uint8_t> injected = m_injectedModifiers;
+  releaseLedgeredModifiers(os);
 
   // Modifiers the OS reports down that we never injected: the user's, if a
   // physical key recently drove them (a hardware flagsChanged carried the
@@ -854,13 +859,15 @@ void OSXKeyState::sanitizeInjectedKeys()
   // process that crashed with the key held (K2): nothing on the keyboard
   // backs them, and nobody else will ever release them. The HID key map
   // (pollPressedKeys) is deliberately NOT consulted here: it reports a
-  // posted modifier as down just like a physical one.
-  // Fn is listed for completeness: it has no side-specific device bit, so
-  // hardwareSlotForVirtualKey() has no slot for it and an un-injected Fn is
-  // always treated as the user's. Caps is deliberately NOT here: its OS
-  // flag is lock state, never evidence of a held key.
+  // posted modifier as down just like a physical one. Caps is deliberately
+  // NOT here: its OS flag is lock state, never evidence of a held key.
+  //
+  // A held key emits ONE flagsChanged, so a >kHardwareModifierFreshS hold
+  // reads as stale here. This sweep therefore belongs only at boundaries
+  // where the user cannot be mid-gesture at this keyboard (enable, lock/
+  // unlock, wake, clear-all); enter/leave/verifier use releaseInjectedKeys().
   const double at = now();
-  for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK, s_fnVK}) {
+  for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
     const auto vk = static_cast<uint8_t>(virtualKey);
     const CGEventFlags flag = modifierFlagForVirtualKey(vk);
     if ((os & flag) == 0 || injected.contains(vk)) {
@@ -888,8 +895,14 @@ void OSXKeyState::updateKeyState()
 
 void OSXKeyState::fakeAllKeysUp()
 {
+  // Synthetic keys first (their fakeKey() Ups drop them from the ledger),
+  // then whatever the ledger still holds beyond the synthetic set -- a
+  // modifier posted outside KeyState's press path. K2 gap b1: this used to
+  // clear() the ledger here, forgetting such a modifier instead of
+  // releasing it, and nothing downstream ever released it either.
   KeyState::fakeAllKeysUp();
-  m_injectedModifiers.clear();
+  reseedShadowFlagsFromOS();
+  releaseLedgeredModifiers(osModifierFlags());
   reseedShadowFlagsFromOS();
 }
 
@@ -910,9 +923,6 @@ void OSXKeyState::setKeyboardModifiers(CGKeyCode virtualKey, bool keyDown)
     break;
   case s_capsLockVK:
     m_capsPressed = keyDown;
-    break;
-  case s_fnVK:
-    m_fnPressed = keyDown;
     break;
   default:
     LOG_VERBOSE("the key is not a modifier");

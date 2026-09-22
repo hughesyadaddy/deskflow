@@ -176,6 +176,18 @@ public:
   {
   }
 
+  //! Release ONLY the modifiers this process injected and never released
+  /*!
+  The strict subset of sanitizeInjectedKeys(): the platform's injected
+  ledger, nothing else. Unlike the full sweep it never reasons about
+  freshness, so a modifier the user is physically holding at THIS keyboard
+  cannot be swept -- safe to call while the user may be mid-gesture (return
+  to the primary, the post-switch verifier). Default does nothing.
+  */
+  virtual void releaseInjectedKeys()
+  {
+  }
+
   //! Fake ctrl+alt+del
   /*!
   Synthesize a press of ctrl+alt+del.  Return true if processing is

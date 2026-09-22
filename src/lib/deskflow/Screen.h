@@ -340,7 +340,8 @@ private:
 
   // Post-switch verifier (secondary only): a one-shot armed on enter that
   // re-reads the OS modifier state and, when something is still held that
-  // nobody typed since we entered, sweeps it via sanitizeInjectedKeys().
+  // nobody typed since we entered, logs it and closes whatever the platform
+  // ledger still holds via releaseInjectedKeys() (never a freshness sweep).
   void armPostSwitchVerifier(double delayS);
   void cancelPostSwitchVerifier();
   void handlePostSwitchVerifier();

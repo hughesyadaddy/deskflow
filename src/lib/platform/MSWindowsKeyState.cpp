@@ -1225,17 +1225,6 @@ std::vector<WORD> MSWindowsKeyState::injectedKeyCandidates(const InjectedModifie
   }
   candidates[VK_LSHIFT] = true;
   candidates[VK_RSHIFT] = true;
-  // Win is the other classic strand (Start menu flashes, Win+letter
-  // shortcuts while typing). The periodic audit only vouches for it while
-  // the ledger does; at a boundary a Win still down is stale by definition.
-  candidates[VK_LWIN] = true;
-  candidates[VK_RWIN] = true;
-  // Caps Lock is a toggle: GetAsyncKeyState(VK_CAPITAL) reports the KEY,
-  // not the lock, and a Caps the user is physically holding must never get
-  // a synthetic UP. Only a Caps this process injected (ledger) qualifies.
-  if (ledger.count(VK_CAPITAL) != 0) {
-    candidates[VK_CAPITAL] = true;
-  }
 
   std::vector<WORD> result;
   for (const auto &[vk, unused] : candidates) {
@@ -1269,6 +1258,26 @@ void MSWindowsKeyState::sanitizeInjectedKeys()
   for (const WORD vk : vks) {
     const bool wasInjected = m_injectedModifiers.erase(vk) != 0;
     LOG_INFO("released stale %s key vk=0x%02x", wasInjected ? "injected" : "held", vk);
+  }
+}
+
+void MSWindowsKeyState::releaseInjectedKeys()
+{
+  // Ledger only: no Shift/Win extras and no freshness reasoning, so a
+  // modifier the user is physically holding at this keyboard is never a
+  // candidate. The desk thread still probes each VK (GetAsyncKeyState on
+  // the input desktop) and trims the list to what it actually released.
+  std::vector<WORD> vks;
+  for (const auto &[vk, stampMs] : m_injectedModifiers) {
+    vks.push_back(vk);
+  }
+  if (vks.empty()) {
+    return;
+  }
+  m_desks->releaseHeldKeys(vks);
+  for (const WORD vk : vks) {
+    m_injectedModifiers.erase(vk);
+    LOG_INFO("released injected key vk=0x%02x", vk);
   }
 }
 
