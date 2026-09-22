@@ -181,9 +181,11 @@ void Screen::disable()
     // I1: a primary is never a target, yet relayed keys ARE injected into
     // its OS (PrimaryClient::injectForwardedKey). Tearing the primary down
     // with those still held (role flip, epoch teardown) used to strand them
-    // with no one left to release them.
+    // with no one left to release them. Ledger only (K5): the user sits at
+    // the primary and an epoch teardown lands at any moment -- including
+    // mid-password with Shift held -- so the freshness sweep must not run.
     m_screen->fakeAllKeysUp();
-    m_screen->sanitizeInjectedKeys();
+    m_screen->releaseInjectedKeys();
   }
   m_screen->disable();
   if (m_isPrimary) {

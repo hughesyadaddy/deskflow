@@ -433,8 +433,10 @@ void ClientApp::handleCoordinationKeyClearAll()
   }
   LOG_INFO("coordination: peer lane failed; releasing relayed keys on the client screen");
   IPlatformScreen *platform = m_clientScreen->getPlatformScreen();
+  // ledger only (K5): the local user may be typing here while the mesh
+  // churns; only what this process injected is closed
   platform->fakeAllKeysUp();
-  platform->sanitizeInjectedKeys();
+  platform->releaseInjectedKeys();
 }
 
 void ClientApp::handleCoordinationKeyForward(const Event &event)

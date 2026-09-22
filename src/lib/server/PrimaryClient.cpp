@@ -154,8 +154,10 @@ void PrimaryClient::keyDown(KeyID key, KeyModifierMask mask, KeyButton button, c
 void PrimaryClient::releaseForwardedKeys()
 {
   fakeInputBegin();
+  // ledger only (K5): the user is at this keyboard; a peer-lane failure is
+  // not evidence that a modifier the OS reports held is not theirs
   m_screen->getPlatformScreen()->fakeAllKeysUp();
-  m_screen->getPlatformScreen()->sanitizeInjectedKeys();
+  m_screen->getPlatformScreen()->releaseInjectedKeys();
   fakeInputEnd();
 }
 

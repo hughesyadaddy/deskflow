@@ -294,11 +294,20 @@ OSXScreen::OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync)
 
     // reconcile injected modifier state with the OS after lock/unlock/wake;
     // runs here on the event-loop thread, queued by OSXScreenImpl's observers.
+    // Ledger ONLY (K5): the user is at this keyboard at exactly these moments
+    // (typing the unlock password, waking the machine), and the tap was blind
+    // for the whole lock (secure input), so the freshness sweep would judge a
+    // physically held Shift stale and post its Up -- global flags then read
+    // Shift OFF under the user's fingers and the next letters came out
+    // lowercase. Only what WE injected is closed here.
     m_events->addHandler(EventTypes::OsxScreenResyncKeyState, getEventTarget(), [this](const auto &) {
       LOG_DEBUG("resyncing key state after session change");
-      m_keyState->sanitizeInjectedKeys();
+      logSecureInputState();
+      m_keyState->releaseInjectedKeys();
       m_keyState->updateKeyState();
     });
+    // the tap does not exist until enable(): no hardware observation yet
+    m_keyState->noteHardwareObservation(false, OSXKeyState::monotonicSeconds());
     m_impl = new OSXScreenImpl(this);
 
     // create thread for monitoring system power state.
@@ -936,6 +945,9 @@ void OSXScreen::enable()
   }
 
   if (m_eventTapPort) {
+    // hardware flagsChanged can reach the freshness clock from here on
+    m_keyState->noteHardwareObservation(true, OSXKeyState::monotonicSeconds());
+    logSecureInputState();
     m_eventTapRLSR = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_eventTapPort, 0);
     if (m_eventTapRLSR) {
       // Run the event tap on a dedicated thread with its own CFRunLoop so it fires
@@ -970,6 +982,8 @@ void OSXScreen::disable()
 
   // FIXME -- stop watching jump zones, stop capturing input
 
+  // the tap goes away: the freshness clock is blind until the next enable()
+  m_keyState->noteHardwareObservation(false, OSXKeyState::monotonicSeconds());
   if (m_eventTapRunLoop) {
     CFRunLoopStop(m_eventTapRunLoop);
   }
@@ -2044,7 +2058,10 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
     // the app teardown calls disable() on the main thread.
     if (AXIsProcessTrusted()) {
       if (screen->m_eventTapPort != nullptr) {
+        // the tap was dead for an unknown stretch: restart the observation window
+        screen->m_keyState->noteHardwareObservation(false, OSXKeyState::monotonicSeconds());
         CGEventTapEnable(screen->m_eventTapPort, true);
+        screen->m_keyState->noteHardwareObservation(true, OSXKeyState::monotonicSeconds());
         LOG_INFO("quartz event tap was disabled by timeout, re-enabling");
       }
     } else {
@@ -2054,6 +2071,7 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
     break;
   case kCGEventTapDisabledByUserInput:
     LOG_ERR("quartz event tap was disabled by user input");
+    screen->m_keyState->noteHardwareObservation(false, OSXKeyState::monotonicSeconds());
     break;
   case NX_NULLEVENT:
     break;
@@ -2155,6 +2173,15 @@ void OSXScreen::waitForCarbonLoop() const
   }
 
   LOG_DEBUG("carbon loop ready");
+}
+
+void OSXScreen::logSecureInputState()
+{
+  const bool on = IsSecureEventInputEnabled();
+  if (on != m_secureInputLogged) {
+    m_secureInputLogged = on;
+    LOG_INFO("[keys] secure-input=%s", on ? "on" : "off");
+  }
 }
 
 std::string OSXScreen::getSecureInputApp() const

@@ -1692,9 +1692,14 @@ void MSWindowsScreen::updateKeysCB(const void *)
     // physically down and the server's later UP is dropped by
     // KeyState::fakeKeyUp as "not ours". Release them first -- this runs on
     // the desk thread, so the UPs are injected inline on the current input
-    // desktop before the OS is polled -- then sweep anything still held.
+    // desktop before the OS is polled -- then close the ledger. Ledger ONLY
+    // (K5): this fires on every desk switch, i.e. the instant the UAC /
+    // credential / LogonUI desktop appears and the person at THIS keyboard
+    // starts typing a password. sanitizeInjectedKeys() always lists
+    // LSHIFT/RSHIFT and releases on GetAsyncKeyState truth, so it dropped
+    // the Shift they were holding and lowercased the password.
     m_keyState->fakeAllKeysUp();
-    m_keyState->sanitizeInjectedKeys();
+    m_keyState->releaseInjectedKeys();
   }
 
   // now update the keyboard state

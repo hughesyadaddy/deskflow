@@ -27,7 +27,7 @@ private Q_SLOTS:
   void enterSecondary_clearsCapsWhenPrimaryHasItOff();
   void keyUp_mapsRealReleaseOntoReassertedModifier();
   void leaveSecondary_releasesEverySyntheticKey();
-  void disablePrimary_releasesInjectedKeysAndSanitizes();
+  void disablePrimary_releasesInjectedKeysLedgerOnly();
   void updateKeyState_releasesSyntheticKeysBeforeZeroing();
   void fakeKeyDown_capsKeyRoutesMaskBitToSetToggleState();
   void fakeKeyDown_doesNotClickCapsAgainAfterSetToggleState();

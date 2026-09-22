@@ -121,6 +121,8 @@ public:
   void setSequenceNumber(uint32_t) override;
   bool isPrimary() const override;
   std::string getSecureInputApp() const override;
+  //! Log a "[keys] secure-input=on/off" line when the state changed since last look
+  void logSecureInputState();
 
   void waitForCarbonLoop() const;
 
@@ -295,6 +297,8 @@ private:
   // screen saver stuff
   OSXScreenSaver *m_screensaver;
   bool m_screensaverNotify;
+  // last secure-input state written to the log as "[keys] secure-input=..."
+  bool m_secureInputLogged = false;
 
   // clipboard stuff
   bool m_ownClipboard;

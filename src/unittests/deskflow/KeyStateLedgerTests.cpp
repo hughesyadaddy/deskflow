@@ -548,10 +548,12 @@ void KeyStateLedgerTests::leaveSecondary_releasesEverySyntheticKey()
   QCOMPARE(f.platform->count(PlatformCall::Kind::AllKeysUp), 1);
 }
 
-void KeyStateLedgerTests::disablePrimary_releasesInjectedKeysAndSanitizes()
+void KeyStateLedgerTests::disablePrimary_releasesInjectedKeysLedgerOnly()
 {
   // A primary is never a target, yet relayed keys are injected into its OS.
-  // Teardown must release them and give the platform a chance to sweep.
+  // Teardown must release them -- and ONLY them (K5): the user sits at the
+  // primary and an epoch teardown lands at any moment, mid-password with
+  // Shift held included, so the freshness sweep (Sanitize) must not run.
   EventQueue events;
   auto *platform = new FakePlatformScreen(&events, true);
   {
@@ -563,7 +565,8 @@ void KeyStateLedgerTests::disablePrimary_releasesInjectedKeysAndSanitizes()
     screen.disable();
 
     QCOMPARE(platform->count(PlatformCall::Kind::AllKeysUp), 1);
-    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 1);
+    QCOMPARE(platform->count(PlatformCall::Kind::ReleaseInjected), 1);
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 0);
     // ~Screen deletes platform
   }
 }
