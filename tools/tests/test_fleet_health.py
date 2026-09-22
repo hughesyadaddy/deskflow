@@ -125,6 +125,7 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.sudo_probe_cmd()): (0, "", ""),
         (hid, fh.login_bridge_agent_cmd()): (0, LOGIN_BRIDGE_PRINT, ""),
         (hid, fh.login_bridge_keystroke_cmd()): (1, "0\n", ""),
+        (hid, fh.keys_log_cmd()): (0, "", ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, fh.DEFAULT_MESH_PORT))] = (0, "", "")
@@ -626,6 +627,98 @@ def test_loginbridge_is_mac_only_and_included_in_all(tmp_path, capsys):
     assert [r for r in out["results"] if r["check"] == "loginbridge"][0]["status"] == "PASS"
 
 
+# ------------------------------------------------------------- keys (stuck-key sweeps)
+
+
+def keys_line(mark, when, rest=""):
+    return f"[{when.strftime('%Y-%m-%dT%H:%M:%S')}.123] {'WARNING' if 'stuck' in mark else 'INFO'}: {mark}{rest}"
+
+
+def test_keys_cmd_greps_core_log_and_rotations_without_sudo():
+    assert "keys" in fh.ALL_CHECKS and "keys" in fh.MAC_ONLY
+    cmd = fh.keys_log_cmd()
+    assert cmd.startswith("f=~/Library/Logs/Deskflow/deskflow-core.log; test -f")
+    assert "exit 3" in cmd and "sudo" not in cmd
+    assert "'[keys] stuck-release'" in cmd and "'[keys] post-switch held='" in cmd
+    assert '"$f" "$f".*' in cmd  # newsyslog rotations too
+
+
+def test_parse_keys_log_fails_on_stuck_release_within_window():
+    from datetime import datetime, timedelta
+    now = datetime(2026, 9, 22, 12, 0, 0)
+    out = "\n".join([
+        keys_line(fh.KEYS_HELD_MARK, now - timedelta(hours=3), "0x0001"),
+        keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=3), " 0x0001"),
+    ]) + "\n"
+    status, detail = fh.parse_keys_log(out, now=now)
+    assert status == "FAIL"
+    assert "1 '[keys] stuck-release' in 24h" in detail and "0x0001" in detail
+
+
+def test_parse_keys_log_ignores_lines_older_than_24h():
+    from datetime import datetime, timedelta
+    now = datetime(2026, 9, 22, 12, 0, 0)
+    out = keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=25), " 0x0008") + "\n"
+    status, detail = fh.parse_keys_log(out, now=now)
+    assert status == "PASS" and "no stuck-key lines in 24h" in detail
+    # right at the edge still counts
+    out = keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=23, minutes=59), " 0x0008") + "\n"
+    assert fh.parse_keys_log(out, now=now)[0] == "FAIL"
+
+
+def test_parse_keys_log_warns_on_held_without_release():
+    from datetime import datetime, timedelta
+    now = datetime(2026, 9, 22, 12, 0, 0)
+    out = keys_line(fh.KEYS_HELD_MARK, now - timedelta(minutes=5), "0x0002") + "\n"
+    status, detail = fh.parse_keys_log(out, now=now)
+    assert status == "WARN"
+    assert "1 '[keys] post-switch held=' in 24h with no release" in detail and "0x0002" in detail
+    assert fh.Result("h", "keys", status, detail).ok  # WARN never fails the run
+
+
+def test_parse_keys_log_unstamped_lines_count_but_are_noted():
+    status, detail = fh.parse_keys_log("garbage [keys] stuck-release 0x0004\n")
+    assert status == "FAIL"
+    status, detail = fh.parse_keys_log("garbage line\n")
+    assert status == "PASS" and "1 unstamped line(s) ignored" in detail
+
+
+def test_keys_mac_pass_warn_fail_and_missing_log():
+    from datetime import datetime, timedelta
+    results, runner = run_checks([mac()], mac_ok_table(), ["keys"])
+    assert [r.check for r in results] == ["keys"]
+    assert results[0].status == "PASS", results[0].detail
+    assert ("macbookpro", fh.keys_log_cmd()) in runner.calls
+
+    recent = datetime.now() - timedelta(minutes=10)
+    t = mac_ok_table()
+    t[("macbookpro", fh.keys_log_cmd())] = (0, keys_line(fh.KEYS_HELD_MARK, recent, "0x0001") + "\n", "")
+    results, _ = run_checks([mac()], t, ["keys"])
+    assert results[0].status == "WARN" and results[0].ok
+
+    t[("macbookpro", fh.keys_log_cmd())] = (0, keys_line(fh.KEYS_STUCK_MARK, recent, " 0x0001") + "\n", "")
+    results, _ = run_checks([mac()], t, ["keys"])
+    assert results[0].status == "FAIL" and "stuck-release" in results[0].detail
+
+    t[("macbookpro", fh.keys_log_cmd())] = (3, "", "missing ~/Library/Logs/Deskflow/deskflow-core.log")
+    results, _ = run_checks([mac()], t, ["keys"])
+    assert results[0].status == "FAIL" and "missing" in results[0].detail
+
+    t[("macbookpro", fh.keys_log_cmd())] = (255, "", "ssh: connect to host macbookpro port 22: timed out")
+    results, _ = run_checks([mac()], t, ["keys"])
+    assert results[0].status == "FAIL" and "rc=255" in results[0].detail
+
+
+def test_keys_is_mac_only_and_included_in_all(tmp_path, capsys):
+    results, runner = run_checks([win()], {}, ["keys"])
+    assert results[0].status == "SKIP" and runner.calls == []
+    env_file = write_env(tmp_path)
+    rc = fh.main(["--json", "--env", str(env_file)], runner=FakeRunner(mac_ok_table()))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert [r for r in out["results"] if r["check"] == "keys"][0]["status"] == "PASS"
+
+
 def test_bridge_ps1_collector_declares_the_check():
     ps1 = (Path(fh.__file__).parent / "fleet-health.ps1").read_text()
     assert '"bridge"       { $results += Test-Bridge $BridgePort }' in ps1
@@ -748,7 +841,8 @@ def test_main_all_checks_single_mac_host(tmp_path, capsys):
     rc = fh.main(["--env", str(env_file)], runner=FakeRunner(mac_ok_table()))
     text = capsys.readouterr().out
     assert rc == 0
-    for check in ("sign", "no-adhoc", "identifiers", "tcc", "session", "mesh", "instances", "bridge", "loginbridge"):
+    for check in ("sign", "no-adhoc", "identifiers", "tcc", "session", "mesh", "instances", "bridge", "loginbridge",
+                  "keys"):
         assert f"| {check}" in text
     assert "authenticode" not in text  # windows-only, not shown for a mac unless explicit
 

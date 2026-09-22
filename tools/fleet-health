@@ -41,6 +41,13 @@ Checks:
                              peer:"deskflow-core" (macOS: nc -w2; Windows: the
                              ps1 collector via .NET TcpClient). Catches a core
                              that is running but silently in legacy/off mode.
+  keys                       stuck-key sweeps in the core log (macOS): FAIL on
+                             any "[keys] stuck-release" line in the last 24 h
+                             (the post-switch verifier had to release a
+                             modifier nobody typed after a crossing); WARN on
+                             "[keys] post-switch held=" lines with no release
+                             behind them (a modifier was still down 250 ms
+                             after entering but cleared on its own).
   loginbridge                the LoginWindow bridge agent (macOS): the plist
                              exists and lints, its program is the installed
                              bundle's deskflow-vhid-bridge, the log is mode 600
@@ -75,6 +82,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -84,8 +92,8 @@ DEFAULT_ENV_FILE = REPO_ROOT / "scripts" / "fleet.env"
 IDENTIFIERS_FILE = TOOLS_DIR / "fleet-health.identifiers"
 
 ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh", "instances", "bridge",
-              "loginbridge")
-MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc", "loginbridge"}
+              "loginbridge", "keys")
+MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc", "loginbridge", "keys"}
 WIN_ONLY = {"authenticode"}
 
 MAC_APPS = ("/Applications/Deskflow.app", "/Applications/Mouser.app")
@@ -115,8 +123,14 @@ LOGIN_BRIDGE_BIN = "/Applications/Deskflow.app/Contents/MacOS/deskflow-vhid-brid
 LOGIN_BRIDGE_LOG = "/var/log/deskflow-vhid-bridge.log"
 LOGIN_BRIDGE_KEYSTROKE_MARK = "key down id="
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
+# Core log on macOS (scripts/deskflow-ctl LOG_DIR; newsyslog rotates to .0, .1 ...).
+CORE_LOG = "~/Library/Logs/Deskflow/deskflow-core.log"
+# Lines the client's post-switch verifier writes (src/lib/deskflow/Screen.cpp).
+KEYS_STUCK_MARK = "[keys] stuck-release"
+KEYS_HELD_MARK = "[keys] post-switch held="
+KEYS_WINDOW_H = 24
 
-PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+PASS, FAIL, SKIP, WARN = "PASS", "FAIL", "SKIP", "WARN"
 
 # --------------------------------------------------------------------------- env
 
@@ -401,6 +415,53 @@ def login_bridge_keystroke_cmd(log: str = LOGIN_BRIDGE_LOG, mark: str = LOGIN_BR
     # The log is root:0600, so the grep needs sudo too. grep -c exits 1 on zero
     # matches; the count on stdout is what matters.
     return f"sudo -n grep -c {shlex.quote(mark)} {shlex.quote(log)}"
+
+
+def keys_log_cmd(log: str = CORE_LOG) -> str:
+    """Every verifier line from the core log and its rotations (rc 3 = no log)."""
+    return (f"f={log}; test -f \"$f\" || {{ echo \"missing $f\" >&2; exit 3; }}; "
+            f"grep -h -F -e '{KEYS_STUCK_MARK}' -e '{KEYS_HELD_MARK}' \"$f\" \"$f\".* 2>/dev/null | tail -n 400; exit 0")
+
+
+_LOG_TS = re.compile(r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def parse_keys_log(output: str, now: Optional[datetime] = None, window_h: int = KEYS_WINDOW_H) -> Tuple[str, str]:
+    """Fold verifier lines into (status, detail).
+
+    Log timestamps are the seat's local wall clock with no offset
+    (base/Log.cpp, Qt::ISODateWithMs), so `now` is compared naive-local too."""
+    now = now or datetime.now()
+    since = now - timedelta(hours=window_h)
+    stuck: List[str] = []
+    held: List[str] = []
+    unstamped = 0
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _LOG_TS.match(line)
+        if m:
+            try:
+                at = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                at = None
+            if at is not None and at < since:
+                continue
+        else:
+            unstamped += 1
+        if KEYS_STUCK_MARK in line:
+            stuck.append(line)
+        elif KEYS_HELD_MARK in line:
+            held.append(line)
+    if stuck:
+        return FAIL, (f"{len(stuck)} '{KEYS_STUCK_MARK}' in {window_h}h "
+                      f"(verifier had to release a modifier; last: {stuck[-1][:100]})")
+    if held:
+        return WARN, (f"{len(held)} '{KEYS_HELD_MARK}' in {window_h}h with no release "
+                      f"(cleared on their own; last: {held[-1][:100]})")
+    note = f"; {unstamped} unstamped line(s) ignored" if unstamped else ""
+    return PASS, f"no stuck-key lines in {window_h}h{note}"
 
 
 def ps1_cmd(root: str, checks: Sequence[str], thumbprint: str, port: int, peers: Sequence[str]) -> str:
@@ -727,6 +788,17 @@ class FleetHealth:
         else:
             self._add(host, "loginbridge", PASS, f"plist lints, program ok, log 600 with 0 keystrokes, {agent}")
 
+    def check_keys_mac(self, host: Host) -> None:
+        rc, out, err = self.runner(host, keys_log_cmd())
+        if rc == 3:
+            self._add(host, "keys", FAIL, f"{CORE_LOG} missing: {(err or out).strip()[:120]}")
+            return
+        if rc != 0:
+            self._add(host, "keys", FAIL, f"core log grep rc={rc}: {(err or out).strip()[:120]}")
+            return
+        status, detail = parse_keys_log(out)
+        self._add(host, "keys", status, detail)
+
     def check_mesh_leg_mac(self, src: Host, dst: Host) -> None:
         rc, out, err = self.runner(src, nc_cmd(dst.addr, self.mesh_port))
         status = PASS if rc == 0 else FAIL
@@ -797,6 +869,8 @@ class FleetHealth:
                     self.check_bridge_mac(host)
                 elif c == "loginbridge":
                     self.check_login_bridge_mac(host)
+                elif c == "keys":
+                    self.check_keys_mac(host)
                 elif c == "mesh":
                     if not peers:
                         self._add(host, "mesh", SKIP, "no peers")
