@@ -19,7 +19,15 @@
   A timestamp-server failure is fatal by default: a signature without an RFC
   3161 timestamp stops validating the moment the certificate expires. Pass
   -AllowNoTimestamp to retry once without /tr (with a warning) for throwaway
-  local builds only.
+  local builds only. Under a fleet deploy ($env:FLEET_DEPLOY = '1', set by
+  scripts/fleet-deploy-windows.ps1) -AllowNoTimestamp is refused outright.
+
+  The verify gate is pinned to the fleet certificate: every fleet-signed file
+  must carry SignerCertificate.Thumbprint equal to the fleet thumbprint
+  (-FleetThumbprint, then $env:DESKFLOW_FLEET_THUMBPRINT, then
+  DESKFLOW_FLEET_THUMBPRINT= in scripts/fleet.env, default
+  FBB49069A6C594E83714724217C7A5F54885FAEC -- the self-signed fleet cert) and
+  a TimeStamperCertificate. The signing thumbprint must be that same cert.
 
   Nothing here is best-effort: a missing thumbprint, a missing signtool, a
   signtool failure or a verify failure all throw. The script never silently
@@ -36,7 +44,12 @@
 .PARAMETER AllowNoTimestamp
   If the timestamp server fails, retry once WITHOUT /tr instead of throwing.
   The resulting signature expires with the certificate; never use for
-  fleet-deployed or released binaries.
+  fleet-deployed or released binaries. Throws when $env:FLEET_DEPLOY is '1'.
+.PARAMETER FleetThumbprint
+  SHA-1 thumbprint of the fleet code-signing certificate every fleet-signed
+  file must verify against. Falls back to $env:DESKFLOW_FLEET_THUMBPRINT,
+  then DESKFLOW_FLEET_THUMBPRINT= in scripts/fleet.env, then the built-in
+  default (the self-signed fleet cert).
 .EXAMPLE
   powershell scripts\sign-windows.ps1 -Root 'C:\Program Files\Deskflow'
   powershell scripts\sign-windows.ps1 -Root C:\Users\alexh\Desktop\Mouser\dist\Mouser -Thumbprint <sha1>
@@ -50,8 +63,15 @@ param(
   [string]$TimestampUrl = 'http://timestamp.digicert.com',
   [string]$KitsBinRoot = 'C:\Program Files (x86)\Windows Kits\10\bin',
   [switch]$VerifyOnly,
-  [switch]$AllowNoTimestamp
+  [switch]$AllowNoTimestamp,
+  [string]$FleetThumbprint,
+  [string]$FleetEnvFile
 )
+
+# The self-signed fleet certificate (user decision 2026-09-22: keep it, harden
+# the gate around it). Override only via -FleetThumbprint /
+# DESKFLOW_FLEET_THUMBPRINT when the fleet cert is rotated.
+$script:DefaultFleetThumbprint = 'FBB49069A6C594E83714724217C7A5F54885FAEC'
 
 # Extensions that carry Authenticode signatures and ship in a Deskflow or
 # Mouser (PyInstaller) install root. Keep in sync with Get-SignTargets and
@@ -81,6 +101,34 @@ function Read-DotEnvValue {
     }
   }
   return $null
+}
+
+function Get-FleetEnvFile {
+  param([string]$Override)
+  if ($Override) { return $Override }
+  $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+  return (Join-Path $scriptDir 'fleet.env')
+}
+
+function Resolve-FleetThumbprint {
+  # The certificate every fleet-signed binary must verify against.
+  param([string]$Explicit, [string]$FleetEnvPath)
+  $raw = $null
+  if ($Explicit) {
+    $raw = $Explicit
+  } elseif ($env:DESKFLOW_FLEET_THUMBPRINT) {
+    $raw = $env:DESKFLOW_FLEET_THUMBPRINT
+  } else {
+    $fromFile = Read-DotEnvValue -Path $FleetEnvPath -Key 'DESKFLOW_FLEET_THUMBPRINT'
+    if ($fromFile) { $raw = $fromFile }
+  }
+  if (-not $raw) { $raw = $script:DefaultFleetThumbprint }
+  return (ConvertTo-NormalizedThumbprint $raw)
+}
+
+function Test-FleetDeploy {
+  # True inside scripts/fleet-deploy-windows.ps1 (it exports FLEET_DEPLOY=1).
+  return ("$($env:FLEET_DEPLOY)" -eq '1')
 }
 
 function ConvertTo-NormalizedThumbprint {
@@ -233,7 +281,13 @@ function Invoke-SignFiles {
 }
 
 function Test-SignedFiles {
-  param([string[]]$Files, [string]$Tp, [string[]]$Vendor = @())
+  # Every non-vendor file must be Valid, signed by the FLEET certificate
+  # ($FleetTp; $Tp is the thumbprint we signed with and must be the same
+  # cert) and carry an RFC 3161 timestamp (TimeStamperCertificate), so the
+  # signature outlives the certificate. Vendor-signed files (Qt, Microsoft,
+  # PyInstaller runtime) are accepted as Valid without those two checks.
+  param([string[]]$Files, [string]$Tp, [string[]]$Vendor = @(), [string]$FleetTp = '')
+  if (-not $FleetTp) { $FleetTp = $Tp }
   $bad = @()
   foreach ($f in $Files) {
     $sig = Get-AuthenticodeSignature -FilePath $f
@@ -241,11 +295,16 @@ function Test-SignedFiles {
     $signer = $null
     $cert = if ($sig.PSObject.Properties['SignerCertificate']) { $sig.SignerCertificate } else { $null }
     if ($cert) { $signer = "$($cert.Thumbprint)".ToUpperInvariant() }
+    $tsCert = if ($sig.PSObject.Properties['TimeStamperCertificate']) { $sig.TimeStamperCertificate } else { $null }
     $msg = if ($sig.PSObject.Properties['StatusMessage']) { $sig.StatusMessage } else { '' }
     if ($status -ne 'Valid') {
       $bad += "$f : status $status ($msg)"
-    } elseif ($signer -ne $Tp -and -not $Vendor.Contains($f)) {
-      $bad += "$f : signed by $signer, expected $Tp"
+    } elseif ($Vendor.Contains($f)) {
+      continue
+    } elseif ($signer -ne $FleetTp) {
+      $bad += "$f : signed by $signer, expected fleet cert $FleetTp"
+    } elseif ($null -eq $tsCert) {
+      $bad += "$f : no RFC 3161 timestamp (TimeStamperCertificate missing); the signature dies with the cert"
     }
   }
   if ($bad.Count -gt 0) {
@@ -262,12 +321,23 @@ function Invoke-SignWindows {
     [string]$Timestamp,
     [string]$KitsRoot,
     [bool]$OnlyVerify,
-    [bool]$NoTimestampOk = $false
+    [bool]$NoTimestampOk = $false,
+    [string]$FleetThumbprintArg = '',
+    [string]$FleetEnvFileArg = ''
   )
   if (-not $Roots -or $Roots.Count -eq 0) { throw 'sign-windows.ps1: -Root is required.' }
+  if ($NoTimestampOk -and (Test-FleetDeploy)) {
+    throw ('sign-windows.ps1: -AllowNoTimestamp is refused under a fleet deploy (FLEET_DEPLOY=1): ' +
+      'an untimestamped signature stops validating when the fleet cert expires. Fix the timestamp server instead.')
+  }
 
   $envPath = Get-SignEnvFile -Override $EnvFileArg
   $tp = Resolve-SignThumbprint -Explicit $ThumbprintArg -EnvFilePath $envPath
+  $fleetTp = Resolve-FleetThumbprint -Explicit $FleetThumbprintArg -FleetEnvPath (Get-FleetEnvFile -Override $FleetEnvFileArg)
+  if ($tp -ne $fleetTp) {
+    throw ("sign-windows.ps1: signing thumbprint $tp is not the fleet certificate $fleetTp " +
+      '(DESKFLOW_SIGN_THUMBPRINT must be the fleet cert; override the fleet cert only via -FleetThumbprint / DESKFLOW_FLEET_THUMBPRINT when it is rotated).')
+  }
   # @() guards against PowerShell unrolling an empty result to $null.
   $files = @(Get-SignTargets -Roots $Roots)
   if ($files.Count -eq 0) {
@@ -283,8 +353,8 @@ function Invoke-SignWindows {
   }
 
   $vendor = @(Get-VendorSignedFiles -Files $files -Tp $tp)
-  Test-SignedFiles -Files $files -Tp $tp -Vendor $vendor
-  Write-Host "== Signature OK: $($files.Count - $vendor.Count) file(s) signed by $tp, $($vendor.Count) vendor-signed =="
+  Test-SignedFiles -Files $files -Tp $tp -Vendor $vendor -FleetTp $fleetTp
+  Write-Host "== Signature OK: $($files.Count - $vendor.Count) file(s) signed + timestamped by fleet cert $fleetTp, $($vendor.Count) vendor-signed =="
   return $files
 }
 
@@ -293,5 +363,5 @@ function Invoke-SignWindows {
 if ($MyInvocation.InvocationName -ne '.') {
   $null = Invoke-SignWindows -Roots $Root -ThumbprintArg $Thumbprint -SignToolArg $SignToolPath `
     -EnvFileArg $EnvFile -Timestamp $TimestampUrl -KitsRoot $KitsBinRoot -OnlyVerify ([bool]$VerifyOnly) `
-    -NoTimestampOk ([bool]$AllowNoTimestamp)
+    -NoTimestampOk ([bool]$AllowNoTimestamp) -FleetThumbprintArg $FleetThumbprint -FleetEnvFileArg $FleetEnvFile
 }

@@ -10,9 +10,15 @@
   Checks:
     authenticode  every *.exe/*.dll under "C:\Program Files\Deskflow" and
                   "C:\Program Files\Mouser" has Get-AuthenticodeSignature
-                  Status Valid and SignerCertificate.Thumbprint equal to the
-                  fleet thumbprint (-Thumbprint, else $env:DESKFLOW_SIGN_THUMBPRINT,
-                  else DESKFLOW_SIGN_THUMBPRINT from the repo .env / scripts/fleet.env).
+                  Status Valid; every fleet-signed one has
+                  SignerCertificate.Thumbprint equal to the FLEET certificate
+                  (-FleetThumbprint, else $env:DESKFLOW_FLEET_THUMBPRINT, else
+                  DESKFLOW_FLEET_THUMBPRINT from .env / scripts/fleet.env, else the
+                  built-in FBB49069A6C594E83714724217C7A5F54885FAEC) and a
+                  TimeStamperCertificate (RFC 3161 timestamp). The configured
+                  signing thumbprint (-Thumbprint, else $env:DESKFLOW_SIGN_THUMBPRINT,
+                  else DESKFLOW_SIGN_THUMBPRINT from .env / scripts/fleet.env) must be
+                  that same fleet certificate.
     session       `sc query Deskflow` reports RUNNING; deskflow and Mouser
                   processes exist with SessionId -ne 0; quser shows an Active session.
     mesh          Test-NetConnection to each -Peers entry on -Port (the
@@ -34,6 +40,7 @@
 param(
   [string]$Checks = "authenticode,session,mesh,instances",
   [string]$Thumbprint = "",
+  [string]$FleetThumbprint = "",
   [string]$Peers = "",
   [int]$Port = 24851,
   [string[]]$InstallRoots = @("C:\Program Files\Deskflow", "C:\Program Files\Mouser"),
@@ -79,13 +86,33 @@ function Resolve-Thumbprint([string]$Explicit) {
   return ""
 }
 
+# The self-signed fleet certificate (kept by user decision 2026-09-22; the
+# gate around it is pinned to this thumbprint plus a timestamp).
+$script:DefaultFleetThumbprint = "FBB49069A6C594E83714724217C7A5F54885FAEC"
+
+function Resolve-FleetThumbprint([string]$Explicit) {
+  if ($Explicit) { return $Explicit.ToUpperInvariant() }
+  if ($env:DESKFLOW_FLEET_THUMBPRINT) { return "$($env:DESKFLOW_FLEET_THUMBPRINT)".ToUpperInvariant() }
+  $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+  foreach ($f in @((Join-Path $root ".env"), (Join-Path $root "scripts\fleet.env"))) {
+    $v = Get-EnvValueFromFile $f "DESKFLOW_FLEET_THUMBPRINT"
+    if ($v) { return $v.ToUpperInvariant() }
+  }
+  return $script:DefaultFleetThumbprint
+}
+
 # --- checks -------------------------------------------------------------------
 
-function Test-Authenticode([string]$Thumb, [string[]]$Roots) {
+function Test-Authenticode([string]$Thumb, [string[]]$Roots, [string]$FleetThumb = "") {
   if (-not $Thumb) {
     return New-Result "authenticode" "FAIL" "DESKFLOW_SIGN_THUMBPRINT not set (param, env, .env, scripts/fleet.env)"
   }
   $Thumb = $Thumb.ToUpperInvariant()
+  if (-not $FleetThumb) { $FleetThumb = Resolve-FleetThumbprint "" }
+  $FleetThumb = $FleetThumb.ToUpperInvariant()
+  if ($Thumb -ne $FleetThumb) {
+    return New-Result "authenticode" "FAIL" ("configured signing thumbprint {0} is not the fleet certificate {1}" -f $Thumb, $FleetThumb)
+  }
   $files = @()
   foreach ($r in $Roots) {
     if (Test-Path -LiteralPath $r) {
@@ -103,26 +130,33 @@ function Test-Authenticode([string]$Thumb, [string[]]$Roots) {
   }
   $bad = @()
   $vendor = 0
+  $untimestamped = 0
   foreach ($f in $files) {
     $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName
     $actual = if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint.ToUpperInvariant() } else { "" }
+    $tsCert = if ($sig.PSObject.Properties["TimeStamperCertificate"]) { $sig.TimeStamperCertificate } else { $null }
     if ($sig.Status -ne "Valid") {
       $bad += ("{0}: {1}" -f $f.Name, $sig.Status)
     } elseif ($actual -eq "") {
       # Valid signature but no signer read back at all: treat as a real failure.
       $bad += ("{0}: thumbprint none" -f $f.Name)
-    } elseif ($actual -ne $Thumb) {
+    } elseif ($actual -ne $FleetThumb) {
       # Valid + signed by a DIFFERENT signer than the fleet thumbprint is a
       # vendor-signed file (Qt, PyInstaller runtime, Microsoft) that
       # scripts/sign-windows.ps1 deliberately leaves untouched (see its
       # Get-VendorSignedFiles) — accept it rather than failing every deploy.
       $vendor += 1
+    } elseif ($null -eq $tsCert) {
+      # Fleet-signed without an RFC 3161 timestamp: the signature stops
+      # validating the moment the fleet cert expires.
+      $untimestamped += 1
+      $bad += ("{0}: no timestamp" -f $f.Name)
     }
   }
   if ($bad.Count -gt 0) {
     return New-Result "authenticode" "FAIL" ($bad -join "; ")
   }
-  New-Result "authenticode" "PASS" ("{0} binaries Valid ({1} fleet-signed {2}, {3} vendor-signed)" -f $files.Count, ($files.Count - $vendor), $Thumb, $vendor)
+  New-Result "authenticode" "PASS" ("{0} binaries Valid ({1} fleet-signed + timestamped {2}, {3} vendor-signed)" -f $files.Count, ($files.Count - $vendor), $FleetThumb, $vendor)
 }
 
 function Invoke-ScQuery([string]$Service) { & sc.exe query $Service 2>&1 | Out-String }
@@ -287,13 +321,13 @@ function Test-Mesh([string[]]$PeerList, [int]$P) {
 function Invoke-FleetHealth {
   param([string]$Checks, [string]$Thumbprint, [string]$Peers, [int]$Port,
         [string[]]$InstallRoots, [string]$ServiceName, [string[]]$GuiProcesses, [string]$Ctl = "",
-        [int]$BridgePort = 19795)
+        [int]$BridgePort = 19795, [string]$FleetThumbprint = "")
   $results = @()
   $wanted = @($Checks.Split(",") | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
   if ($wanted -contains "all") { $wanted = @("authenticode", "session", "mesh", "instances", "bridge") }
   foreach ($c in $wanted) {
     switch ($c) {
-      "authenticode" { $results += Test-Authenticode (Resolve-Thumbprint $Thumbprint) $InstallRoots }
+      "authenticode" { $results += Test-Authenticode (Resolve-Thumbprint $Thumbprint) $InstallRoots (Resolve-FleetThumbprint $FleetThumbprint) }
       "session"      { $results += Test-Session $ServiceName $GuiProcesses }
       "mesh"         { $results += Test-Mesh @($Peers.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }) $Port }
       "instances"    { $results += Test-Instances (Resolve-Ctl $Ctl) }
@@ -306,7 +340,8 @@ function Invoke-FleetHealth {
 
 if ($MyInvocation.InvocationName -ne ".") {
   $r = Invoke-FleetHealth -Checks $Checks -Thumbprint $Thumbprint -Peers $Peers -Port $Port `
-    -InstallRoots $InstallRoots -ServiceName $ServiceName -GuiProcesses $GuiProcesses -Ctl $Ctl -BridgePort $BridgePort
+    -InstallRoots $InstallRoots -ServiceName $ServiceName -GuiProcesses $GuiProcesses -Ctl $Ctl -BridgePort $BridgePort `
+    -FleetThumbprint $FleetThumbprint
   # Always emit a JSON *array*, even for a single result.
   $json = ConvertTo-Json -InputObject @($r) -Depth 3 -Compress
   if (-not $json.StartsWith("[")) { $json = "[" + $json + "]" }

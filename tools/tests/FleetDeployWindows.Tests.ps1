@@ -35,6 +35,13 @@ BeforeAll {
   # Lift Invoke-Git / Invoke-Native into this scope so they can be exercised.
   Invoke-Expression $script:Functions['Invoke-Git'].Extent.Text
   Invoke-Expression $script:Functions['Invoke-Native'].Extent.Text
+  # ... and the settings-survival helpers (pure functions over a directory).
+  $script:MouserSettingsFiles = @('config.json', 'last_device.json')
+  foreach ($n in 'Get-MouserSettingsSnapshot', 'Read-MouserConfigText', 'Backup-MouserConfig', 'Test-JsonSubset',
+                 'Test-MouserConfigMigration', 'Get-MouserSettingsDiff', 'Assert-MouserSettingsIdentical',
+                 'Get-MouserSettingsVerdict') {
+    Invoke-Expression $script:Functions[$n].Extent.Text
+  }
 }
 
 Describe 'fleet-deploy-windows.ps1 structure' {
@@ -203,6 +210,121 @@ Describe 'fleet-deploy-windows.ps1 structure' {
   It 'contains no "|| true"-style swallowing of failures' {
     $script:Text | Should -Not -Match '\|\|\s*true'
     $script:Text | Should -Not -Match '-ErrorAction\s+SilentlyContinue[^\n]*git'
+  }
+
+  It 'exports FLEET_DEPLOY=1 before any signing is invoked (sign-windows.ps1 then refuses -AllowNoTimestamp)' {
+    $script:Text | Should -Match "\`$env:FLEET_DEPLOY = '1'"
+    $script:Text.IndexOf("`$env:FLEET_DEPLOY = '1'") | Should -BeLessThan $script:Text.IndexOf('function Deploy-Deskflow')
+    $script:Text.IndexOf("`$env:FLEET_DEPLOY = '1'") | Should -BeLessThan $script:Text.IndexOf('sign-windows.ps1')
+  }
+
+  It 'Deploy-Mouser snapshots settings before the build, asserts identical after install, and judges again after Mouser ran' {
+    $deploy = $script:Functions['Deploy-Mouser'].Extent.Text
+    $pre = $deploy.IndexOf('Get-MouserSettingsSnapshot $settingsDir')
+    $backup = $deploy.IndexOf('Backup-MouserConfig')
+    $build = $deploy.IndexOf('build_and_install.py')
+    $assert = $deploy.IndexOf("Assert-MouserSettingsIdentical")
+    $sleep = $deploy.IndexOf('Start-Sleep')
+    $verdict = $deploy.IndexOf('Get-MouserSettingsVerdict')
+    $pre | Should -BeGreaterThan 0
+    $pre | Should -BeLessThan $backup
+    $backup | Should -BeLessThan $build
+    $build | Should -BeLessThan $assert
+    $assert | Should -BeLessThan $sleep
+    $sleep | Should -BeLessThan $verdict
+    $deploy | Should -Match "FLEET_SETTINGS=\`$verdict"
+    $deploy | Should -Match "FLEET_SETTINGS=FAIL"
+    $deploy | Should -Match 'FLEET_SETTINGS_SETTLE_S'
+  }
+}
+
+Describe 'Mouser settings-survival helpers' {
+  BeforeEach {
+    $script:Dir = Join-Path $TestDrive ('mouser-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $script:Dir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $script:Dir 'config.json') -Value '{"version": 12, "settings": {"start_at_login": true, "scroll": {"speed": 3}}, "buttons": ["a", "b"]}' -NoNewline
+    Set-Content -LiteralPath (Join-Path $script:Dir 'last_device.json') -Value '{"vid": 1133}' -NoNewline
+  }
+
+  It 'hashes both files (sha256) and reports absent ones' {
+    $snap = Get-MouserSettingsSnapshot $script:Dir
+    $snap['config.json'] | Should -Match '^[0-9a-f]{64}$'
+    $snap['last_device.json'] | Should -Match '^[0-9a-f]{64}$'
+    Remove-Item -LiteralPath (Join-Path $script:Dir 'last_device.json')
+    (Get-MouserSettingsSnapshot $script:Dir)['last_device.json'] | Should -Be 'absent'
+  }
+
+  It 'identical snapshots at three checkpoints pass with ok' {
+    $pre = Get-MouserSettingsSnapshot $script:Dir
+    $text = Read-MouserConfigText $script:Dir
+    { Assert-MouserSettingsIdentical $pre (Get-MouserSettingsSnapshot $script:Dir) 'by the install' } | Should -Not -Throw
+    Get-MouserSettingsVerdict -Pre $pre -Post (Get-MouserSettingsSnapshot $script:Dir) -PreText $text -PostText (Read-MouserConfigText $script:Dir) |
+      Should -Be 'ok'
+  }
+
+  It 'a config.json rewritten by the install fails with a diff summary' {
+    $pre = Get-MouserSettingsSnapshot $script:Dir
+    Set-Content -LiteralPath (Join-Path $script:Dir 'config.json') -Value '{"version": 12}' -NoNewline
+    { Assert-MouserSettingsIdentical $pre (Get-MouserSettingsSnapshot $script:Dir) 'by the install' } |
+      Should -Throw -ExpectedMessage '*changed by the install*config.json*->*'
+  }
+
+  It 'a version bump that keeps every pre-deploy key passes as changed' {
+    $pre = Get-MouserSettingsSnapshot $script:Dir
+    $text = Read-MouserConfigText $script:Dir
+    Set-Content -LiteralPath (Join-Path $script:Dir 'config.json') -Value '{"version": 13, "settings": {"start_at_login": true, "scroll": {"speed": 3}, "new_key": 1}, "buttons": ["a", "b"], "extra": {"x": 1}}' -NoNewline
+    Get-MouserSettingsVerdict -Pre $pre -Post (Get-MouserSettingsSnapshot $script:Dir) -PreText $text -PostText (Read-MouserConfigText $script:Dir) |
+      Should -Be 'changed'
+  }
+
+  It 'a shrunk config (key lost) fails even with a version bump' {
+    $pre = Get-MouserSettingsSnapshot $script:Dir
+    $text = Read-MouserConfigText $script:Dir
+    Set-Content -LiteralPath (Join-Path $script:Dir 'config.json') -Value '{"version": 13, "settings": {"start_at_login": true}, "buttons": ["a", "b"]}' -NoNewline
+    { Get-MouserSettingsVerdict -Pre $pre -Post (Get-MouserSettingsSnapshot $script:Dir) -PreText $text -PostText (Read-MouserConfigText $script:Dir) } |
+      Should -Throw -ExpectedMessage '*not an allowed migration*'
+  }
+
+  It 'a changed value or an unchanged version fails' {
+    $pre = Get-MouserSettingsSnapshot $script:Dir
+    $text = Read-MouserConfigText $script:Dir
+    Set-Content -LiteralPath (Join-Path $script:Dir 'config.json') -Value '{"version": 13, "settings": {"start_at_login": false, "scroll": {"speed": 3}}, "buttons": ["a", "b"]}' -NoNewline
+    { Get-MouserSettingsVerdict -Pre $pre -Post (Get-MouserSettingsSnapshot $script:Dir) -PreText $text -PostText (Read-MouserConfigText $script:Dir) } |
+      Should -Throw
+    Set-Content -LiteralPath (Join-Path $script:Dir 'config.json') -Value '{"version": 12, "settings": {"start_at_login": true, "scroll": {"speed": 3}}, "buttons": ["a", "b"], "extra": 1}' -NoNewline
+    { Get-MouserSettingsVerdict -Pre $pre -Post (Get-MouserSettingsSnapshot $script:Dir) -PreText $text -PostText (Read-MouserConfigText $script:Dir) } |
+      Should -Throw
+  }
+
+  It 'a rewritten last_device.json after the run is reported but still ok' {
+    $pre = Get-MouserSettingsSnapshot $script:Dir
+    $text = Read-MouserConfigText $script:Dir
+    Set-Content -LiteralPath (Join-Path $script:Dir 'last_device.json') -Value '{"vid": 1133, "pid": 45}' -NoNewline
+    Get-MouserSettingsVerdict -Pre $pre -Post (Get-MouserSettingsSnapshot $script:Dir) -PreText $text -PostText (Read-MouserConfigText $script:Dir) |
+      Should -Be 'ok'
+  }
+
+  It 'backs up config.json to config.json.pre-deploy-<ts> and prunes to the newest 5' {
+    foreach ($i in 1..6) {
+      Set-Content -LiteralPath (Join-Path $script:Dir ("config.json.pre-deploy-2026090{0}-000000" -f $i)) -Value 'old'
+    }
+    $dest = Backup-MouserConfig -Dir $script:Dir -Stamp '20260922-120000'
+    $dest | Should -Be (Join-Path $script:Dir 'config.json.pre-deploy-20260922-120000')
+    (Get-Content -LiteralPath $dest -Raw) | Should -Be (Get-Content -LiteralPath (Join-Path $script:Dir 'config.json') -Raw)
+    $left = @(Get-ChildItem -LiteralPath $script:Dir -File | Where-Object { $_.Name -like 'config.json.pre-deploy-*' } | Sort-Object Name)
+    $left.Count | Should -Be 5
+    $left[-1].Name | Should -Be 'config.json.pre-deploy-20260922-120000'
+    $left[0].Name | Should -Be 'config.json.pre-deploy-20260903-000000'
+    # the live config and the other file are untouched
+    Test-Path (Join-Path $script:Dir 'config.json') | Should -BeTrue
+    Test-Path (Join-Path $script:Dir 'last_device.json') | Should -BeTrue
+  }
+
+  It 'Test-JsonSubset compares nested objects, arrays and scalar types' {
+    (Test-JsonSubset ('{"a":{"b":[1,2]}}' | ConvertFrom-Json) ('{"a":{"b":[1,2],"c":3},"d":4}' | ConvertFrom-Json)) | Should -BeTrue
+    (Test-JsonSubset ('{"a":{"b":[1,2]}}' | ConvertFrom-Json) ('{"a":{"b":[1]}}' | ConvertFrom-Json)) | Should -BeFalse
+    (Test-JsonSubset ('{"a":1}' | ConvertFrom-Json) ('{"a":"1"}' | ConvertFrom-Json)) | Should -BeFalse
+    (Test-JsonSubset ('{"a":null}' | ConvertFrom-Json) ('{"a":null}' | ConvertFrom-Json)) | Should -BeTrue
   }
 }
 
