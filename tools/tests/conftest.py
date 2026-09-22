@@ -24,3 +24,7 @@ def load_tool(name: str):
 @pytest.fixture(scope="session")
 def fleet_doctor():
     return load_tool("fleet-doctor")
+
+# Tests must never reach the real sudo (this Mac has passwordless sudo); a shim on PATH fails loudly.
+import os as _os
+_os.environ["PATH"] = _os.path.join(_os.path.dirname(__file__), "fakebin") + _os.pathsep + _os.environ.get("PATH", "")
