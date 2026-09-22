@@ -674,4 +674,57 @@ void KeyStateLedgerTests::describeKey_printsCharacterWithItsCase()
   QVERIFY(caps.find('\'') == std::string::npos);
 }
 
+void KeyStateLedgerTests::primarySweep_neverReleasesPhysicallyCapturedKey()
+{
+  // K4 audit HIGH-1 (Pair D): on the primary, KeyState::onKey records what
+  // the hardware tap saw -- the user's own Shift, held while dragging across
+  // the edge. It is captured, not injected, so neither the leave-time
+  // updateKeyState() (Screen::leavePrimary) nor the disable-time
+  // fakeAllKeysUp() (Screen::disable, PrimaryClient::releaseForwardedKeys)
+  // may post a release for it. A Shift WE injected still is.
+  constexpr KeyButton kShift = 0x38;
+  deskflow::KeyMap map;
+  deskflow::KeyMap::KeyItem shift;
+  shift.m_id = kKeyShift_L;
+  shift.m_group = 0;
+  shift.m_button = kShift;
+  shift.m_generates = KeyModifierShift;
+  map.addKeyEntry(shift);
+  map.finish();
+  EventQueue events;
+  RecordingKeyState ks(&events, map);
+  ks.osModifiers = KeyModifierShift; // the OS still reports the user's Shift down
+
+  auto releasedShift = [&] {
+    for (const auto &[button, press] : ks.strokes) {
+      if (button == kShift && !press) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // hardware capture on the primary: the user presses and HOLDS Shift
+  ks.onKey(kShift, true, KeyModifierShift);
+  QVERIFY(ks.isKeyDown(kShift));
+
+  // Server::switchScreen -> PrimaryClient::leave -> Screen::leavePrimary -> updateKeyState()
+  ks.updateKeyState();
+  QVERIFY2(!releasedShift(), "updateKeyState released a physically held Shift");
+  QVERIFY(ks.strokes.empty());
+
+  // Screen::disable(primary) / releaseForwardedKeys -> fakeAllKeysUp()
+  ks.onKey(kShift, true, KeyModifierShift);
+  ks.fakeAllKeysUp();
+  QVERIFY2(!releasedShift(), "fakeAllKeysUp released a physically held Shift");
+  QVERIFY(ks.strokes.empty());
+
+  // control: an injected Shift IS synthetic and IS released (press + release)
+  ks.fakeKeyDown(kKeyShift_L, 0, 0x1F0, "en");
+  ks.fakeAllKeysUp();
+  QCOMPARE(ks.strokes.size(), size_t(2));
+  QVERIFY(ks.strokes[0].first == kShift && ks.strokes[0].second);
+  QVERIFY(ks.strokes[1].first == kShift && !ks.strokes[1].second);
+}
+
 QTEST_MAIN(KeyStateLedgerTests)

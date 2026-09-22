@@ -611,6 +611,55 @@ void OSXKeyStateTests::fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet(
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlternate | kCGEventFlagMaskShift));
 }
 
+void OSXKeyStateTests::primarySweepNeverReleasesPhysicallyCapturedShift()
+{
+  // K4 audit HIGH-1 (Pair C twin): on the PRIMARY the event tap reports the
+  // user's own Shift through onKey(). That key is captured, not injected,
+  // so the leave-time updateKeyState() and the disable-time fakeAllKeysUp()
+  // must not post a Shift UP for it -- they used to, which made the OS
+  // report Shift up mid-drag and lowercased every relayed letter until a
+  // re-press. A Shift WE injected is still released by the same path.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK; // the user holds Shift
+  keyState.setHooks(os.hooks());
+  keyState.updateKeyMap();
+  const KeyButton shiftButton = buttonFor(kVK_Shift);
+
+  // OSXScreen::onKey (flagsChanged on the primary) -> handleModifierKey -> onKey
+  keyState.onKey(shiftButton, true, KeyModifierShift);
+  QVERIFY(keyState.isKeyDown(shiftButton));
+  QVERIFY(keyState.injectedModifiers().empty());
+
+  // Screen::leavePrimary -> updateKeyState
+  keyState.updateKeyState();
+  for (const auto &p : os.posted) {
+    QVERIFY2(!(p.virtualKey == kVK_Shift && !p.down), "updateKeyState posted a Shift UP for a physical Shift");
+  }
+
+  // Screen::disable(primary) / PrimaryClient::releaseForwardedKeys -> fakeAllKeysUp
+  os.posted.clear();
+  keyState.onKey(shiftButton, true, KeyModifierShift);
+  keyState.fakeAllKeysUp();
+  for (const auto &p : os.posted) {
+    QVERIFY2(!(p.virtualKey == kVK_Shift && !p.down), "fakeAllKeysUp posted a Shift UP for a physical Shift");
+  }
+
+  // control: an INJECTED Shift is ledgered and released by the same sweep
+  os.posted.clear();
+  keyState.fakeKeyDown(kKeyShift_L, 0, 0x1F0, "en");
+  QVERIFY(!keyState.injectedModifiers().empty());
+  keyState.fakeAllKeysUp();
+  bool releasedInjected = false;
+  for (const auto &p : os.posted) {
+    releasedInjected |= (p.virtualKey == kVK_Shift && !p.down);
+  }
+  QVERIFY(releasedInjected);
+  QVERIFY(keyState.injectedModifiers().empty());
+}
+
 void OSXKeyStateTests::setToggleStateNoOpsWhenCapsMatches()
 {
   deskflow::KeyMap keyMap;

@@ -692,13 +692,21 @@ void KeyState::onKey(KeyButton button, bool down, KeyModifierMask newState)
     return;
   }
 
-  // update key state
+  // update key state. ONLY m_keys: this is the hardware tap reporting a key
+  // the USER pressed at this keyboard (OSXScreen::onKey / MSWindowsScreen::
+  // onKey). m_syntheticKeys is the ledger of keys THIS process injected and
+  // is maintained solely by fakeKeyDown/Up/Repeat and updateModifierKeyState.
+  // Marking a captured key synthetic (K4 audit HIGH-1) made the primary's
+  // leave-time updateKeyState() and disable-time fakeAllKeysUp() post a
+  // release for the Shift the user was physically holding while dragging
+  // across the edge -- the OS then reported Shift up, the enter mask lost
+  // it, and every relayed letter came out lowercase until a re-press; on
+  // Windows the release also went out with wVk=0 because onKey never sets
+  // m_keyClientData.
   if (down) {
     m_keys[button] = 1;
-    m_syntheticKeys[button] = 1;
   } else {
     m_keys[button] = 0;
-    m_syntheticKeys[button] = 0;
   }
 }
 
