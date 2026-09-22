@@ -453,6 +453,35 @@ void KeyMapTests::mapKey_halfDuplexCapsByKeyId_pressThenReleaseAroundKey()
   }
 }
 
+// Reviewer (K4 item 8, B-1): a key whose item REQUIRES Caps Lock (Turkish-F
+// dotted capital I, reachable only with the lock on) must still get the
+// Caps toggle -- required-state pass, not the s_notRequiredMask pass.
+void KeyMapTests::mapKey_capsRequiredKeyStillTogglesCaps()
+{
+  KeyMap keyMap;
+  addLetterLayout(keyMap);
+  KeyMap::KeyItem dottedI;
+  dottedI.m_id = 0x0130;
+  dottedI.m_group = 0;
+  dottedI.m_button = 0x22;
+  dottedI.m_required = KeyModifierCapsLock;
+  dottedI.m_sensitive = KeyModifierShift | KeyModifierCapsLock;
+  keyMap.addKeyEntry(dottedI);
+  keyMap.finish();
+
+  for (KeyModifierMask desired : {KeyModifierMask{0}, KeyModifierMask{KeyModifierCapsLock}}) {
+    KeyMap::Keystrokes keys;
+    KeyMap::ModifierToKeys activeModifiers;
+    KeyModifierMask currentState = 0;
+    const auto *item = keyMap.mapKey(keys, 0x0130, 0, activeModifiers, currentState, desired, false, "tr");
+    QVERIFY(item != nullptr);
+    QCOMPARE(item->m_button, KeyButton(0x22));
+    const auto strokes = buttonStrokes(keys);
+    QVERIFY(hasStroke(strokes, 0x22, true));
+    QVERIFY2(hasStroke(strokes, kCapsButton, true), "caps toggle missing for a caps-REQUIRED key");
+  }
+}
+
 void KeyMapTests::parseModifiers_plusKey_keepsPlusAsKey()
 {
   std::string keystroke = "Control+Shift++";

@@ -776,4 +776,30 @@ void KeyStateLedgerTests::postSwitchVerifier_keepsReassertedModifiers()
   QVERIFY(f.screen->leave());
 }
 
+// Reviewer (K4 item 2): shift-drag across, the user releases Shift on the
+// server while on the client, then some other modifier reads stuck. Pass 2
+// must release with keep=0: the stale Shift is no longer "kept".
+void KeyStateLedgerTests::postSwitchVerifier_keepsNothingAfterShiftReleased()
+{
+  SecondaryFixture f;
+  f.platform->osModifiers = 0;
+  f.screen->enter(KeyModifierShift);
+  QVERIFY(f.platform->find(PlatformCall::Kind::KeyDown) != nullptr);
+  f.platform->calls.clear();
+
+  f.screen->keyUp(kKeyShift_L, 0, 0x2A); // real release relayed from the server
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyUp), 1);
+  f.platform->calls.clear();
+
+  f.platform->osModifiers = KeyModifierControl; // stale Ctrl, nothing typed
+  pumpUntil(f.events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 3.0, [&] {
+    return f.platform->count(PlatformCall::Kind::ReleaseInjected) > 0;
+  });
+  QCOMPARE(f.platform->count(PlatformCall::Kind::ReleaseInjected), 1);
+  const auto *release = f.platform->find(PlatformCall::Kind::ReleaseInjected);
+  QVERIFY(release != nullptr);
+  QCOMPARE(release->mask, KeyModifierMask(0));
+  QVERIFY(f.screen->leave());
+}
+
 QTEST_MAIN(KeyStateLedgerTests)

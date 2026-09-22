@@ -35,4 +35,5 @@ private Q_SLOTS:
   void describeKey_printsCharacterWithItsCase();
   void primarySweep_neverReleasesPhysicallyCapturedKey();
   void postSwitchVerifier_keepsReassertedModifiers();
+  void postSwitchVerifier_keepsNothingAfterShiftReleased();
 };

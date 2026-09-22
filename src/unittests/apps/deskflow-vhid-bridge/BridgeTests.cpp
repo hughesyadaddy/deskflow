@@ -150,6 +150,8 @@ private Q_SLOTS:
   void capsAssumptionExpiresWithDisagreementLine();
   void cheapSpecialKeysAreMapped();
   void unmappedKeyPostsNothing();
+  void physicalShiftRolloverWithShiftEntry();
+  void physicalShiftRolloverMaskOnly();
 
 private:
   struct Fixture
@@ -420,6 +422,55 @@ void BridgeTests::unmappedKeyPostsNothing()
   QVERIFY(log.any("unmapped key"));
   QVERIFY(f.sink.kb.empty());
   g_debug_keys = false;
+}
+
+
+namespace {
+void compareReports(const std::vector<RecordingSink::Kb> &got, const std::vector<RecordingSink::Kb> &want)
+{
+  QCOMPARE(got.size(), want.size());
+  for (size_t i = 0; i < want.size(); ++i) {
+    QCOMPARE(int(got[i].mods), int(want[i].mods));
+    QCOMPARE(got[i].keys, want[i].keys);
+  }
+}
+} // namespace
+
+// Reviewer (K4 item 4): PHYSICAL Shift on the server, relayed as its own
+// key event, then k rolled over to 1 -> server sends 'K' and '!' with the
+// Shift mask. The real Shift entry keeps Shift on every report; k is never
+// dropped/re-added between reports.
+void BridgeTests::physicalShiftRolloverWithShiftEntry()
+{
+  Fixture f;
+  f.sink.caps = [] { return std::optional<bool>{false}; };
+  const uint8_t S = bridge_logic::kHidLeftShift;
+  QVERIFY(f.keyDown(kKeyIdShiftL, bridge_logic::kMaskShift, 20));
+  QVERIFY(f.keyDown('K', bridge_logic::kMaskShift, 10));
+  QVERIFY(f.keyDown('!', bridge_logic::kMaskShift, 11));
+  QVERIFY(f.keyUp('!', bridge_logic::kMaskShift, 11));
+  QVERIFY(f.keyUp('K', bridge_logic::kMaskShift, 10));
+  QVERIFY(f.keyUp(kKeyIdShiftL, 0, 20));
+  compareReports(
+      f.sink.kb, {{S, {}}, {S, {kUsageK}}, {S, {kUsageK, kUsage1}}, {S, {kUsageK}}, {S, {}}, {0, {}}}
+  );
+}
+
+// Same, but Shift was already held at Enter so the server never relays a
+// Shift key-down: only the mask carries it. Derived Shift rides on each
+// key-down report; on '!' up the ledger has no Shift left, so the OS sees
+// Shift released while k is still held (no k re-trigger: HID is stateless).
+void BridgeTests::physicalShiftRolloverMaskOnly()
+{
+  Fixture f;
+  f.sink.caps = [] { return std::optional<bool>{false}; };
+  const uint8_t S = bridge_logic::kHidLeftShift;
+  QVERIFY(f.keyDown('K', bridge_logic::kMaskShift, 10));
+  QVERIFY(f.keyDown('!', bridge_logic::kMaskShift, 11));
+  QVERIFY(f.keyUp('!', bridge_logic::kMaskShift, 11));
+  QVERIFY(f.keyUp('K', bridge_logic::kMaskShift, 10));
+  compareReports(f.sink.kb, {{S, {kUsageK}}, {S, {kUsageK, kUsage1}}, {0, {kUsageK}}, {0, {}}});
+  // and the '!' entry carried the mask's Shift on its heldBits while held (report 2 above)
 }
 
 } // namespace vhid_bridge
