@@ -71,6 +71,13 @@ STUB
   stub_bridge_renderer "$BRIDGE_PLIST"
   printf '%s\n' "$BRIDGE_PLIST" >"$DESKFLOW_LOGIN_BRIDGE_PLIST"
   : >"$MOUSER/scripts/build_macos_gui_session.py"
+  # Mouser's settings dir + log live in the sandbox (the script refuses real
+  # paths under bats). The settle wait is 0 s so the suite stays fast.
+  export MOUSER_SETTINGS_DIR="$TMP/AppSupport/Mouser"
+  export MOUSER_LOG="$TMP/Logs/Mouser/mouser.log"
+  export FLEET_SETTINGS_SETTLE_S=0
+  mkdir -p "$MOUSER_SETTINGS_DIR" "$(dirname "$MOUSER_LOG")"
+  printf '[MouseHook] boot\n' >"$MOUSER_LOG"
 
   make_shim cmake <<'EOF'
 echo "cmake $*" >> "$SHIM_LOG"
@@ -123,6 +130,9 @@ EOF
 
   # python3 stands in for both the Mouser build and tools/fleet-gui-exec.py.
   # For the latter it honours the documented interface: `-- cmd args...` is exec'd.
+  # As the Mouser installer it appends what the freshly started Mouser logs
+  # (SHIM_MOUSER_LOG_APPEND, default: the native-tap line) and, with
+  # SHIM_PYTHON_WRITE_CONFIG, rewrites config.json the way a bad installer would.
   make_shim python3 <<'EOF'
 echo "python3 $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"
 if [[ "${1:-}" == *fleet-gui-exec.py ]]; then
@@ -131,7 +141,21 @@ if [[ "${1:-}" == *fleet-gui-exec.py ]]; then
   shift
   exec "$@"
 fi
+if [[ "${1:-}" == *build_macos_gui_session.py || "${1:-}" == *build_and_install.py ]]; then
+  line="${SHIM_MOUSER_LOG_APPEND-[MouseHook] CGEventTap created (native tap: /tmp/x/Contents/Frameworks/mouser_tap.dylib)}"
+  [[ -n "$line" ]] && printf '%s\n' "$line" >> "$MOUSER_LOG"
+  [[ -n "${SHIM_PYTHON_WRITE_CONFIG:-}" ]] && cp "$SHIM_PYTHON_WRITE_CONFIG" "$MOUSER_SETTINGS_DIR/config.json"
+fi
 exit "${SHIM_PYTHON_RC:-0}"
+EOF
+
+  # sleep is only called by the settle wait / native-tap poll; SHIM_SLEEP_CONFIG
+  # lets a test change config.json "while Mouser runs" (between checkpoints 2 and 3).
+  make_shim sleep <<'EOF'
+echo "sleep $*" >> "$SHIM_LOG"
+[[ -n "${SHIM_SLEEP_CONFIG:-}" ]] && cp "$SHIM_SLEEP_CONFIG" "$MOUSER_SETTINGS_DIR/config.json"
+[[ -n "${SHIM_SLEEP_DEVICE:-}" ]] && printf '%s' "$SHIM_SLEEP_DEVICE" > "$MOUSER_SETTINGS_DIR/last_device.json"
+exit 0
 EOF
 
   export PATH="$SHIMS:$PATH"
@@ -141,6 +165,23 @@ EOF
   unset DESKFLOW_CODESIGN_ID FLEET_KEYCHAIN_PASSWORD
   unset SHIM_CMAKE_RC SHIM_CODESIGN_VERIFY_RC SHIM_GIT_PULL_RC SHIM_PYTHON_RC SHIM_SECURITY_RC
   unset SHIM_CTL_RETIRE_RC SHIM_CTL_ASSERT_RC SHIM_INSTALL_ASSERT_PROBLEMS
+  unset SHIM_MOUSER_LOG_APPEND SHIM_PYTHON_WRITE_CONFIG SHIM_SLEEP_CONFIG SHIM_SLEEP_DEVICE FLEET_NATIVE_TAP_TIMEOUT_S
+}
+
+# Mouser config fixtures (core/config.py shape, version 12).
+CONFIG_V12='{"version": 12, "settings": {"start_at_login": true, "scroll": {"speed": 3}}, "buttons": ["a", "b"]}'
+CONFIG_V13_SUPERSET='{"version": 13, "settings": {"start_at_login": true, "scroll": {"speed": 3}, "new_key": 1}, "buttons": ["a", "b"], "extra": {"x": 1}}'
+CONFIG_V13_SHRUNK='{"version": 13, "settings": {"start_at_login": true}, "buttons": ["a", "b"]}'
+CONFIG_V12_EXTRA='{"version": 12, "settings": {"start_at_login": true, "scroll": {"speed": 3}}, "buttons": ["a", "b"], "extra": 1}'
+
+write_mouser_settings() {
+  printf '%s' "$CONFIG_V12" >"$MOUSER_SETTINGS_DIR/config.json"
+  printf '{"vid": 1133}' >"$MOUSER_SETTINGS_DIR/last_device.json"
+}
+
+fixture_file() { # name text -> path
+  printf '%s' "$2" >"$TMP/$1"
+  printf '%s' "$TMP/$1"
 }
 
 teardown() {
@@ -546,6 +587,147 @@ script_lacks() {
   log_lacks "git fetch"
   log_lacks "git checkout"
   log_has "python3 scripts/build_macos_gui_session.py"
+}
+
+# --- L4: Mouser settings-survival proof --------------------------------------
+
+@test "settings hashes identical at all three checkpoints: FLEET_SETTINGS=ok, a pre-deploy backup is kept, native tap seen" {
+  write_env "ABCDEF0123456789"
+  write_mouser_settings
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Mouser settings snapshot (pre-deploy): config.json="*"last_device.json="*"backup=$MOUSER_SETTINGS_DIR/config.json.pre-deploy-"* ]]
+  [[ "$output" == *"Mouser settings identical after install"* ]]
+  [[ "$output" == *"Mouser native tap: [MouseHook] CGEventTap created (native tap:"* ]]
+  [[ "$output" == *"FLEET_SETTINGS=ok"* ]]
+  [[ "$output" != *"FLEET_SETTINGS=FAIL"* ]]
+  backups=("$MOUSER_SETTINGS_DIR"/config.json.pre-deploy-*)
+  [ "${#backups[@]}" -eq 1 ]
+  cmp -s "${backups[0]}" "$MOUSER_SETTINGS_DIR/config.json"
+  # the live files are untouched
+  [ "$(cat "$MOUSER_SETTINGS_DIR/config.json")" = "$CONFIG_V12" ]
+  # snapshot happens before the build, verdict after the settle wait
+  snap_line="$(grep -n 'settings snapshot' <<<"$output" | head -1 | cut -d: -f1)"
+  build_line="$(grep -n 'Mouser build + install' <<<"$output" | head -1 | cut -d: -f1)"
+  [ "$snap_line" -lt "$build_line" ]
+  log_has "sleep 0"
+}
+
+@test "absent settings files are a valid (identical) snapshot" {
+  write_env "ABCDEF0123456789"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"config.json=absent last_device.json=absent backup=none"* ]]
+  [[ "$output" == *"FLEET_SETTINGS=ok"* ]]
+}
+
+@test "a version bump that keeps every pre-deploy key passes as FLEET_SETTINGS=changed" {
+  write_env "ABCDEF0123456789"
+  write_mouser_settings
+  SHIM_SLEEP_CONFIG="$(fixture_file v13.json "$CONFIG_V13_SUPERSET")" run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Mouser config.json migrated (version increased, pre-deploy keys preserved): config.json "* ]]
+  [[ "$output" == *"FLEET_SETTINGS=changed"* ]]
+}
+
+@test "a shrunk config after the run fails with a diff summary and FLEET_SETTINGS=FAIL" {
+  write_env "ABCDEF0123456789"
+  write_mouser_settings
+  SHIM_SLEEP_CONFIG="$(fixture_file shrunk.json "$CONFIG_V13_SHRUNK")" run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FLEET_SETTINGS=FAIL"* ]]
+  [[ "$output" == *"not an allowed migration"* ]]
+  [[ "$output" == *"config.json "*" -> "* ]]
+  [[ "$output" == *"restore from $MOUSER_SETTINGS_DIR/config.json.pre-deploy-"* ]]
+  [[ "$output" != *"=== done"* ]]
+}
+
+@test "a config rewritten without a version increase fails even when nothing was lost" {
+  write_env "ABCDEF0123456789"
+  write_mouser_settings
+  SHIM_SLEEP_CONFIG="$(fixture_file extra.json "$CONFIG_V12_EXTRA")" run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FLEET_SETTINGS=FAIL"* ]]
+}
+
+@test "a config.json touched by the install itself fails before the native-tap gate" {
+  write_env "ABCDEF0123456789"
+  write_mouser_settings
+  SHIM_PYTHON_WRITE_CONFIG="$(fixture_file v13.json "$CONFIG_V13_SUPERSET")" run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FLEET_SETTINGS=FAIL"* ]]
+  [[ "$output" == *"Mouser settings changed by the install: config.json "* ]]
+  [[ "$output" != *"Mouser native tap:"* ]]
+  [[ "$output" != *"identical after install"* ]]
+}
+
+@test "a rewritten last_device.json (HID warm-path cache) after the run is reported, not judged" {
+  write_env "ABCDEF0123456789"
+  write_mouser_settings
+  SHIM_SLEEP_DEVICE='{"vid": 1133, "pid": 45}' run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Mouser cache rewritten while running (not judged): last_device.json "* ]]
+  [[ "$output" == *"FLEET_SETTINGS=ok"* ]]
+}
+
+@test "pre-deploy backups are pruned to the newest 5" {
+  write_env "ABCDEF0123456789"
+  write_mouser_settings
+  for i in 1 2 3 4 5 6; do printf 'old' >"$MOUSER_SETTINGS_DIR/config.json.pre-deploy-2026090${i}-000000"; done
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  backups=($(ls "$MOUSER_SETTINGS_DIR"/config.json.pre-deploy-* | sort))
+  [ "${#backups[@]}" -eq 5 ]
+  [[ "${backups[0]}" == *pre-deploy-20260903-000000 ]]
+  [[ "${backups[4]}" == *pre-deploy-2026$(date +%m%d)-* ]]
+  cmp -s "${backups[4]}" "$MOUSER_SETTINGS_DIR/config.json"
+  [ -f "$MOUSER_SETTINGS_DIR/last_device.json" ]
+}
+
+# --- M4: native-tap deploy gate ------------------------------------------------
+
+@test "native-tap gate fails when Mouser never logs the native tap within the timeout" {
+  write_env "ABCDEF0123456789"
+  SHIM_MOUSER_LOG_APPEND="" FLEET_NATIVE_TAP_TIMEOUT_S=0 run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not log 'CGEventTap created (native tap:' within 0s"* ]]
+  [[ "$output" != *"FLEET_SETTINGS="* ]]
+}
+
+@test "native-tap gate fails when Mouser comes up on the PyObjC tap (own run loop)" {
+  write_env "ABCDEF0123456789"
+  SHIM_MOUSER_LOG_APPEND="[MouseHook] CGEventTap enabled on its own run loop" run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Mouser came up on the PyObjC tap"* ]]
+  [[ "$output" != *"FLEET_SETTINGS="* ]]
+}
+
+@test "native-tap gate only reads the log past the pre-install offset" {
+  write_env "ABCDEF0123456789"
+  printf '[MouseHook] CGEventTap created (native tap: /old)\n' >>"$MOUSER_LOG"
+  SHIM_MOUSER_LOG_APPEND="" FLEET_NATIVE_TAP_TIMEOUT_S=0 run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not log"* ]]
+}
+
+@test "native-tap gate tolerates a log rotated during the install" {
+  write_env "ABCDEF0123456789"
+  head -c 4096 /dev/zero | tr '\0' 'x' >"$MOUSER_LOG"
+  # the installer shim appends to a fresh (smaller) log
+  rm -f "$MOUSER_LOG"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Mouser native tap:"* ]]
+}
+
+@test "refuses to run under bats when MOUSER_SETTINGS_DIR or MOUSER_LOG point outside the sandbox" {
+  write_env "ABCDEF0123456789"
+  MOUSER_SETTINGS_DIR="/Library/Application Support/DeskflowGuardRegressionTest" run bash "$SCRIPT"
+  [ "$status" -eq 90 ]
+  [[ "$output" == *"FATAL: running under bats"* ]]
+  MOUSER_LOG="/Library/Logs/DeskflowGuardRegressionTest/mouser.log" run bash "$SCRIPT"
+  [ "$status" -eq 90 ]
+  [ ! -e "/Library/Application Support/DeskflowGuardRegressionTest" ]
 }
 
 @test "refuses to run under bats against a non-sandboxed FLEET_MOUSER_ROOT (2026-09-16 incident regression)" {
