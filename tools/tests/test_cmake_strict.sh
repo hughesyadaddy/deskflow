@@ -5,7 +5,9 @@
 #
 #   ON  + APPLE_CODESIGN_DEV=-   -> configure must fail with the strict message
 #   ON  + APPLE_CODESIGN_DEV=""  -> configure must fail with the strict message
-#   OFF + APPLE_CODESIGN_DEV=""  -> configure must succeed and warn "ad-hoc signing"
+#   OFF + APPLE_CODESIGN_DEV=""  -> configure must fail unless FLEET_ALLOW_ADHOC_DEV_BUILD=ON
+#   OFF + ""  + ALLOW_ADHOC=ON   -> configure must succeed, warn "ad-hoc signing", write ADHOC-DEV-BUILD
+#   ON  + real identity          -> configure must succeed and leave no ADHOC-DEV-BUILD marker
 #
 # Usage: tools/tests/test_cmake_strict.sh
 # Env:   CMAKE_PREFIX_PATH (default /opt/homebrew/opt/qt), CMAKE (default cmake)
@@ -16,7 +18,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CMAKE="${CMAKE:-cmake}"
 QT_PREFIX="${CMAKE_PREFIX_PATH:-/opt/homebrew/opt/qt}"
 STRICT_MSG="FLEET_STRICT_SIGNING=ON but APPLE_CODESIGN_DEV is empty or '-'"
-ADHOC_MSG="ad-hoc signing (FLEET_STRICT_SIGNING=OFF)"
+ADHOC_MSG="ad-hoc signing (FLEET_STRICT_SIGNING=OFF"
+ALLOW_MSG="FLEET_ALLOW_ADHOC_DEV_BUILD is OFF"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "SKIP: FLEET_STRICT_SIGNING only gates macOS bundles (uname=$(uname -s))"
@@ -60,14 +63,33 @@ else
   tail -20 "$b.log"
 fi
 
-# --- Case 3: strict OFF, empty identity must configure and warn about ad-hoc
-b="$base-off"
+# --- Case 3a: strict OFF, empty identity, no explicit ad-hoc opt-in must fail
+b="$base-off-noallow"
 rc=$(run_configure "$b" -DFLEET_STRICT_SIGNING=OFF -DAPPLE_CODESIGN_DEV=)
+if [[ "$rc" -ne 0 ]] && grep -qF "$ALLOW_MSG" "$b.log"; then
+  pass "strict OFF + empty identity without FLEET_ALLOW_ADHOC_DEV_BUILD fails configure (exit $rc)"
+else
+  fail "strict OFF + empty identity without FLEET_ALLOW_ADHOC_DEV_BUILD: exit=$rc, allow message present=$(grep -cF "$ALLOW_MSG" "$b.log")"
+  tail -20 "$b.log"
+fi
+if [[ -e "$b/ADHOC-DEV-BUILD" ]]; then
+  fail "a refused ad-hoc configure must not leave an ADHOC-DEV-BUILD marker"
+fi
+
+# --- Case 3: strict OFF + FLEET_ALLOW_ADHOC_DEV_BUILD=ON, empty identity must
+# configure, warn about ad-hoc and mark the tree ADHOC-DEV-BUILD
+b="$base-off"
+rc=$(run_configure "$b" -DFLEET_STRICT_SIGNING=OFF -DFLEET_ALLOW_ADHOC_DEV_BUILD=ON -DAPPLE_CODESIGN_DEV=)
 if [[ "$rc" -eq 0 ]]; then
   if grep -qF "$ADHOC_MSG" "$b.log"; then
-    pass "strict OFF configures (exit 0) and warns: $ADHOC_MSG"
+    pass "strict OFF + allow configures (exit 0) and warns: $ADHOC_MSG"
   else
-    fail "strict OFF configured but did not emit the ad-hoc warning"
+    fail "strict OFF + allow configured but did not emit the ad-hoc warning"
+  fi
+  if [[ -f "$b/ADHOC-DEV-BUILD" ]]; then
+    pass "allowed ad-hoc configure writes ADHOC-DEV-BUILD marker"
+  else
+    fail "allowed ad-hoc configure did not write $b/ADHOC-DEV-BUILD"
   fi
   if grep -qF "$STRICT_MSG" "$b.log"; then
     fail "strict OFF must not emit the strict FATAL_ERROR message"
@@ -98,7 +120,7 @@ if [[ "$rc" -eq 0 ]]; then
     fail "deskflow-prio target missing from the generated build"
   fi
 else
-  fail "strict OFF configure failed (exit $rc); unrelated dependency problem? see tail:"
+  fail "strict OFF + allow configure failed (exit $rc); unrelated dependency problem? see tail:"
   tail -30 "$b.log"
 fi
 
@@ -121,6 +143,11 @@ if [[ "$rc" -eq 0 ]]; then
     fail "bundle codesign call must not pass --identifier (Info.plist id wins)"
   else
     pass "bundle codesign call carries no --identifier"
+  fi
+  if [[ -e "$b/ADHOC-DEV-BUILD" ]]; then
+    fail "a real-identity configure must not leave an ADHOC-DEV-BUILD marker"
+  else
+    pass "real-identity configure leaves no ADHOC-DEV-BUILD marker"
   fi
 else
   fail "identity configure failed (exit $rc); see tail:"
