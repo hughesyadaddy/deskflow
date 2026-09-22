@@ -30,11 +30,13 @@ bool macSetStartAtLogin(bool enable);
 //! source of truth, like the login-window bridge).
 bool macStartAtLoginEnabled();
 
-//! True when the fleet LaunchAgent for the GUI is installed
-//! (~/Library/LaunchAgents/io.github.hughesyadaddy.deskflow.plist), or the agent
-//! passed DESKFLOW_LAUNCHD=1: launchd owns the launch, the app must not add a
-//! Login Item and must not exit 5 to launchd on a lost instance lock.
+//! True only when launchd started THIS process (the fleet GUI LaunchAgent
+//! passes DESKFLOW_LAUNCHD=1). Deliberately not a plist test: a Login Item copy
+//! sees the same plist and must not think it is launchd's. See LaunchOwnership.h.
 bool macLaunchdOwnsGui();
+//! True when the fleet LaunchAgent plist for the GUI is installed
+//! (~/Library/LaunchAgents/io.github.hughesyadaddy.deskflow.plist).
+bool macGuiLaunchAgentInstalled();
 //! True when the fleet LaunchAgent for the core is installed
 //! (~/Library/LaunchAgents/io.github.hughesyadaddy.deskflow-core.plist).
 bool macLaunchdOwnsCore();

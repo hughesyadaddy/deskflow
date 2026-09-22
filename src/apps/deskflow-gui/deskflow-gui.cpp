@@ -20,6 +20,7 @@
 #include "gui/StyleUtils.h"
 
 #if defined(Q_OS_MACOS)
+#include "gui/LaunchOwnership.h"
 #include "gui/OSXHelpers.h"
 #endif
 
@@ -114,10 +115,14 @@ int main(int argc, char *argv[])
   const auto socketName = QStringLiteral("%1-gui").arg(kAppId);
   auto instanceLock = SingleInstanceLock::tryAcquire(SingleInstanceLock::Role::Gui, SingleInstanceLock::Scope::Session);
 #if defined(Q_OS_MACOS)
-  if (!instanceLock && macLaunchdOwnsGui()) {
+  const auto ownership = deskflow::gui::decideLaunchOwnership(
+      macLaunchdOwnsGui(), macGuiLaunchAgentInstalled(), macStartAtLoginEnabled()
+  );
+  if (!instanceLock && ownership.mayTakeOver) {
     // launchd's copy is canonical. Exit 5 here would make a KeepAlive agent relaunch
     // us every 30 s for as long as an unmanaged (Login Item) copy lives; instead ask
     // that copy to quit and take its place. Exit 0 keeps launchd quiet if it will not.
+    // An unmanaged copy never takes over: it exits 5 below like any duplicate.
     if (InstanceHandoffServer::requestQuit(socketName)) {
       instanceLock = SingleInstanceLock::tryAcquire(
           SingleInstanceLock::Role::Gui, SingleInstanceLock::Scope::Session, std::chrono::milliseconds(5000)

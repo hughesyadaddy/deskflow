@@ -59,6 +59,7 @@
 #include <memory>
 
 #if defined(Q_OS_MACOS)
+#include "LaunchOwnership.h"
 #include "OSXHelpers.h"
 #include <ApplicationServices/ApplicationServices.h>
 #endif
@@ -136,8 +137,12 @@ MainWindow::MainWindow()
   // Setup the Instance Checking
   m_guiDupeChecker->listen(m_guiSocketName);
 #if defined(Q_OS_MACOS)
-  // The launchd-owned instance is the canonical one: it never steps aside for a peer.
-  m_guiDupeChecker->setHonoursQuit(!macLaunchdOwnsGui());
+  // The launchd-owned instance is the canonical one: it never steps aside for a
+  // peer. Any other copy (Login Item, `open`) honours a quit from launchd's.
+  const auto ownership = deskflow::gui::decideLaunchOwnership(
+      macLaunchdOwnsGui(), macGuiLaunchAgentInstalled(), macStartAtLoginEnabled()
+  );
+  m_guiDupeChecker->setHonoursQuit(ownership.honoursQuit);
 #endif
 
   createMenuBar();
@@ -170,19 +175,13 @@ MainWindow::MainWindow()
   restoreWindow();
 
 #if defined(Q_OS_MACOS)
-  // With the fleet LaunchAgent installed launchd owns the launch; a Login Item
-  // as well means two GUIs race at login and one exits 5. Otherwise the app
-  // registers itself on every launch: replacing the bundle (fleet deploys
-  // re-sign /Applications/Deskflow.app) invalidates the record.
-  if (macLaunchdOwnsGui()) {
-    if (macStartAtLoginEnabled()) {
-      qInfo("launchd owns the gui launch, unregistering the login item");
-      macSetStartAtLogin(false);
-    }
-  } else if (!macStartAtLoginEnabled()) {
-    macSetStartAtLogin(true);
-    Settings::setValue(Settings::Gui::LoginItemConfigured, true);
-    Settings::save();
+  // The fleet LaunchAgent is the only launcher. A Login Item next to it means
+  // two GUIs race at login and one exits 5, so the SMAppService record is only
+  // ever removed here, never added (see LaunchOwnership.h). Registration on a
+  // dev box without the agent is a user action in System Settings, not ours.
+  if (ownership.loginItem == deskflow::gui::LaunchOwnership::LoginItem::Unregister) {
+    qInfo("launchd owns the gui launch, unregistering the login item");
+    macSetStartAtLogin(false);
   }
 #elif defined(Q_OS_WIN)
   // Self-managed launch: register the GUI in the user's Run key once so the
