@@ -333,6 +333,64 @@ function Start-Deskflow {
 
 # ---------------------------------------------------------- status / assert
 
+function Get-RunKeyEntries {
+  # Every value under a Run key whose data mentions deskflow, as
+  # @{ Hive; Name; Command; Exe } rows. Exe is the unquoted executable path.
+  param([string]$Hive, [string]$KeyPath)
+  $rows = @()
+  $key = Get-Item -LiteralPath $KeyPath -ErrorAction SilentlyContinue
+  if (-not $key) { return $rows }
+  foreach ($name in $key.GetValueNames()) {
+    $cmd = [string]$key.GetValue($name)
+    if ($cmd -notmatch '(?i)deskflow') { continue }
+    $exe = if ($cmd -match '^"([^"]+)"') { $Matches[1] } else { ($cmd -split '\s+')[0] }
+    $rows += [pscustomobject]@{ Hive = $Hive; Name = $name; Command = $cmd; Exe = $exe }
+  }
+  return $rows
+}
+
+function Get-StartupShortcuts {
+  # *.lnk/*.url/*.exe in the user's and the common Startup folders that
+  # name deskflow or point at a deskflow executable.
+  $rows = @()
+  $shell = $null
+  foreach ($dir in @((Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'),
+                     (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'))) {
+    if (-not (Test-Path -LiteralPath $dir)) { continue }
+    foreach ($f in Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue) {
+      $target = ''
+      if ($f.Extension -ieq '.lnk') {
+        try {
+          if (-not $shell) { $shell = New-Object -ComObject WScript.Shell }
+          $target = [string]$shell.CreateShortcut($f.FullName).TargetPath
+        } catch { $target = '' }
+      }
+      if ($f.Name -match '(?i)deskflow' -or $target -match '(?i)deskflow') {
+        $rows += [pscustomobject]@{ Path = $f.FullName; Target = $target }
+      }
+    }
+  }
+  return $rows
+}
+
+function Get-DeskflowScheduledTasks {
+  # Scheduled tasks with an action that runs a deskflow executable. The
+  # transient DeskflowCtlLaunch task (Start-GuiInSession) is unregistered in
+  # its finally block; it is excluded so a race with `start` is not a launcher.
+  $rows = @()
+  $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+  foreach ($t in $tasks) {
+    if ($t.TaskName -eq 'DeskflowCtlLaunch') { continue }
+    foreach ($a in @($t.Actions)) {
+      $exe = [string]$a.Execute
+      if ($exe -match '(?i)deskflow') {
+        $rows += [pscustomobject]@{ TaskName = $t.TaskName; TaskPath = $t.TaskPath; Execute = $exe; State = [string]$t.State }
+      }
+    }
+  }
+  return $rows
+}
+
 function Get-DeskflowInventory {
   param([string]$RootDir)
   $svc = Get-DeskflowService
@@ -353,11 +411,26 @@ function Get-DeskflowInventory {
       Canonical = (Test-UnderRoot $path $RootDir)
     }
   }
+  # Launchers besides the service: exactly one HKCU Run entry (the GUI tray,
+  # written by MainWindow.cpp) at the canonical exe; nothing in HKLM, the
+  # Startup folders or the task scheduler. Anything else is a second launcher
+  # (the macOS BTM/LaunchAgent race, Windows edition).
+  $hkcuRun = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+  $hklmRun = @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
+               'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run')
+  $runEntries = @(Get-RunKeyEntries -Hive 'HKCU' -KeyPath $hkcuRun)
+  $hklmEntries = @()
+  foreach ($k in $hklmRun) { $hklmEntries += @(Get-RunKeyEntries -Hive 'HKLM' -KeyPath $k) }
   [pscustomobject]@{
-    Service        = $(if ($svc) { $svc.State } else { 'absent' })
-    ServicePid     = $svcPid
-    ConsoleSession = $console
-    Processes      = @($rows)
+    Service          = $(if ($svc) { $svc.State } else { 'absent' })
+    ServicePid       = $svcPid
+    ConsoleSession   = $console
+    Processes        = @($rows)
+    GuiExe           = (Join-Path $RootDir 'deskflow.exe')
+    RunEntries       = $runEntries
+    HklmRunEntries   = @($hklmEntries)
+    StartupShortcuts = @(Get-StartupShortcuts)
+    ScheduledTasks   = @(Get-DeskflowScheduledTasks)
   }
 }
 
@@ -371,6 +444,10 @@ function Show-DeskflowStatus {
     $flag = if ($r.Canonical) { 'yes' } else { 'NO' }
     Write-Host ("  {0,-26} pid={1,-6} parent={2,-6} session={3,-2} canonical={4} {5}" -f $r.Name, $r.Pid, $r.Parent, $r.Session, $flag, $r.Path)
   }
+  Write-Host 'launchers:'
+  foreach ($e in @($inv.RunEntries) + @($inv.HklmRunEntries)) { Write-Host ("  {0} Run\{1} = {2}" -f $e.Hive, $e.Name, $e.Command) }
+  foreach ($s in @($inv.StartupShortcuts)) { Write-Host ("  Startup {0} -> {1}" -f $s.Path, $s.Target) }
+  foreach ($t in @($inv.ScheduledTasks)) { Write-Host ("  Task {0}{1} ({2}) -> {3}" -f $t.TaskPath, $t.TaskName, $t.State, $t.Execute) }
 }
 
 function Get-AssertSingleProblems {
@@ -410,6 +487,23 @@ function Get-AssertSingleProblems {
   $bridges = @($procs | Where-Object { $_.Name -ieq 'deskflow-vhid-bridge.exe' })
   if ($bridges.Count -ne 0) { $problems += "deskflow-vhid-bridge.exe count=$($bridges.Count) (want 0)" }
 
+  # Launchers (only when the inventory collected them; older callers pass
+  # process-only inventories). Exactly one HKCU Run entry at the canonical
+  # GUI exe, zero anywhere else: the service is the only core launcher and
+  # the Run entry the only GUI launcher.
+  if ($null -ne $Inventory.PSObject.Properties['RunEntries']) {
+    $guiExe = [string]$Inventory.GuiExe
+    $run = @($Inventory.RunEntries)
+    if ($run.Count -ne 1) {
+      $problems += "HKCU Run entries for deskflow count=$($run.Count) (want exactly 1 at $guiExe): " + (($run | ForEach-Object { "$($_.Name)=$($_.Command)" }) -join ', ')
+    } elseif ($guiExe -and -not ([System.IO.Path]::GetFullPath($run[0].Exe).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($guiExe).TrimEnd('\'))) {
+      $problems += "HKCU Run\$($run[0].Name) launches $($run[0].Exe), not the canonical $guiExe"
+    }
+    foreach ($e in @($Inventory.HklmRunEntries)) { $problems += "HKLM Run\$($e.Name) launches deskflow ($($e.Command)); want none (per-user Run entry only)" }
+    foreach ($s in @($Inventory.StartupShortcuts)) { $problems += "Startup folder launcher $($s.Path) -> $($s.Target); want none" }
+    foreach ($t in @($Inventory.ScheduledTasks)) { $problems += "scheduled task $($t.TaskPath)$($t.TaskName) runs $($t.Execute); want none" }
+  }
+
   return $problems
 }
 
@@ -420,7 +514,7 @@ function Assert-DeskflowSingle {
   if ($problems.Count -gt 0) {
     throw ("deskflow-ctl assert-single: FAIL`n  " + ($problems -join "`n  "))
   }
-  Write-Host "deskflow-ctl assert-single: OK (daemon=1 session 0 pid $($inv.ServicePid); core=1 child of service in session $($inv.ConsoleSession); gui=1; bridge=0)"
+  Write-Host "deskflow-ctl assert-single: OK (daemon=1 session 0 pid $($inv.ServicePid); core=1 child of service in session $($inv.ConsoleSession); gui=1; bridge=0; launchers: HKCU Run only)"
 }
 
 # --------------------------------------------------------------------- main

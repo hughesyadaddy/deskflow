@@ -40,6 +40,23 @@ BeforeAll {
   function New-Row([string]$Name, [int]$ProcessId, [int]$Parent, [int]$Session, [bool]$Canonical) {
     [pscustomobject]@{ Name = $Name; Pid = $ProcessId; Parent = $Parent; Session = $Session; Path = "$script:Root\$Name"; Canonical = $Canonical }
   }
+  function New-RunEntry([string]$Hive, [string]$Name, [string]$Exe) {
+    [pscustomobject]@{ Hive = $Hive; Name = $Name; Command = "`"$Exe`""; Exe = $Exe }
+  }
+  # A healthy process table plus the launcher inventory fields.
+  function New-LauncherInventory($Run, $Hklm, $Startup, $Tasks) {
+    $inv = New-Inventory 'Running' 1000 1 @(
+      (New-Row 'deskflow-daemon.exe' 1000 4 0 $true),
+      (New-Row 'deskflow-core.exe' 1001 1000 1 $true),
+      (New-Row 'deskflow.exe' 1003 500 1 $true)
+    )
+    $inv | Add-Member -NotePropertyName GuiExe -NotePropertyValue "$script:Root\deskflow.exe"
+    $inv | Add-Member -NotePropertyName RunEntries -NotePropertyValue @($Run)
+    $inv | Add-Member -NotePropertyName HklmRunEntries -NotePropertyValue @($Hklm)
+    $inv | Add-Member -NotePropertyName StartupShortcuts -NotePropertyValue @($Startup)
+    $inv | Add-Member -NotePropertyName ScheduledTasks -NotePropertyValue @($Tasks)
+    $inv
+  }
 }
 
 Describe 'Test-UnderRoot' {
@@ -271,6 +288,45 @@ Describe 'Get-AssertSingleProblems' {
     $p | Should -Match 'deskflow-daemon.exe count=0'
     $p | Should -Match 'deskflow.exe count=0'
     $p | Should -Match 'deskflow-vhid-bridge.exe count=1 \(want 0\)'
+  }
+
+  It 'is empty with exactly one HKCU Run entry at the canonical exe and no other launcher' {
+    $inv = New-LauncherInventory @((New-RunEntry 'HKCU' 'Deskflow' "$script:Root\deskflow.exe")) @() @() @()
+    @(Get-AssertSingleProblems -Inventory $inv) | Should -BeNullOrEmpty
+  }
+
+  It 'fails on two HKCU Run entries, a missing one, or one at a non-canonical exe' {
+    $two = New-LauncherInventory @(
+      (New-RunEntry 'HKCU' 'Deskflow' "$script:Root\deskflow.exe"),
+      (New-RunEntry 'HKCU' 'Deskflow (old)' 'C:\Users\alexh\Desktop\deskflow\build\bin\Release\deskflow.exe')
+    ) @() @() @()
+    (@(Get-AssertSingleProblems -Inventory $two) -join "`n") | Should -Match 'HKCU Run entries for deskflow count=2'
+
+    $none = New-LauncherInventory @() @() @() @()
+    (@(Get-AssertSingleProblems -Inventory $none) -join "`n") | Should -Match 'HKCU Run entries for deskflow count=0'
+
+    $wrong = New-LauncherInventory @((New-RunEntry 'HKCU' 'Deskflow' 'C:\Users\alexh\Desktop\deskflow\build\bin\Release\deskflow.exe')) @() @() @()
+    (@(Get-AssertSingleProblems -Inventory $wrong) -join "`n") | Should -Match 'HKCU Run\\Deskflow launches .*build\\bin\\Release\\deskflow.exe, not the canonical'
+  }
+
+  It 'fails on an HKLM Run entry, a Startup shortcut or a scheduled task launching deskflow' {
+    $inv = New-LauncherInventory @((New-RunEntry 'HKCU' 'Deskflow' "$script:Root\deskflow.exe")) `
+      @((New-RunEntry 'HKLM' 'Deskflow' "$script:Root\deskflow.exe")) `
+      @([pscustomobject]@{ Path = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\Deskflow.lnk'; Target = "$script:Root\deskflow.exe" }) `
+      @([pscustomobject]@{ TaskName = 'DeskflowAtLogon'; TaskPath = '\'; Execute = "$script:Root\deskflow.exe"; State = 'Ready' })
+    $p = @(Get-AssertSingleProblems -Inventory $inv) -join "`n"
+    $p | Should -Match 'HKLM Run\\Deskflow launches deskflow'
+    $p | Should -Match 'Startup folder launcher .*Deskflow.lnk'
+    $p | Should -Match 'scheduled task \\DeskflowAtLogon runs'
+  }
+
+  It 'skips the launcher rules for a process-only inventory (older callers)' {
+    $inv = New-Inventory 'Running' 1000 1 @(
+      (New-Row 'deskflow-daemon.exe' 1000 4 0 $true),
+      (New-Row 'deskflow-core.exe' 1001 1000 1 $true),
+      (New-Row 'deskflow.exe' 1003 500 1 $true)
+    )
+    @(Get-AssertSingleProblems -Inventory $inv) | Should -BeNullOrEmpty
   }
 
   It 'Assert-DeskflowSingle throws with every problem listed' {
