@@ -29,6 +29,7 @@ private Q_SLOTS:
   void isKeyDown_noKeysDown_returnsFalse();
   void isKeyDown_keyDown_retrunsTrue();
   void updateKeyState_pollInsertsSingleKey_keyIsDown();
+  void fakeAllKeysUp_releasesOnlySyntheticThenReseeds();
 
 private:
   Arch m_arch;

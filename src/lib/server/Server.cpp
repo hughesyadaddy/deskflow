@@ -784,18 +784,27 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     // a Super still deferred (no chord/session yet) must not follow the
     // cursor to the next screen
     m_deferredSuper = {};
-    // Ask the screen to leave FIRST: a refused leave means we are staying,
-    // and releasing beforehand would drop modifiers on a screen we never
-    // left. Only once the leave is agreed do we release what we hold there
-    // -- while m_active still points at it, so the release cannot land on
-    // the next screen (the stuck-Win bug).
+    // Release order depends on who the active screen is, and both orders
+    // keep m_active pointing at the screen we are leaving so the release
+    // can never land on the next screen (the stuck-Win bug):
+    //
+    //  * Primary: ask it to leave FIRST. Its leave can refuse (we stay), and
+    //    releasing beforehand would drop modifiers on a screen we never left.
+    //  * Secondary (ClientProxy): release FIRST, then leave. A proxy leave
+    //    never refuses, and sending kMsgCLeave before the kMsgDKeyUp batch
+    //    lets a client that tears down on CLeave discard the releases.
     closeOpenWheelGesture();
+    if (m_active != m_primaryClient) {
+      releaseKeysHeldOnActive();
+    }
     if (!m_active->leave()) {
       // cannot leave screen
       LOG_WARN("can't leave screen");
       return;
     }
-    releaseKeysHeldOnActive();
+    if (m_active == m_primaryClient) {
+      releaseKeysHeldOnActive();
+    }
 
     // update the primary client's clipboards if we're leaving the
     // primary screen.

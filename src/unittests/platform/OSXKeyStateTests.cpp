@@ -214,6 +214,20 @@ constexpr KeyButton buttonFor(uint32_t virtualKey)
   return static_cast<KeyButton>(virtualKey + 1);
 }
 
+//! Exposes the protected fakeKey() so a test can post a modifier virtual
+//! key directly (ledgered but outside the synthetic key set), as a relay
+//! or a crashed incarnation would have.
+struct InjectingKeyState : OSXKeyState
+{
+  using OSXKeyState::fakeKey;
+  using OSXKeyState::OSXKeyState;
+};
+
+deskflow::KeyMap::Keystroke stroke(uint32_t virtualKey, bool press)
+{
+  return deskflow::KeyMap::Keystroke(buttonFor(virtualKey), press, false, 0);
+}
+
 } // namespace
 
 void OSXKeyStateTests::shadowFlagsReseedFromOsOnUpdateKeyState()
@@ -439,6 +453,146 @@ void OSXKeyStateTests::sanitizeKeepsModifiersBackedByRecentHardwarePress()
   os.now += 5.0;
   keyState.sanitizeInjectedKeys();
   QCOMPARE(os.posted.size(), size_t(2));
+}
+
+void OSXKeyStateTests::sanitizeReleasesInjectedCaps()
+{
+  // K2 gap b2: a Caps Lock KEY we posted Down and never Up used to have no
+  // release path (the sweep skipped it as "a lock"). The sweep must post
+  // the Up; the lock state stays whatever the OS says.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  keyState.fakeKey(stroke(kVK_CapsLock, true));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_CapsLock));
+  QCOMPARE(os.posted.size(), size_t(1));
+  os.posted.clear();
+
+  // our Caps down toggled the lock ON in the OS
+  os.osFlags = kCGEventFlagMaskAlphaShift;
+  keyState.sanitizeInjectedKeys();
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_CapsLock));
+  QVERIFY(!os.posted[0].down);
+  // the caps key-up carries the lock state, it does not clear it
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskAlphaShift) != 0);
+  QVERIFY(keyState.injectedModifiers().empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlphaShift));
+
+  // nothing left to do on a second pass
+  keyState.sanitizeInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(1));
+}
+
+void OSXKeyStateTests::sanitizeLeavesOsCapsLockAlone()
+{
+  // Caps lock ON in the OS with nothing injected is the user's lock state:
+  // never a candidate for a synthetic key-up, whatever the freshness clock
+  // says (there is no hardware press to back a lock).
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  QVERIFY(keyState.injectedModifiers().empty());
+
+  os.osFlags = kCGEventFlagMaskAlphaShift;
+  keyState.sanitizeInjectedKeys();
+  QVERIFY(os.posted.empty());
+  QVERIFY(keyState.injectedModifiers().empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlphaShift));
+
+  // a caps we pressed AND released (a toggle tap) leaves nothing to sweep
+  keyState.fakeKey(stroke(kVK_CapsLock, true));
+  keyState.fakeKey(stroke(kVK_CapsLock, false));
+  QVERIFY(keyState.injectedModifiers().empty());
+  os.posted.clear();
+  keyState.sanitizeInjectedKeys();
+  QVERIFY(os.posted.empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlphaShift));
+}
+
+void OSXKeyStateTests::releaseInjectedKeysLeavesPhysicallyHeldModifierAlone()
+{
+  // Review finding: a held key emits ONE flagsChanged, so a user shift-
+  // dragging for longer than kHardwareModifierFreshS reads as "stale" to
+  // the full sweep. The ledger-only release used on enterPrimary and by
+  // the post-switch verifier must never reason about freshness at all.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  QVERIFY(keyState.injectedModifiers().empty());
+
+  // Shift and Cmd held on this keyboard; the last flagsChanged is long past
+  os.osFlags = kCGEventFlagMaskShift | kCGEventFlagMaskCommand;
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK, os.now - 30.0);
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK, os.now - 30.0);
+
+  keyState.releaseInjectedKeys();
+  QVERIFY(os.posted.empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift | kCGEventFlagMaskCommand));
+
+  // ... whereas the full sweep WOULD release them (documented, boundary-only)
+  keyState.sanitizeInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(2));
+}
+
+void OSXKeyStateTests::releaseInjectedKeysReleasesLedgeredCmd()
+{
+  // The stuck case the verifier exists for: WE posted Cmd down (ledger),
+  // the Up never came, nothing was typed. The ledger release closes it and
+  // nothing else, with the user's physically held Shift left alone.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  keyState.fakeKey(stroke(kVK_Command, true));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Command));
+  os.posted.clear();
+
+  os.osFlags = kCGEventFlagMaskCommand | kCGEventFlagMaskShift;
+  keyState.releaseInjectedKeys();
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Command));
+  QVERIFY(!os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskCommand) == 0);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0);
+  QVERIFY(keyState.injectedModifiers().empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift));
+}
+
+void OSXKeyStateTests::fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet()
+{
+  // K2 gap b1: leave() runs fakeAllKeysUp(), which used to clear() the
+  // injected ledger without releasing a modifier posted outside the
+  // synthetic key set. It must post the Up (and still leave the user's
+  // own Shift alone, freshness or not).
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  keyState.fakeKey(stroke(kVK_Option, true)); // ledgered, not synthetic
+  os.posted.clear();
+  os.osFlags = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift;
+
+  keyState.fakeAllKeysUp();
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Option));
+  QVERIFY(!os.posted[0].down);
+  QVERIFY(keyState.injectedModifiers().empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlternate | kCGEventFlagMaskShift));
 }
 
 void OSXKeyStateTests::setToggleStateNoOpsWhenCapsMatches()

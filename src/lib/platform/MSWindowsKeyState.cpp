@@ -1261,6 +1261,26 @@ void MSWindowsKeyState::sanitizeInjectedKeys()
   }
 }
 
+void MSWindowsKeyState::releaseInjectedKeys()
+{
+  // Ledger only: no Shift/Win extras and no freshness reasoning, so a
+  // modifier the user is physically holding at this keyboard is never a
+  // candidate. The desk thread still probes each VK (GetAsyncKeyState on
+  // the input desktop) and trims the list to what it actually released.
+  std::vector<WORD> vks;
+  for (const auto &[vk, stampMs] : m_injectedModifiers) {
+    vks.push_back(vk);
+  }
+  if (vks.empty()) {
+    return;
+  }
+  m_desks->releaseHeldKeys(vks);
+  for (const WORD vk : vks) {
+    m_injectedModifiers.erase(vk);
+    LOG_INFO("released injected key vk=0x%02x", vk);
+  }
+}
+
 void MSWindowsKeyState::setToggleState(KeyModifierMask bit, bool on)
 {
   WORD vk;

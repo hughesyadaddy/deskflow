@@ -189,6 +189,7 @@ public:
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
   void setToggleState(KeyModifierMask bit, bool on) override;
   void sanitizeInjectedKeys() override;
+  void releaseInjectedKeys() override;
 
   // KeyState overrides
   void onKey(KeyButton button, bool down, KeyModifierMask newState) override;

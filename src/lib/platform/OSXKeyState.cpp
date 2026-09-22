@@ -31,6 +31,9 @@ static const uint32_t s_controlVK = kVK_Control;
 static const uint32_t s_altVK = kVK_Option;
 static const uint32_t s_superVK = kVK_Command;
 static const uint32_t s_capsLockVK = kVK_CapsLock;
+// Fn/Globe (kVK_Function) is deliberately NOT tracked: no KeyID in the key
+// map resolves to it, so this process can never post it and there is
+// nothing to release. Revisit only if a Globe KeyID is ever added.
 static const uint32_t s_numLockVK = kVK_ANSI_KeypadClear; // 71
 
 static const uint32_t s_brightnessUp = 144;
@@ -794,19 +797,27 @@ void OSXKeyState::noteHardwareModifierFlags(CGEventFlags flags, double now)
   }
 }
 
-void OSXKeyState::sanitizeInjectedKeys()
+void OSXKeyState::releaseLedgeredModifiers(CGEventFlags os)
 {
-  // Start from OS truth so the release we post below carries the real
-  // global flags for every other modifier.
-  reseedShadowFlagsFromOS();
-  const CGEventFlags os = osModifierFlags();
-
   const std::set<uint8_t> injected = m_injectedModifiers;
   for (uint8_t virtualKey : injected) {
     const CGEventFlags flag = modifierFlagForVirtualKey(virtualKey);
-    if (flag == 0 || flag == kCGEventFlagMaskAlphaShift) {
-      // caps is a lock, not a held key; setToggleState() owns it
+    if (flag == 0) {
       m_injectedModifiers.erase(virtualKey);
+      continue;
+    }
+    if (flag == kCGEventFlagMaskAlphaShift) {
+      // Caps is a lock: the OS flag is the lock STATE (setToggleState()
+      // owns that) and says nothing about whether the KEY is still down.
+      // We posted this Down ourselves and never the Up, so close the key.
+      // A Caps key-up toggles nothing -- and m_capsPressed keeps the lock
+      // state reseedShadowFlagsFromOS() just read, so the release event
+      // carries it. Never done for an OS-reported lock with no injection.
+      if (postHIDVirtualKey(virtualKey, false) != KERN_SUCCESS) {
+        postKeyboardKey(virtualKey, false);
+      }
+      m_injectedModifiers.erase(virtualKey);
+      LOG_INFO("released injected caps lock key 0x%02x (lock state untouched)", virtualKey);
       continue;
     }
     if ((os & flag) == 0) {
@@ -821,6 +832,25 @@ void OSXKeyState::sanitizeInjectedKeys()
     m_injectedModifiers.erase(virtualKey);
     LOG_INFO("released injected modifier 0x%02x", virtualKey);
   }
+}
+
+void OSXKeyState::releaseInjectedKeys()
+{
+  // Ledger only -- the strict subset of sanitizeInjectedKeys() that can
+  // never touch a modifier the user is physically holding, whatever the
+  // freshness clock says. Reseed first so the release carries real flags.
+  reseedShadowFlagsFromOS();
+  releaseLedgeredModifiers(osModifierFlags());
+}
+
+void OSXKeyState::sanitizeInjectedKeys()
+{
+  // Start from OS truth so the release we post below carries the real
+  // global flags for every other modifier.
+  reseedShadowFlagsFromOS();
+  const CGEventFlags os = osModifierFlags();
+  const std::set<uint8_t> injected = m_injectedModifiers;
+  releaseLedgeredModifiers(os);
 
   // Modifiers the OS reports down that we never injected: the user's, if a
   // physical key recently drove them (a hardware flagsChanged carried the
@@ -829,7 +859,13 @@ void OSXKeyState::sanitizeInjectedKeys()
   // process that crashed with the key held (K2): nothing on the keyboard
   // backs them, and nobody else will ever release them. The HID key map
   // (pollPressedKeys) is deliberately NOT consulted here: it reports a
-  // posted modifier as down just like a physical one.
+  // posted modifier as down just like a physical one. Caps is deliberately
+  // NOT here: its OS flag is lock state, never evidence of a held key.
+  //
+  // A held key emits ONE flagsChanged, so a >kHardwareModifierFreshS hold
+  // reads as stale here. This sweep therefore belongs only at boundaries
+  // where the user cannot be mid-gesture at this keyboard (enable, lock/
+  // unlock, wake, clear-all); enter/leave/verifier use releaseInjectedKeys().
   const double at = now();
   for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
     const auto vk = static_cast<uint8_t>(virtualKey);
@@ -859,8 +895,14 @@ void OSXKeyState::updateKeyState()
 
 void OSXKeyState::fakeAllKeysUp()
 {
+  // Synthetic keys first (their fakeKey() Ups drop them from the ledger),
+  // then whatever the ledger still holds beyond the synthetic set -- a
+  // modifier posted outside KeyState's press path. K2 gap b1: this used to
+  // clear() the ledger here, forgetting such a modifier instead of
+  // releasing it, and nothing downstream ever released it either.
   KeyState::fakeAllKeysUp();
-  m_injectedModifiers.clear();
+  reseedShadowFlagsFromOS();
+  releaseLedgeredModifiers(osModifierFlags());
   reseedShadowFlagsFromOS();
 }
 

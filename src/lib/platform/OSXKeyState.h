@@ -90,6 +90,7 @@ public:
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
   void updateKeyState() override;
   void fakeAllKeysUp() override;
+  void releaseInjectedKeys() override;
   void setToggleState(KeyModifierMask bit, bool on) override;
   void sanitizeInjectedKeys() override;
 
@@ -199,6 +200,12 @@ private:
 
   // OS truth for the modifier flags (hookable)
   CGEventFlags osModifierFlags() const;
+
+  // Post the Up for every ledgered modifier the OS (\p os) still reports
+  // down (Caps: always, it is a key not the lock) and drop it from the
+  // ledger. Shared by sanitizeInjectedKeys(), releaseInjectedKeys() and
+  // fakeAllKeysUp(). Callers reseed the shadow flags first.
+  void releaseLedgeredModifiers(CGEventFlags os);
 
   // Overwrite the shadow modifier flags with what the OS reports so the
   // next posted event carries the real global flags, not stale ones.

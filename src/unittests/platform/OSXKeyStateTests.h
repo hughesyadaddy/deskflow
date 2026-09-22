@@ -29,6 +29,11 @@ private Q_SLOTS:
   void sanitizeSkipsModifiersOsReportsUp();
   void sanitizeReleasesStaleModifiersWithoutRecentHardwarePress();
   void sanitizeKeepsModifiersBackedByRecentHardwarePress();
+  void sanitizeReleasesInjectedCaps();
+  void sanitizeLeavesOsCapsLockAlone();
+  void releaseInjectedKeysLeavesPhysicallyHeldModifierAlone();
+  void releaseInjectedKeysReleasesLedgeredCmd();
+  void fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet();
   void setToggleStateNoOpsWhenCapsMatches();
   void setToggleStateDrivesCapsViaLockStateApi();
   void setToggleStateFallsBackToFakeCapsPress();
