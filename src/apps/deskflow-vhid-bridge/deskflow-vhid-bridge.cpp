@@ -53,9 +53,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <future>
-#include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1818,7 +1818,6 @@ private:
   unsigned long letters_shifted_ = 0;
   unsigned long letters_unshifted_ = 0;
   unsigned long caps_edges_ = 0;
-
 };
 
 } // namespace

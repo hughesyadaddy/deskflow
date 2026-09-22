@@ -215,8 +215,9 @@ void addLetterLayout(KeyMap &map)
     KeyID id;
     KeyModifierMask required;
   };
-  for (const Row &row : {Row{'k', 0}, Row{'K', KeyModifierShift}, Row{'K', KeyModifierCapsLock},
-                         Row{'k', KeyModifierShift | KeyModifierCapsLock}}) {
+  for (const Row &row :
+       {Row{'k', 0}, Row{'K', KeyModifierShift}, Row{'K', KeyModifierCapsLock},
+        Row{'k', KeyModifierShift | KeyModifierCapsLock}}) {
     KeyMap::KeyItem item;
     item.m_id = row.id;
     item.m_group = 0;
