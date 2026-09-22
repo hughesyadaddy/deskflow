@@ -72,6 +72,128 @@ constexpr uint8_t key_down_modifier_bits(uint16_t key_id, uint32_t mask)
   return mask_to_modifier_bits(mask);
 }
 
+// True for KeyIDs naming an alphabetic character. Caps Lock affects ONLY
+// these on the US layout, so only these need caps-aware shift handling.
+constexpr bool keyid_is_letter(uint16_t key_id)
+{
+  return (key_id >= 'A' && key_id <= 'Z') || (key_id >= 'a' && key_id <= 'z');
+}
+
+constexpr bool keyid_is_upper_letter(uint16_t key_id)
+{
+  return key_id >= 'A' && key_id <= 'Z';
+}
+
+// True for KeyIDs that name a character reachable only with shift on the US
+// layout: uppercase letters and the shifted symbol row/pairs. The KeyID is
+// the character the server wants typed, so shift is implied even when the
+// protocol modifier mask lacks it (e.g. uppercase composed via caps lock).
+constexpr bool keyid_requires_shift(uint16_t key_id)
+{
+  if (keyid_is_upper_letter(key_id))
+    return true;
+  switch (key_id) {
+  case '!':
+  case '@':
+  case '#':
+  case '$':
+  case '%':
+  case '^':
+  case '&':
+  case '*':
+  case '(':
+  case ')':
+  case '_':
+  case '+':
+  case '{':
+  case '}':
+  case '|':
+  case ':':
+  case '"':
+  case '~':
+  case '<':
+  case '>':
+  case '?':
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Outcome of decide_letter_modifiers: the HID modifier byte to emit with the
+// key, and whether the target's Caps Lock must be toggled (one edge) FIRST so
+// that byte composes the intended character.
+struct LetterDecision
+{
+  uint8_t modifierBits = 0;
+  bool capsEdge = false;
+};
+
+// Modifier decision for a key-down.
+/*!
+The bridge posts raw HID reports; the usage is always the unshifted key
+(`K` and `k` are both usage 0x0E) and case is decided by Shift in the
+modifier byte and the TARGET's Caps Lock. macOS composes caps+shift as
+LOWERCASE, so for letters the Shift decision inverts whenever caps is on.
+
+Inputs: the KeyID (the character the server wants typed), the server's
+modifier mask (its Shift bit S and its Caps Lock bit M -- the server's caps
+truth at event time), and this machine's caps state when readable.
+
+Letters:
+  wantUpper = isUpper(id) || (S && !M)   -- never lowercases an uppercase
+                                            KeyID; a base KeyID arriving with
+                                            Shift held (Windows ToUnicodeEx
+                                            fallbacks, relay-normalised masks)
+                                            still uppercases; Shift+Caps
+                                            composed lowercase by the server
+                                            (S && M, id 'k') stays lowercase.
+  capsEdge  = localCaps known && localCaps != M
+                                         -- bring the target's lock in line
+                                            with the server's BEFORE the key
+                                            so M is the truth the byte is
+                                            computed against.
+  shift     = wantUpper XOR M            -- with caps on, uppercase needs no
+                                            shift and lowercase needs one.
+  Other mask bits (ctrl/alt/super) pass through; the mask's Shift bit itself
+  is NOT propagated for letters -- `shift` replaces it.
+
+  id  | S | M | wantUpper | shift | capsEdge (local known)
+  ----+---+---+-----------+-------+-----------------------
+  'K' | 0 | 0 |     1     |   1   | local != 0
+  'K' | 1 | 0 |     1     |   1   | local != 0
+  'K' | 0 | 1 |     1     |   0   | local != 1
+  'K' | 1 | 1 |     1     |   0   | local != 1
+  'k' | 0 | 0 |     0     |   0   | local != 0
+  'k' | 1 | 0 |     1     |   1   | local != 0
+  'k' | 0 | 1 |     0     |   1   | local != 1
+  'k' | 1 | 1 |     0     |   1   | local != 1   (caps+shift+k -> 'k')
+
+Non-letters: unchanged behaviour -- the mask's modifier bits, plus Shift
+when the KeyID itself is a shifted character (keyid_requires_shift); never
+a caps edge. Caps Lock's own KeyID yields no modifier bits (it is an edge,
+handled by the caller) and no caps edge.
+*/
+constexpr LetterDecision decide_letter_modifiers(uint16_t id16, uint32_t mask32, std::optional<bool> localCaps)
+{
+  LetterDecision d;
+  if (!keyid_is_letter(id16)) {
+    d.modifierBits = key_down_modifier_bits(id16, mask32);
+    if (keyid_requires_shift(id16))
+      d.modifierBits |= kHidLeftShift;
+    return d;
+  }
+  const bool serverCaps = (mask32 & kMaskCapsLock) != 0;
+  const bool serverShift = (mask32 & kMaskShift) != 0;
+  const bool wantUpper = keyid_is_upper_letter(id16) || (serverShift && !serverCaps);
+  const bool shift = wantUpper != serverCaps;
+  d.capsEdge = localCaps.has_value() && *localCaps != serverCaps;
+  d.modifierBits = mask_to_modifier_bits(mask32 & ~kMaskShift);
+  if (shift)
+    d.modifierBits |= kHidLeftShift;
+  return d;
+}
+
 // Server's intent for the caps lock state after this key event.
 /*!
 Deskflow's mask reflects the SERVER's caps state at event time. On the caps
