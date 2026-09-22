@@ -5,9 +5,11 @@ Stdlib only (ctypes is used for libproc on macOS).
 
     fleet-soak sample --label L --exe P (--out F | --soak DIR | --start-soak DIR)
                       [--once] [--interval 60] [--proc NAME] [--probe-json FILE|-]
+                      [--heap-classes]
     fleet-soak report --in F [--seat S] [--proc P] [--window H] [--accelerated]
                       [--scenario X] [--slope-max MB/h] [--cap MB]
                       [--ports-slope-max n/h] [--max-step pct]
+                      [--class-slope-max N/h]
                       [--max-restarts N] [--min-hours 72]
                       [--min-completeness 0.95] [--validate] [--json]
                       [--cpu-max 80] [--cpu-ticks 3] [--tap-timeouts-max 10]
@@ -23,6 +25,14 @@ are detected only from (exe, pid, start_time) tuple changes.
 
 On macOS a verdict is INVALID when any post-warm-up sample's metric_source is
 not proc_pid_rusage (the top(1) RSS fallback measures something else).
+
+With `--heap-classes` (macOS) each sample also carries `classes`: the live
+ObjC/CF instance counts per tracked class (CGEvent, NSXPCConnection, ...) from
+the Mouser repo tool `tools/mouser-heap-classes --pid <pid>` (looked up at
+$FLEET_MOUSER_ROOT/tools/mouser-heap-classes, default ~/Desktop/Mouser). When
+the tool is absent the field is null and a note is printed once. `report
+--class-slope-max N` then fails when any tracked class grows faster than N
+instances per hour (Theil-Sen over the post-warm-up body).
 
 Each sample also carries `cpu_s` (user+system CPU seconds of the process),
 `cpu_pct` (derived from the previous sample of the same pid), and per-tick
@@ -78,6 +88,10 @@ LOG_DELTA_MAX_BYTES = 4 * MB
 
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
+
+# Mouser repo tool that turns `heap -s <pid>` into {"<class>": count, ...}.
+HEAP_CLASSES_TOOL_REL = Path("tools") / "mouser-heap-classes"
+HEAP_CLASSES_TIMEOUT_S = 120
 
 
 # --------------------------------------------------------------------------
@@ -537,7 +551,56 @@ def derive_scenario(proc: str, home: Path | None = None, log_path: str | None = 
     return "unknown"
 
 
-def mac_collect(label: str, exe: str, proc: str, scenario_log: str | None = None) -> dict:
+# --------------------------------------------------------------------------
+# heap classes (Mouser repo tool, optional)
+# --------------------------------------------------------------------------
+
+
+def mouser_root(env: dict | None = None) -> Path:
+    env = os.environ if env is None else env
+    return Path(os.path.expanduser(env.get("FLEET_MOUSER_ROOT") or "~/Desktop/Mouser"))
+
+
+def heap_classes_tool(root: Path | None = None) -> Path | None:
+    """Path of tools/mouser-heap-classes in the Mouser checkout, or None."""
+    tool = (root if root is not None else mouser_root()) / HEAP_CLASSES_TOOL_REL
+    return tool if tool.is_file() and os.access(tool, os.X_OK) else None
+
+
+def parse_heap_classes(text: str) -> dict[str, int] | None:
+    """Accept {"<class>": n, ...} or {"classes": {...}, ...}; None when unusable."""
+    try:
+        obj = json.loads(text or "")
+    except json.JSONDecodeError:
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("classes"), dict):
+        obj = obj["classes"]
+    if not isinstance(obj, dict):
+        return None
+    out: dict[str, int] = {}
+    for k, v in obj.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        out[str(k)] = int(v)
+    return out
+
+
+def collect_heap_classes(pid: int | None, tool: Path | None) -> dict[str, int] | None:
+    """Per-class live instance counts, or None (no pid, no tool, tool failed)."""
+    if pid is None or tool is None:
+        return None
+    try:
+        proc = subprocess.run([str(tool), "--pid", str(pid)], capture_output=True, text=True,
+                              timeout=HEAP_CLASSES_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_heap_classes(proc.stdout)
+
+
+def mac_collect(label: str, exe: str, proc: str, scenario_log: str | None = None,
+                heap_tool: Path | None = None, heap_classes: bool = False) -> dict:
     pid, start = mac_find_pid(exe)
     rec: dict = {
         "pid": pid,
@@ -564,6 +627,8 @@ def mac_collect(label: str, exe: str, proc: str, scenario_log: str | None = None
             rec["metric_source"] = "top-mem-fallback"
         rec["fds"] = mac_fds(pid)
         rec["cpu_s"] = mac_cpu_seconds(pid)
+    if heap_classes:
+        rec["classes"] = collect_heap_classes(pid, heap_tool)
     rec["scenario"] = derive_scenario(proc, log_path=scenario_log)
     rec["restart_count"] = mac_restart_count(label, exe)
     return rec
@@ -820,13 +885,14 @@ def notify(message: str) -> None:
 
 
 def collect_one(label: str, exe: str, proc: str, probe: dict | None = None,
-                scenario_log: str | None = None, interval: int = 60) -> dict:
+                scenario_log: str | None = None, interval: int = 60,
+                heap_tool: Path | None = None, heap_classes: bool = False) -> dict:
     if probe is not None:
         rec = win_record_from_probe(probe, exe, proc)
     elif IS_WIN:
         rec = win_record_from_probe(win_probe(label, exe, interval), exe, proc)
     else:
-        rec = mac_collect(label, exe, proc, scenario_log)
+        rec = mac_collect(label, exe, proc, scenario_log, heap_tool, heap_classes)
     return {"ts": iso(now_utc()), **rec, "heartbeat": True}
 
 
@@ -865,6 +931,14 @@ def cmd_sample(a: argparse.Namespace) -> int:
         raw = sys.stdin.read() if a.probe_json == "-" else Path(a.probe_json).read_text()
         probe = json.loads(raw or "{}")
 
+    heap_tool = None
+    heap_classes = bool(getattr(a, "heap_classes", False))
+    if heap_classes:
+        heap_tool = heap_classes_tool()
+        if heap_tool is None:
+            print(f"fleet-soak: note: --heap-classes requested but {mouser_root() / HEAP_CLASSES_TOOL_REL} "
+                  "is missing or not executable; 'classes' will be null in every sample", file=sys.stderr)
+
     for out, p, label, exe in zip(outs, procs, a.label, a.exe):
         ensure_header(out, make_header(p, a.interval, seat, restart_source(label, exe)))
 
@@ -872,7 +946,8 @@ def cmd_sample(a: argparse.Namespace) -> int:
         for label, exe, proc, out, slog in zip(a.label, a.exe, procs, outs, logs):
             prev = read_last_samples(out, max(CPU_ALERT_TICKS, ABSENT_ALERT_TICKS))
             log_path = Path(slog) if slog and slog != "-" else default_log_for(proc)
-            rec = derive_fields(collect_one(label, exe, proc, probe, slog, a.interval),
+            rec = derive_fields(collect_one(label, exe, proc, probe, slog, a.interval,
+                                            heap_tool, heap_classes),
                                 prev[-1] if prev else None, proc, log_path)
             with out.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
@@ -1132,6 +1207,8 @@ def analyze(header: dict | None, samples: list[dict], window_h: float | None,
     res["daily_medians_mb"] = [round(m, 3) for m in meds]
     res.update(cpu_summary(body))
     res.update(counter_rates(body))
+    res["class_slopes_h"] = class_slopes(body)
+    res["class_samples"] = sum(1 for s in body if isinstance(s.get("classes"), dict))
     return res
 
 
@@ -1159,6 +1236,32 @@ def cpu_summary(body: list[dict], cpu_max: float = CPU_ALERT_PCT, ticks: int = C
         "cpu_high_longest": longest,
         "cpu_high_first_at": first_at,
     }
+
+
+def class_slopes(body: list[dict]) -> dict[str, float | None]:
+    """Theil-Sen slope (instances/h) per tracked heap class over the body.
+
+    Classes are the union of every sample's `classes` keys; a class seen in
+    fewer than 2 samples has slope None.
+    """
+    names: list[str] = []
+    for s in body:
+        cls = s.get("classes")
+        if isinstance(cls, dict):
+            for k in cls:
+                if k not in names:
+                    names.append(k)
+    out: dict[str, float | None] = {}
+    for name in names:
+        xs, ys = [], []
+        for s in body:
+            cls = s.get("classes")
+            if isinstance(cls, dict) and isinstance(cls.get(name), (int, float)):
+                xs.append(s["_t"] / 3600)
+                ys.append(float(cls[name]))
+        slope = theil_sen(xs, ys)
+        out[name] = round(slope, 4) if slope is not None else None
+    return out
 
 
 def counter_rates(body: list[dict]) -> dict:
@@ -1230,6 +1333,16 @@ def cmd_report(a: argparse.Namespace) -> int:
             rate = res.get(f"{key}_h")
             if limit is not None and rate is not None and rate > limit:
                 fails.append(f"{key} {rate}/h > {limit}/h")
+        if a.class_slope_max is not None:
+            slopes = res.get("class_slopes_h") or {}
+            usable = {k: v for k, v in slopes.items() if v is not None}
+            if not usable:
+                # A heap-class gate that never saw a sample cannot prove flatness.
+                fails.append("heap classes: no samples with `classes` (run `sample --heap-classes` "
+                             "with tools/mouser-heap-classes present)")
+            for name, slope in sorted(usable.items()):
+                if slope > a.class_slope_max:
+                    fails.append(f"heap class {name} {slope}/h > {a.class_slope_max}/h")
 
     if invalid:
         verdict, code = "INVALID", EXIT_INVALID
@@ -1253,6 +1366,8 @@ def cmd_report(a: argparse.Namespace) -> int:
             f"tap_timeouts={res.get('tap_timeouts_h')}/h flips={res.get('epoch_flips_h')}/h "
             f"unresponsive={res.get('unresponsive_h')}/h"
         )
+        if res.get("class_slopes_h"):
+            print("  classes/h: " + " ".join(f"{k}={v}" for k, v in sorted(res["class_slopes_h"].items())))
         for f in fails:
             print(f"  FAIL: {f}")
         for i in invalid:
@@ -1285,6 +1400,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--soak", metavar="DIR",
                    help="append into DIR/latest (started with --start-soak if missing)")
     s.add_argument("--probe-json", metavar="FILE", help="Windows: read Get-Process JSON from FILE or '-'")
+    s.add_argument("--heap-classes", action="store_true",
+                   help="macOS: store per-class live instance counts from "
+                        "$FLEET_MOUSER_ROOT/tools/mouser-heap-classes --pid <pid> as `classes` (skipped with a note when absent)")
     s.add_argument("--verbose", action="store_true")
     s.set_defaults(func=cmd_sample)
 
@@ -1313,6 +1431,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="core role flips ('promoting to server') per hour (default 6)")
     r.add_argument("--unresponsive-max", type=float, default=20.0, metavar="N/h",
                    help="core ClientProxyUnknown lines per hour (default 20)")
+    r.add_argument("--class-slope-max", type=float, metavar="N/h",
+                   help="fail when any tracked heap class (`classes` from --heap-classes) grows faster than N instances/h")
     r.add_argument("--json", action="store_true")
     r.set_defaults(func=cmd_report)
     return p
