@@ -144,6 +144,7 @@ private Q_SLOTS:
   void rolloverUnderServerCapsDoesNotLeakDerivedShift();
   void shiftReleaseMidHoldDropsDerivedShift();
   void stuckKeyWarningCarriesNoButtonId();
+  void keysSummaryHidesLetterCountsByDefault();
   void escapeBurstReleasesBeforeStop();
   void cheapSpecialKeysAreMapped();
   void unmappedKeyPostsNothing();
@@ -250,6 +251,41 @@ void BridgeTests::stuckKeyWarningCarriesNoButtonId()
   // once per entry
   f.bridge.warn_stuck_keys();
   QCOMPARE(log.lines.size(), size_t(1));
+}
+
+// A-3: the per-session summary at Enter/Leave/disconnect prints only the
+// caps-edge count and a case-applied boolean unless --debug-keys.
+void BridgeTests::keysSummaryHidesLetterCountsByDefault()
+{
+  Fixture f;
+  f.sink.caps = [] { return std::optional<bool>{false}; };
+  QVERIFY(f.keyDown('K', 0, 10)); // derived Shift: case applied
+  QVERIFY(f.keyUp('K', 0, 10));
+  QVERIFY(f.keyDown('a', 0, 11));
+  QVERIFY(f.keyUp('a', 0, 11));
+  FramedSocket noSocket(-1);
+  const std::vector<uint8_t> leave(proto::kLeave, proto::kLeave + 4);
+  {
+    LogCapture log;
+    QVERIFY(f.bridge.dispatch(noSocket, leave));
+    QVERIFY(log.any("leave; [keys] session caps-edges=0 case-applied=yes"));
+    QVERIFY(!log.any("letters shifted="));
+    QVERIFY(!log.any("unshifted="));
+  }
+  {
+    g_debug_keys = true;
+    LogCapture log;
+    QVERIFY(f.bridge.dispatch(noSocket, leave));
+    QVERIFY(log.any("caps-edges=0 case-applied=yes letters shifted=1 unshifted=1"));
+    g_debug_keys = false;
+  }
+  // a session that never derived Shift says so
+  Fixture g;
+  g.sink.caps = [] { return std::optional<bool>{false}; };
+  QVERIFY(g.keyDown('a', 0, 11));
+  LogCapture log;
+  QVERIFY(g.bridge.dispatch(noSocket, leave));
+  QVERIFY(log.any("case-applied=no"));
 }
 
 // A-4: the 4x Esc rescue must not exit the process before the release

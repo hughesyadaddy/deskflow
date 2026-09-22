@@ -668,12 +668,19 @@ bool Bridge::on_enter(const std::vector<uint8_t> &body)
   return true;
 }
 
-// Per-session observability without keystrokes: how letters were composed
-// and how often the target's Caps Lock had to be toggled.
+// Per-session observability without keystrokes (A-3). At the default level:
+// how often the target's Caps Lock had to be toggled, and whether case
+// composition (a derived Shift) was applied to any letter at all. The
+// shifted/unshifted letter COUNTS are a password's letter and uppercase
+// counts, so they are printed only under --debug-keys.
 std::string Bridge::keys_summary() const
 {
-  return "[keys] session letters shifted=" + std::to_string(letters_shifted_) +
-         " unshifted=" + std::to_string(letters_unshifted_) + " caps-edges=" + std::to_string(caps_edges_);
+  std::string s = "[keys] session caps-edges=" + std::to_string(caps_edges_) +
+                  " case-applied=" + (letters_shifted_ > 0 ? "yes" : "no");
+  if (g_debug_keys) {
+    s += " letters shifted=" + std::to_string(letters_shifted_) + " unshifted=" + std::to_string(letters_unshifted_);
+  }
+  return s;
 }
 
 bool Bridge::on_mouse_abs(const std::vector<uint8_t> &body)

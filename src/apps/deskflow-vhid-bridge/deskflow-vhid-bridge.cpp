@@ -8,12 +8,16 @@
 //          [--vhid-wait-s=N] [--debug-keys]
 //
 // Logging never includes key ids, usages, buttons or anything else decodable
-// to typed text: at the login window that stream is the password. --debug-keys
-// adds per-key lines carrying only the held count (never the key, and not the
+// to typed text: at the login window that stream is the password. At the
+// default level the per-session "[keys]" summary (Enter/Leave/disconnect)
+// carries only the number of Caps Lock edges emitted and a yes/no for
+// whether case composition was applied at all; the stuck-key WARNING carries
+// counts and durations, never a button id (a scancode). --debug-keys adds
+// per-key lines carrying only the held count (never the key, and not the
 // modifier mask/byte either: per-key Shift is a password's case pattern),
-// plus per-session counters (letters shifted/unshifted, caps edges) that are
-// always printed at Enter/Leave/disconnect; it is for diagnosis
-// only, never for a production plist.
+// plus the per-session letter counters (shifted/unshifted -- a password's
+// letter and uppercase counts, which is why they are debug-only); it is for
+// diagnosis only, never for a production plist.
 //
 // Unmapped keys: the bridge speaks the US layout and the Deskflow KeyID
 // space it can reach with a boot-keyboard usage table: ASCII, Backspace,
