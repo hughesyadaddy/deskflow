@@ -31,6 +31,10 @@ static const uint32_t s_controlVK = kVK_Control;
 static const uint32_t s_altVK = kVK_Option;
 static const uint32_t s_superVK = kVK_Command;
 static const uint32_t s_capsLockVK = kVK_CapsLock;
+// Fn/Globe (0x3F): a flagsChanged key like the others, driving
+// kCGEventFlagMaskSecondaryFn. Not in any key map, but a relayed or
+// crashed-incarnation hold has to have a release path (K2 gap b2).
+static const uint32_t s_fnVK = kVK_Function;
 static const uint32_t s_numLockVK = kVK_ANSI_KeypadClear; // 71
 
 static const uint32_t s_brightnessUp = 144;
@@ -173,7 +177,7 @@ io_connect_t getEventDriver()
 
 bool isModifier(uint8_t virtualKey)
 {
-  static std::set<uint8_t> modifiers{s_shiftVK, s_superVK, s_altVK, s_controlVK, s_capsLockVK};
+  static std::set<uint8_t> modifiers{s_shiftVK, s_superVK, s_altVK, s_controlVK, s_capsLockVK, s_fnVK};
 
   return (modifiers.find(virtualKey) != modifiers.end());
 }
@@ -206,6 +210,7 @@ void OSXKeyState::init()
   m_altPressed = false;
   m_superPressed = false;
   m_capsPressed = false;
+  m_fnPressed = false;
 
   // build virtual key map
   for (size_t i = 0; i < sizeof(s_controlKeys) / sizeof(s_controlKeys[0]); ++i) {
@@ -433,6 +438,10 @@ CGEventFlags OSXKeyState::getModifierStateAsOSXFlags() const
     modifiers |= kCGEventFlagMaskAlphaShift;
   }
 
+  if (m_fnPressed) {
+    modifiers |= kCGEventFlagMaskSecondaryFn;
+  }
+
   return modifiers;
 }
 
@@ -627,6 +636,8 @@ CGEventFlags OSXKeyState::modifierFlagForVirtualKey(uint8_t virtualKey)
     return kCGEventFlagMaskCommand;
   case s_capsLockVK:
     return kCGEventFlagMaskAlphaShift;
+  case s_fnVK:
+    return kCGEventFlagMaskSecondaryFn;
   default:
     return 0;
   }
@@ -658,6 +669,7 @@ void OSXKeyState::reseedShadowFlagsFromOS()
   m_altPressed = (os & kCGEventFlagMaskAlternate) != 0;
   m_superPressed = (os & kCGEventFlagMaskCommand) != 0;
   m_capsPressed = (os & kCGEventFlagMaskAlphaShift) != 0;
+  m_fnPressed = (os & kCGEventFlagMaskSecondaryFn) != 0;
   LOG_DEBUG("reseeded shadow modifier flags from os: 0x%llx", static_cast<unsigned long long>(os));
 }
 
@@ -804,9 +816,22 @@ void OSXKeyState::sanitizeInjectedKeys()
   const std::set<uint8_t> injected = m_injectedModifiers;
   for (uint8_t virtualKey : injected) {
     const CGEventFlags flag = modifierFlagForVirtualKey(virtualKey);
-    if (flag == 0 || flag == kCGEventFlagMaskAlphaShift) {
-      // caps is a lock, not a held key; setToggleState() owns it
+    if (flag == 0) {
       m_injectedModifiers.erase(virtualKey);
+      continue;
+    }
+    if (flag == kCGEventFlagMaskAlphaShift) {
+      // Caps is a lock: the OS flag is the lock STATE (setToggleState()
+      // owns that) and says nothing about whether the KEY is still down.
+      // We posted this Down ourselves and never the Up, so close the key.
+      // A Caps key-up toggles nothing -- and m_capsPressed keeps the lock
+      // state reseedShadowFlagsFromOS() just read, so the release event
+      // carries it. Never done for an OS-reported lock with no injection.
+      if (postHIDVirtualKey(virtualKey, false) != KERN_SUCCESS) {
+        postKeyboardKey(virtualKey, false);
+      }
+      m_injectedModifiers.erase(virtualKey);
+      LOG_INFO("released injected caps lock key 0x%02x (lock state untouched)", virtualKey);
       continue;
     }
     if ((os & flag) == 0) {
@@ -830,8 +855,12 @@ void OSXKeyState::sanitizeInjectedKeys()
   // backs them, and nobody else will ever release them. The HID key map
   // (pollPressedKeys) is deliberately NOT consulted here: it reports a
   // posted modifier as down just like a physical one.
+  // Fn is listed for completeness: it has no side-specific device bit, so
+  // hardwareSlotForVirtualKey() has no slot for it and an un-injected Fn is
+  // always treated as the user's. Caps is deliberately NOT here: its OS
+  // flag is lock state, never evidence of a held key.
   const double at = now();
-  for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
+  for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK, s_fnVK}) {
     const auto vk = static_cast<uint8_t>(virtualKey);
     const CGEventFlags flag = modifierFlagForVirtualKey(vk);
     if ((os & flag) == 0 || injected.contains(vk)) {
@@ -881,6 +910,9 @@ void OSXKeyState::setKeyboardModifiers(CGKeyCode virtualKey, bool keyDown)
     break;
   case s_capsLockVK:
     m_capsPressed = keyDown;
+    break;
+  case s_fnVK:
+    m_fnPressed = keyDown;
     break;
   default:
     LOG_VERBOSE("the key is not a modifier");

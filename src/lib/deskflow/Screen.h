@@ -14,11 +14,13 @@
 #include "deskflow/OptionTypes.h"
 #include "deskflow/ProtocolTypes.h"
 
+#include <chrono>
 #include <map>
 #include <string>
 
 class IClipboard;
 class IPlatformScreen;
+class EventQueueTimer;
 class IEventQueue;
 
 namespace deskflow {
@@ -291,6 +293,12 @@ public:
     return m_screen;
   }
 
+  //! Post-switch verifier delays (seconds). After enterSecondary() the
+  //! first check looks at what the OS still holds; a non-zero, untyped hold
+  //! gets one more look after the second delay before it is swept.
+  static constexpr double kPostSwitchFirstCheckS = 0.25;
+  static constexpr double kPostSwitchSecondCheckS = 2.0;
+
 protected:
   void enablePrimary();
   void enableSecondary();
@@ -329,6 +337,17 @@ private:
   std::map<KeyModifierMask, KeyButton> m_reassertedModifiers;
 
   IEventQueue *m_events = nullptr;
+
+  // Post-switch verifier (secondary only): a one-shot armed on enter that
+  // re-reads the OS modifier state and, when something is still held that
+  // nobody typed since we entered, sweeps it via sanitizeInjectedKeys().
+  void armPostSwitchVerifier(double delayS);
+  void cancelPostSwitchVerifier();
+  void handlePostSwitchVerifier();
+  EventQueueTimer *m_postSwitchTimer = nullptr;
+  int m_postSwitchPass = 0;
+  std::chrono::steady_clock::time_point m_enteredAt{};
+  std::chrono::steady_clock::time_point m_lastKeyDownAt{};
 };
 
 } // namespace deskflow

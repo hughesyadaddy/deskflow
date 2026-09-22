@@ -248,6 +248,7 @@ private:
   bool m_altPressed;
   bool m_superPressed;
   bool m_capsPressed;
+  bool m_fnPressed;
   // modifier virtual keys this process posted Down for and has not yet
   // posted Up for; the only modifiers sanitizeInjectedKeys() may release.
   std::set<uint8_t> m_injectedModifiers;

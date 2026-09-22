@@ -6,6 +6,7 @@
  */
 
 #include "deskflow/Screen.h"
+#include "base/EventTypes.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "deskflow/IPlatformScreen.h"
@@ -136,6 +137,7 @@ Screen::~Screen()
     }
   }
 
+  cancelPostSwitchVerifier();
   delete m_screen;
   LOG_DEBUG("closed display");
 }
@@ -169,6 +171,7 @@ void Screen::disable()
 {
   assert(m_enabled);
 
+  cancelPostSwitchVerifier();
   if (!m_isPrimary && m_entered) {
     leave();
   } else if (m_isPrimary && !m_entered) {
@@ -283,6 +286,7 @@ void Screen::screensaver(bool) const
 
 void Screen::keyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang)
 {
+  m_lastKeyDownAt = std::chrono::steady_clock::now();
   // check for ctrl+alt+del emulation
   if (id == kKeyDelete && (mask & (KeyModifierControl | KeyModifierAlt)) == (KeyModifierControl | KeyModifierAlt)) {
     LOG_DEBUG("emulating ctrl+alt+del press");
@@ -532,7 +536,11 @@ void Screen::disableSecondary()
 
 void Screen::enterPrimary() const
 {
-  // do nothing
+  // Coming back to the primary means the server holds nothing here any
+  // more, yet relayed keys ARE injected into its OS (PrimaryClient::
+  // injectForwardedKey). Anything still down that no hardware press backs
+  // is stale; sweep it before the user's first real key lands on top.
+  m_screen->sanitizeInjectedKeys();
 }
 
 void Screen::enterSecondary(KeyModifierMask mask)
@@ -569,6 +577,16 @@ void Screen::enterSecondary(KeyModifierMask mask)
     m_screen->fakeKeyDown(mod.key, desired, mod.button, std::string{});
     m_reassertedModifiers[mod.bit] = mod.button;
   }
+
+  // 3. Verify. Whatever leave() and the server's release batch missed (a
+  //    CLeave that raced the key-ups, a modifier the platform ledger never
+  //    saw) shows up as a modifier the OS still holds while nothing has
+  //    been typed here. Look once the dust settles, then once more before
+  //    sweeping, so a user genuinely holding Shift at the crossing is
+  //    never touched.
+  m_enteredAt = std::chrono::steady_clock::now();
+  m_postSwitchPass = 0;
+  armPostSwitchVerifier(kPostSwitchFirstCheckS);
 }
 
 void Screen::leavePrimary()
@@ -581,10 +599,74 @@ void Screen::leavePrimary()
 
 void Screen::leaveSecondary()
 {
+  cancelPostSwitchVerifier();
   // release any keys we think are still down (including modifiers
   // re-asserted on enter; fakeAllKeysUp covers every synthetic key)
   m_reassertedModifiers.clear();
   m_screen->fakeAllKeysUp();
+  // ... then let the platform sweep what the ledger did not know about:
+  // fakeAllKeysUp() releases only m_syntheticKeys, so a modifier the OS
+  // holds that never made it into that ledger (K2 gap b1) would be
+  // forgotten, not released. Windows already does this in its own leave();
+  // the macOS path had no release for it anywhere.
+  m_screen->sanitizeInjectedKeys();
+}
+
+void Screen::armPostSwitchVerifier(double delayS)
+{
+  cancelPostSwitchVerifier();
+  m_postSwitchTimer = m_events->newOneShotTimer(delayS, nullptr);
+  if (m_postSwitchTimer == nullptr) {
+    // event queues without timers (test doubles): nothing to verify with
+    return;
+  }
+  m_events->addHandler(EventTypes::Timer, m_postSwitchTimer, [this](const auto &) { handlePostSwitchVerifier(); });
+}
+
+void Screen::cancelPostSwitchVerifier()
+{
+  if (m_postSwitchTimer == nullptr) {
+    return;
+  }
+  m_events->removeHandler(EventTypes::Timer, m_postSwitchTimer);
+  m_events->deleteTimer(m_postSwitchTimer);
+  m_postSwitchTimer = nullptr;
+}
+
+void Screen::handlePostSwitchVerifier()
+{
+  // one-shot: it has fired, drop it before anything else
+  cancelPostSwitchVerifier();
+  if (m_isPrimary || !m_entered) {
+    return;
+  }
+  ++m_postSwitchPass;
+
+  // Lock bits are state, not held keys. Modifiers we re-asserted on enter
+  // are tracked and have their own release path (the server's real key up
+  // or leave), so they are not "stuck" however long the user holds them --
+  // a shift-drag across the crossing must survive this.
+  KeyModifierMask held = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask;
+  for (const auto &[bit, button] : m_reassertedModifiers) {
+    held &= ~bit;
+  }
+  if (held == 0) {
+    LOG_DEBUG("[keys] post-switch clear (pass %d)", m_postSwitchPass);
+    return;
+  }
+  if (m_lastKeyDownAt > m_enteredAt) {
+    // the server has typed here since we entered: whatever is down is the
+    // user's own chord in progress, not a leftover
+    LOG_DEBUG("[keys] post-switch user-held 0x%04x (typed since enter)", held);
+    return;
+  }
+  if (m_postSwitchPass == 1) {
+    LOG_INFO("[keys] post-switch held=0x%04x", held);
+    armPostSwitchVerifier(kPostSwitchSecondCheckS);
+    return;
+  }
+  LOG_WARN("[keys] stuck-release 0x%04x", held);
+  m_screen->sanitizeInjectedKeys();
 }
 
 std::string Screen::getSecureInputApp() const

@@ -1225,6 +1225,17 @@ std::vector<WORD> MSWindowsKeyState::injectedKeyCandidates(const InjectedModifie
   }
   candidates[VK_LSHIFT] = true;
   candidates[VK_RSHIFT] = true;
+  // Win is the other classic strand (Start menu flashes, Win+letter
+  // shortcuts while typing). The periodic audit only vouches for it while
+  // the ledger does; at a boundary a Win still down is stale by definition.
+  candidates[VK_LWIN] = true;
+  candidates[VK_RWIN] = true;
+  // Caps Lock is a toggle: GetAsyncKeyState(VK_CAPITAL) reports the KEY,
+  // not the lock, and a Caps the user is physically holding must never get
+  // a synthetic UP. Only a Caps this process injected (ledger) qualifies.
+  if (ledger.count(VK_CAPITAL) != 0) {
+    candidates[VK_CAPITAL] = true;
+  }
 
   std::vector<WORD> result;
   for (const auto &[vk, unused] : candidates) {
