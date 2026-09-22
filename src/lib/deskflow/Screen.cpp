@@ -154,8 +154,13 @@ void Screen::enable()
     // with a modifier injected into the OS. Nobody is typing on a screen the
     // cursor is not on, so anything the OS still holds that no hardware
     // press backs is stale; let the platform sweep it before the first
-    // relayed key lands on top of it.
+    // relayed key lands on top of it. On macOS the freshness clock has no
+    // observation yet at this instant (the tap was just created), so the
+    // sweep is repeated once the window has elapsed (K5 review item 2).
     m_screen->sanitizeInjectedKeys();
+    if (!m_isPrimary) {
+      armEnableSweep();
+    }
   }
   if (m_isPrimary) {
     enablePrimary();
@@ -172,6 +177,7 @@ void Screen::disable()
   assert(m_enabled);
 
   cancelPostSwitchVerifier();
+  cancelEnableSweep();
   if (!m_isPrimary && m_entered) {
     leave();
   } else if (m_isPrimary && !m_entered) {
@@ -550,6 +556,9 @@ void Screen::enterPrimary() const
 
 void Screen::enterSecondary(KeyModifierMask mask)
 {
+  // the server is about to type here: the delayed K2 sweep must not land
+  // on top of a chord it is holding
+  cancelEnableSweep();
   // The enter mask is the primary's OS truth at the crossing. Two things
   // ride in it that a fresh target must honour (I4: every boundary resyncs):
   //
@@ -613,6 +622,33 @@ void Screen::leaveSecondary()
   // held on this machine's own keyboard must survive the crossing.
   m_reassertedModifiers.clear();
   m_screen->fakeAllKeysUp();
+}
+
+void Screen::armEnableSweep()
+{
+  cancelEnableSweep();
+  m_enableSweepTimer = m_events->newOneShotTimer(kEnableSweepDelayS, nullptr);
+  if (m_enableSweepTimer == nullptr) {
+    return; // event queues without timers (test doubles)
+  }
+  m_events->addHandler(EventTypes::Timer, m_enableSweepTimer, [this](const auto &) {
+    cancelEnableSweep();
+    if (m_entered) {
+      return;
+    }
+    LOG_DEBUG("[keys] delayed enable sweep");
+    m_screen->sanitizeInjectedKeys();
+  });
+}
+
+void Screen::cancelEnableSweep()
+{
+  if (m_enableSweepTimer == nullptr) {
+    return;
+  }
+  m_events->removeHandler(EventTypes::Timer, m_enableSweepTimer);
+  m_events->deleteTimer(m_enableSweepTimer);
+  m_enableSweepTimer = nullptr;
 }
 
 void Screen::armPostSwitchVerifier(double delayS)

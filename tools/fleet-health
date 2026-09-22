@@ -620,7 +620,7 @@ def parse_keys_log(output: str, now: Optional[datetime] = None, window_h: int = 
     secure = sum(1 for _, ln in stamped if KEYS_SECURE_INPUT_MARK in ln)
     note = f"; {unstamped} unstamped line(s) ignored" if unstamped else ""
     if skipped or secure:
-        note += f"; sweep-skipped={skipped} secure-input-edges={secure}"
+        note += f"; sweep-skipped={skipped} secure-input-samples={secure}"
     if stuck:
         return FAIL, (f"{len(stuck)} '{KEYS_STUCK_MARK}' in {window_h}h "
                       f"(verifier had to release a modifier; newest: {stuck[-1][:100]}){note}")

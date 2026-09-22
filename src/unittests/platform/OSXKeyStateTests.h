@@ -46,6 +46,7 @@ private Q_SLOTS:
   void sanitizeSkipsStaleSweepWithoutObservationWindow();
   void ledgerReleaseKeepsShiftHeldOnRightHandKey();
   void modifierPostFlagsDeriveFromLiveOsNotShadow();
+  void lagRaceDoesNotReassertReleasedShift();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);

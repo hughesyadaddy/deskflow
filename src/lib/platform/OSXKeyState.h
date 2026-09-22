@@ -238,12 +238,21 @@ private:
 
   // The global flag word a modifier virtual key's Down/Up must carry.
   // IOHIDPostEvent(..., kIOHIDSetGlobalEventFlags) REPLACES the system's
-  // modifier flags with the word we post, so it is derived from the LIVE
-  // OS flags (which already include every physical key) and only the bit
-  // this virtual key owns is set or cleared: the generic bit is cleared
-  // only when no right-hand device bit still holds it, and a Caps Up keeps
-  // the lock state. Never from the shadow -- a shadow that missed a
-  // physical Shift used to lowercase the user's next local keystrokes.
+  // modifier flags with the word we post, so: LIVE OS flags for every bit
+  // that is not ours (a physical key the shadow never saw survives), the
+  // LEDGER for ours. Every modifier we hold (m_injectedModifiers) is forced
+  // on, the key being posted is forced to its new state, and a key whose Up
+  // we posted but the OS has not adopted yet (m_pendingReleases) is forced
+  // off -- otherwise a Shift-Up / Control-Down pair posted back-to-back
+  // re-asserted the Shift the live read still showed. The generic bit is
+  // cleared only when no right-hand device bit still holds it; a Caps Up
+  // keeps the lock state.
+  //
+  // Same-side limitation: we only ever post the LEFT virtual keys, and the
+  // device bits cannot tell our left Shift from the user's left Shift. A
+  // physical left Shift held while we release our injected left Shift is
+  // cleared with it (it self-corrects on the user's next Shift edge); only
+  // a right-hand modifier is protected through a release of ours.
   CGEventFlags modifierEventFlags(uint8_t virtualKey, bool down) const;
   static CGEventFlags leftDeviceBitForVirtualKey(uint8_t virtualKey);
   static CGEventFlags rightDeviceBitForVirtualKey(uint8_t virtualKey);
@@ -297,6 +306,10 @@ private:
   // modifier virtual keys this process posted Down for and has not yet
   // posted Up for; the only modifiers sanitizeInjectedKeys() may release.
   std::set<uint8_t> m_injectedModifiers;
+  // modifier virtual keys whose Up we posted and whose left device bit the
+  // live flags still showed at the last post (the OS had not adopted it);
+  // forced off in modifierEventFlags() until the live flags drop it
+  std::set<uint8_t> m_pendingReleases;
   // monotonic time a hardware flagsChanged last carried each modifier's
   // side-specific device bit (shift, control, alt, super); written on the
   // event-tap thread, read by sanitizeInjectedKeys()

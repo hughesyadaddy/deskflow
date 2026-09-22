@@ -998,4 +998,56 @@ void OSXKeyStateTests::modifierPostFlagsDeriveFromLiveOsNotShadow()
   QVERIFY((os.posted[1].flags & kCGEventFlagMaskAlphaShift) != 0);
 }
 
+void OSXKeyStateTests::lagRaceDoesNotReassertReleasedShift()
+{
+  // K5 review (1): the OS adopts a posted global flag word asynchronously.
+  // Shift-Up then Control-Down back-to-back: the live read for the Control
+  // post still shows Shift|LSHIFT, and building the word from it re-asserted
+  // the Shift we had just released (stuck on until the next Shift edge).
+  // The ledger is authoritative for OUR bits: a pending release stays off
+  // until the live flags drop its left device bit.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  OSXKeyState::Hooks hooks = os.hooks();
+  hooks.postHIDKey = [&](uint8_t vk, bool down, CGEventFlags flags) {
+    os.posted.push_back({vk, down, flags}); // lagging OS: osFlags never follows
+    return KERN_SUCCESS;
+  };
+  keyState.setHooks(hooks);
+
+  os.osFlags = 0;
+  keyState.fakeKey(stroke(kVK_Shift, true));
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK; // adopted
+  keyState.fakeKey(stroke(kVK_Shift, false));
+  QCOMPARE(os.posted.size(), size_t(2));
+  QVERIFY((os.posted[1].flags & kCGEventFlagMaskShift) == 0);
+
+  // live still shows our Shift (lag) when Control goes down
+  keyState.fakeKey(stroke(kVK_Control, true));
+  QCOMPARE(os.posted.size(), size_t(3));
+  QVERIFY((os.posted[2].flags & kCGEventFlagMaskControl) != 0);
+  QVERIFY((os.posted[2].flags & kCGEventFlagMaskShift) == 0);
+  QVERIFY((os.posted[2].flags & NX_DEVICELSHIFTKEYMASK) == 0);
+  QVERIFY((keyState.getKeyboardEventFlags() & kCGEventFlagMaskShift) == 0);
+
+  // ... and a ledgered modifier we still hold is never dropped by a lagging
+  // read the other way (live shows Control OFF while we hold it)
+  os.osFlags = 0;
+  keyState.fakeKey(stroke(kVK_Option, true));
+  QCOMPARE(os.posted.size(), size_t(4));
+  QVERIFY((os.posted[3].flags & kCGEventFlagMaskControl) != 0);
+  QVERIFY((os.posted[3].flags & kCGEventFlagMaskAlternate) != 0);
+  QVERIFY((os.posted[3].flags & kCGEventFlagMaskShift) == 0);
+
+  // once the OS has dropped the Shift device bit, a physical left Shift
+  // (the user's) rides along again: the pending release is forgotten
+  keyState.fakeKey(stroke(kVK_Control, false));
+  keyState.fakeKey(stroke(kVK_Option, false));
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK; // user's own Shift, seen after adoption
+  keyState.fakeKey(stroke(kVK_Command, true));
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskShift) != 0);
+}
+
 QTEST_MAIN(OSXKeyStateTests)

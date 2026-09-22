@@ -707,22 +707,42 @@ CGEventFlags OSXKeyState::rightDeviceBitForVirtualKey(uint8_t virtualKey)
 
 CGEventFlags OSXKeyState::modifierEventFlags(uint8_t virtualKey, bool down) const
 {
-  const CGEventFlags generic = modifierFlagForVirtualKey(virtualKey);
   CGEventFlags flags = osModifierFlags();
-  if (generic == kCGEventFlagMaskAlphaShift) {
-    // Caps is a lock: the Down asserts the flag (the OS toggles the lock on
-    // the press); the Up carries whatever lock state the OS now reports.
-    return down ? (flags | generic) : flags;
+  const auto force = [&flags](uint8_t vk, bool on) {
+    const CGEventFlags generic = modifierFlagForVirtualKey(vk);
+    if (generic == kCGEventFlagMaskAlphaShift) {
+      // Caps is a lock: the Down asserts the flag (the OS toggles the lock
+      // on the press); the Up carries whatever lock state the OS reports.
+      if (on) {
+        flags |= generic;
+      }
+      return;
+    }
+    const CGEventFlags left = leftDeviceBitForVirtualKey(vk);
+    const CGEventFlags right = rightDeviceBitForVirtualKey(vk);
+    if (on) {
+      flags |= generic | left;
+      return;
+    }
+    flags &= ~left;
+    if ((flags & right) == 0) {
+      flags &= ~generic;
+    }
+  };
+
+  // ledger first: what we hold stays on, what we released stays off ...
+  for (const uint8_t vk : m_pendingReleases) {
+    if (vk != virtualKey) {
+      force(vk, false);
+    }
   }
-  const CGEventFlags left = leftDeviceBitForVirtualKey(virtualKey);
-  const CGEventFlags right = rightDeviceBitForVirtualKey(virtualKey);
-  if (down) {
-    return flags | generic | left;
+  for (const uint8_t vk : m_injectedModifiers) {
+    if (vk != virtualKey) {
+      force(vk, true);
+    }
   }
-  flags &= ~left;
-  if ((flags & right) == 0) {
-    flags &= ~generic;
-  }
+  // ... and the key being posted takes its new state last
+  force(virtualKey, down);
   return flags;
 }
 
@@ -988,7 +1008,7 @@ void OSXKeyState::sanitizeInjectedKeys()
   // fingers -- lowercase at the prompt until the next physical re-press.
   const double at = now();
   if (secureInputEnabled()) {
-    LOG_INFO("[keys] secure-input=on; stale-modifier sweep skipped (hardware presses invisible)");
+    LOG_INFO("[keys] stale-modifier sweep skipped: a password field owns input (hardware presses invisible)");
     return;
   }
   if (!hardwareObservableFor(kHardwareModifierFreshS, at)) {
@@ -1066,8 +1086,20 @@ kern_return_t OSXKeyState::postHIDVirtualKey(uint8_t virtualKey, bool postDown)
   // agree so every following non-modifier post composes the same way.
   CGEventFlags modifierFlags = 0;
   if (isModifier(virtualKey)) {
+    // Drop pending releases the OS has adopted (left device bit gone from
+    // the live read); everything else keeps being forced off.
+    const CGEventFlags live = osModifierFlags();
+    for (auto it = m_pendingReleases.begin(); it != m_pendingReleases.end();) {
+      const CGEventFlags left = leftDeviceBitForVirtualKey(*it);
+      it = (left == 0 || (live & left) == 0) ? m_pendingReleases.erase(it) : std::next(it);
+    }
     modifierFlags = modifierEventFlags(virtualKey, postDown);
     setShadowFlags(modifierFlags);
+    if (postDown) {
+      m_pendingReleases.erase(virtualKey);
+    } else if (const CGEventFlags left = leftDeviceBitForVirtualKey(virtualKey); left != 0 && (live & left) != 0) {
+      m_pendingReleases.insert(virtualKey);
+    }
   }
 
   if (m_hooks.postHIDKey) {

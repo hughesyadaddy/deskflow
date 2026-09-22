@@ -257,8 +257,10 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
   if (m_keyState != nullptr) {
     // Second sweep from the other direction: the audit above skips what the
     // ledger says WE hold, but at this boundary the server holds nothing, so
-    // any ledger entry (and any Shift) still physically down is stale too.
-    m_keyState->sanitizeInjectedKeys();
+    // any ledger entry still physically down is stale too. Ledger only (K5):
+    // the LSHIFT/RSHIFT candidates of sanitizeInjectedKeys() released a Shift
+    // the local user was holding at enable/enter.
+    m_keyState->releaseInjectedKeys();
     // The releases just changed the OS modifier state behind KeyState's back.
     // Without a resync the shadow still says (e.g.) Ctrl is held, and
     // KeyMap::keysForModifierState then emits NO modifier press for a key
@@ -1034,7 +1036,9 @@ bool MSWindowsScreen::onEvent(HWND, UINT msg, WPARAM wParam, LPARAM lParam, LRES
         // Sleep interrupts any chord mid-hold and the UP never arrives
         // (the server has long since moved on); waking with a modifier
         // still injected is a stuck key until something releases it.
-        m_keyState->sanitizeInjectedKeys();
+        // Ledger only (K5): the person waking this box is at its keyboard,
+        // often with Shift held for the password that follows.
+        m_keyState->releaseInjectedKeys();
       }
       m_events->addEvent(
           Event(EventTypes::ScreenResume, getEventTarget(), nullptr, Event::EventFlags::DeliverImmediately)
