@@ -24,6 +24,8 @@ private Q_SLOTS:
   void mapKey_upperLetterWithoutShiftInMask_pressesShift();
   void mapKey_lowerLetterWithShiftDesired_noShiftKeystroke();
   void mapKey_upperLetterWithShiftAndCaps_noExtraCapsPress();
+  void mapKey_capsInsensitiveKeyWithCapsMaskMismatch_noCapsStrokes_data();
+  void mapKey_capsInsensitiveKeyWithCapsMaskMismatch_noCapsStrokes();
   void parseModifiers_plusKey_keepsPlusAsKey();
   void parseKey_plusSymbol_parsesAsAsciiKey();
 

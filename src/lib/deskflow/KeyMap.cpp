@@ -701,7 +701,17 @@ bool KeyMap::keysForKeyItem(
     const std::string &lang
 ) const
 {
-  static const KeyModifierMask s_notRequiredMask = KeyModifierAltGr | KeyModifierNumLock | KeyModifierScrollLock;
+  // Modifiers the "match desiredState as closely as possible" pass below
+  // never tries to flip. Caps Lock belongs here (K4 audit B-1): it is a LOCK
+  // whose state is taken as given (mapCommandKey masks it out of the desired
+  // mask for the same reason), so a key that is not caps-sensitive (Return,
+  // digits, arrows, Backspace) must not toggle the client's Caps Lock to
+  // match the server's mask and back -- that was two real OS caps edges per
+  // key whenever the two masks disagreed, and one debounced edge left the
+  // client permanently inverted. Keys that ARE caps-sensitive still get
+  // Caps matched by the required-state pass above.
+  static const KeyModifierMask s_notRequiredMask =
+      KeyModifierAltGr | KeyModifierNumLock | KeyModifierScrollLock | KeyModifierCapsLock;
 
   // add keystrokes to adjust the group
   if (group != keyItem.m_group) {

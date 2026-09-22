@@ -188,6 +188,7 @@ namespace {
 constexpr KeyButton kShiftButton = 0x38;
 constexpr KeyButton kCapsButton = 0x3A;
 constexpr KeyButton kKButton = 0x28;
+constexpr KeyButton kReturnButton = 0x24;
 
 // The shape a real US layout produces for one letter key: a Shift modifier,
 // a locking Caps Lock modifier, and 'k' / 'K' on the same button where the
@@ -330,6 +331,48 @@ void KeyMapTests::mapKey_upperLetterWithShiftAndCaps_noExtraCapsPress()
   QVERIFY(!hasStroke(strokes, kCapsButton, false));
   QVERIFY(!hasStroke(strokes, kShiftButton, true));
   QVERIFY((currentState & KeyModifierCapsLock) != 0);
+}
+
+// K4 audit B-1: a key that is NOT caps-sensitive (Return, digits, arrows,
+// Backspace) must never toggle the client's Caps Lock to match the server's
+// mask. Before the fix, keysForKeyItem's "match desiredState as closely as
+// possible" pass flipped Caps on the way in and keysToRestoreModifiers
+// flipped it back: two real OS caps edges per key whenever the two masks
+// disagreed, and a single debounced edge left the client inverted for good.
+void KeyMapTests::mapKey_capsInsensitiveKeyWithCapsMaskMismatch_noCapsStrokes_data()
+{
+  QTest::addColumn<KeyModifierMask>("currentState");
+  QTest::addColumn<KeyModifierMask>("desiredMask");
+  QTest::newRow("client caps off, server caps on") << KeyModifierMask{0} << KeyModifierMask{KeyModifierCapsLock};
+  QTest::newRow("client caps on, server caps off") << KeyModifierMask{KeyModifierCapsLock} << KeyModifierMask{0};
+}
+
+void KeyMapTests::mapKey_capsInsensitiveKeyWithCapsMaskMismatch_noCapsStrokes()
+{
+  QFETCH(KeyModifierMask, currentState);
+  QFETCH(KeyModifierMask, desiredMask);
+  const KeyModifierMask capsBefore = currentState & KeyModifierCapsLock;
+
+  KeyMap keyMap;
+  addLetterLayout(keyMap);
+  KeyMap::KeyItem ret;
+  ret.m_id = kKeyReturn;
+  ret.m_group = 0;
+  ret.m_button = kReturnButton;
+  keyMap.addKeyEntry(ret); // not caps-sensitive, not shift-sensitive
+  keyMap.finish();
+
+  KeyMap::Keystrokes keys;
+  KeyMap::ModifierToKeys activeModifiers;
+  const auto *item = keyMap.mapKey(keys, kKeyReturn, 0, activeModifiers, currentState, desiredMask, false, "en");
+  QVERIFY(item != nullptr);
+  QCOMPARE(item->m_button, kReturnButton);
+  const auto strokes = buttonStrokes(keys);
+  QVERIFY(hasStroke(strokes, kReturnButton, true));
+  QVERIFY(!hasStroke(strokes, kCapsButton, true));
+  QVERIFY(!hasStroke(strokes, kCapsButton, false));
+  // the tracked lock state is untouched too
+  QCOMPARE(currentState & KeyModifierCapsLock, capsBefore);
 }
 
 void KeyMapTests::parseModifiers_plusKey_keepsPlusAsKey()
