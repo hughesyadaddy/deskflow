@@ -151,15 +151,26 @@ start_deskflow() {
 # ADHOC-DEV-BUILD (FLEET_ALLOW_ADHOC_DEV_BUILD=ON) is refused outright.
 EXPECT_TEAM="${DESKFLOW_EXPECT_TEAM:-J5KPG8ZR5C}"
 
-# Every Mach-O in the bundle, one path per line: Contents/MacOS/* plus the
-# dylibs and executables under Contents/Frameworks (same enumeration as
-# tools/fleet-health macho_scan_cmd, so the deploy and the health check
-# agree on what "every Mach-O" means).
+# Every Mach-O in the bundle, one path per line: Contents/MacOS/*, the dylibs
+# and executables under Contents/Frameworks, and every dylib or executable
+# Mach-O under Contents/PlugIns (libqcocoa, imageformats, tls backends: 22 of
+# the 60 Mach-Os in a real Deskflow.app) and Contents/Resources. Same
+# enumeration as tools/fleet-health macho_scan_cmd, so the deploy and the
+# health check agree on what "every Mach-O" means. Extension-less files are
+# only counted when `file` says Mach-O (scripts in Resources are skipped).
 bundle_machos() {
-  local app="$1"
+  local app="$1" f
   find "$app/Contents/MacOS" -type f 2>/dev/null
   find "$app/Contents/Frameworks" -type f \( -name '*.dylib' -o -perm -u+x \) \
     -not -path '*/Resources/*' -not -path '*/Headers/*' 2>/dev/null
+  find "$app/Contents/PlugIns" "$app/Contents/Resources" -type f \( -name '*.dylib' -o -perm +111 \) 2>/dev/null |
+    while IFS= read -r f; do
+      case "$f" in
+        *.dylib) printf '%s\n' "$f" ;;
+        *) file -b "$f" 2>/dev/null | grep -q 'Mach-O' && printf '%s\n' "$f" ;;
+      esac
+    done
+  return 0
 }
 
 verify_signature() {

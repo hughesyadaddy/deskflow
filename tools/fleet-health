@@ -296,10 +296,20 @@ def macho_scan_cmd(apps: Sequence[str] = MAC_APPS, extra: Sequence[str] = MAC_EX
     for app in apps:
         macos = f"{app}/Contents/MacOS"
         frameworks = f"{app}/Contents/Frameworks"
+        plugins = f"{app}/Contents/PlugIns"
+        resources = f"{app}/Contents/Resources"
         finds.append(f"find {shlex.quote(macos)} -type f 2>/dev/null")
         finds.append(
             f"find {shlex.quote(frameworks)} -type f \\( -name '*.dylib' -o -perm -u+x \\) "
             f"-not -path '*/Resources/*' -not -path '*/Headers/*' 2>/dev/null"
+        )
+        # Qt plugins (libqcocoa, imageformats, tls: 22 of 60 Mach-Os in a real
+        # Deskflow.app) and Resources: every dylib, plus extension-less
+        # executables only when `file` says Mach-O (scripts are skipped).
+        finds.append(
+            f"find {shlex.quote(plugins)} {shlex.quote(resources)} -type f "
+            f"\\( -name '*.dylib' -o -perm +111 \\) 2>/dev/null | while IFS= read -r m; do "
+            'case "$m" in *.dylib) echo "$m";; *) file -b "$m" 2>/dev/null | grep -q Mach-O && echo "$m";; esac; done'
         )
     for path in extra:
         finds.append(f"ls {shlex.quote(path)} 2>/dev/null")

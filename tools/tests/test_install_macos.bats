@@ -94,6 +94,15 @@ if [[ "${1:-}" == "--install" ]]; then
   : > "$fw/QtCore.framework/Versions/A/Resources/Info.plist"
   : > "$fw/QtCore.framework/Versions/A/Headers/qglobal.h"
   : > "$fw/libcrypto.3.dylib"
+  # Qt plugins and a Resources dylib: 22 of 60 Mach-Os in a real bundle live
+  # under PlugIns; both trees are part of the signature walk.
+  mkdir -p "$prefix/Deskflow.app/Contents/PlugIns/platforms" "$prefix/Deskflow.app/Contents/PlugIns/imageformats"
+  : > "$prefix/Deskflow.app/Contents/PlugIns/platforms/libqcocoa.dylib"
+  : > "$prefix/Deskflow.app/Contents/PlugIns/imageformats/libqbad.dylib"
+  : > "$prefix/Deskflow.app/Contents/Resources/libres.dylib"
+  # an executable script in Resources is not a Mach-O and must be skipped
+  printf '#!/bin/sh\n' > "$prefix/Deskflow.app/Contents/Resources/helper.sh"
+  chmod +x "$prefix/Deskflow.app/Contents/Resources/helper.sh"
 fi
 exit 0
 EOF
@@ -207,12 +216,18 @@ log_lacks() {
   [[ "$output" == *"Codesign verify OK"* ]]
   [[ "$output" == *"Authority=Apple Development"* ]]
   [[ "$output" == *"TeamIdentifier=ABCDE12345"* ]]
-  # every Mach-O walked: 2 in Contents/MacOS + QtCore + libcrypto (Resources/Headers skipped)
-  [[ "$output" == *"sign: total=4 apple=4 adhoc=0 hardened=4"* ]]
+  # every Mach-O walked: 2 in Contents/MacOS + QtCore + libcrypto + 2 PlugIns + Resources dylib
+  # (framework Resources/Headers and the Resources shell script skipped)
+  [[ "$output" == *"sign: total=7 apple=7 adhoc=0 hardened=7"* ]]
   grep -q '^codesign -dvvv .*/Contents/Frameworks/QtCore.framework/Versions/A/QtCore$' "$SHIM_LOG"
   grep -q '^codesign -dvvv .*/Contents/Frameworks/libcrypto.3.dylib$' "$SHIM_LOG"
+  grep -q '^codesign -dvvv .*/Contents/PlugIns/platforms/libqcocoa.dylib$' "$SHIM_LOG"
+  grep -q '^codesign -dvvv .*/Contents/PlugIns/imageformats/libqbad.dylib$' "$SHIM_LOG"
+  grep -q '^codesign -dvvv .*/Contents/Resources/libres.dylib$' "$SHIM_LOG"
   log_lacks "Versions/A/Resources/Info.plist"
   log_lacks "Headers/qglobal.h"
+  log_lacks "Resources/helper.sh"
+  log_lacks "install-login-bridge-macos.sh"
   [ -f "$APP/Contents/MacOS/deskflow-core" ]
   # The signature is checked on the STAGED bundle, never on the live path.
   log_has "codesign --verify --deep --strict "
@@ -353,7 +368,7 @@ EOF
   SHIM_CODESIGN_DV="$ADHOC_DV" run bash "$SCRIPT"
   [ "$status" -eq 1 ]
   [[ "$output" == *"Signature=adhoc"* ]]
-  [[ "$output" == *"sign: total=4 apple=0 adhoc=4 hardened=0"* ]]
+  [[ "$output" == *"sign: total=7 apple=0 adhoc=7 hardened=0"* ]]
   log_lacks "launchctl bootstrap"
 }
 
@@ -362,10 +377,21 @@ EOF
   run bash "$SCRIPT"
   [ "$status" -eq 1 ]
   [[ "$output" == *"Contents/Frameworks/libcrypto.3.dylib: Signature=adhoc"* ]]
-  [[ "$output" == *"sign: total=4 apple=3 adhoc=1 hardened=3"* ]]
+  [[ "$output" == *"sign: total=7 apple=6 adhoc=1 hardened=6"* ]]
   [[ "$output" != *"Codesign verify OK"* ]]
   log_lacks "launchctl bootstrap"
   [ ! -e "${APP}.bak" ]
+}
+
+@test "an ad-hoc Qt plugin or Resources dylib exits 1 (PlugIns/Resources are walked)" {
+  dv_for libqbad.dylib "$ADHOC_DV"
+  dv_for libres.dylib "$ADHOC_DV"
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Contents/PlugIns/imageformats/libqbad.dylib: Signature=adhoc"* ]]
+  [[ "$output" == *"Contents/Resources/libres.dylib: Signature=adhoc"* ]]
+  [[ "$output" == *"sign: total=7 apple=5 adhoc=2 hardened=5"* ]]
+  log_lacks "launchctl bootstrap"
 }
 
 @test "a first-party binary without the hardened runtime exits 1" {
@@ -373,7 +399,7 @@ EOF
   run bash "$SCRIPT"
   [ "$status" -eq 1 ]
   [[ "$output" == *"Contents/MacOS/deskflow-prio is not signed with the hardened runtime"* ]]
-  [[ "$output" == *"sign: total=4 apple=4 adhoc=0 hardened=3"* ]]
+  [[ "$output" == *"sign: total=7 apple=7 adhoc=0 hardened=6"* ]]
   log_lacks "launchctl bootstrap"
 }
 
@@ -381,7 +407,7 @@ EOF
   dv_for QtCore "$UNHARDENED_DV"
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"sign: total=4 apple=4 adhoc=0 hardened=3"* ]]
+  [[ "$output" == *"sign: total=7 apple=7 adhoc=0 hardened=6"* ]]
   [[ "$output" == *"Codesign verify OK"* ]]
 }
 

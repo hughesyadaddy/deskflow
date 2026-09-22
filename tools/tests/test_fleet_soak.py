@@ -342,6 +342,9 @@ def mocked_mac(fs, monkeypatch):
     monkeypatch.setattr(fs, "notify", lambda message: (_ for _ in ()).throw(AssertionError(message)))
     monkeypatch.setattr(fs, "derive_scenario",
                         lambda proc, home=None, log_path=None, status_fn=None: "device-connected")
+    # heap-classes: pretend passwordless sudo exists and run the (fake) tool directly
+    monkeypatch.setattr(fs, "sudo_noninteractive_ok", lambda: True)
+    monkeypatch.setattr(fs, "HEAP_SUDO", ())
     return fs
 
 
@@ -914,6 +917,40 @@ def test_sample_heap_classes_skips_with_a_note_when_the_tool_is_absent(mocked_ma
     assert rec["classes"] is None and rec["heap_total_bytes"] is None
     err = capsys.readouterr().err
     assert "note: --heap-classes requested" in err and "mouser-heap-classes" in err
+
+
+def test_collect_heap_classes_runs_the_tool_under_sudo_n(fs, monkeypatch):
+    calls = []
+
+    class P:
+        returncode = 0
+        stdout = HEAP_TOOL_JSON
+
+    monkeypatch.setattr(fs.subprocess, "run", lambda cmd, **kw: (calls.append(cmd), P())[1])
+    classes, total = fs.collect_heap_classes(4242, Path("/m/tools/mouser-heap-classes"))
+    assert calls == [["sudo", "-n", "/m/tools/mouser-heap-classes", "--pid", "4242"]]
+    assert classes["CGEvent"] == 120 and total == 587427918
+
+
+def test_sample_heap_classes_without_passwordless_sudo_records_null_and_notes_once(
+        mocked_mac, tmp_path, monkeypatch, capsys):
+    fs = mocked_mac
+    monkeypatch.setenv("FLEET_MOUSER_ROOT", str(fake_mouser_root(tmp_path)))
+    monkeypatch.setattr(fs, "sudo_noninteractive_ok", lambda: False)
+    out = tmp_path / "nosudo"
+    out.mkdir()
+    # two targets per tick -> two samples, still exactly one notice
+    assert fs.main(["sample", "--label", "io.github.hughesyadaddy.mouser", "--label", "deskflow-core",
+                    "--exe", "/Applications/Mouser.app/Contents/MacOS/Mouser", "--exe", "/x/deskflow-core",
+                    "--start-soak", str(out), "--once", "--heap-classes"]) == 0
+    recs = [json.loads(ln) for f in sorted((out / "latest").glob("*.jsonl"))
+            for ln in f.read_text().splitlines()[1:]]
+    assert len(recs) == 2 and all(r["classes"] is None for r in recs)
+    err = capsys.readouterr().err
+    assert err.count("fleet-soak: note:") == 1
+    assert "passwordless sudo" in err and "mouser-heap-classes-soak.md" in err
+    # the tool was never invoked
+    assert not (tmp_path / "Mouser" / "tools" / "heap-classes.calls").exists()
 
 
 def test_sample_heap_classes_null_when_the_tool_fails_or_prints_junk(mocked_mac, tmp_path, monkeypatch):

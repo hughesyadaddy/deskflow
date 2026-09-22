@@ -29,10 +29,18 @@ not proc_pid_rusage (the top(1) RSS fallback measures something else).
 With `--heap-classes` (macOS) each sample also carries `classes`: the live
 ObjC/CF instance counts per tracked class (CGEvent, NSXPCConnection, ...) from
 the Mouser repo tool `tools/mouser-heap-classes --pid <pid>` (looked up at
-$FLEET_MOUSER_ROOT/tools/mouser-heap-classes, default ~/Desktop/Mouser). When
-the tool is absent the field is null and a note is printed once. `report
---class-slope-max N` then fails when any tracked class grows faster than N
-instances per hour (Theil-Sen over the post-warm-up body).
+$FLEET_MOUSER_ROOT/tools/mouser-heap-classes, default ~/Desktop/Mouser).
+The tool wraps `heap -s`, which must attach to Mouser; the fleet bundle runs
+under the hardened runtime WITHOUT get-task-allow, so the tool is invoked as
+`sudo -n <tool> --pid <pid>` and the seat needs passwordless sudo for `heap`
+(see docs/runbooks/mouser-heap-classes-soak.md for the sudoers line). When
+the tool is absent or `sudo -n` is not available, every sample is recorded
+without classes (null) and ONE notice is printed at start-up, never per
+sample; the tool's own exit 2 (cannot attach, process gone, unexpected
+`heap` layout) likewise yields a null sample. `report --class-slope-max N`
+then fails when any tracked class grows faster than N instances per hour
+(Theil-Sen over the post-warm-up body), and fails when no sample carried
+classes at all.
 
 Each sample also carries `cpu_s` (user+system CPU seconds of the process),
 `cpu_pct` (derived from the previous sample of the same pid), and per-tick
@@ -51,6 +59,7 @@ Report exit codes: 0 pass, 1 fail (criteria), 2 verdict invalid.
 from __future__ import annotations
 
 import argparse
+from typing import Sequence
 import datetime as _dt
 import json
 import os
@@ -589,18 +598,34 @@ def parse_heap_classes(text: str) -> tuple[dict[str, int], int | None] | None:
     return out, total_bytes
 
 
-def collect_heap_classes(pid: int | None, tool: Path | None) -> tuple[dict[str, int] | None, int | None]:
-    """(classes, total_bytes) from ``tools/mouser-heap-classes --pid PID``.
+# `heap` must attach to the hardened fleet Mouser (no get-task-allow), so the
+# tool runs under non-interactive sudo; the seat needs a sudoers line for it.
+HEAP_SUDO: tuple[str, ...] = ("sudo", "-n")
+
+
+def sudo_noninteractive_ok() -> bool:
+    """True when `sudo -n true` succeeds (passwordless sudo for this user)."""
+    try:
+        return subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True,
+                              timeout=10, check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def collect_heap_classes(pid: int | None, tool: Path | None,
+                         sudo: Sequence[str] | None = None) -> tuple[dict[str, int] | None, int | None]:
+    """(classes, total_bytes) from ``sudo -n tools/mouser-heap-classes --pid PID``.
 
     (None, None) when there is no pid or tool, on a timeout, or when the tool
-    exits non-zero -- its exit 2 (``heap`` missing, cannot attach without
-    get-task-allow/sudo, process gone, unexpected format) is a sample without
-    classes, never a soak failure.
+    exits non-zero -- its exit 2 (``heap`` missing, cannot attach, process
+    gone, unexpected format) is a sample without classes, never a soak failure.
     """
     if pid is None or tool is None:
         return None, None
+    if sudo is None:
+        sudo = HEAP_SUDO  # resolved at call time so tests can disable it
     try:
-        proc = subprocess.run([str(tool), "--pid", str(pid)], capture_output=True, text=True,
+        proc = subprocess.run([*sudo, str(tool), "--pid", str(pid)], capture_output=True, text=True,
                               timeout=HEAP_CLASSES_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return None, None
@@ -945,10 +970,18 @@ def cmd_sample(a: argparse.Namespace) -> int:
     heap_tool = None
     heap_classes = bool(getattr(a, "heap_classes", False))
     if heap_classes:
+        # Decided once here, never per sample: absent tool or no passwordless
+        # sudo -> every sample gets classes=null and exactly one notice.
         heap_tool = heap_classes_tool()
         if heap_tool is None:
             print(f"fleet-soak: note: --heap-classes requested but {mouser_root() / HEAP_CLASSES_TOOL_REL} "
                   "is missing or not executable; 'classes' will be null in every sample", file=sys.stderr)
+        elif not sudo_noninteractive_ok():
+            print("fleet-soak: note: --heap-classes needs passwordless sudo for `heap` (the fleet Mouser bundle "
+                  "is hardened without get-task-allow; `sudo -n true` failed) -- see "
+                  "docs/runbooks/mouser-heap-classes-soak.md; 'classes' will be null in every sample",
+                  file=sys.stderr)
+            heap_tool = None
 
     for out, p, label, exe in zip(outs, procs, a.label, a.exe):
         ensure_header(out, make_header(p, a.interval, seat, restart_source(label, exe)))

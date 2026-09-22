@@ -377,6 +377,13 @@ mouser_backup_config() { # copy config.json -> config.json.pre-deploy-<ts>, keep
 
 # jq: .version strictly increased AND del(.version) of the pre-deploy config is
 # a (recursive) subset of the post-run config. Any parse problem -> not allowed.
+#
+# By design this rule refuses key REMOVALS and RENAMES (a pre-deploy key that
+# is gone or moved is a lost setting) and refuses same-version key ADDITIONS
+# (a rewrite without a migration is the app clobbering settings). A future
+# Mouser migration that legitimately removes or renames a key must bump this
+# deploy rule deliberately (e.g. an allowlist of removed keys per version)
+# in the same PR -- do not loosen the subset check to make a deploy pass.
 MOUSER_MIGRATION_JQ='
   def subset($x; $y):
     if ($x|type) == "object" then
