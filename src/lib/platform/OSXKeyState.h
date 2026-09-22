@@ -121,6 +121,10 @@ public:
     // replaces monotonicSeconds() (the clock sanitizeInjectedKeys() judges
     // hardware-modifier freshness with)
     std::function<double()> monotonicNow;
+    // replaces IsSecureEventInputEnabled(): while a password field owns
+    // input the event tap sees no keyboard events at all, so the freshness
+    // clock has no data and the stale-modifier sweep must not judge
+    std::function<bool()> secureInputEnabled;
   };
   void setHooks(Hooks hooks);
 
@@ -143,6 +147,22 @@ public:
 
   //! Which OS X modifier flag a modifier virtual key drives (0 if none)
   static CGEventFlags modifierFlagForVirtualKey(uint8_t virtualKey);
+
+  //! Tell the freshness clock whether hardware flagsChanged events can
+  //! currently reach noteHardwareModifierFlags() at all (the event tap is
+  //! installed and enabled). sanitizeInjectedKeys() judges a modifier stale
+  //! only when hardware has been observable for the whole
+  //! kHardwareModifierFreshS window: a tap that was down (epoch teardown,
+  //! disabled-by-timeout) or blind (secure input) leaves the stamps old for
+  //! a key the user is really holding. Safe to call from the tap thread.
+  void noteHardwareObservation(bool observing, double now);
+
+  //! True when hardware presses have been observable for \p seconds up to
+  //! \p at (see noteHardwareObservation)
+  bool hardwareObservableFor(double seconds, double at) const;
+
+  //! Whether a password field currently owns keyboard input (hookable)
+  bool secureInputEnabled() const;
 
 protected:
   // KeyState overrides
@@ -212,6 +232,22 @@ private:
   // next posted event carries the real global flags, not stale ones.
   void reseedShadowFlagsFromOS();
 
+  // Shadow modifier flags from an explicit flag word (what we just posted
+  // as the global flags, so getKeyboardEventFlags() agrees with the OS).
+  void setShadowFlags(CGEventFlags flags);
+
+  // The global flag word a modifier virtual key's Down/Up must carry.
+  // IOHIDPostEvent(..., kIOHIDSetGlobalEventFlags) REPLACES the system's
+  // modifier flags with the word we post, so it is derived from the LIVE
+  // OS flags (which already include every physical key) and only the bit
+  // this virtual key owns is set or cleared: the generic bit is cleared
+  // only when no right-hand device bit still holds it, and a Caps Up keeps
+  // the lock state. Never from the shadow -- a shadow that missed a
+  // physical Shift used to lowercase the user's next local keystrokes.
+  CGEventFlags modifierEventFlags(uint8_t virtualKey, bool down) const;
+  static CGEventFlags leftDeviceBitForVirtualKey(uint8_t virtualKey);
+  static CGEventFlags rightDeviceBitForVirtualKey(uint8_t virtualKey);
+
   // Caps lock state via IOHIDSystem (hookable). Return false when unknown.
   bool getCapsLockState(bool &on) const;
   bool setCapsLockState(bool on);
@@ -268,5 +304,11 @@ private:
       std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(),
       std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest()
   };
+  // whether hardware flagsChanged events can reach the freshness clock, and
+  // since when (monotonic seconds). Defaults to "observable since forever"
+  // so a bare OSXKeyState (tests, tools) keeps the sweep; OSXScreen owns
+  // the real value around the event tap's lifetime.
+  std::atomic<bool> m_hardwareObservable{true};
+  std::atomic<double> m_hardwareObservableSince{std::numeric_limits<double>::lowest()};
   Hooks m_hooks;
 };

@@ -198,15 +198,22 @@ struct HookedState
   bool capsSetSucceeds = true;
   int capsSetCalls = 0;
   double now = 100.0; // fake monotonic clock, seconds
+  bool secureInput = false;
 
   OSXKeyState::Hooks hooks()
   {
     OSXKeyState::Hooks h;
     h.monotonicNow = [this] { return now; };
+    h.secureInputEnabled = [this] { return secureInput; };
     h.osModifierFlags = [this] { return osFlags; };
     h.pressedKeys = [this](IKeyState::KeyButtonSet &out) { out = physical; };
     h.postHIDKey = [this](uint8_t vk, bool down, CGEventFlags flags) {
       posted.push_back({vk, down, flags});
+      // IOHIDPostEvent(..., kIOHIDSetGlobalEventFlags) semantics: a modifier
+      // post REPLACES the system's modifier flags with the posted word.
+      if (vk == kVK_Shift || vk == kVK_Control || vk == kVK_Option || vk == kVK_Command || vk == kVK_CapsLock) {
+        osFlags = flags;
+      }
       return KERN_SUCCESS;
     };
     h.getCapsLockState = [this](bool &on) {
@@ -607,8 +614,11 @@ void OSXKeyStateTests::fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet(
   QCOMPARE(os.posted.size(), size_t(1));
   QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Option));
   QVERIFY(!os.posted[0].down);
+  // the Up carries the user's Shift and drops only our Option (K5: live-derived)
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskAlternate) == 0);
   QVERIFY(keyState.injectedModifiers().empty());
-  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlternate | kCGEventFlagMaskShift));
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift));
 }
 
 void OSXKeyStateTests::primarySweepNeverReleasesPhysicallyCapturedShift()
@@ -837,6 +847,155 @@ bool OSXKeyStateTests::isKeyPressed(const OSXKeyState &keyState, KeyButton butto
     }
   }
   return false;
+}
+
+void OSXKeyStateTests::sanitizeSkipsStaleSweepWhileSecureInput()
+{
+  // K5: a password field owns input (lock screen, sudo, 1Password). The tap
+  // sees nothing, so a Shift the user is physically holding has no fresh
+  // stamp and read as stale: the sweep posted its Up with global flags,
+  // and the rest of the password came out lowercase. With secure input on
+  // the sweep must not judge at all. The ledger is still closed.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  keyState.fakeKey(stroke(kVK_Command, true)); // ours, ledgered
+  os.posted.clear();
+  os.secureInput = true;
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | kCGEventFlagMaskCommand;
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK, os.now - 30.0);
+
+  keyState.sanitizeInjectedKeys();
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Command));
+  QVERIFY(!os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0); // the user's Shift rides along
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskCommand) == 0);
+  QVERIFY(keyState.injectedModifiers().empty());
+  QVERIFY((keyState.getKeyboardEventFlags() & kCGEventFlagMaskShift) != 0);
+
+  // secure input off again: the (documented) boundary sweep is back
+  os.secureInput = false;
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK;
+  keyState.sanitizeInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(2));
+  QCOMPARE(int(os.posted[1].virtualKey), int(kVK_Shift));
+}
+
+void OSXKeyStateTests::sanitizeSkipsStaleSweepWithoutObservationWindow()
+{
+  // K5: the freshness clock only means something if the tap could have
+  // stamped it for the whole window. OSXScreen reports the tap's lifetime;
+  // right after an enable() (epoch restart) nothing is known yet.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK; // held, never stamped
+  keyState.noteHardwareObservation(false, os.now - 60.0);      // tap down (disable)
+  keyState.sanitizeInjectedKeys();
+  QVERIFY(os.posted.empty());
+
+  keyState.noteHardwareObservation(true, os.now - 0.5); // enable() half a second ago
+  keyState.sanitizeInjectedKeys();
+  QVERIFY(os.posted.empty());
+
+  // a re-report of "observing" does not restart the window
+  keyState.noteHardwareObservation(true, os.now);
+  os.now += OSXKeyState::kHardwareModifierFreshS; // 2.0 s after the enable
+  keyState.sanitizeInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Shift));
+
+  // a tap outage restarts it
+  os.posted.clear();
+  keyState.noteHardwareObservation(false, os.now);
+  keyState.noteHardwareObservation(true, os.now);
+  keyState.sanitizeInjectedKeys();
+  QVERIFY(os.posted.empty());
+}
+
+void OSXKeyStateTests::ledgerReleaseKeepsShiftHeldOnRightHandKey()
+{
+  // K5 / H2: IOHIDPostEvent with kIOHIDSetGlobalEventFlags REPLACES the
+  // system modifier flags with the word we post. Releasing OUR left Shift
+  // while the user holds the RIGHT Shift used to post Shift OFF (shadow-
+  // derived) and lowercase their next local keystroke. The Up must be
+  // derived from the live flags: left device bit gone, right device bit and
+  // the generic Shift kept -- and the shadow must agree afterwards.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  keyState.fakeKey(stroke(kVK_Shift, true));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Shift));
+  os.posted.clear();
+
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK;
+  keyState.releaseInjectedKeys();
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Shift));
+  QVERIFY(!os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0);
+  QVERIFY((os.posted[0].flags & NX_DEVICERSHIFTKEYMASK) != 0);
+  QVERIFY((os.posted[0].flags & NX_DEVICELSHIFTKEYMASK) == 0);
+  QVERIFY(keyState.injectedModifiers().empty());
+  QVERIFY((keyState.getKeyboardEventFlags() & kCGEventFlagMaskShift) != 0);
+
+  // control: only OUR left Shift held -> the Up clears Shift
+  keyState.fakeKey(stroke(kVK_Shift, true));
+  os.posted.clear();
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK;
+  keyState.releaseInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(1));
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) == 0);
+  QVERIFY((keyState.getKeyboardEventFlags() & kCGEventFlagMaskShift) == 0);
+}
+
+void OSXKeyStateTests::modifierPostFlagsDeriveFromLiveOsNotShadow()
+{
+  // K5 / H2: the shadow last reseeded long ago; meanwhile the user pressed
+  // Control on this keyboard (the OS knows, the shadow does not). Posting
+  // a modifier Down from the shadow would have replaced the global flags
+  // with Control OFF. The word posted must carry the live Control plus the
+  // bit we own, and the shadow must be brought in step.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(0)); // shadow: nothing
+
+  os.osFlags = kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK; // live: user's Control
+  keyState.fakeKey(stroke(kVK_Shift, true));
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QVERIFY(os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskControl) != 0);
+  QVERIFY((os.posted[0].flags & NX_DEVICELCTLKEYMASK) != 0);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0);
+  QVERIFY((os.posted[0].flags & NX_DEVICELSHIFTKEYMASK) != 0);
+  QCOMPARE(
+      keyState.getModifierStateAsOSXFlags() & (kCGEventFlagMaskControl | kCGEventFlagMaskShift),
+      CGEventFlags(kCGEventFlagMaskControl | kCGEventFlagMaskShift)
+  );
+
+  // a Caps Up never clears the lock state the OS reports
+  os.posted.clear();
+  os.osFlags = kCGEventFlagMaskAlphaShift;
+  keyState.fakeKey(stroke(kVK_CapsLock, true));
+  keyState.fakeKey(stroke(kVK_CapsLock, false));
+  QCOMPARE(os.posted.size(), size_t(2));
+  QVERIFY((os.posted[1].flags & kCGEventFlagMaskAlphaShift) != 0);
 }
 
 QTEST_MAIN(OSXKeyStateTests)

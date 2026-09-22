@@ -41,6 +41,11 @@ private Q_SLOTS:
   void setToggleStateFallsBackToFakeCapsPress();
   void setToggleStateIgnoresNumAndScrollLock();
   void setToggleStateKeepsTrackedMaskInStep();
+  // K5: local-keyboard capitalization at password prompts
+  void sanitizeSkipsStaleSweepWhileSecureInput();
+  void sanitizeSkipsStaleSweepWithoutObservationWindow();
+  void ledgerReleaseKeepsShiftHeldOnRightHandKey();
+  void modifierPostFlagsDeriveFromLiveOsNotShadow();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);
