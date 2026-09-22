@@ -984,6 +984,13 @@ void KeyState::fakeAllKeysUp()
   memset(&m_serverKeys, 0, sizeof(m_serverKeys));
   m_activeModifiers.clear();
   m_mask = pollActiveModifiers();
+  // Rebuild the modifier -> key-item table from the reseeded mask, exactly
+  // as updateKeyState does (K4 audit B-2): a modifier the OS reports held
+  // (the user's own Shift, or one we injected before a resync) needs a key
+  // item here, or KeyMap can never synthesise its release when a later key
+  // requires that modifier off.
+  AddActiveModifierContext addModifierContext(pollActiveGroup(), m_mask, m_activeModifiers);
+  m_keyMap.foreachKey(&KeyState::addActiveModifierCB, &addModifierContext);
 }
 
 bool KeyState::fakeMediaKey(KeyID)

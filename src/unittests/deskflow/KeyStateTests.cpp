@@ -228,4 +228,61 @@ void KeyStateTests::fakeAllKeysUp_releasesOnlySyntheticThenReseeds()
   QCOMPARE(keyState.getActiveModifiers(), KeyModifierShift);
 }
 
+// K4 audit B-2: fakeAllKeysUp reseeds m_mask from the OS but used to leave
+// m_activeModifiers empty, so a modifier the OS reports held had no key item
+// and KeyMap could never synthesise its release: the next 'a' went out with
+// Shift still down and typed 'A'. After the fix the table is rebuilt like
+// updateKeyState does, and the Shift release precedes the letter.
+void KeyStateTests::fakeAllKeysUp_reseedsActiveModifiers_osHeldShiftIsReleasable()
+{
+  constexpr KeyButton kAButton = 1;
+  constexpr KeyButton kShiftButton = 2;
+  deskflow::KeyMap keyMap;
+  deskflow::KeyMap::KeyItem shift;
+  shift.m_id = kKeyShift_L;
+  shift.m_button = kShiftButton;
+  shift.m_group = 0;
+  shift.m_generates = KeyModifierShift;
+  keyMap.addKeyEntry(shift);
+  deskflow::KeyMap::KeyItem a;
+  a.m_id = static_cast<KeyID>('a');
+  a.m_button = kAButton;
+  a.m_group = 0;
+  a.m_required = 0;
+  a.m_sensitive = KeyModifierShift;
+  keyMap.addKeyEntry(a);
+  deskflow::KeyMap::KeyItem upperA;
+  upperA.m_id = static_cast<KeyID>('A');
+  upperA.m_button = kAButton;
+  upperA.m_group = 0;
+  upperA.m_required = KeyModifierShift;
+  upperA.m_sensitive = KeyModifierShift;
+  keyMap.addKeyEntry(upperA);
+  keyMap.finish();
+  MockEventQueue eventQueue;
+  ShiftHeldKeyState keyState(eventQueue, keyMap);
+
+  // resync with an empty ledger: nothing posted, mask reseeded to OS truth
+  keyState.fakeAllKeysUp();
+  QVERIFY(keyState.posted.empty());
+  QCOMPARE(keyState.getActiveModifiers(), KeyModifierShift);
+
+  // the server wants a lowercase 'a': Shift must be released first
+  keyState.fakeKeyDown(a.m_id, 0, 7, "en");
+  size_t shiftReleaseAt = keyState.posted.size();
+  size_t aPressAt = keyState.posted.size();
+  for (size_t i = 0; i < keyState.posted.size(); ++i) {
+    const auto &p = keyState.posted[i];
+    if (p.button == kShiftButton && !p.press && shiftReleaseAt == keyState.posted.size()) {
+      shiftReleaseAt = i;
+    }
+    if (p.button == kAButton && p.press) {
+      aPressAt = i;
+    }
+  }
+  QVERIFY2(shiftReleaseAt < keyState.posted.size(), "no Shift release was synthesised");
+  QVERIFY2(aPressAt < keyState.posted.size(), "the letter was not pressed");
+  QVERIFY(shiftReleaseAt < aPressAt);
+}
+
 QTEST_MAIN(KeyStateTests)
