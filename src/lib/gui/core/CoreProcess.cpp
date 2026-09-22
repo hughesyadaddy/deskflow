@@ -279,6 +279,10 @@ bool CoreProcess::hasExternalSupervisor() const
   // spawn a core. The old `launchctl print` probe timed out at login storms and the
   // GUI then spawned its own core, leaving launchd's agent looping on exit 5; a
   // file stat cannot time out. Without the agent (dev machines) the GUI spawns.
+  // This stays plist-based on purpose (unlike macLaunchdOwnsGui, which is
+  // env-only): the question here is "does launchd own the CORE on this box",
+  // which is true for every GUI copy, launchd's or not -- a Login Item copy
+  // must not spawn a second core just because launchd did not start *it*.
 #ifdef Q_OS_MACOS
   return macLaunchdOwnsCore();
 #else

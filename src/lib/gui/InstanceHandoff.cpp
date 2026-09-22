@@ -7,7 +7,9 @@
 #include "InstanceHandoff.h"
 
 #include <QDebug>
+#include <QElapsedTimer>
 #include <QLocalServer>
+#include <QThread>
 #include <QLocalSocket>
 
 namespace deskflow::gui {
@@ -93,6 +95,21 @@ bool InstanceHandoffServer::requestShow(const QString &socketName, int timeoutMs
 bool InstanceHandoffServer::requestQuit(const QString &socketName, int timeoutMs)
 {
   return send(socketName, kQuit, timeoutMs);
+}
+
+bool InstanceHandoffServer::requestQuitRetrying(const QString &socketName, int totalMs, int attemptMs)
+{
+  QElapsedTimer clock;
+  clock.start();
+  while (true) {
+    if (send(socketName, kQuit, attemptMs)) {
+      return true;
+    }
+    if (clock.elapsed() >= totalMs) {
+      return false;
+    }
+    QThread::msleep(200);
+  }
 }
 
 } // namespace deskflow::gui

@@ -247,6 +247,45 @@ build_install_deskflow() {
   verify_login_bridge_plist "$install_app"
 }
 
+# The ONE fatal single-launcher gate, after everything is installed (agents,
+# bridge check, Mouser): install-macos.sh's own assert-single is report-only
+# so a seat with pending human steps (a BTM login item, root-owned retired
+# files) is still fully deployed before this exits non-zero.
+final_single_launcher_gate() {
+  local ctl="$DESKFLOW_ROOT/scripts/deskflow-ctl"
+  local install_app="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
+  [[ -x "$ctl" ]] || fail "deskflow-ctl missing at $ctl; cannot assert a single launcher"
+  echo "== [$HOST_TAG] retired files (deskflow-ctl retire) =="
+  local retire_out
+  retire_out="$(DESKFLOW_INSTALL_APP="$install_app" "$ctl" retire 2>&1)" || true # fleet:allow exit 2 = root steps, listed below
+  echo "$retire_out"
+  echo "== [$HOST_TAG] single launcher (deskflow-ctl assert-single, fatal) =="
+  local assert_out
+  if assert_out="$(DESKFLOW_INSTALL_APP="$install_app" "$ctl" assert-single 2>&1)"; then
+    echo "$assert_out"
+    return 0
+  fi
+  echo "$assert_out"
+  local steps
+  steps="$(DESKFLOW_INSTALL_APP="$install_app" "$ctl" login-items print-steps 2>&1 || true)" # fleet:allow best-effort detail for the block below
+  cat <<EOF
+
+################################################################################
+# HUMAN STEP REQUIRED on $HOST_TAG -- the seat IS deployed (agents, bridge,
+# Mouser), but more than one launcher survives. Fix each line, then re-run:
+#   $ctl assert-single
+################################################################################
+$(echo "$assert_out" | sed -n '2,$p' | sed 's/^  /  - /')
+
+  exact commands / UI paths:
+$(echo "$retire_out" | grep -E '^\s*sudo ' | sed 's/^ */    /')
+$(echo "$steps" | grep -vE 'nothing to remove' | sed 's/^ */    /')
+    (retired root files: $ctl retire; login items: $ctl login-items print-steps)
+################################################################################
+EOF
+  fail "deskflow-ctl assert-single failed on $HOST_TAG after a full deploy -- see HUMAN STEP REQUIRED above"
+}
+
 # The LoginWindow bridge plist lives in /Library/LaunchAgents (root) and this
 # script never escalates, so it can only be rendered and compared here; a
 # stale one is reported as a root step, never fixed silently.
@@ -331,6 +370,7 @@ main() {
     build_install_deskflow
   fi
   deploy_mouser
+  final_single_launcher_gate
   echo "=== done: $HOST_TAG ==="
 }
 

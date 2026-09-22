@@ -41,6 +41,13 @@ create_test(
 )
 
 create_test(
+  NAME LaunchOwnershipTests
+  DEPENDS gui
+  SOURCE LaunchOwnershipTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/gui"
+)
+
+create_test(
   NAME InstanceHandoffTests
   DEPENDS gui
   SOURCE InstanceHandoffTests.cpp

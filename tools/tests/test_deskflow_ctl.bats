@@ -1,10 +1,13 @@
 #!/usr/bin/env bats
 # scripts/deskflow-ctl — launchd is the only owner of Deskflow on macOS.
 #
-# launchctl / ps / kill / sleep are PATH shims. Fake launchd state lives in
-# $SHIM_STATE: loaded/<label> marks a bootstrapped agent, pid/<label> is the
-# pid launchd reports, and ps.txt is the process table (pid uid path; uid
-# defaults to the caller's, since stop only owns this user's processes).
+# launchctl / ps / kill / sleep / sfltool are PATH shims. Fake launchd state
+# lives in $SHIM_STATE: loaded/<label> marks a bootstrapped agent, pid/<label>
+# is the pid launchd reports, ps.txt is the process table (pid uid path; uid
+# defaults to the caller's, since stop only owns this user's processes),
+# ppid/<pid> a parent pid (default 1 = launchd), domain.txt the `launchctl
+# print gui/$UID` listing, and btm.txt the `sfltool dumpbtm` output (default:
+# the fleet-agents-only fixture; btm.rc + btm.err fake a privilege refusal).
 
 SCRIPT="$BATS_TEST_DIRNAME/../../scripts/deskflow-ctl"
 REPO="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
@@ -28,6 +31,11 @@ echo "launchctl $*" >> "$SHIM_LOG"
 verb="$1"; shift
 case "$verb" in
   print)
+    if [[ "$1" != */*/* ]]; then
+      # domain listing (gui/$UID): runningboard instances etc.
+      cat "$SHIM_STATE/domain.txt" 2>/dev/null
+      exit 0
+    fi
     label="${1##*/}"
     [[ -f "$SHIM_STATE/loaded/$label" ]] || exit 113
     echo "$label = {"
@@ -61,7 +69,24 @@ EOF
 
   make_shim ps <<'EOF'
 echo "ps $*" >> "$SHIM_LOG"
+if [[ "${1:-}" == "-o" && "${2:-}" == "ppid=" ]]; then
+  cat "$SHIM_STATE/ppid/$4" 2>/dev/null || echo 1
+  exit 0
+fi
 cat "$SHIM_STATE/ps.txt"
+EOF
+
+  # Background Task Management dump: the audit never PASSes without one.
+  mkdir -p "$SHIM_STATE/ppid"
+  cp "$BATS_TEST_DIRNAME/fixtures/btm-dump-fleet-agents-only.txt" "$SHIM_STATE/btm.txt"
+  make_shim sfltool <<'EOF'
+echo "sfltool $*" >> "$SHIM_LOG"
+[[ "${1:-}" == "dumpbtm" ]] || { echo "unexpected sfltool verb $1" >&2; exit 64; }
+if [[ -f "$SHIM_STATE/btm.rc" ]]; then
+  cat "$SHIM_STATE/btm.err" 2>/dev/null >&2
+  exit "$(cat "$SHIM_STATE/btm.rc")"
+fi
+cat "$SHIM_STATE/btm.txt"
 EOF
 
   make_shim kill <<'EOF'
@@ -91,6 +116,9 @@ EOF
   export DESKFLOW_CTL_STOP_TIMEOUT=1
   export DESKFLOW_CTL_ESCALATE_TIMEOUT=1
   export DESKFLOW_CTL_START_TIMEOUT=1
+  # Retired root-owned files: never probe the real /usr/local or /Library.
+  export DESKFLOW_CTL_RETIRED_PRIO_APPLY="$TMP/usr-local-bin/deskflow-prio-apply.sh"
+  export DESKFLOW_CTL_RETIRED_SYNERGY_AGENT="$TMP/LibraryLaunchAgents/com.symless.synergy-agent.plist"
 }
 
 teardown() {
@@ -103,6 +131,12 @@ make_shim() {
 }
 
 add_proc() { printf '%s\t%s\t%s\n' "$1" "${3:-$(id -u)}" "$2" >>"$SHIM_STATE/ps.txt"; }
+set_ppid() { echo "$2" >"$SHIM_STATE/ppid/$1"; }
+use_btm() { cp "$BATS_TEST_DIRNAME/fixtures/btm-dump-$1.txt" "$SHIM_STATE/btm.txt"; }
+healthy_seat() {
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  load_agent $GUI 301;  add_proc 301 "$APP/Contents/MacOS/Deskflow"
+}
 load_agent() { touch "$SHIM_STATE/loaded/$1"; [[ -n "${2:-}" ]] && echo "$2" >"$SHIM_STATE/pid/$1"; return 0; }
 autostart() { mkdir -p "$SHIM_STATE/autostart"; echo "$2" >"$SHIM_STATE/autostart/$1"; echo "$3" >"$SHIM_STATE/autostart/$1.path"; }
 
@@ -140,13 +174,15 @@ DOMAIN="gui/$(id -u)"
   [[ "$output" == *"escalating: SIGKILL"* ]]
   [ ! -s "$SHIM_STATE/ps.txt" ]
   # No pattern-based killing or `open` anywhere in the ctl (comments excluded).
-  # osascript is allowed for one thing only: the converge toast (notify()).
+  # osascript is allowed for two things only: the converge toast (notify())
+  # and the legacy login-item delete behind `login-items audit --fix`.
   run grep -E '^[^#]*[[:space:]](pkill|pgrep|killall|open)[[:space:]]' "$SCRIPT"
   [ "$status" -ne 0 ]
   run grep -cE '^[^#]*[[:space:]]osascript[[:space:]]' "$SCRIPT"
-  [ "$output" -eq 1 ]
+  [ "$output" -eq 2 ]
   run grep -E '^[^#]*[[:space:]]osascript[[:space:]]' "$SCRIPT"
   [[ "$output" == *"display notification"* ]]
+  [[ "$output" == *"delete login item"* ]]
 }
 
 @test "stop is a no-op when nothing is loaded or running" {
@@ -351,6 +387,218 @@ PRIO=io.github.hughesyadaddy.deskflow-prio
 
 add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Contents/MacOS/deskflow-prio"; }
 
+@test "assert-single fails when the GUI pid is not launchd's (Login Item copy holds the lock)" {
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  load_agent $GUI 301;  add_proc 2141 "$APP/Contents/MacOS/Deskflow"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Deskflow GUI pid 2141 is not launchd's (301)"* ]]
+
+  : >"$SHIM_STATE/ps.txt"; rm -f "$SHIM_STATE/pid/$GUI"
+  add_proc 300 "$APP/Contents/MacOS/deskflow-core"; add_proc 2141 "$APP/Contents/MacOS/Deskflow"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$GUI has no running pid under launchd"* ]]
+}
+
+@test "assert-single fails when core ppid is not 1 (GUI-spawned core)" {
+  healthy_seat
+  set_ppid 300 301
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"deskflow-core pid 300 ppid=301 (want 1: launchd)"* ]]
+  log_has "ps -o ppid= -p 300"
+  set_ppid 300 1
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 0 ]
+}
+
+@test "assert-single fails on a runningboard application.* instance in the user domain" {
+  healthy_seat
+  printf 'gui/501 = {\n\tservices = {\n\t\t0\t-\t%s\n\t\t2141\t-\tapplication.%s.1234.5678\n\t\t0\t-\tcom.apple.foo\n\t}\n}\n' "$GUI" "$GUI" >"$SHIM_STATE/domain.txt"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"runningboard instance application.$GUI.1234.5678"* ]]
+  log_has "launchctl print $DOMAIN"
+  # the agent's own label in the listing is not an instance
+  printf 'gui/501 = {\n\tservices = {\n\t\t301\t-\t%s\n\t}\n}\n' "$GUI" >"$SHIM_STATE/domain.txt"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 0 ]
+}
+
+@test "assert-single fails on retired files and passes once retire removed the user-owned one" {
+  healthy_seat
+  mkdir -p "$HOME/Library/Logs/Deskflow"; : >"$HOME/Library/Logs/Deskflow/deskflow-keepalive.log"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"retired file present: $HOME/Library/Logs/Deskflow/deskflow-keepalive.log"* ]]
+  run bash "$SCRIPT" retire
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 0 ]
+}
+
+@test "assert-single runs the login-items audit and fails on an enabled BTM app record" {
+  healthy_seat
+  use_btm two-app-records
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"login-items audit FAIL: enabled BTM app record"* ]]
+  log_has "sfltool dumpbtm"
+}
+
+# --- login-items -------------------------------------------------------------
+
+@test "login-items audit parses the dumpbtm fixture and fails on an enabled app record with the manual step" {
+  use_btm two-app-records
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"login-items: FAIL"* ]]
+  [[ "$output" == *"2.io.github.hughesyadaddy.deskflow (file:///Applications/Deskflow.app/)"* ]]
+  [[ "$output" == *"2.org.deskflow.deskflow"* ]]
+  [[ "$output" == *'System Settings -> General -> Login Items & Extensions -> "Open at Login" -> remove "Deskflow"'* ]]
+  [[ "$output" == *"more than one enabled BTM app/login-item record for /Applications/Deskflow.app"* ]]
+  [[ "$output" == *"sfltool resetbtm"* ]]
+  # never the osascript delete by default
+  log_lacks "osascript"
+  # the pure parser yields exactly identifier/type/disposition/url per record
+  sed -n '/^parse_btm_dump()/,/^}/p' "$SCRIPT" >"$TMP/parse_btm_dump.sh"
+  run bash -c "source '$TMP/parse_btm_dump.sh'; parse_btm_dump <'$BATS_TEST_DIRNAME/fixtures/btm-dump-two-app-records.txt'"
+  [ "$status" -eq 0 ]
+  [ "$(echo "$output" | wc -l | tr -d ' ')" = 8 ]
+  [[ "$output" == *$'2.io.github.hughesyadaddy.deskflow\tapp\tenabled, allowed, not notified\tfile:///Applications/Deskflow.app/'* ]]
+  [[ "$output" == *$'16.com.carriez.RustDesk_service\tlegacy daemon\tenabled, allowed, notified\tfile:///Library/LaunchDaemons/com.carriez.RustDesk_service.plist'* ]]
+  # a sub-list "#1: 16.com..." line never becomes a record
+  [ "$(echo "$output" | awk -F'\t' 'NF != 4' | wc -l | tr -d ' ')" = 0 ]
+}
+
+@test "login-items audit allows the fleet agent records (core, gui, converge, prio daemon, vhid-bridge)" {
+  use_btm fleet-agents-only
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"login-items: OK"* ]]
+  # a foreign enabled login item (Synergy) is a second launcher
+  use_btm synergy-login-item
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'remove "Synergy"'* ]]
+  # a disabled app record is not a launcher, but two records still fail
+  awk '/^ #5:/{skip=1} /^ #6:/{skip=0} !skip' "$BATS_TEST_DIRNAME/fixtures/btm-dump-two-app-records.txt" |
+    sed 's/Disposition: \[enabled, allowed, not notified\] (0x3)/Disposition: [disabled, allowed, not notified] (0x2)/' >"$SHIM_STATE/btm.txt"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 0 ]
+}
+
+@test "login-items audit passes the adversarial dump: look-alike names, a sibling's agent, a DISABLED Deskflow login item" {
+  use_btm adversarial
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"login-items: OK"* ]]
+  # "Desk Flow Notes" / "Barrier Breaker" are not launchers of ours; the
+  # disabled 4.io.github.hughesyadaddy.deskflow record is not a launcher at all.
+  [[ "$output" != *"Desk Flow"* ]]
+  [[ "$output" != *"Barrier Breaker"* ]]
+  # flip the Deskflow login item to enabled: the only thing that may fail it
+  sed 's/Disposition: \[disabled, allowed, not notified\] (0x2)/Disposition: [enabled, allowed, not notified] (0x3)/' \
+    "$BATS_TEST_DIRNAME/fixtures/btm-dump-adversarial.txt" >"$SHIM_STATE/btm.txt"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"4.io.github.hughesyadaddy.deskflow"* ]]
+  [[ "$output" != *"Desk Flow"* ]]
+  # a real barrier bundle id (component match) is a launcher
+  sed -e 's/2.com.game.barrierbreaker/2.com.github.debauchee.barrier/' -e 's#Barrier%20Breaker.app#Barrier.app#' \
+    "$BATS_TEST_DIRNAME/fixtures/btm-dump-adversarial.txt" >"$SHIM_STATE/btm.txt"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"2.com.github.debauchee.barrier"* ]]
+}
+
+@test "login-items audit URL-decodes the bundle name in the System Events step" {
+  sed 's#file:///Applications/Deskflow.app/#file:///Applications/Deskflow%20Fleet.app/#' \
+    "$BATS_TEST_DIRNAME/fixtures/btm-dump-two-app-records.txt" >"$SHIM_STATE/btm.txt"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'delete login item "Deskflow Fleet"'* ]]
+  [[ "$output" != *'Deskflow%20Fleet'* ]]
+  [[ "$output" == *"more than one enabled BTM app/login-item record for /Applications/Deskflow Fleet.app"* ]]
+}
+
+@test "login-items audit reports SKIP (exit 3, never PASS) with the sudo hint when dumpbtm needs privileges" {
+  echo 1 >"$SHIM_STATE/btm.rc"; echo "Error: dumpbtm requires root privileges" >"$SHIM_STATE/btm.err"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"login-items: SKIP"* ]]
+  [[ "$output" == *"sudo sfltool dumpbtm | $REPO/scripts/deskflow-ctl login-items audit --stdin"* ]]
+  # assert-single never passes on a SKIP
+  healthy_seat
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"login-items audit SKIPPED (never a pass)"* ]]
+  # --stdin is the way through
+  run bash -c "bash '$SCRIPT' login-items audit --stdin <'$BATS_TEST_DIRNAME/fixtures/btm-dump-fleet-agents-only.txt'"
+  [ "$status" -eq 0 ]
+}
+
+@test "login-items audit --fix tries the legacy System Events delete once, then re-audits; print-steps lists only the steps" {
+  use_btm two-app-records
+  run bash "$SCRIPT" login-items audit --fix
+  [ "$status" -eq 1 ]
+  log_has 'osascript -e tell application "System Events" to delete login item "Deskflow"'
+  [ "$(grep -c '^sfltool dumpbtm' "$SHIM_LOG")" = 2 ]
+  run bash "$SCRIPT" login-items print-steps
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'remove "Deskflow"'* ]]
+  [[ "$output" != *"FAIL:"* ]]
+}
+
+# --- retire ------------------------------------------------------------------
+
+@test "retire removes the keepalive log and prints (never runs) the root steps; exit 2 while they remain" {
+  mkdir -p "$HOME/Library/Logs/Deskflow" "$(dirname "$DESKFLOW_CTL_RETIRED_PRIO_APPLY")" "$(dirname "$DESKFLOW_CTL_RETIRED_SYNERGY_AGENT")"
+  : >"$HOME/Library/Logs/Deskflow/deskflow-keepalive.log"
+  : >"$DESKFLOW_CTL_RETIRED_PRIO_APPLY"
+  ln -s /nonexistent "$DESKFLOW_CTL_RETIRED_SYNERGY_AGENT"
+  run bash "$SCRIPT" retire
+  [ "$status" -eq 2 ]
+  [ ! -e "$HOME/Library/Logs/Deskflow/deskflow-keepalive.log" ]
+  [[ "$output" == *"removed $HOME/Library/Logs/Deskflow/deskflow-keepalive.log"* ]]
+  [[ "$output" == *"sudo rm -f \"$DESKFLOW_CTL_RETIRED_PRIO_APPLY\""* ]]
+  [[ "$output" == *"sudo rm -f \"$DESKFLOW_CTL_RETIRED_SYNERGY_AGENT\""* ]]
+  [ -e "$DESKFLOW_CTL_RETIRED_PRIO_APPLY" ]
+  [ -L "$DESKFLOW_CTL_RETIRED_SYNERGY_AGENT" ]
+  log_lacks "sudo"
+  rm -f "$DESKFLOW_CTL_RETIRED_PRIO_APPLY" "$DESKFLOW_CTL_RETIRED_SYNERGY_AGENT"
+  run bash "$SCRIPT" retire
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"nothing left to retire"* ]]
+}
+
+# --- stale loaded agent ------------------------------------------------------
+
+@test "start boots out a loaded agent whose installed plist is stale before bootstrapping the fresh render" {
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  mkdir -p "$DESKFLOW_CTL_AGENT_DIR"
+  echo "<plist>stale: no DESKFLOW_LAUNCHD</plist>" >"$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$CORE: installed plist was stale while loaded; bootout then bootstrap"* ]]
+  log_has "launchctl bootout $DOMAIN/$CORE"
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  out_line="$(grep -n "bootout $DOMAIN/$CORE" "$SHIM_LOG" | cut -d: -f1)"
+  bs_line="$(grep -n "bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist" "$SHIM_LOG" | cut -d: -f1)"
+  [ "$out_line" -lt "$bs_line" ]
+  log_lacks "launchctl kickstart $DOMAIN/$CORE"
+  grep -q "DESKFLOW_LAUNCHD" "$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  # an up-to-date loaded agent is still only kickstarted (no bootout)
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 0 ]
+  log_lacks "launchctl bootout $DOMAIN/$CORE"
+  log_has "launchctl kickstart $DOMAIN/$CORE"
+}
+
 @test "prio renders the LaunchDaemon template with the bundle path and prints the exact sudo steps when not root" {
   add_prio_binary
   run bash "$SCRIPT" prio
@@ -504,6 +752,26 @@ healthy() {
   grep -q "^302" "$SHIM_STATE/ps.txt"
   # plan mode reports the same state but never fails
   run bash "$SCRIPT" converge
+  [ "$status" -eq 0 ]
+}
+
+@test "converge --apply exits 1 with a toast while a BTM app record is enabled; plan mode only reports it" {
+  healthy_seat; load_agent $CONVERGE
+  use_btm two-app-records
+  run bash "$SCRIPT" converge --apply --quiet
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"converge: FAILED: login-items: enabled BTM app record"* ]]
+  [[ "$output" == *"System Settings -> General -> Login Items"* ]]
+  log_has "osascript -e display notification"
+  log_lacks "delete login item"
+  grep -q '"errors": \["login-items: ' "$STATE/health.json"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"converge: plan (plan): login-items: enabled BTM app record"* ]]
+  log_lacks "osascript -e display notification"
+  use_btm fleet-agents-only
+  run bash "$SCRIPT" converge --apply --quiet
   [ "$status" -eq 0 ]
 }
 

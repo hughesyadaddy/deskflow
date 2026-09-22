@@ -29,6 +29,7 @@ add_library(${target} STATIC
   Hotkey.h
   InstanceHandoff.cpp
   InstanceHandoff.h
+  LaunchOwnership.h
   ChordRemap.cpp
   ChordRemap.h
   KeySequence.cpp

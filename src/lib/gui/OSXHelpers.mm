@@ -159,8 +159,16 @@ bool launchAgentInstalled(const char *label)
 
 bool macLaunchdOwnsGui()
 {
-  return launchAgentInstalled("io.github.hughesyadaddy.deskflow") ||
-         qEnvironmentVariable("DESKFLOW_LAUNCHD") == QLatin1String("1");
+  // Environment only, never the plist: the plist exists for every copy of the
+  // GUI on the box (the LaunchAgent one AND a BTM/Login Item one), so a file
+  // test made the unmanaged incumbent claim "launchd owns me", refuse the
+  // handoff, and leave launchd's copy exiting 5 at every login.
+  return qEnvironmentVariable("DESKFLOW_LAUNCHD") == QLatin1String("1");
+}
+
+bool macGuiLaunchAgentInstalled()
+{
+  return launchAgentInstalled("io.github.hughesyadaddy.deskflow");
 }
 
 bool macLaunchdOwnsCore()

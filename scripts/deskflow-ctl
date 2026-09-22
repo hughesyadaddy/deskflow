@@ -13,6 +13,23 @@
 #                                       install+bootstrap it when root, otherwise
 #                                       print the exact sudo commands (also run by
 #                                       `start`)
+#   scripts/deskflow-ctl login-items audit [--fix] [--stdin]
+#                                       one launcher only: parse `sfltool dumpbtm`
+#                                       and FAIL (exit 1) on any enabled BTM app /
+#                                       login-item record for deskflow|synergy|
+#                                       barrier, or more than one such app record;
+#                                       the fleet LaunchAgents are allowed. Prints
+#                                       the exact System Settings step. SKIP (exit
+#                                       3, never PASS) when dumpbtm needs root.
+#                                       --fix first tries the legacy System Events
+#                                       delete, then re-audits. --stdin reads a dump
+#                                       from stdin (`sudo sfltool dumpbtm | ...`).
+#   scripts/deskflow-ctl login-items print-steps
+#                                       print the manual removal steps only
+#   scripts/deskflow-ctl retire         remove retired fleet files this user owns
+#                                       (keepalive log); print, never run, the sudo
+#                                       lines for the root-owned ones. Exit 2 while
+#                                       root steps remain.
 #   scripts/deskflow-ctl converge [--apply] [--quiet]
 #                                       report-and-repair: re-render stale plists,
 #                                       enable + bootstrap unloaded agents, kickstart
@@ -23,7 +40,8 @@
 #                                       is present; at most 3 start actions per
 #                                       rolling hour, then report-only. Writes
 #                                       ~/Library/Application Support/Deskflow/health.json.
-#                                       Exit 1 when --apply leaves assert-single failing.
+#                                       Exit 1 when --apply leaves assert-single failing
+#                                       or the login-items audit fails.
 #
 # launchd is the only owner of deskflow-core and the GUI:
 #   gui/$UID/io.github.hughesyadaddy.deskflow-core     deskflow-core auto (KeepAlive on crash)
@@ -38,7 +56,9 @@
 # Env: DESKFLOW_INSTALL_APP (default /Applications/Deskflow.app),
 #      DESKFLOW_CTL_STOP_TIMEOUT / DESKFLOW_CTL_START_TIMEOUT (seconds),
 #      DESKFLOW_CTL_DAEMON_DIR (default /Library/LaunchDaemons),
-#      DESKFLOW_CTL_DAEMON_STAGE_DIR (default ~/Library/Deskflow/launchd).
+#      DESKFLOW_CTL_DAEMON_STAGE_DIR (default ~/Library/Deskflow/launchd),
+#      DESKFLOW_CTL_RETIRED_PRIO_APPLY / DESKFLOW_CTL_RETIRED_SYNERGY_AGENT
+#      (retired root-owned paths; overridable for tests only).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -69,6 +89,21 @@ CONVERGE_BUDGET=3
 CONVERGE_BUDGET_WINDOW=3600
 DEPLOY_LOCK_MAX_AGE=1800
 DOMAIN="gui/$(id -u)"
+# Retired launchers/logs from earlier fleet designs. The keepalive log is this
+# user's (retire removes it); the other two are root-owned (retire prints the
+# sudo lines). All three fail assert-single while present.
+RETIRED_KEEPALIVE_LOG="$LOG_DIR/deskflow-keepalive.log"
+RETIRED_KEEPALIVE_LOG_OLD="$HOME/Library/Logs/deskflow-keepalive.log"
+RETIRED_PRIO_APPLY="${DESKFLOW_CTL_RETIRED_PRIO_APPLY:-/usr/local/bin/deskflow-prio-apply.sh}"
+RETIRED_SYNERGY_AGENT="${DESKFLOW_CTL_RETIRED_SYNERGY_AGENT:-/Library/LaunchAgents/com.symless.synergy-agent.plist}"
+# BTM (Background Task Management) records that may launch Deskflow: the fleet
+# LaunchAgents, the prio LaunchDaemon and the login-window bridge. Any other
+# enabled app / login-item record whose BUNDLE ID is ours or a KVM sibling's
+# is a second launcher. Bundle-id components, never free substrings: "Desk
+# Flow Notes" (com.acme.deskflownotes) and "Barrier Breaker" are not launchers.
+BTM_ALLOWED_LABELS="$CORE_LABEL $GUI_LABEL $CONVERGE_LABEL $PRIO_LABEL org.deskflow.vhid-bridge"
+LOGIN_ITEM_ID_PATTERN='^(io\.github\.hughesyadaddy\.deskflow([.-]|$)|org\.deskflow(\.|$)|com\.symless(\.|$)|([a-z0-9-]+\.)*barrier(\.|$))'
+LOGIN_ITEM_BUNDLE_PATTERN='^(deskflow|synergy|barrier)\.app$'
 
 # `kill` is a bash builtin; disable it so the external binary is used and a
 # PATH shim can observe the escalation in tests.
@@ -129,6 +164,18 @@ agent_pid() {
   # script instead of yielding an empty string. `|| true` on the producer
   # keeps this a plain "no pid" result in every case.
   launchctl print "$DOMAIN/$1" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }' || true # fleet:allow launchctl exits non-zero when the label isn't loaded; empty output is the intended "no pid" result
+}
+
+proc_ppid() {
+  # Parent pid of $1 via ps (a PATH shim in tests); empty when the pid is gone.
+  ps -o ppid= -p "$1" 2>/dev/null | tr -d ' ' || true # fleet:allow exited pid = empty ppid
+}
+
+domain_services() {
+  # `launchctl print gui/$UID` lists every service in the user domain, including
+  # runningboard's application.<bundle-id>.<n> instances (a GUI launched by a
+  # Login Item, Finder or `open`). Empty when launchd will not answer.
+  launchctl print "$DOMAIN" 2>/dev/null || true # fleet:allow unreadable domain = no runningboard evidence
 }
 
 render_agent_to() {
@@ -237,13 +284,28 @@ EOF
   return 0
 }
 
+agent_plist_differs() {
+  # $1 = label. True when $AGENT_DIR/<label>.plist exists AND differs from a
+  # fresh render (a missing file is "not yet rendered", not "stale").
+  [[ -f "$AGENT_DIR/$1.plist" ]] && agent_plist_stale "$1"
+}
+
 bootstrap_agent() {
-  local label="$1" plist="$AGENT_DIR/$1.plist"
+  local label="$1" plist="$AGENT_DIR/$1.plist" reload=0
+  # launchd keeps the definition it loaded: a re-rendered file only takes
+  # effect at the next bootstrap. A loaded label whose installed plist is
+  # stale (macbookpro's GUI agent without DESKFLOW_LAUNCHD=1) must be booted
+  # out and bootstrapped again, or the old definition runs forever.
+  if agent_loaded "$label" && agent_plist_differs "$label"; then reload=1; fi
   render_agent "$label"
   # A label disabled by an earlier `launchctl disable` (or the Login Items
   # pane) makes bootstrap fail silently at login; enable is idempotent.
   launchctl enable "$DOMAIN/$label"
-  if agent_loaded "$label"; then
+  if (( reload )); then
+    log "$label: installed plist was stale while loaded; bootout then bootstrap"
+    launchctl bootout "$DOMAIN/$label" || die "launchctl bootout $DOMAIN/$label failed"
+    launchctl bootstrap "$DOMAIN" "$plist"
+  elif agent_loaded "$label"; then
     # Already loaded (e.g. previous start with KeepAlive false and a clean
     # exit): kickstart runs it if it is not running.
     launchctl kickstart "$DOMAIN/$label"
@@ -522,6 +584,24 @@ cmd_converge() {
   converge_agent "$CONVERGE_LABEL" "$apply" "$starts_ok" 0
   local gate="$CONVERGE_GATE"
 
+  # A second launcher (BTM app / login item) cannot be repaired from here: it
+  # is a manual System Settings step, surfaced as an error (toast, exit 1)
+  # under --apply and as a pending plan item otherwise.
+  local audit_out audit_rc=0 audit_line
+  audit_out="$(login_items_audit tool)" || audit_rc=$?
+  case "$audit_rc" in
+    0) ;;
+    3) CONVERGE_PLAN+=("login-items audit skipped: $(echo "$audit_out" | sed -n '2p' | sed 's/^ *//')") ;;
+    *)
+      audit_line="$(echo "$audit_out" | grep -m1 'FAIL:' | sed 's/^ *FAIL: //')"
+      if (( apply )); then
+        CONVERGE_ERRORS+=("login-items: ${audit_line:-second launcher present}; remove it in System Settings -> General -> Login Items (deskflow-ctl login-items print-steps)")
+      else
+        CONVERGE_PLAN+=("login-items: ${audit_line:-second launcher present} (manual: deskflow-ctl login-items print-steps)")
+      fi
+      ;;
+  esac
+
   local assert_out assert_rc=0
   assert_out="$(cmd_assert_single 2>&1)" || assert_rc=$?
   local assert_summary="OK"
@@ -553,6 +633,238 @@ cmd_converge() {
   fi
   (( verbose )) && echo "$assert_out"
   return "$failing"
+}
+
+# ------------------------------------------------------------ login items
+parse_btm_dump() {
+  # Pure: `sfltool dumpbtm` text on stdin -> one TSV line per record:
+  #   identifier<TAB>type<TAB>disposition<TAB>url
+  # e.g. "2.io.github.hughesyadaddy.deskflow\tapp\tenabled, allowed, not notified\tfile:///Applications/Deskflow.app/"
+  # Records start at a bare " #N:" line; "Embedded Item Identifiers" sub-lists
+  # (" #1: 16.com...") carry text after the colon and are not records.
+  awk '
+    function flush() {
+      if (id != "") printf "%s\t%s\t%s\t%s\n", id, type, disp, url
+      id = ""; type = ""; disp = ""; url = ""
+    }
+    /^[[:space:]]*#[0-9]+:[[:space:]]*$/ { flush(); next }
+    /^[[:space:]]*Records for UID/       { flush(); next }
+    /^[[:space:]]*Type:/ {
+      sub(/^[[:space:]]*Type:[[:space:]]*/, ""); sub(/[[:space:]]*\(0x[0-9a-fA-F]+\)[[:space:]]*$/, "")
+      type = $0; next
+    }
+    /^[[:space:]]*Disposition:/ {
+      sub(/^[[:space:]]*Disposition:[[:space:]]*\[/, ""); sub(/\].*$/, "")
+      disp = $0; next
+    }
+    /^[[:space:]]*Identifier:/ { sub(/^[[:space:]]*Identifier:[[:space:]]*/, ""); id = $0; next }
+    /^[[:space:]]*URL:/        { sub(/^[[:space:]]*URL:[[:space:]]*/, ""); url = $0; next }
+    END { flush() }
+  '
+}
+
+url_decode() {
+  # file:///Applications/Desk%20Flow.app/ -> ... Desk Flow.app/ (the System
+  # Events step needs the real name). Pure bash: %XX -> \xXX -> printf %b.
+  local s="${1//%/\\x}"
+  printf '%b' "$s"
+}
+
+btm_record_name() {
+  # Display name for a record: the decoded bundle/plist basename from its
+  # URL, else the identifier without the "N." type prefix.
+  local id="$1" url="$2" base
+  base="$(url_decode "${url%/}")"; base="${base##*/}"; base="${base%.app}"; base="${base%.plist}"
+  [[ -n "$base" && "$base" != "(null)" ]] && { echo "$base"; return; }
+  echo "${id#[0-9]*.}"
+}
+
+btm_is_ours() {
+  # $1 = identifier (any "N." prefix stripped), $2 = URL. True for our bundle
+  # ids / KVM siblings by id component, or a bundle literally named
+  # Deskflow.app / Synergy.app / Barrier.app.
+  local label="$1" url="$2" bundle
+  grep -qiE "$LOGIN_ITEM_ID_PATTERN" <<<"$label" && return 0
+  bundle="$(url_decode "${url%/}")"; bundle="${bundle##*/}"
+  grep -qiE "$LOGIN_ITEM_BUNDLE_PATTERN" <<<"$bundle"
+}
+
+btm_manual_step() {
+  # $1 = name, $2 = identifier. The removal is a user action in System Settings.
+  cat <<EOF
+    manual step: System Settings -> General -> Login Items & Extensions -> "Open at Login" -> remove "$1"
+                 (legacy records only: \`osascript -e 'tell application "System Events" to delete login item "$1"'\`, i.e. \`deskflow-ctl login-items audit --fix\`)
+                 record: $2
+EOF
+}
+
+btm_evaluate() {
+  # Pure policy over parse_btm_dump TSV on stdin. Prints one finding per
+  # offending record (with its manual step) and returns 1 on any finding.
+  # The four fleet agents, the prio daemon and the login bridge are allowed;
+  # disabled records are not launchers and never count.
+  local id type disp url rc=0 name label enabled_urls=""
+  while IFS=$'\t' read -r id type disp url; do
+    [[ -n "$id" ]] || continue
+    label="${id#[0-9]*.}"
+    btm_is_ours "$label" "$url" || continue
+    [[ "$disp" == enabled* ]] || continue
+    name="$(btm_record_name "$id" "$url")"
+    case "$type" in
+      app|"login item")
+        echo "  FAIL: enabled BTM $type record launches \"$name\" beside the LaunchAgent: $id ($url)"
+        btm_manual_step "$name" "$id"
+        enabled_urls+="$(url_decode "${url%/}")"$'\n'
+        rc=1
+        ;;
+      agent|"legacy agent")
+        # Only OUR ids are policed here (an old org.deskflow.* agent plist);
+        # a sibling KVM's agent plist is the retired-file check's business.
+        case " $BTM_ALLOWED_LABELS " in
+          *" $label "*) ;;
+          *)
+            if grep -qiE '^(io\.github\.hughesyadaddy\.deskflow|org\.deskflow)' <<<"$label"; then
+              echo "  FAIL: enabled BTM $type record is not a fleet agent: $id ($url)"
+              echo "    manual step: remove the plist behind $url and run: launchctl bootout $DOMAIN/$label"
+              rc=1
+            fi
+            ;;
+        esac
+        ;;
+      *) ;; # daemons (deskflow-prio), developer/curated groups, quicklook: not launchers of the GUI
+    esac
+  done
+  # Two ENABLED app/login-item records for the SAME bundle (macbookpro had
+  # 2.io.github.hughesyadaddy.deskflow + orphaned 2.org.deskflow.deskflow for
+  # /Applications/Deskflow.app): one row in System Settings may hide the other.
+  local dup
+  dup="$(printf '%s' "$enabled_urls" | sort | uniq -d | head -1)"
+  if [[ -n "$dup" ]]; then
+    echo "  FAIL: more than one enabled BTM app/login-item record for ${dup#file://}"
+    echo "    manual step: remove every \"$(btm_record_name '' "$dup")\" row under System Settings -> General -> Login Items & Extensions; if one survives: sfltool resetbtm, then reboot"
+    rc=1
+  fi
+  return "$rc"
+}
+
+btm_dump() {
+  # Runs `sfltool dumpbtm` (a PATH shim in tests). Prints the dump; returns 3
+  # when the tool refused for lack of privilege (SKIP, never PASS), 1 on any
+  # other failure.
+  local out rc=0
+  out="$(sfltool dumpbtm 2>&1)" || rc=$?
+  if (( rc != 0 )) || ! grep -q 'Records for UID' <<<"$out"; then
+    if grep -qiE 'root|privilege|permission|not permitted|must be run|operation not' <<<"$out" || (( rc != 0 )); then
+      echo "$out"
+      return 3
+    fi
+    echo "$out"
+    return 1
+  fi
+  echo "$out"
+}
+
+login_items_audit() {
+  # $1 = source: "tool" (run sfltool) or "stdin". Prints the verdict; exit
+  # 0 PASS, 1 FAIL, 3 SKIP (dumpbtm needs root; the hint is the sudo pipe).
+  local src="${1:-tool}" dump rc=0 findings
+  if [[ "$src" == "stdin" ]]; then
+    dump="$(cat)"
+    grep -q 'Records for UID' <<<"$dump" || { echo "deskflow-ctl login-items: SKIP: stdin is not a sfltool dumpbtm dump"; return 3; }
+  else
+    dump="$(btm_dump)" || rc=$?
+    if (( rc == 3 )); then
+      echo "deskflow-ctl login-items: SKIP: sfltool dumpbtm needs privileges here ($(echo "$dump" | head -1))"
+      echo "  run as admin: sudo sfltool dumpbtm | $ROOT/scripts/deskflow-ctl login-items audit --stdin"
+      return 3
+    elif (( rc != 0 )); then
+      echo "deskflow-ctl login-items: FAIL: sfltool dumpbtm produced no records ($(echo "$dump" | head -1))"
+      return 1
+    fi
+  fi
+  findings="$(parse_btm_dump <<<"$dump" | btm_evaluate)" || rc=$?
+  if (( rc == 0 )); then
+    echo "deskflow-ctl login-items: OK (no BTM app/login-item launcher for Deskflow; fleet agents only)"
+    return 0
+  fi
+  echo "deskflow-ctl login-items: FAIL"
+  echo "$findings"
+  return 1
+}
+
+login_items_fix() {
+  # Legacy LSSharedFileList records answer to System Events; SMAppService /
+  # BTM ones do not (the audit re-run tells). Only reached via `--fix`.
+  local name
+  for name in Deskflow Synergy Barrier; do
+    osascript -e "tell application \"System Events\" to delete login item \"$name\"" >/dev/null 2>&1 || true # fleet:allow no such legacy item
+  done
+}
+
+cmd_login_items() {
+  local sub="${1:-}" fix=0 src="tool" arg rc=0
+  for arg in "${@:2}"; do
+    case "$arg" in
+      --fix) fix=1 ;;
+      --stdin) src="stdin" ;;
+      *) die "login-items: unknown option '$arg'" ;;
+    esac
+  done
+  case "$sub" in
+    audit)
+      if (( fix )); then
+        [[ "$src" == "tool" ]] || die "login-items: --fix cannot be combined with --stdin"
+        login_items_audit tool >/dev/null || rc=$?
+        if (( rc == 1 )); then
+          log "login-items: trying the legacy System Events delete, then re-auditing"
+          login_items_fix
+        fi
+        rc=0
+      fi
+      login_items_audit "$src" || rc=$?
+      return "$rc"
+      ;;
+    print-steps)
+      local findings
+      findings="$(login_items_audit tool)" || rc=$?
+      case "$rc" in
+        0) echo "deskflow-ctl login-items: nothing to remove" ;;
+        3) echo "$findings" ;;
+        *) echo "$findings" | grep -E 'manual step|^ +\(|record:' ;;
+      esac
+      return 0
+      ;;
+    *) die "login-items: usage: login-items audit [--fix] [--stdin] | print-steps" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- retire
+retired_root_files_present() {
+  local f n=0
+  for f in "$RETIRED_PRIO_APPLY" "$RETIRED_SYNERGY_AGENT"; do
+    [[ -e "$f" || -L "$f" ]] && { echo "$f"; n=$((n + 1)); }
+  done
+  (( n > 0 ))
+}
+
+cmd_retire() {
+  local f present
+  for f in "$RETIRED_KEEPALIVE_LOG" "$RETIRED_KEEPALIVE_LOG_OLD"; do
+    if [[ -e "$f" ]]; then
+      rm -f "$f"
+      log "retire: removed $f"
+    fi
+  done
+  if present="$(retired_root_files_present)"; then
+    cat <<EOF
+== deskflow-ctl: retire: root-owned retired files remain; run once as admin: ==
+$(printf '  sudo rm -f "%s"\n' $present)
+(the prio LaunchDaemon is $DAEMON_DIR/$PRIO_LABEL.plist via \`deskflow-ctl prio\`; the synergy agent plist is a stray symlink)
+EOF
+    return 2
+  fi
+  log "retire: nothing left to retire"
+  return 0
 }
 
 cmd_status() {
@@ -596,12 +908,44 @@ cmd_assert_single() {
     core_pid="$(inventory | awk -F'\t' -v app="$APP/Contents/MacOS/deskflow-core" '$3 == app { print $1 }')"
     [[ "$core_pid" == "$launchd_pid" ]] || problems+=("deskflow-core pid $core_pid is not launchd's ($launchd_pid)")
   fi
+  # A core spawned by the GUI (hackintosh: ppid = the GUI) survives a GUI
+  # crash as an orphan and races launchd's core at the next login.
+  if [[ "$cores" -eq 1 ]]; then
+    core_pid="${core_pid:-$(inventory | awk -F'\t' -v app="$APP/Contents/MacOS/deskflow-core" '$3 == app { print $1 }')}"
+    local core_ppid
+    core_ppid="$(proc_ppid "$core_pid")"
+    [[ "$core_ppid" == "1" ]] || problems+=("deskflow-core pid $core_pid ppid=${core_ppid:-?} (want 1: launchd)")
+  fi
+  # The GUI must be launchd's copy too: a Login Item / runningboard copy holds
+  # the instance lock and makes the LaunchAgent copy exit 5 forever.
+  local gui_pid gui_launchd_pid
+  gui_launchd_pid="$(agent_pid "$GUI_LABEL")"
+  if [[ -z "$gui_launchd_pid" ]]; then
+    problems+=("$GUI_LABEL has no running pid under launchd")
+  elif [[ "$gui" -eq 1 ]]; then
+    gui_pid="$(inventory | awk -F'\t' -v app="$APP/Contents/MacOS/Deskflow" '$3 == app { print $1 }')"
+    [[ "$gui_pid" == "$gui_launchd_pid" ]] || problems+=("Deskflow GUI pid $gui_pid is not launchd's ($gui_launchd_pid)")
+  fi
+  local rb
+  rb="$(domain_services | grep -oE "application\.$GUI_LABEL(\.[^[:space:]]*)?" | head -1 || true)" # fleet:allow no match = no runningboard instance
+  [[ -z "$rb" ]] || problems+=("runningboard instance $rb in $DOMAIN (GUI launched by a Login Item/Finder, not launchd)")
+  local audit_out audit_rc=0
+  audit_out="$(login_items_audit tool)" || audit_rc=$?
+  case "$audit_rc" in
+    0) ;;
+    3) problems+=("login-items audit SKIPPED (never a pass): $(echo "$audit_out" | sed -n '2p' | sed 's/^ *//')") ;;
+    *) problems+=("login-items audit FAIL: $(echo "$audit_out" | grep -m1 'FAIL:' | sed 's/^ *FAIL: //')") ;;
+  esac
+  local f
+  for f in "$RETIRED_KEEPALIVE_LOG" "$RETIRED_KEEPALIVE_LOG_OLD" "$RETIRED_PRIO_APPLY" "$RETIRED_SYNERGY_AGENT"; do
+    [[ -e "$f" || -L "$f" ]] && problems+=("retired file present: $f (deskflow-ctl retire)")
+  done
   if ((${#problems[@]})); then
     printf 'deskflow-ctl assert-single: FAIL\n' >&2
     printf '  %s\n' "${problems[@]}" >&2
     return 1
   fi
-  echo "deskflow-ctl assert-single: OK (core=1 launchd-owned, gui=1, bridge=$bridge)"
+  echo "deskflow-ctl assert-single: OK (core=1 launchd-owned ppid 1, gui=1 launchd-owned, bridge=$bridge, login-items clean)"
 }
 
 case "${1:-}" in
@@ -612,6 +956,8 @@ case "${1:-}" in
   assert-single) cmd_assert_single ;;
   prio) cmd_prio ;;
   converge) cmd_converge "${@:2}" ;;
+  login-items) cmd_login_items "${@:2}" ;;
+  retire) cmd_retire ;;
   -h|--help|help) usage ;;
   *) usage >&2; die "unknown verb '${1:-}'" ;;
 esac

@@ -191,6 +191,9 @@ function Invoke-CtlAssertSingle([string]$CtlPath) {
 }
 
 function Test-Instances([string]$CtlPath) {
+  # Inherits every deskflow-ctl.ps1 assert-single rule, including the
+  # launcher inventory (one HKCU Run entry at the canonical exe, no HKLM /
+  # Startup / scheduled-task launchers).
   $r = Invoke-CtlAssertSingle $CtlPath
   $text = ($r.text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join "; "
   if ($r.ok) {

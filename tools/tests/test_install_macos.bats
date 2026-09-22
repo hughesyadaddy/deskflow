@@ -96,22 +96,38 @@ EOF
 echo "xattr $*" >> "$SHIM_LOG"
 exit 0
 EOF
-  # Fake launchd: nothing loaded; bootstrap of the core reports a pid so
-  # deskflow-ctl start succeeds.
+  # Fake launchd: nothing loaded; bootstrap of an agent reports a pid so
+  # deskflow-ctl start and assert-single succeed (core 4242, GUI 4243).
   make_shim launchctl <<'EOF'
 echo "launchctl $*" >> "$SHIM_LOG"
 case "${1:-}" in
   print)
+    [[ "$2" == */*/* ]] || exit 0   # domain listing: no runningboard instances
     [[ -f "$SHIM_STATE/loaded-${2##*/}" ]] || exit 113
-    echo "	pid = 4242"
+    case "${2##*/}" in
+      *deskflow-core) echo "	pid = 4242" ;;
+      *deskflow) echo "	pid = 4243" ;;
+    esac
     ;;
   bootstrap) touch "$SHIM_STATE/loaded-$(basename "$3" .plist)" ;;
+  bootout) rm -f "$SHIM_STATE/loaded-${2##*/}" ;;
 esac
 exit 0
 EOF
-  # Nothing is running.
+  # Background Task Management: fleet agents only (assert-single's audit).
+  make_shim sfltool <<EOF
+echo "sfltool \$*" >> "\$SHIM_LOG"
+cat "$BATS_TEST_DIRNAME/fixtures/btm-dump-fleet-agents-only.txt"
+EOF
+  export DESKFLOW_CTL_RETIRED_PRIO_APPLY="$TMP/usr-local-bin/deskflow-prio-apply.sh"
+  export DESKFLOW_CTL_RETIRED_SYNERGY_AGENT="$TMP/LibraryLaunchAgents/com.symless.synergy-agent.plist"
+  # Nothing runs until deskflow-ctl start bootstrapped the agents; after
+  # that the process table holds launchd's core (ppid 1) and GUI.
   make_shim ps <<'EOF'
 echo "ps $*" >> "$SHIM_LOG"
+if [[ "${1:-}" == "-o" && "${2:-}" == "ppid=" ]]; then echo 1; exit 0; fi
+[[ -f "$SHIM_STATE/loaded-io.github.hughesyadaddy.deskflow-core" ]] && printf '4242\t%s\t%s/Contents/MacOS/deskflow-core\n' "$(id -u)" "$DESKFLOW_INSTALL_APP"
+[[ -f "$SHIM_STATE/loaded-io.github.hughesyadaddy.deskflow" ]] && printf '4243\t%s\t%s/Contents/MacOS/Deskflow\n' "$(id -u)" "$DESKFLOW_INSTALL_APP"
 exit 0
 EOF
   # Keep the suite fast.
@@ -179,6 +195,46 @@ log_lacks() {
   [ ! -e "${TMPDIR:-/tmp}/$stage" ]
 }
 
+@test "install ends with retire (keepalive log gone, root steps printed) and a REPORT-ONLY assert-single" {
+  mkdir -p "$HOME/Library/Logs/Deskflow" "$(dirname "$DESKFLOW_CTL_RETIRED_PRIO_APPLY")"
+  : >"$HOME/Library/Logs/Deskflow/deskflow-keepalive.log"
+  : >"$DESKFLOW_CTL_RETIRED_PRIO_APPLY"
+  run bash "$SCRIPT"
+  # a root-owned retired file is a human step: retire (exit 2) and
+  # assert-single both say so, but the install still completes -- the one
+  # fatal gate is at the end of fleet-deploy-macos.sh, after Mouser.
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"retire: removed $HOME/Library/Logs/Deskflow/deskflow-keepalive.log"* ]]
+  [[ "$output" == *"sudo rm -f \"$DESKFLOW_CTL_RETIRED_PRIO_APPLY\""* ]]
+  [[ "$output" == *"assert-single: FAIL"* ]]
+  [[ "$output" == *"retired file present: $DESKFLOW_CTL_RETIRED_PRIO_APPLY"* ]]
+  [[ "$output" == *"warning: assert-single reported problems"* ]]
+  [[ "$output" == *"== Done:"* ]]
+  [ ! -e "$HOME/Library/Logs/Deskflow/deskflow-keepalive.log" ]
+  log_lacks "sudo"
+  # opt-in fatal
+  : >"$SHIM_LOG"
+  DESKFLOW_INSTALL_ASSERT_FATAL=1 run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"assert-single: FAIL"* ]]
+  [[ "$output" != *"== Done:"* ]]
+
+  rm -f "$DESKFLOW_CTL_RETIRED_PRIO_APPLY"; : >"$SHIM_LOG"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"assert-single: OK"* ]]
+  [[ "$output" == *"== Done:"* ]]
+  # order: start (bootstrap) -> retire -> assert-single (sfltool audit)
+  start_line="$(grep -n 'launchctl bootstrap' "$SHIM_LOG" | tail -1 | cut -d: -f1)"
+  audit_line="$(grep -n '^sfltool dumpbtm' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  [ "$start_line" -lt "$audit_line" ]
+  # --no-restart: nothing running, so no assert-single
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" --no-restart
+  [ "$status" -eq 0 ]
+  log_lacks "sfltool dumpbtm"
+}
+
 @test "a rejected build never touches the running seat: no bootout, no .bak, live bundle intact" {
   mkdir -p "$APP/Contents/MacOS"; echo live >"$APP/Contents/MacOS/deskflow-core"
   SHIM_CODESIGN_VERIFY_RC=1 run bash "$SCRIPT"
@@ -197,14 +253,23 @@ log_lacks() {
   # lock state at both moments.
   make_shim ps <<'EOF'
 echo "ps $*" >> "$SHIM_LOG"
+if [[ "${1:-}" == "-o" && "${2:-}" == "ppid=" ]]; then echo 1; exit 0; fi
 [[ -f "$HOME/Library/Deskflow/deploy.lock" ]] && echo "lock-at-stop pid=$(cat "$HOME/Library/Deskflow/deploy.lock")" >> "$SHIM_LOG"
+# same process table as the default shim, so the closing assert-single passes
+[[ -f "$SHIM_STATE/loaded-io.github.hughesyadaddy.deskflow-core" ]] && printf '4242\t%s\t%s/Contents/MacOS/deskflow-core\n' "$(id -u)" "$DESKFLOW_INSTALL_APP"
+[[ -f "$SHIM_STATE/loaded-io.github.hughesyadaddy.deskflow" ]] && printf '4243\t%s\t%s/Contents/MacOS/Deskflow\n' "$(id -u)" "$DESKFLOW_INSTALL_APP"
 exit 0
 EOF
   make_shim launchctl <<'EOF'
 echo "launchctl $*" >> "$SHIM_LOG"
 case "${1:-}" in
-  print) [[ -f "$SHIM_STATE/loaded-${2##*/}" ]] || exit 113; echo "	pid = 4242" ;;
+  print)
+    [[ "$2" == */*/* ]] || exit 0
+    [[ -f "$SHIM_STATE/loaded-${2##*/}" ]] || exit 113
+    case "${2##*/}" in *deskflow-core) echo "	pid = 4242" ;; *deskflow) echo "	pid = 4243" ;; esac
+    ;;
   bootstrap) touch "$SHIM_STATE/loaded-$(basename "$3" .plist)"; [[ -f "$HOME/Library/Deskflow/deploy.lock" ]] && echo "lock-at-start" >> "$SHIM_LOG" ;;
+  bootout) rm -f "$SHIM_STATE/loaded-${2##*/}" ;;
 esac
 exit 0
 EOF
