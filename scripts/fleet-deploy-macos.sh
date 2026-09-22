@@ -245,6 +245,15 @@ build_install_deskflow() {
   fi
   echo "== [$HOST_TAG] codesign verify OK =="
   verify_login_bridge_plist "$install_app"
+  # install-macos.sh already asserted this once; repeat it from the deploy so
+  # the per-seat report carries the verdict, after retiring what this user can.
+  local ctl="$DESKFLOW_ROOT/scripts/deskflow-ctl"
+  echo "== [$HOST_TAG] retired files (deskflow-ctl retire) =="
+  DESKFLOW_INSTALL_APP="$install_app" "$ctl" retire || true # fleet:allow exit 2 = root steps printed for the operator
+  echo "== [$HOST_TAG] single launcher (deskflow-ctl assert-single) =="
+  if ! DESKFLOW_INSTALL_APP="$install_app" "$ctl" assert-single; then
+    fail "deskflow-ctl assert-single failed after install — a second launcher or a stray core survives (see above)"
+  fi
 }
 
 # The LoginWindow bridge plist lives in /Library/LaunchAgents (root) and this

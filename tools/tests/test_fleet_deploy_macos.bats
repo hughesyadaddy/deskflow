@@ -30,6 +30,10 @@ setup() {
 
   # The deploy script calls the repo's install script; stub it inside the fake root.
   printf '#!/usr/bin/env bash\necho "install-macos.sh $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"\n' >"$FAKE_ROOT/scripts/install-macos.sh"
+  # ... and deskflow-ctl (retire, then a fatal assert-single, after install).
+  # SHIM_CTL_ASSERT_RC fakes a failing seat; retire's exit 2 is tolerated.
+  printf '#!/usr/bin/env bash\necho "deskflow-ctl $* APP=${DESKFLOW_INSTALL_APP:-unset}" >> "$SHIM_LOG"\ncase "$1" in retire) exit "${SHIM_CTL_RETIRE_RC:-0}" ;; assert-single) [[ "${SHIM_CTL_ASSERT_RC:-0}" == 0 ]] || echo "deskflow-ctl assert-single: FAIL" >&2; exit "${SHIM_CTL_ASSERT_RC:-0}" ;; esac\n' >"$FAKE_ROOT/scripts/deskflow-ctl"
+  chmod +x "$FAKE_ROOT/scripts/deskflow-ctl"
   # ... and the login-bridge renderer (--dry-run); the installed plist is a tmp path.
   export DESKFLOW_LOGIN_BRIDGE_PLIST="$TMP/org.deskflow.vhid-bridge.plist"
   stub_bridge_renderer "$BRIDGE_PLIST"
@@ -104,6 +108,7 @@ EOF
   unset FLEET_BRANCH FLEET_DEPLOY_MOUSER FLEET_DEPLOY_DESKFLOW FLEET_RECONFIGURE FLEET_SKIP_GIT_PULL
   unset DESKFLOW_CODESIGN_ID FLEET_KEYCHAIN_PASSWORD
   unset SHIM_CMAKE_RC SHIM_CODESIGN_VERIFY_RC SHIM_GIT_PULL_RC SHIM_PYTHON_RC SHIM_SECURITY_RC
+  unset SHIM_CTL_RETIRE_RC SHIM_CTL_ASSERT_RC
 }
 
 teardown() {
@@ -269,6 +274,23 @@ script_lacks() {
 }
 
 # --- login bridge plist ---------------------------------------------------------
+
+@test "after install the deploy retires stale files (exit 2 tolerated) and fails on assert-single" {
+  write_env "ABC123"
+  export FLEET_DEPLOY_MOUSER=0 SHIM_CTL_RETIRE_RC=2
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_has "deskflow-ctl retire APP=/Applications/Deskflow.app"
+  log_has "deskflow-ctl assert-single APP=/Applications/Deskflow.app"
+  install_line="$(grep -n 'install-macos.sh' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  retire_line="$(grep -n 'deskflow-ctl retire' "$SHIM_LOG" | cut -d: -f1)"
+  assert_line="$(grep -n 'deskflow-ctl assert-single' "$SHIM_LOG" | cut -d: -f1)"
+  [ "$install_line" -lt "$retire_line" ] && [ "$retire_line" -lt "$assert_line" ]
+  export SHIM_CTL_ASSERT_RC=1
+  run bash "$SCRIPT"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"assert-single failed after install"* ]]
+}
 
 @test "after install the bridge plist is rendered via --dry-run, linted, and compared: up to date is reported" {
   write_env "ABCDEF0123456789"

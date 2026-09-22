@@ -123,6 +123,15 @@ start_deskflow() {
   fi
   echo "== Starting Deskflow (deskflow-ctl start) =="
   DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" start
+  # Retired fleet files (keepalive log) go now; root-owned ones are printed
+  # as a human step (exit 2), never run from here.
+  echo "== Retired files (deskflow-ctl retire) =="
+  DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" retire || true # fleet:allow exit 2 = root steps printed for the operator
+  # One launcher only: launchd's core (ppid 1) and launchd's GUI, no BTM
+  # login item, no runningboard copy. Fatal: an install that leaves two
+  # launchers is the 2026-09-21 macbookpro "already running -> exit 5" bug.
+  echo "== Single launcher (deskflow-ctl assert-single) =="
+  DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" assert-single
 }
 
 # Fatal unless the bundle verifies AND deskflow-core carries a real (non ad-hoc)

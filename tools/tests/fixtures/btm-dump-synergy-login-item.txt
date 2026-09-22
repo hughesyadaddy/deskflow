@@ -1,0 +1,103 @@
+========================
+ Records for UID 501 : 3E361E32-3642-420F-91F4-07A3258EC782
+========================
+
+ ServiceManagement migrated: true
+ LaunchServices registered: true
+
+ Items:
+
+ #1:
+                 UUID: 2A7E4103-BADD-49CA-812E-D591A2ED7C12
+                 Name: sh
+       Developer Name: (null)
+                 Type: legacy daemon (0x10010)
+                Flags: [ legacy ] (0x1)
+          Disposition: [enabled, allowed, notified] (0xb)
+           Identifier: 16.com.carriez.RustDesk_service
+                  URL: file:///Library/LaunchDaemons/com.carriez.RustDesk_service.plist
+      Executable Path: /bin/sh
+           Generation: 4
+    Parent Identifier: Unknown Developer
+
+ #2:
+                 UUID: D8F48C77-0C40-456A-902E-FFD9E5CB16AF
+                 Name: Deskflow
+       Developer Name: Mariner License Prep, LLC
+      Team Identifier: J5KPG8ZR5C
+                 Type: legacy daemon (0x10010)
+                Flags: [ legacy ] (0x1)
+          Disposition: [enabled, allowed, notified] (0xb)
+           Identifier: 16.io.github.hughesyadaddy.deskflow-prio
+                  URL: file:///Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist
+      Executable Path: /Applications/Deskflow.app/Contents/MacOS/deskflow-prio
+           Generation: 1
+    Parent Identifier: Mariner License Prep, LLC
+
+ #3:
+                 UUID: 9F1AC5BA-DB9B-4EFE-BDD9-9FDB92313EFB
+                 Name: Deskflow
+       Developer Name: Mariner License Prep, LLC
+      Team Identifier: J5KPG8ZR5C
+                 Type: legacy agent (0x10008)
+                Flags: [ legacy ] (0x1)
+          Disposition: [enabled, allowed, not notified] (0x3)
+           Identifier: 8.org.deskflow.vhid-bridge
+                  URL: file:///Library/LaunchAgents/org.deskflow.vhid-bridge.plist
+      Executable Path: /Applications/Deskflow.app/Contents/MacOS/deskflow-vhid-bridge
+           Generation: 0
+    Parent Identifier: Mariner License Prep, LLC
+
+ #6:
+                 UUID: BD32BFE1-7A80-404A-9E3F-01A70622FED1
+                 Name: Deskflow
+       Developer Name: Mariner License Prep, LLC
+      Team Identifier: J5KPG8ZR5C
+                 Type: legacy agent (0x10008)
+                Flags: [ legacy ] (0x1)
+          Disposition: [enabled, allowed, notified] (0xb)
+           Identifier: 8.io.github.hughesyadaddy.deskflow
+                  URL: file:///Users/alexhughes/Library/LaunchAgents/io.github.hughesyadaddy.deskflow.plist
+      Executable Path: /Applications/Deskflow.app/Contents/MacOS/Deskflow
+           Generation: 2
+    Parent Identifier: Mariner License Prep, LLC
+
+ #7:
+                 UUID: 45237D45-6E10-4C34-B859-882FB2765B22
+                 Name: Deskflow
+       Developer Name: Mariner License Prep, LLC
+      Team Identifier: J5KPG8ZR5C
+                 Type: legacy agent (0x10008)
+                Flags: [ legacy ] (0x1)
+          Disposition: [enabled, allowed, not notified] (0x3)
+           Identifier: 8.io.github.hughesyadaddy.deskflow-core
+                  URL: file:///Users/alexhughes/Library/LaunchAgents/io.github.hughesyadaddy.deskflow-core.plist
+      Executable Path: /Applications/Deskflow.app/Contents/MacOS/deskflow-core
+           Generation: 0
+    Parent Identifier: Mariner License Prep, LLC
+
+ #8:
+                 UUID: 0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D
+                 Name: Deskflow
+       Developer Name: Mariner License Prep, LLC
+      Team Identifier: J5KPG8ZR5C
+                 Type: legacy agent (0x10008)
+                Flags: [ legacy ] (0x1)
+          Disposition: [enabled, allowed, not notified] (0x3)
+           Identifier: 8.io.github.hughesyadaddy.deskflow-converge
+                  URL: file:///Users/alexhughes/Library/LaunchAgents/io.github.hughesyadaddy.deskflow-converge.plist
+      Executable Path: /Users/alexhughes/Desktop/deskflow/scripts/deskflow-ctl
+           Generation: 0
+    Parent Identifier: Mariner License Prep, LLC
+
+ #9:
+                 UUID: 5F6E7D8C-9B0A-4C1D-8E2F-3A4B5C6D7E8F
+                 Name: Synergy
+       Developer Name: (null)
+                 Type: login item (0x4)
+                Flags: [  ] (0)
+          Disposition: [enabled, allowed, not notified] (0x3)
+           Identifier: 4.com.symless.synergy
+                  URL: file:///Applications/Synergy.app/
+           Generation: 0
+    Bundle Identifier: com.symless.synergy
