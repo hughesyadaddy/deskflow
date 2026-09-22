@@ -143,6 +143,7 @@ private Q_SLOTS:
   void init();
   void rolloverUnderServerCapsDoesNotLeakDerivedShift();
   void shiftReleaseMidHoldDropsDerivedShift();
+  void stuckKeyWarningCarriesNoButtonId();
   void escapeBurstReleasesBeforeStop();
   void cheapSpecialKeysAreMapped();
   void unmappedKeyPostsNothing();
@@ -228,6 +229,27 @@ void BridgeTests::shiftReleaseMidHoldDropsDerivedShift()
   QCOMPARE(f.sink.kb.size(), before);
   QVERIFY(f.keyUp('k', 0, 10));
   QVERIFY(f.sink.kb.back().keys.empty());
+}
+
+// A-2: the stuck-key WARNING is a count and a duration, never `btn=<n>`
+// (a Deskflow button id is a scancode).
+void BridgeTests::stuckKeyWarningCarriesNoButtonId()
+{
+  Fixture f;
+  f.sink.caps = [] { return std::optional<bool>{false}; };
+  QVERIFY(f.keyDown('a', 0, 42));
+  f.now += std::chrono::seconds(11);
+  LogCapture log;
+  f.bridge.warn_stuck_keys();
+  QCOMPARE(log.lines.size(), size_t(1));
+  QVERIFY(log.any("WARNING"));
+  QVERIFY(log.any("1 held > 10s"));
+  QVERIFY(log.any("longest 11s"));
+  QVERIFY(!log.any("btn="));
+  QVERIFY(log.messages().find("42") == std::string::npos);
+  // once per entry
+  f.bridge.warn_stuck_keys();
+  QCOMPARE(log.lines.size(), size_t(1));
 }
 
 // A-4: the 4x Esc rescue must not exit the process before the release

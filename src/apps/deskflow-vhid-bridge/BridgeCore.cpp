@@ -499,29 +499,30 @@ void Bridge::run(FramedSocket &socket)
 
 // Logs a WARNING (once per entry) for any key held longer than
 // kStuckKeyWarning: a missed key-up or a latched entry shows up here
-// instead of only as "everything types wrong until Leave".
+// instead of only as "everything types wrong until Leave". Counts and
+// durations only (A-2): a button id is a scancode, i.e. a keystroke.
 void Bridge::warn_stuck_keys()
 {
   if (held_keys_.empty())
     return;
   const auto now = now_();
   bool any = false;
-  std::string summary;
+  int stuck = 0;
+  long longest_s = 0;
   for (auto &[button, held] : held_keys_) {
     if (now - held.since < kStuckKeyWarning)
       continue;
+    ++stuck;
+    longest_s = std::max(longest_s, static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(now - held.since).count()));
     if (!held.warned) {
       held.warned = true;
       any = true;
     }
-    summary += " {btn=" + std::to_string(button) +
-               " held=" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(now - held.since).count()) +
-               "s}";
   }
   if (any) {
     log_line(
-        "WARNING: " + std::to_string(held_keys_.size()) + " key(s) in held_keys_, some > 10s:" + summary +
-        " (Leave/close will release); " + keys_summary()
+        "WARNING: " + std::to_string(held_keys_.size()) + " key(s) in held_keys_, " + std::to_string(stuck) +
+        " held > 10s (longest " + std::to_string(longest_s) + "s) (Leave/close will release); " + keys_summary()
     );
   }
 }
