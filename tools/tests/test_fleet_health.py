@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -125,7 +126,7 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.sudo_probe_cmd()): (0, "", ""),
         (hid, fh.login_bridge_agent_cmd()): (0, LOGIN_BRIDGE_PRINT, ""),
         (hid, fh.login_bridge_keystroke_cmd()): (1, "0\n", ""),
-        (hid, fh.keys_log_cmd()): (0, "", ""),
+        (hid, fh.keys_log_cmd()): (0, "level=INFO\n", ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, fh.DEFAULT_MESH_PORT))] = (0, "", "")
@@ -634,19 +635,24 @@ def keys_line(mark, when, rest=""):
     return f"[{when.strftime('%Y-%m-%dT%H:%M:%S')}.123] {'WARNING' if 'stuck' in mark else 'INFO'}: {mark}{rest}"
 
 
-def test_keys_cmd_greps_core_log_and_rotations_without_sudo():
+def test_keys_cmd_reads_conf_log_path_and_generations_under_sh():
     assert "keys" in fh.ALL_CHECKS and "keys" in fh.MAC_ONLY
     cmd = fh.keys_log_cmd()
-    assert cmd.startswith("f=~/Library/Logs/Deskflow/deskflow-core.log; test -f")
-    assert "exit 3" in cmd and "sudo" not in cmd
-    assert "'[keys] stuck-release'" in cmd and "'[keys] post-switch held='" in cmd
-    assert '"$f" "$f".*' in cmd  # newsyslog rotations too
+    assert cmd.startswith("sh -c ")
+    script = shlex.split(cmd)[2]
+    assert "conf=~/Library/Deskflow/Deskflow.conf" in script
+    assert "log=~/Library/Deskflow/deskflow-core.log" in script
+    assert "Library/Logs" not in script  # launchd routes that one to /dev/null
+    assert "s/^file=//p" in script and "s/^level=//p" in script
+    assert "exit 4" in script and "exit 3" in script and "sudo" not in script
+    assert '"$f".1 "$f".2 "$f".3' in script  # FileLogOutputter generations
+    assert "'[keys] stuck-release'" in script and "'[keys] post-switch held='" in script
 
 
 def test_parse_keys_log_fails_on_stuck_release_within_window():
     from datetime import datetime, timedelta
     now = datetime(2026, 9, 22, 12, 0, 0)
-    out = "\n".join([
+    out = "level=INFO\n" + "\n".join([
         keys_line(fh.KEYS_HELD_MARK, now - timedelta(hours=3), "0x0001"),
         keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=3), " 0x0001"),
     ]) + "\n"
@@ -655,35 +661,66 @@ def test_parse_keys_log_fails_on_stuck_release_within_window():
     assert "1 '[keys] stuck-release' in 24h" in detail and "0x0001" in detail
 
 
+def test_parse_keys_log_orders_by_timestamp_across_generations():
+    # grep emits the current log first, then .1/.2 (older): the newest line
+    # is NOT last in the input, and generation age is irrelevant -- only the
+    # stamp decides whether a line is inside the window.
+    from datetime import datetime, timedelta
+    now = datetime(2026, 9, 22, 12, 0, 0)
+    out = "level=INFO\n" + "\n".join([
+        keys_line(fh.KEYS_STUCK_MARK, now - timedelta(minutes=5), " 0x0008"),   # current log, newest
+        keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=30), " 0x0001"),    # .1, outside window
+        keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=2), " 0x0002"),     # .2 but inside window
+    ]) + "\n"
+    status, detail = fh.parse_keys_log(out, now=now)
+    assert status == "FAIL"
+    assert "2 '[keys] stuck-release'" in detail and "newest:" in detail and "0x0008" in detail
+
+
 def test_parse_keys_log_ignores_lines_older_than_24h():
     from datetime import datetime, timedelta
     now = datetime(2026, 9, 22, 12, 0, 0)
-    out = keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=25), " 0x0008") + "\n"
+    out = "level=INFO\n" + keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=25), " 0x0008") + "\n"
     status, detail = fh.parse_keys_log(out, now=now)
     assert status == "PASS" and "no stuck-key lines in 24h" in detail
     # right at the edge still counts
-    out = keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=23, minutes=59), " 0x0008") + "\n"
+    out = "level=INFO\n" + keys_line(fh.KEYS_STUCK_MARK, now - timedelta(hours=23, minutes=59), " 0x0008") + "\n"
     assert fh.parse_keys_log(out, now=now)[0] == "FAIL"
 
 
 def test_parse_keys_log_warns_on_held_without_release():
     from datetime import datetime, timedelta
     now = datetime(2026, 9, 22, 12, 0, 0)
-    out = keys_line(fh.KEYS_HELD_MARK, now - timedelta(minutes=5), "0x0002") + "\n"
+    out = "level=DEBUG\n" + keys_line(fh.KEYS_HELD_MARK, now - timedelta(minutes=5), "0x0002") + "\n"
     status, detail = fh.parse_keys_log(out, now=now)
     assert status == "WARN"
     assert "1 '[keys] post-switch held=' in 24h with no release" in detail and "0x0002" in detail
     assert fh.Result("h", "keys", status, detail).ok  # WARN never fails the run
 
 
-def test_parse_keys_log_unstamped_lines_count_but_are_noted():
-    status, detail = fh.parse_keys_log("garbage [keys] stuck-release 0x0004\n")
-    assert status == "FAIL"
-    status, detail = fh.parse_keys_log("garbage line\n")
+def test_parse_keys_log_unstamped_lines_are_ignored_and_counted():
+    status, detail = fh.parse_keys_log("level=INFO\ngarbage [keys] stuck-release 0x0004\n")
     assert status == "PASS" and "1 unstamped line(s) ignored" in detail
 
 
-def test_keys_mac_pass_warn_fail_and_missing_log():
+def test_parse_keys_log_warns_when_log_level_hides_the_lines():
+    assert fh.log_level_hides("ERROR", "WARNING") and fh.log_level_hides("WARNING", "INFO")
+    assert not fh.log_level_hides("INFO", "INFO") and not fh.log_level_hides("DEBUG", "WARNING")
+    assert not fh.log_level_hides("bogus", "INFO")
+    status, detail = fh.parse_keys_log("level=ERROR\n")
+    assert status == "WARN" and "hides '[keys] stuck-release'" in detail and "blind" in detail
+    status, detail = fh.parse_keys_log("level=WARNING\n")
+    assert status == "WARN" and "hides '[keys] post-switch held='" in detail
+    status, detail = fh.parse_keys_log("level=INFO\n")
+    assert status == "PASS" and "level=INFO" in detail
+    # the level line never masks a real finding
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    out = "level=WARNING\n" + keys_line(fh.KEYS_STUCK_MARK, now - timedelta(minutes=1), " 0x0001") + "\n"
+    assert fh.parse_keys_log(out, now=now)[0] == "FAIL"
+
+
+def test_keys_mac_pass_warn_fail_skip_and_missing_log():
     from datetime import datetime, timedelta
     results, runner = run_checks([mac()], mac_ok_table(), ["keys"])
     assert [r.check for r in results] == ["keys"]
@@ -692,17 +729,21 @@ def test_keys_mac_pass_warn_fail_and_missing_log():
 
     recent = datetime.now() - timedelta(minutes=10)
     t = mac_ok_table()
-    t[("macbookpro", fh.keys_log_cmd())] = (0, keys_line(fh.KEYS_HELD_MARK, recent, "0x0001") + "\n", "")
+    t[("macbookpro", fh.keys_log_cmd())] = (0, "level=INFO\n" + keys_line(fh.KEYS_HELD_MARK, recent, "0x0001") + "\n", "")
     results, _ = run_checks([mac()], t, ["keys"])
     assert results[0].status == "WARN" and results[0].ok
 
-    t[("macbookpro", fh.keys_log_cmd())] = (0, keys_line(fh.KEYS_STUCK_MARK, recent, " 0x0001") + "\n", "")
+    t[("macbookpro", fh.keys_log_cmd())] = (0, "level=INFO\n" + keys_line(fh.KEYS_STUCK_MARK, recent, " 0x0001") + "\n", "")
     results, _ = run_checks([mac()], t, ["keys"])
     assert results[0].status == "FAIL" and "stuck-release" in results[0].detail
 
-    t[("macbookpro", fh.keys_log_cmd())] = (3, "", "missing ~/Library/Logs/Deskflow/deskflow-core.log")
+    t[("macbookpro", fh.keys_log_cmd())] = (4, "", "no log dir /Users/x/Library/Deskflow")
     results, _ = run_checks([mac()], t, ["keys"])
-    assert results[0].status == "FAIL" and "missing" in results[0].detail
+    assert results[0].status == "SKIP" and results[0].ok and "no core log directory" in results[0].detail
+
+    t[("macbookpro", fh.keys_log_cmd())] = (3, "", "missing /Users/x/Library/Deskflow/deskflow-core.log (toFile off?)")
+    results, _ = run_checks([mac()], t, ["keys"])
+    assert results[0].status == "FAIL" and "toFile" in results[0].detail
 
     t[("macbookpro", fh.keys_log_cmd())] = (255, "", "ssh: connect to host macbookpro port 22: timed out")
     results, _ = run_checks([mac()], t, ["keys"])

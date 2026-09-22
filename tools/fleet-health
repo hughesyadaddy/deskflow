@@ -41,13 +41,21 @@ Checks:
                              peer:"deskflow-core" (macOS: nc -w2; Windows: the
                              ps1 collector via .NET TcpClient). Catches a core
                              that is running but silently in legacy/off mode.
-  keys                       stuck-key sweeps in the core log (macOS): FAIL on
-                             any "[keys] stuck-release" line in the last 24 h
-                             (the post-switch verifier had to release a
-                             modifier nobody typed after a crossing); WARN on
-                             "[keys] post-switch held=" lines with no release
-                             behind them (a modifier was still down 250 ms
-                             after entering but cleared on its own).
+  keys                       stuck-key sweeps in the core's own rotated log
+                             (macOS; `[log] file=` from ~/Library/Deskflow/
+                             Deskflow.conf, default ~/Library/Deskflow/
+                             deskflow-core.log, plus its .1/.2 generations --
+                             NOT ~/Library/Logs, which launchd routes to
+                             /dev/null). Lines are ordered by their own
+                             timestamp across generations; unstamped lines
+                             are ignored and counted. FAIL on any "[keys]
+                             stuck-release" (WARNING) line in the last 24 h --
+                             the post-switch verifier had to release a
+                             modifier nobody typed after a crossing. WARN on
+                             "[keys] post-switch held=" (INFO) lines with no
+                             release behind them, or when `[log] level` is
+                             too quiet for those lines to ever land in the
+                             file. SKIP when the log directory does not exist.
   loginbridge                the LoginWindow bridge agent (macOS): the plist
                              exists and lints, its program is the installed
                              bundle's deskflow-vhid-bridge, the log is mode 600
@@ -123,12 +131,19 @@ LOGIN_BRIDGE_BIN = "/Applications/Deskflow.app/Contents/MacOS/deskflow-vhid-brid
 LOGIN_BRIDGE_LOG = "/var/log/deskflow-vhid-bridge.log"
 LOGIN_BRIDGE_KEYSTROKE_MARK = "key down id="
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
-# Core log on macOS (scripts/deskflow-ctl LOG_DIR; newsyslog rotates to .0, .1 ...).
-CORE_LOG = "~/Library/Logs/Deskflow/deskflow-core.log"
-# Lines the client's post-switch verifier writes (src/lib/deskflow/Screen.cpp).
-KEYS_STUCK_MARK = "[keys] stuck-release"
-KEYS_HELD_MARK = "[keys] post-switch held="
+# The core's own rotated log on macOS: Deskflow.conf `[log] toFile=true
+# file=...` (FileLogOutputter, generations file.1 .. file.3). launchd's
+# stdout capture under ~/Library/Logs goes to /dev/null on purpose
+# (tools/launchd/*deskflow-core.plist).
+CORE_CONF = "~/Library/Deskflow/Deskflow.conf"
+CORE_LOG = "~/Library/Deskflow/deskflow-core.log"
+# Lines the client's post-switch verifier writes (src/lib/deskflow/Screen.cpp)
+# and the level each is logged at.
+KEYS_STUCK_MARK = "[keys] stuck-release"   # WARNING
+KEYS_HELD_MARK = "[keys] post-switch held="  # INFO
 KEYS_WINDOW_H = 24
+# src/lib/common/LogLevel.h order: quietest first.
+LOG_LEVELS = ("FATAL", "ERROR", "WARNING", "INFO", "DEBUG", "VERBOSE")
 
 PASS, FAIL, SKIP, WARN = "PASS", "FAIL", "SKIP", "WARN"
 
@@ -417,51 +432,90 @@ def login_bridge_keystroke_cmd(log: str = LOGIN_BRIDGE_LOG, mark: str = LOGIN_BR
     return f"sudo -n grep -c {shlex.quote(mark)} {shlex.quote(log)}"
 
 
-def keys_log_cmd(log: str = CORE_LOG) -> str:
-    """Every verifier line from the core log and its rotations (rc 3 = no log)."""
-    return (f"f={log}; test -f \"$f\" || {{ echo \"missing $f\" >&2; exit 3; }}; "
-            f"grep -h -F -e '{KEYS_STUCK_MARK}' -e '{KEYS_HELD_MARK}' \"$f\" \"$f\".* 2>/dev/null | tail -n 400; exit 0")
+def keys_log_cmd(conf: str = CORE_CONF, default_log: str = CORE_LOG) -> str:
+    """Verifier lines from the core's rotated log, newest generation first.
+
+    Resolves `[log] file=` (and `level=`) from Deskflow.conf, falling back to
+    the default path. Exit 4 = the log directory does not exist (SKIP), 3 =
+    the directory exists but the log file does not (toFile must be on).
+    Runs under sh so an unmatched `.N` glob stays literal instead of aborting
+    the command the way zsh would; the first stdout line is `level=...`."""
+    script = (
+        f"conf={conf}; log={default_log}; "
+        "if [ -f \"$conf\" ]; then "
+        "  f=$(sed -n '/^\\[log\\]/,/^\\[/p' \"$conf\" | sed -n 's/^file=//p' | tail -n 1); "
+        "  lvl=$(sed -n '/^\\[log\\]/,/^\\[/p' \"$conf\" | sed -n 's/^level=//p' | tail -n 1); "
+        "fi; "
+        "case \"$f\" in '') f=$log;; '~'*) f=$HOME${f#~};; esac; "
+        "d=$(dirname \"$f\"); "
+        "test -d \"$d\" || { echo \"no log dir $d\" >&2; exit 4; }; "
+        "test -f \"$f\" || { echo \"missing $f (toFile off?)\" >&2; exit 3; }; "
+        "echo \"level=${lvl:-INFO}\"; "
+        f"grep -h -F -e '{KEYS_STUCK_MARK}' -e '{KEYS_HELD_MARK}' \"$f\" \"$f\".1 \"$f\".2 \"$f\".3 2>/dev/null"
+        " | head -n 20000; exit 0"
+    )
+    return "sh -c " + shlex.quote(script)
 
 
 _LOG_TS = re.compile(r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
 
 
-def parse_keys_log(output: str, now: Optional[datetime] = None, window_h: int = KEYS_WINDOW_H) -> Tuple[str, str]:
-    """Fold verifier lines into (status, detail).
+def log_level_hides(level: str, needed: str) -> bool:
+    """True when a `[log] level` of `level` drops lines logged at `needed`."""
+    try:
+        return LOG_LEVELS.index(level.upper()) < LOG_LEVELS.index(needed)
+    except ValueError:
+        return False  # unknown spelling: assume the default (INFO) applies
 
-    Log timestamps are the seat's local wall clock with no offset
-    (base/Log.cpp, Qt::ISODateWithMs), so `now` is compared naive-local too."""
+
+def parse_keys_log(output: str, now: Optional[datetime] = None, window_h: int = KEYS_WINDOW_H) -> Tuple[str, str]:
+    """Fold `level=...` plus verifier lines into (status, detail).
+
+    Lines are ordered by their own timestamp (the log and its generations
+    arrive newest-first from grep, so nothing is assumed about input order)
+    and only those inside the window count; a line with no leading
+    timestamp cannot be placed in time and is ignored (counted in the
+    detail). Log timestamps are the seat's local wall clock with no offset
+    (base/Log.cpp, Qt::ISODateWithMs), so `now` is compared naive-local."""
     now = now or datetime.now()
     since = now - timedelta(hours=window_h)
-    stuck: List[str] = []
-    held: List[str] = []
+    level = "INFO"
+    stamped: List[Tuple[datetime, str]] = []
     unstamped = 0
     for raw in output.splitlines():
         line = raw.strip()
         if not line:
             continue
+        if line.startswith("level="):
+            level = line[len("level="):].strip() or level
+            continue
         m = _LOG_TS.match(line)
+        at = None
         if m:
             try:
                 at = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
             except ValueError:
                 at = None
-            if at is not None and at < since:
-                continue
-        else:
+        if at is None:
             unstamped += 1
-        if KEYS_STUCK_MARK in line:
-            stuck.append(line)
-        elif KEYS_HELD_MARK in line:
-            held.append(line)
+            continue
+        if at >= since:
+            stamped.append((at, line))
+    stamped.sort(key=lambda p: p[0])
+    stuck = [ln for _, ln in stamped if KEYS_STUCK_MARK in ln]
+    held = [ln for _, ln in stamped if KEYS_HELD_MARK in ln]
+    note = f"; {unstamped} unstamped line(s) ignored" if unstamped else ""
     if stuck:
         return FAIL, (f"{len(stuck)} '{KEYS_STUCK_MARK}' in {window_h}h "
-                      f"(verifier had to release a modifier; last: {stuck[-1][:100]})")
+                      f"(verifier had to release a modifier; newest: {stuck[-1][:100]}){note}")
     if held:
         return WARN, (f"{len(held)} '{KEYS_HELD_MARK}' in {window_h}h with no release "
-                      f"(cleared on their own; last: {held[-1][:100]})")
-    note = f"; {unstamped} unstamped line(s) ignored" if unstamped else ""
-    return PASS, f"no stuck-key lines in {window_h}h{note}"
+                      f"(cleared on their own; newest: {held[-1][:100]}){note}")
+    if log_level_hides(level, "WARNING"):
+        return WARN, f"[log] level={level} hides '{KEYS_STUCK_MARK}' (WARNING) lines; check is blind{note}"
+    if log_level_hides(level, "INFO"):
+        return WARN, f"[log] level={level} hides '{KEYS_HELD_MARK}' (INFO) lines; only stuck-release visible{note}"
+    return PASS, f"no stuck-key lines in {window_h}h (level={level}){note}"
 
 
 def ps1_cmd(root: str, checks: Sequence[str], thumbprint: str, port: int, peers: Sequence[str]) -> str:
@@ -790,8 +844,11 @@ class FleetHealth:
 
     def check_keys_mac(self, host: Host) -> None:
         rc, out, err = self.runner(host, keys_log_cmd())
+        if rc == 4:
+            self._add(host, "keys", SKIP, f"no core log directory: {(err or out).strip()[:120]}")
+            return
         if rc == 3:
-            self._add(host, "keys", FAIL, f"{CORE_LOG} missing: {(err or out).strip()[:120]}")
+            self._add(host, "keys", FAIL, f"core log missing ([log] toFile must stay on): {(err or out).strip()[:120]}")
             return
         if rc != 0:
             self._add(host, "keys", FAIL, f"core log grep rc={rc}: {(err or out).strip()[:120]}")
