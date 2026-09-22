@@ -567,36 +567,47 @@ def heap_classes_tool(root: Path | None = None) -> Path | None:
     return tool if tool.is_file() and os.access(tool, os.X_OK) else None
 
 
-def parse_heap_classes(text: str) -> dict[str, int] | None:
-    """Accept {"<class>": n, ...} or {"classes": {...}, ...}; None when unusable."""
+def parse_heap_classes(text: str) -> tuple[dict[str, int], int | None] | None:
+    """Parse the tool's JSON contract
+    ``{"pid", "ts", "classes": {"CGEvent": n, ...}, "total_bytes": n}``
+    (a bare ``{"<class>": n, ...}`` object is accepted too).
+    Returns (classes, total_bytes) or None when unusable."""
     try:
         obj = json.loads(text or "")
     except json.JSONDecodeError:
         return None
-    if isinstance(obj, dict) and isinstance(obj.get("classes"), dict):
-        obj = obj["classes"]
     if not isinstance(obj, dict):
         return None
+    total = obj.get("total_bytes")
+    total_bytes = int(total) if isinstance(total, (int, float)) and not isinstance(total, bool) else None
+    classes = obj["classes"] if isinstance(obj.get("classes"), dict) else obj
     out: dict[str, int] = {}
-    for k, v in obj.items():
+    for k, v in classes.items():
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             continue
         out[str(k)] = int(v)
-    return out
+    return out, total_bytes
 
 
-def collect_heap_classes(pid: int | None, tool: Path | None) -> dict[str, int] | None:
-    """Per-class live instance counts, or None (no pid, no tool, tool failed)."""
+def collect_heap_classes(pid: int | None, tool: Path | None) -> tuple[dict[str, int] | None, int | None]:
+    """(classes, total_bytes) from ``tools/mouser-heap-classes --pid PID``.
+
+    (None, None) when there is no pid or tool, on a timeout, or when the tool
+    exits non-zero -- its exit 2 (``heap`` missing, cannot attach without
+    get-task-allow/sudo, process gone, unexpected format) is a sample without
+    classes, never a soak failure.
+    """
     if pid is None or tool is None:
-        return None
+        return None, None
     try:
         proc = subprocess.run([str(tool), "--pid", str(pid)], capture_output=True, text=True,
                               timeout=HEAP_CLASSES_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return None, None
     if proc.returncode != 0:
-        return None
-    return parse_heap_classes(proc.stdout)
+        return None, None
+    parsed = parse_heap_classes(proc.stdout)
+    return parsed if parsed is not None else (None, None)
 
 
 def mac_collect(label: str, exe: str, proc: str, scenario_log: str | None = None,
@@ -628,7 +639,7 @@ def mac_collect(label: str, exe: str, proc: str, scenario_log: str | None = None
         rec["fds"] = mac_fds(pid)
         rec["cpu_s"] = mac_cpu_seconds(pid)
     if heap_classes:
-        rec["classes"] = collect_heap_classes(pid, heap_tool)
+        rec["classes"], rec["heap_total_bytes"] = collect_heap_classes(pid, heap_tool)
     rec["scenario"] = derive_scenario(proc, log_path=scenario_log)
     rec["restart_count"] = mac_restart_count(label, exe)
     return rec

@@ -846,10 +846,21 @@ def fake_mouser_root(tmp_path: Path) -> Path:
     return root
 
 
-def test_parse_heap_classes_accepts_flat_and_nested_shapes(fs):
+HEAP_TOOL_JSON = ('{"pid": 4242, "ts": 1758493271, "classes": {"CGEvent": 120, "CGSEventAppendix": 120, '
+                  '"HIDEvent": 300, "NSXPCConnection": 4, "GPProcessMonitor": 4, "CGImage": 9, "non-object": 17}, '
+                  '"total_bytes": 587427918}')
+
+
+def test_parse_heap_classes_reads_the_tool_contract(fs):
+    # the exact shape of Mouser tools/mouser-heap-classes (pid, ts, classes, total_bytes)
+    assert fs.parse_heap_classes(HEAP_TOOL_JSON) == (
+        {"CGEvent": 120, "CGSEventAppendix": 120, "HIDEvent": 300, "NSXPCConnection": 4,
+         "GPProcessMonitor": 4, "CGImage": 9, "non-object": 17},
+        587427918,
+    )
+    # a bare class map is accepted too; non-numeric values are dropped
     assert fs.parse_heap_classes('{"CGEvent": 12, "NSXPCConnection": 3.0, "note": "x", "flag": true}') == \
-        {"CGEvent": 12, "NSXPCConnection": 3}
-    assert fs.parse_heap_classes('{"pid": 4242, "classes": {"CGEvent": 7}}') == {"CGEvent": 7}
+        ({"CGEvent": 12, "NSXPCConnection": 3}, None)
     assert fs.parse_heap_classes("not json") is None
     assert fs.parse_heap_classes("[1, 2]") is None
 
@@ -868,13 +879,15 @@ def test_sample_heap_classes_stores_counts_from_the_tool(mocked_mac, tmp_path, m
     fs = mocked_mac
     root = fake_mouser_root(tmp_path)
     monkeypatch.setenv("FLEET_MOUSER_ROOT", str(root))
-    monkeypatch.setenv("FAKE_HEAP_CLASSES", '{"CGEvent": 120, "NSXPCConnection": 4, "GPProcessMonitor": 1}')
+    monkeypatch.setenv("FAKE_HEAP_CLASSES", HEAP_TOOL_JSON)
     out = tmp_path / "hc.jsonl"
     assert fs.main(["sample", "--label", "io.github.hughesyadaddy.mouser",
                     "--exe", "/Applications/Mouser.app/Contents/MacOS/Mouser",
                     "--out", str(out), "--once", "--heap-classes"]) == 0
     rec = json.loads(out.read_text().splitlines()[1])
-    assert rec["classes"] == {"CGEvent": 120, "NSXPCConnection": 4, "GPProcessMonitor": 1}
+    assert rec["classes"]["CGEvent"] == 120 and rec["classes"]["NSXPCConnection"] == 4
+    assert rec["classes"]["non-object"] == 17
+    assert rec["heap_total_bytes"] == 587427918
     # the tool was invoked with the sampled pid
     assert (root / "tools" / "heap-classes.calls").read_text().strip() == "--pid 4242"
     assert "note" not in capsys.readouterr().err
@@ -898,16 +911,17 @@ def test_sample_heap_classes_skips_with_a_note_when_the_tool_is_absent(mocked_ma
                     "--exe", "/Applications/Mouser.app/Contents/MacOS/Mouser",
                     "--out", str(out), "--once", "--heap-classes"]) == 0
     rec = json.loads(out.read_text().splitlines()[1])
-    assert rec["classes"] is None
+    assert rec["classes"] is None and rec["heap_total_bytes"] is None
     err = capsys.readouterr().err
     assert "note: --heap-classes requested" in err and "mouser-heap-classes" in err
 
 
 def test_sample_heap_classes_null_when_the_tool_fails_or_prints_junk(mocked_mac, tmp_path, monkeypatch):
+    # exit 2 = heap missing / cannot attach / process gone: a sample without classes, not a failure
     fs = mocked_mac
     monkeypatch.setenv("FLEET_MOUSER_ROOT", str(fake_mouser_root(tmp_path)))
     out = tmp_path / "bad.jsonl"
-    monkeypatch.setenv("FAKE_HEAP_RC", "3")
+    monkeypatch.setenv("FAKE_HEAP_RC", "2")
     assert fs.main(["sample", "--label", "mouser", "--exe", "/x/Mouser", "--out", str(out), "--once", "--heap-classes"]) == 0
     monkeypatch.delenv("FAKE_HEAP_RC")
     monkeypatch.setenv("FAKE_HEAP_CLASSES", "garbage")

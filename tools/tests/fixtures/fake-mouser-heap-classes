@@ -3,6 +3,6 @@
 # Prints FAKE_HEAP_CLASSES (JSON) and records its argv next to itself.
 printf '%s\n' "$*" >> "$(dirname "$0")/heap-classes.calls"
 [ -n "${FAKE_HEAP_RC:-}" ] && exit "$FAKE_HEAP_RC"
-default='{"CGEvent": 1, "NSXPCConnection": 1}'
+default='{"pid": 1, "ts": 0, "classes": {"CGEvent": 1, "NSXPCConnection": 1}, "total_bytes": 1}'
 printf '%s\n' "${FAKE_HEAP_CLASSES:-$default}"
 exit 0
