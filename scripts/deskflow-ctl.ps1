@@ -496,6 +496,8 @@ function Get-AssertSingleProblems {
     $run = @($Inventory.RunEntries)
     if ($run.Count -ne 1) {
       $problems += "HKCU Run entries for deskflow count=$($run.Count) (want exactly 1 at $guiExe): " + (($run | ForEach-Object { "$($_.Name)=$($_.Command)" }) -join ', ')
+    } elseif ([string]::IsNullOrWhiteSpace([string]$run[0].Exe)) {
+      $problems += "HKCU Run\$($run[0].Name) has no executable in its command ('$($run[0].Command)'); want `"$guiExe`""
     } elseif ($guiExe -and -not ([System.IO.Path]::GetFullPath($run[0].Exe).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($guiExe).TrimEnd('\'))) {
       $problems += "HKCU Run\$($run[0].Name) launches $($run[0].Exe), not the canonical $guiExe"
     }

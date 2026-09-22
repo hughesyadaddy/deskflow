@@ -307,6 +307,10 @@ Describe 'Get-AssertSingleProblems' {
 
     $wrong = New-LauncherInventory @((New-RunEntry 'HKCU' 'Deskflow' 'C:\Users\alexh\Desktop\deskflow\build\bin\Release\deskflow.exe')) @() @() @()
     (@(Get-AssertSingleProblems -Inventory $wrong) -join "`n") | Should -Match 'HKCU Run\\Deskflow launches .*build\\bin\\Release\\deskflow.exe, not the canonical'
+
+    $empty = New-LauncherInventory @([pscustomobject]@{ Hive = 'HKCU'; Name = 'Deskflow'; Command = ''; Exe = $null }) @() @() @()
+    { Get-AssertSingleProblems -Inventory $empty } | Should -Not -Throw
+    (@(Get-AssertSingleProblems -Inventory $empty) -join "`n") | Should -Match 'HKCU Run\\Deskflow has no executable'
   }
 
   It 'fails on an HKLM Run entry, a Startup shortcut or a scheduled task launching deskflow' {

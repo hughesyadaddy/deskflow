@@ -28,11 +28,43 @@ setup() {
   mkdir -p "$SHIMS" "$FAKE_ROOT/scripts" "$MOUSER/.git" "$MOUSER/scripts" "$SHIM_STATE"
   : >"$SHIM_LOG"
 
-  # The deploy script calls the repo's install script; stub it inside the fake root.
-  printf '#!/usr/bin/env bash\necho "install-macos.sh $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"\n' >"$FAKE_ROOT/scripts/install-macos.sh"
-  # ... and deskflow-ctl (retire, then a fatal assert-single, after install).
-  # SHIM_CTL_ASSERT_RC fakes a failing seat; retire's exit 2 is tolerated.
-  printf '#!/usr/bin/env bash\necho "deskflow-ctl $* APP=${DESKFLOW_INSTALL_APP:-unset}" >> "$SHIM_LOG"\ncase "$1" in retire) exit "${SHIM_CTL_RETIRE_RC:-0}" ;; assert-single) [[ "${SHIM_CTL_ASSERT_RC:-0}" == 0 ]] || echo "deskflow-ctl assert-single: FAIL" >&2; exit "${SHIM_CTL_ASSERT_RC:-0}" ;; esac\n' >"$FAKE_ROOT/scripts/deskflow-ctl"
+  # The deploy script calls the repo's install script; stub it inside the fake
+  # root. Its own assert-single is report-only: SHIM_INSTALL_ASSERT_PROBLEMS
+  # makes the stub print them (and still exit 0, like the real script).
+  cat >"$FAKE_ROOT/scripts/install-macos.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "install-macos.sh $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"
+if [[ -n "${SHIM_INSTALL_ASSERT_PROBLEMS:-}" ]]; then
+  echo "deskflow-ctl assert-single: FAIL"
+  printf '  %s\n' "$SHIM_INSTALL_ASSERT_PROBLEMS"
+  echo "warning: assert-single reported problems (above); human steps remain -- the install continues" >&2
+fi
+STUB
+  # ... and deskflow-ctl: retire (exit 2 tolerated) then the ONE fatal
+  # assert-single at the very end of the deploy. SHIM_CTL_ASSERT_RC=1 fakes a
+  # seat with human steps left; the stub prints them like the real ctl.
+  cat >"$FAKE_ROOT/scripts/deskflow-ctl" <<'STUB'
+#!/usr/bin/env bash
+echo "deskflow-ctl $* APP=${DESKFLOW_INSTALL_APP:-unset}" >> "$SHIM_LOG"
+case "$1" in
+  retire)
+    if [[ "${SHIM_CTL_RETIRE_RC:-0}" == 2 ]]; then
+      echo "== deskflow-ctl: retire: root-owned retired files remain; run once as admin: =="
+      echo '  sudo rm -f "/usr/local/bin/deskflow-prio-apply.sh"'
+    fi
+    exit "${SHIM_CTL_RETIRE_RC:-0}" ;;
+  assert-single)
+    if [[ "${SHIM_CTL_ASSERT_RC:-0}" != 0 ]]; then
+      echo "deskflow-ctl assert-single: FAIL" >&2
+      echo "  login-items audit FAIL: enabled BTM app record launches \"Deskflow\" beside the LaunchAgent: 2.io.github.hughesyadaddy.deskflow" >&2
+      echo "  retired file present: /usr/local/bin/deskflow-prio-apply.sh (deskflow-ctl retire)" >&2
+    fi
+    exit "${SHIM_CTL_ASSERT_RC:-0}" ;;
+  login-items)
+    echo '    manual step: System Settings -> General -> Login Items & Extensions -> "Open at Login" -> remove "Deskflow"'
+    exit 0 ;;
+esac
+STUB
   chmod +x "$FAKE_ROOT/scripts/deskflow-ctl"
   # ... and the login-bridge renderer (--dry-run); the installed plist is a tmp path.
   export DESKFLOW_LOGIN_BRIDGE_PLIST="$TMP/org.deskflow.vhid-bridge.plist"
@@ -108,7 +140,7 @@ EOF
   unset FLEET_BRANCH FLEET_DEPLOY_MOUSER FLEET_DEPLOY_DESKFLOW FLEET_RECONFIGURE FLEET_SKIP_GIT_PULL
   unset DESKFLOW_CODESIGN_ID FLEET_KEYCHAIN_PASSWORD
   unset SHIM_CMAKE_RC SHIM_CODESIGN_VERIFY_RC SHIM_GIT_PULL_RC SHIM_PYTHON_RC SHIM_SECURITY_RC
-  unset SHIM_CTL_RETIRE_RC SHIM_CTL_ASSERT_RC
+  unset SHIM_CTL_RETIRE_RC SHIM_CTL_ASSERT_RC SHIM_INSTALL_ASSERT_PROBLEMS
 }
 
 teardown() {
@@ -275,21 +307,51 @@ script_lacks() {
 
 # --- login bridge plist ---------------------------------------------------------
 
-@test "after install the deploy retires stale files (exit 2 tolerated) and fails on assert-single" {
+@test "the deploy ends with retire (exit 2 tolerated) then ONE fatal assert-single, after Mouser" {
   write_env "ABC123"
-  export FLEET_DEPLOY_MOUSER=0 SHIM_CTL_RETIRE_RC=2
+  export SHIM_CTL_RETIRE_RC=2
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
+  [[ "$output" == *"=== done:"* ]]
   log_has "deskflow-ctl retire APP=/Applications/Deskflow.app"
   log_has "deskflow-ctl assert-single APP=/Applications/Deskflow.app"
   install_line="$(grep -n 'install-macos.sh' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  mouser_line="$(grep -n 'MOUSER_RESTART=1' "$SHIM_LOG" | head -1 | cut -d: -f1)"
   retire_line="$(grep -n 'deskflow-ctl retire' "$SHIM_LOG" | cut -d: -f1)"
   assert_line="$(grep -n 'deskflow-ctl assert-single' "$SHIM_LOG" | cut -d: -f1)"
-  [ "$install_line" -lt "$retire_line" ] && [ "$retire_line" -lt "$assert_line" ]
-  export SHIM_CTL_ASSERT_RC=1
+  [ -n "$mouser_line" ]
+  [ "$install_line" -lt "$mouser_line" ] && [ "$mouser_line" -lt "$retire_line" ] && [ "$retire_line" -lt "$assert_line" ]
+  [ "$(grep -c 'deskflow-ctl assert-single' "$SHIM_LOG")" = 1 ]
+}
+
+@test "a seat with human steps left is still FULLY deployed (Mouser included) before the final assert-single exits non-zero with a HUMAN STEP REQUIRED block" {
+  write_env "ABC123"
+  # install-macos.sh's own assert-single only reports; the deploy goes on.
+  export SHIM_INSTALL_ASSERT_PROBLEMS="login-items audit FAIL: enabled BTM app record" SHIM_CTL_RETIRE_RC=2 SHIM_CTL_ASSERT_RC=1
   run bash "$SCRIPT"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"assert-single failed after install"* ]]
+  # everything after install still ran: codesign verify, bridge plist, Mouser
+  log_has "codesign --verify --deep --strict /Applications/Deskflow.app"
+  log_has "install-login-bridge-macos.sh --dry-run"
+  log_has "MOUSER_RESTART=1"
+  log_has "deskflow-ctl retire"
+  log_has "deskflow-ctl assert-single"
+  mouser_line="$(grep -n 'MOUSER_RESTART=1' "$SHIM_LOG" | head -1 | cut -d: -f1)"
+  assert_line="$(grep -n 'deskflow-ctl assert-single' "$SHIM_LOG" | cut -d: -f1)"
+  [ "$mouser_line" -lt "$assert_line" ]
+  # the report-only problems from install were printed, not fatal there
+  [[ "$output" == *"warning: assert-single reported problems"* ]]
+  # the final block lists each problem with its exact command / UI path
+  [[ "$output" == *"HUMAN STEP REQUIRED"* ]]
+  [[ "$output" == *"the seat IS deployed"* ]]
+  [[ "$output" == *"- login-items audit FAIL: enabled BTM app record"* ]]
+  [[ "$output" == *"- retired file present: /usr/local/bin/deskflow-prio-apply.sh"* ]]
+  [[ "$output" == *'sudo rm -f "/usr/local/bin/deskflow-prio-apply.sh"'* ]]
+  [[ "$output" == *'System Settings -> General -> Login Items & Extensions -> "Open at Login" -> remove "Deskflow"'* ]]
+  [[ "$output" == *"assert-single failed on"* ]]
+  [[ "$output" != *"=== done:"* ]]
+  # a deploy never escalates
+  log_lacks "sudo"
 }
 
 @test "after install the bridge plist is rendered via --dry-run, linted, and compared: up to date is reported" {

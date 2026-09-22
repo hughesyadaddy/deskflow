@@ -97,10 +97,13 @@ RETIRED_KEEPALIVE_LOG_OLD="$HOME/Library/Logs/deskflow-keepalive.log"
 RETIRED_PRIO_APPLY="${DESKFLOW_CTL_RETIRED_PRIO_APPLY:-/usr/local/bin/deskflow-prio-apply.sh}"
 RETIRED_SYNERGY_AGENT="${DESKFLOW_CTL_RETIRED_SYNERGY_AGENT:-/Library/LaunchAgents/com.symless.synergy-agent.plist}"
 # BTM (Background Task Management) records that may launch Deskflow: the fleet
-# LaunchAgents, the prio LaunchDaemon and the login-window bridge. Anything
-# else matching LOGIN_ITEM_PATTERN is a second launcher.
+# LaunchAgents, the prio LaunchDaemon and the login-window bridge. Any other
+# enabled app / login-item record whose BUNDLE ID is ours or a KVM sibling's
+# is a second launcher. Bundle-id components, never free substrings: "Desk
+# Flow Notes" (com.acme.deskflownotes) and "Barrier Breaker" are not launchers.
 BTM_ALLOWED_LABELS="$CORE_LABEL $GUI_LABEL $CONVERGE_LABEL $PRIO_LABEL org.deskflow.vhid-bridge"
-LOGIN_ITEM_PATTERN='deskflow|synergy|barrier'
+LOGIN_ITEM_ID_PATTERN='^(io\.github\.hughesyadaddy\.deskflow([.-]|$)|org\.deskflow(\.|$)|com\.symless(\.|$)|([a-z0-9-]+\.)*barrier(\.|$))'
+LOGIN_ITEM_BUNDLE_PATTERN='^(deskflow|synergy|barrier)\.app$'
 
 # `kill` is a bash builtin; disable it so the external binary is used and a
 # PATH shim can observe the escalation in tests.
@@ -660,13 +663,30 @@ parse_btm_dump() {
   '
 }
 
+url_decode() {
+  # file:///Applications/Desk%20Flow.app/ -> ... Desk Flow.app/ (the System
+  # Events step needs the real name). Pure bash: %XX -> \xXX -> printf %b.
+  local s="${1//%/\\x}"
+  printf '%b' "$s"
+}
+
 btm_record_name() {
-  # Display name for a record: the bundle/plist basename from its URL, else
-  # the identifier without the "N." type prefix.
+  # Display name for a record: the decoded bundle/plist basename from its
+  # URL, else the identifier without the "N." type prefix.
   local id="$1" url="$2" base
-  base="${url%/}"; base="${base##*/}"; base="${base%.app}"; base="${base%.plist}"
+  base="$(url_decode "${url%/}")"; base="${base##*/}"; base="${base%.app}"; base="${base%.plist}"
   [[ -n "$base" && "$base" != "(null)" ]] && { echo "$base"; return; }
   echo "${id#[0-9]*.}"
+}
+
+btm_is_ours() {
+  # $1 = identifier (any "N." prefix stripped), $2 = URL. True for our bundle
+  # ids / KVM siblings by id component, or a bundle literally named
+  # Deskflow.app / Synergy.app / Barrier.app.
+  local label="$1" url="$2" bundle
+  grep -qiE "$LOGIN_ITEM_ID_PATTERN" <<<"$label" && return 0
+  bundle="$(url_decode "${url%/}")"; bundle="${bundle##*/}"
+  grep -qiE "$LOGIN_ITEM_BUNDLE_PATTERN" <<<"$bundle"
 }
 
 btm_manual_step() {
@@ -681,27 +701,29 @@ EOF
 btm_evaluate() {
   # Pure policy over parse_btm_dump TSV on stdin. Prints one finding per
   # offending record (with its manual step) and returns 1 on any finding.
-  # The four fleet agents, the prio daemon and the login bridge are allowed.
-  local id type disp url rc=0 app_records=0 app_ids="" name label
+  # The four fleet agents, the prio daemon and the login bridge are allowed;
+  # disabled records are not launchers and never count.
+  local id type disp url rc=0 name label enabled_urls=""
   while IFS=$'\t' read -r id type disp url; do
     [[ -n "$id" ]] || continue
     label="${id#[0-9]*.}"
-    if ! printf '%s\n%s\n' "$id" "$url" | grep -qiE "$LOGIN_ITEM_PATTERN"; then continue; fi
+    btm_is_ours "$label" "$url" || continue
+    [[ "$disp" == enabled* ]] || continue
     name="$(btm_record_name "$id" "$url")"
     case "$type" in
       app|"login item")
-        app_records=$((app_records + 1)); app_ids+="${app_ids:+, }$id"
-        if [[ "$disp" == enabled* ]]; then
-          echo "  FAIL: enabled BTM $type record launches \"$name\" beside the LaunchAgent: $id ($url)"
-          btm_manual_step "$name" "$id"
-          rc=1
-        fi
+        echo "  FAIL: enabled BTM $type record launches \"$name\" beside the LaunchAgent: $id ($url)"
+        btm_manual_step "$name" "$id"
+        enabled_urls+="$(url_decode "${url%/}")"$'\n'
+        rc=1
         ;;
       agent|"legacy agent")
+        # Only OUR ids are policed here (an old org.deskflow.* agent plist);
+        # a sibling KVM's agent plist is the retired-file check's business.
         case " $BTM_ALLOWED_LABELS " in
           *" $label "*) ;;
           *)
-            if [[ "$disp" == enabled* ]]; then
+            if grep -qiE '^(io\.github\.hughesyadaddy\.deskflow|org\.deskflow)' <<<"$label"; then
               echo "  FAIL: enabled BTM $type record is not a fleet agent: $id ($url)"
               echo "    manual step: remove the plist behind $url and run: launchctl bootout $DOMAIN/$label"
               rc=1
@@ -712,9 +734,14 @@ btm_evaluate() {
       *) ;; # daemons (deskflow-prio), developer/curated groups, quicklook: not launchers of the GUI
     esac
   done
-  if (( app_records > 1 )); then
-    echo "  FAIL: $app_records BTM app/login-item records for one bundle (want <=1, ideally 0): $app_ids"
-    echo "    manual step: remove every \"Deskflow\" row under System Settings -> General -> Login Items & Extensions; if one survives: sfltool resetbtm, then reboot"
+  # Two ENABLED app/login-item records for the SAME bundle (macbookpro had
+  # 2.io.github.hughesyadaddy.deskflow + orphaned 2.org.deskflow.deskflow for
+  # /Applications/Deskflow.app): one row in System Settings may hide the other.
+  local dup
+  dup="$(printf '%s' "$enabled_urls" | sort | uniq -d | head -1)"
+  if [[ -n "$dup" ]]; then
+    echo "  FAIL: more than one enabled BTM app/login-item record for ${dup#file://}"
+    echo "    manual step: remove every \"$(btm_record_name '' "$dup")\" row under System Settings -> General -> Login Items & Extensions; if one survives: sfltool resetbtm, then reboot"
     rc=1
   fi
   return "$rc"

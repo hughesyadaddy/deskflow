@@ -128,10 +128,19 @@ start_deskflow() {
   echo "== Retired files (deskflow-ctl retire) =="
   DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" retire || true # fleet:allow exit 2 = root steps printed for the operator
   # One launcher only: launchd's core (ppid 1) and launchd's GUI, no BTM
-  # login item, no runningboard copy. Fatal: an install that leaves two
-  # launchers is the 2026-09-21 macbookpro "already running -> exit 5" bug.
-  echo "== Single launcher (deskflow-ctl assert-single) =="
-  DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" assert-single
+  # login item, no runningboard copy. REPORT-ONLY here: the remaining
+  # problems are human steps (System Settings login item, root-owned files)
+  # and a deploy must still finish the whole seat (bridge check, the other
+  # installers) before it fails on them -- fleet-deploy-macos.sh runs the one fatal assert-single
+  # at its very end. DESKFLOW_INSTALL_ASSERT_FATAL=1 makes it fatal here.
+  echo "== Single launcher (deskflow-ctl assert-single, report-only) =="
+  if ! DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" assert-single; then
+    if [[ "${DESKFLOW_INSTALL_ASSERT_FATAL:-0}" == "1" ]]; then
+      echo "error: assert-single failed and DESKFLOW_INSTALL_ASSERT_FATAL=1" >&2
+      exit 1
+    fi
+    echo "warning: assert-single reported problems (above); human steps remain -- the install continues" >&2
+  fi
 }
 
 # Fatal unless the bundle verifies AND deskflow-core carries a real (non ad-hoc)

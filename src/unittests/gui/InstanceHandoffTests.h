@@ -17,4 +17,6 @@ private Q_SLOTS:
   void quit_is_refused_by_launchd_owned_instance();
   void show_and_legacy_bare_connection_raise_window();
   void requests_fail_when_nothing_listens();
+  void quit_retries_until_a_late_listener_appears();
+  void quit_retry_gives_up_after_the_budget();
 };

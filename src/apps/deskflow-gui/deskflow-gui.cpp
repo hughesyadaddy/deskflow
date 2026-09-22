@@ -119,18 +119,21 @@ int main(int argc, char *argv[])
       macLaunchdOwnsGui(), macGuiLaunchAgentInstalled(), macStartAtLoginEnabled()
   );
   if (!instanceLock && ownership.mayTakeOver) {
-    // launchd's copy is canonical. Exit 5 here would make a KeepAlive agent relaunch
-    // us every 30 s for as long as an unmanaged (Login Item) copy lives; instead ask
-    // that copy to quit and take its place. Exit 0 keeps launchd quiet if it will not.
+    // launchd's copy is canonical: ask the unmanaged (Login Item) copy that holds
+    // the lock to quit and take its place. That copy took the lock in ITS main()
+    // and only listens on the handoff socket once its MainWindow is up, so retry
+    // for a few seconds instead of judging on one connect. If it still will not
+    // hand over, exit NON-zero: the agent has SuccessfulExit=false, so exit 0 would
+    // never be respawned and the BTM copy would own the session until logout.
     // An unmanaged copy never takes over: it exits 5 below like any duplicate.
-    if (InstanceHandoffServer::requestQuit(socketName)) {
+    if (InstanceHandoffServer::requestQuitRetrying(socketName, 5000)) {
       instanceLock = SingleInstanceLock::tryAcquire(
           SingleInstanceLock::Role::Gui, SingleInstanceLock::Scope::Session, std::chrono::milliseconds(5000)
       );
     }
     if (!instanceLock) {
-      qWarning("another gui instance holds the lock and would not hand over; exiting quietly");
-      return s_exitSuccess;
+      qWarning("another gui instance holds the lock and would not hand over; exiting so launchd retries");
+      return s_exitDuplicate;
     }
     qInfo("took over from an unmanaged gui instance");
   }

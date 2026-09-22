@@ -9,6 +9,7 @@
 #include "gui/InstanceHandoff.h"
 
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QLocalSocket>
 #include <QSignalSpy>
 #include <QThread>
@@ -28,7 +29,10 @@ QString uniqueSocketName()
 class ClientThread : public QThread
 {
 public:
-  ClientThread(QString socketName, bool quit) : m_socketName(std::move(socketName)), m_quit(quit)
+  ClientThread(QString socketName, bool quit, int retryTotalMs = 0)
+      : m_socketName(std::move(socketName)),
+        m_quit(quit),
+        m_retryTotalMs(retryTotalMs)
   {
   }
   bool result = false;
@@ -36,13 +40,18 @@ public:
 protected:
   void run() override
   {
-    result = m_quit ? InstanceHandoffServer::requestQuit(m_socketName, 3000)
-                    : InstanceHandoffServer::requestShow(m_socketName, 3000);
+    if (m_retryTotalMs > 0) {
+      result = InstanceHandoffServer::requestQuitRetrying(m_socketName, m_retryTotalMs, 300);
+    } else {
+      result = m_quit ? InstanceHandoffServer::requestQuit(m_socketName, 3000)
+                      : InstanceHandoffServer::requestShow(m_socketName, 3000);
+    }
   }
 
 private:
   QString m_socketName;
   bool m_quit;
+  int m_retryTotalMs;
 };
 
 } // namespace
@@ -111,6 +120,34 @@ void InstanceHandoffTests::requests_fail_when_nothing_listens()
   const auto name = uniqueSocketName();
   QVERIFY(!InstanceHandoffServer::requestQuit(name, 500));
   QVERIFY(!InstanceHandoffServer::requestShow(name, 500));
+}
+
+// The launchd copy asks before the BTM copy's MainWindow listens: the retry
+// must bridge that gap instead of reporting "would not hand over".
+void InstanceHandoffTests::quit_retries_until_a_late_listener_appears()
+{
+  const auto name = uniqueSocketName();
+  ClientThread client(name, true, 5000);
+  client.start();
+  QThread::msleep(700); // nothing listens yet; the first attempt(s) fail
+
+  InstanceHandoffServer server;
+  server.setHonoursQuit(true);
+  QVERIFY(server.listen(name));
+  QSignalSpy quitSpy(&server, &InstanceHandoffServer::quitRequested);
+  QTRY_COMPARE_WITH_TIMEOUT(quitSpy.count(), 1, 6000);
+  QVERIFY(client.wait(6000));
+  QVERIFY(client.result);
+}
+
+void InstanceHandoffTests::quit_retry_gives_up_after_the_budget()
+{
+  const auto name = uniqueSocketName();
+  QElapsedTimer clock;
+  clock.start();
+  QVERIFY(!InstanceHandoffServer::requestQuitRetrying(name, 600, 100));
+  QVERIFY(clock.elapsed() >= 600);
+  QVERIFY(clock.elapsed() < 3000);
 }
 
 QTEST_MAIN(InstanceHandoffTests)

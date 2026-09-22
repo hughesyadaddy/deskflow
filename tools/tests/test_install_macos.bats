@@ -195,21 +195,29 @@ log_lacks() {
   [ ! -e "${TMPDIR:-/tmp}/$stage" ]
 }
 
-@test "install ends with retire (keepalive log gone, root steps printed) and a fatal assert-single" {
+@test "install ends with retire (keepalive log gone, root steps printed) and a REPORT-ONLY assert-single" {
   mkdir -p "$HOME/Library/Logs/Deskflow" "$(dirname "$DESKFLOW_CTL_RETIRED_PRIO_APPLY")"
   : >"$HOME/Library/Logs/Deskflow/deskflow-keepalive.log"
   : >"$DESKFLOW_CTL_RETIRED_PRIO_APPLY"
   run bash "$SCRIPT"
-  # a root-owned retired file is a human step for retire (exit 2, tolerated)
-  # but a hard failure for assert-single: the install is not done.
-  [ "$status" -eq 1 ]
+  # a root-owned retired file is a human step: retire (exit 2) and
+  # assert-single both say so, but the install still completes -- the one
+  # fatal gate is at the end of fleet-deploy-macos.sh, after Mouser.
+  [ "$status" -eq 0 ]
   [[ "$output" == *"retire: removed $HOME/Library/Logs/Deskflow/deskflow-keepalive.log"* ]]
   [[ "$output" == *"sudo rm -f \"$DESKFLOW_CTL_RETIRED_PRIO_APPLY\""* ]]
   [[ "$output" == *"assert-single: FAIL"* ]]
   [[ "$output" == *"retired file present: $DESKFLOW_CTL_RETIRED_PRIO_APPLY"* ]]
-  [[ "$output" != *"== Done:"* ]]
+  [[ "$output" == *"warning: assert-single reported problems"* ]]
+  [[ "$output" == *"== Done:"* ]]
   [ ! -e "$HOME/Library/Logs/Deskflow/deskflow-keepalive.log" ]
   log_lacks "sudo"
+  # opt-in fatal
+  : >"$SHIM_LOG"
+  DESKFLOW_INSTALL_ASSERT_FATAL=1 run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"assert-single: FAIL"* ]]
+  [[ "$output" != *"== Done:"* ]]
 
   rm -f "$DESKFLOW_CTL_RETIRED_PRIO_APPLY"; : >"$SHIM_LOG"
   run bash "$SCRIPT"

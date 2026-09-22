@@ -1,0 +1,63 @@
+========================
+ Records for UID 501 : 11111111-2222-3333-4444-555555555555
+========================
+ #1:
+                 UUID: A
+                 Name: Desk Flow Notes
+       Developer Name: Acme
+                 Type: app (0x2)
+          Disposition: [enabled, allowed, visible, notified] (0xf)
+           Identifier: 2.com.acme.deskflownotes
+                  URL: file:///Applications/Desk%20Flow%20Notes.app/
+    Bundle Identifier: com.acme.deskflownotes
+
+ #2:
+                 UUID: B
+                 Name: Synergy
+                 Type: agent (0x8)
+          Disposition: [enabled, allowed, notified] (0xb)
+           Identifier: 8.com.symless.synergy-agent
+                  URL: file:///Library/LaunchAgents/com.symless.synergy-agent.plist
+
+ #3:
+                 UUID: C
+                 Name: Deskflow
+                 Type: login item (0x4)
+          Disposition: [disabled, allowed, not notified] (0x2)
+           Identifier: 4.io.github.hughesyadaddy.deskflow
+                  URL: file:///Applications/Deskflow.app/
+
+ #4:
+                 UUID: D
+                 Name: Deskflow prio
+                 Type: daemon (0x10)
+          Disposition: [enabled, allowed, notified] (0xb)
+           Identifier: 16.io.github.hughesyadaddy.deskflow-prio
+                  URL: file:///Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist
+
+ #5:
+                 UUID: E
+                 Name: Mariner License Prep, LLC
+                 Type: developer (0x80)
+          Disposition: [enabled, allowed, notified] (0xb)
+           Identifier: Mariner License Prep, LLC
+                  URL: (null)
+   Embedded Item Identifiers:
+        #1: 2.io.github.hughesyadaddy.deskflow
+        #2: 8.org.deskflow.vhid-bridge
+
+ #6:
+                 UUID: F
+                 Name: Deskflow
+                 Type: legacy agent (0x10008)
+          Disposition: [enabled, allowed, not notified] (0x3)
+           Identifier: 8.org.deskflow.vhid-bridge
+                  URL: file:///Library/LaunchAgents/org.deskflow.vhid-bridge.plist
+
+ #7:
+                 UUID: G
+                 Name: Barrier Breaker
+                 Type: app (0x2)
+          Disposition: [enabled, allowed, notified] (0xb)
+           Identifier: 2.com.game.barrierbreaker
+                  URL: file:///Applications/Barrier%20Breaker.app/

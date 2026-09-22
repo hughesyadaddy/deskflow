@@ -457,7 +457,7 @@ add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Conte
   [[ "$output" == *"2.io.github.hughesyadaddy.deskflow (file:///Applications/Deskflow.app/)"* ]]
   [[ "$output" == *"2.org.deskflow.deskflow"* ]]
   [[ "$output" == *'System Settings -> General -> Login Items & Extensions -> "Open at Login" -> remove "Deskflow"'* ]]
-  [[ "$output" == *"2 BTM app/login-item records for one bundle"* ]]
+  [[ "$output" == *"more than one enabled BTM app/login-item record for /Applications/Deskflow.app"* ]]
   [[ "$output" == *"sfltool resetbtm"* ]]
   # never the osascript delete by default
   log_lacks "osascript"
@@ -487,6 +487,40 @@ add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Conte
     sed 's/Disposition: \[enabled, allowed, not notified\] (0x3)/Disposition: [disabled, allowed, not notified] (0x2)/' >"$SHIM_STATE/btm.txt"
   run bash "$SCRIPT" login-items audit
   [ "$status" -eq 0 ]
+}
+
+@test "login-items audit passes the adversarial dump: look-alike names, a sibling's agent, a DISABLED Deskflow login item" {
+  use_btm adversarial
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"login-items: OK"* ]]
+  # "Desk Flow Notes" / "Barrier Breaker" are not launchers of ours; the
+  # disabled 4.io.github.hughesyadaddy.deskflow record is not a launcher at all.
+  [[ "$output" != *"Desk Flow"* ]]
+  [[ "$output" != *"Barrier Breaker"* ]]
+  # flip the Deskflow login item to enabled: the only thing that may fail it
+  sed 's/Disposition: \[disabled, allowed, not notified\] (0x2)/Disposition: [enabled, allowed, not notified] (0x3)/' \
+    "$BATS_TEST_DIRNAME/fixtures/btm-dump-adversarial.txt" >"$SHIM_STATE/btm.txt"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"4.io.github.hughesyadaddy.deskflow"* ]]
+  [[ "$output" != *"Desk Flow"* ]]
+  # a real barrier bundle id (component match) is a launcher
+  sed -e 's/2.com.game.barrierbreaker/2.com.github.debauchee.barrier/' -e 's#Barrier%20Breaker.app#Barrier.app#' \
+    "$BATS_TEST_DIRNAME/fixtures/btm-dump-adversarial.txt" >"$SHIM_STATE/btm.txt"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"2.com.github.debauchee.barrier"* ]]
+}
+
+@test "login-items audit URL-decodes the bundle name in the System Events step" {
+  sed 's#file:///Applications/Deskflow.app/#file:///Applications/Deskflow%20Fleet.app/#' \
+    "$BATS_TEST_DIRNAME/fixtures/btm-dump-two-app-records.txt" >"$SHIM_STATE/btm.txt"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'delete login item "Deskflow Fleet"'* ]]
+  [[ "$output" != *'Deskflow%20Fleet'* ]]
+  [[ "$output" == *"more than one enabled BTM app/login-item record for /Applications/Deskflow Fleet.app"* ]]
 }
 
 @test "login-items audit reports SKIP (exit 3, never PASS) with the sudo hint when dumpbtm needs privileges" {
