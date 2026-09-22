@@ -342,6 +342,9 @@ def mocked_mac(fs, monkeypatch):
     monkeypatch.setattr(fs, "notify", lambda message: (_ for _ in ()).throw(AssertionError(message)))
     monkeypatch.setattr(fs, "derive_scenario",
                         lambda proc, home=None, log_path=None, status_fn=None: "device-connected")
+    # heap-classes: pretend passwordless sudo exists and run the (fake) tool directly
+    monkeypatch.setattr(fs, "sudo_noninteractive_ok", lambda: True)
+    monkeypatch.setattr(fs, "HEAP_SUDO", ())
     return fs
 
 
@@ -827,6 +830,202 @@ def test_read_last_samples_skips_header_and_partial_lines(fs, tmp_path):
     assert [s["pid"] for s in fs.read_last_samples(p, 3)] == [1, 2]
     assert [s["pid"] for s in fs.read_last_samples(p, 1)] == [2]
     assert fs.read_last_samples(tmp_path / "absent.jsonl", 2) == []
+
+
+# --------------------------------------------------------------------------
+# heap classes (--heap-classes / --class-slope-max)
+# --------------------------------------------------------------------------
+
+FAKE_HEAP_TOOL = Path(__file__).resolve().parent / "fixtures" / "fake-mouser-heap-classes"
+
+
+def fake_mouser_root(tmp_path: Path) -> Path:
+    """A Mouser checkout stub whose tools/mouser-heap-classes is the fixture script."""
+    root = tmp_path / "Mouser"
+    (root / "tools").mkdir(parents=True)
+    dest = root / "tools" / "mouser-heap-classes"
+    dest.write_bytes(FAKE_HEAP_TOOL.read_bytes())
+    dest.chmod(0o755)
+    return root
+
+
+HEAP_TOOL_JSON = ('{"pid": 4242, "ts": 1758493271, "classes": {"CGEvent": 120, "CGSEventAppendix": 120, '
+                  '"HIDEvent": 300, "NSXPCConnection": 4, "GPProcessMonitor": 4, "CGImage": 9, "non-object": 17}, '
+                  '"total_bytes": 587427918}')
+
+
+def test_parse_heap_classes_reads_the_tool_contract(fs):
+    # the exact shape of Mouser tools/mouser-heap-classes (pid, ts, classes, total_bytes)
+    assert fs.parse_heap_classes(HEAP_TOOL_JSON) == (
+        {"CGEvent": 120, "CGSEventAppendix": 120, "HIDEvent": 300, "NSXPCConnection": 4,
+         "GPProcessMonitor": 4, "CGImage": 9, "non-object": 17},
+        587427918,
+    )
+    # a bare class map is accepted too; non-numeric values are dropped
+    assert fs.parse_heap_classes('{"CGEvent": 12, "NSXPCConnection": 3.0, "note": "x", "flag": true}') == \
+        ({"CGEvent": 12, "NSXPCConnection": 3}, None)
+    assert fs.parse_heap_classes("not json") is None
+    assert fs.parse_heap_classes("[1, 2]") is None
+
+
+def test_heap_classes_tool_lookup(fs, tmp_path, monkeypatch):
+    monkeypatch.setenv("FLEET_MOUSER_ROOT", str(tmp_path / "nowhere"))
+    assert fs.heap_classes_tool() is None
+    root = fake_mouser_root(tmp_path)
+    monkeypatch.setenv("FLEET_MOUSER_ROOT", str(root))
+    assert fs.heap_classes_tool() == root / "tools" / "mouser-heap-classes"
+    (root / "tools" / "mouser-heap-classes").chmod(0o644)
+    assert fs.heap_classes_tool() is None
+
+
+def test_sample_heap_classes_stores_counts_from_the_tool(mocked_mac, tmp_path, monkeypatch, capsys):
+    fs = mocked_mac
+    root = fake_mouser_root(tmp_path)
+    monkeypatch.setenv("FLEET_MOUSER_ROOT", str(root))
+    monkeypatch.setenv("FAKE_HEAP_CLASSES", HEAP_TOOL_JSON)
+    out = tmp_path / "hc.jsonl"
+    assert fs.main(["sample", "--label", "io.github.hughesyadaddy.mouser",
+                    "--exe", "/Applications/Mouser.app/Contents/MacOS/Mouser",
+                    "--out", str(out), "--once", "--heap-classes"]) == 0
+    rec = json.loads(out.read_text().splitlines()[1])
+    assert rec["classes"]["CGEvent"] == 120 and rec["classes"]["NSXPCConnection"] == 4
+    assert rec["classes"]["non-object"] == 17
+    assert rec["heap_total_bytes"] == 587427918
+    # the tool was invoked with the sampled pid
+    assert (root / "tools" / "heap-classes.calls").read_text().strip() == "--pid 4242"
+    assert "note" not in capsys.readouterr().err
+
+
+def test_sample_without_heap_classes_flag_has_no_classes_field(mocked_mac, tmp_path, monkeypatch):
+    fs = mocked_mac
+    monkeypatch.setenv("FLEET_MOUSER_ROOT", str(fake_mouser_root(tmp_path)))
+    out = tmp_path / "plain.jsonl"
+    assert fs.main(["sample", "--label", "io.github.hughesyadaddy.mouser",
+                    "--exe", "/Applications/Mouser.app/Contents/MacOS/Mouser",
+                    "--out", str(out), "--once"]) == 0
+    assert "classes" not in json.loads(out.read_text().splitlines()[1])
+
+
+def test_sample_heap_classes_skips_with_a_note_when_the_tool_is_absent(mocked_mac, tmp_path, monkeypatch, capsys):
+    fs = mocked_mac
+    monkeypatch.setenv("FLEET_MOUSER_ROOT", str(tmp_path / "no-mouser"))
+    out = tmp_path / "absent.jsonl"
+    assert fs.main(["sample", "--label", "io.github.hughesyadaddy.mouser",
+                    "--exe", "/Applications/Mouser.app/Contents/MacOS/Mouser",
+                    "--out", str(out), "--once", "--heap-classes"]) == 0
+    rec = json.loads(out.read_text().splitlines()[1])
+    assert rec["classes"] is None and rec["heap_total_bytes"] is None
+    err = capsys.readouterr().err
+    assert "note: --heap-classes requested" in err and "mouser-heap-classes" in err
+
+
+def test_collect_heap_classes_runs_the_tool_under_sudo_n(fs, monkeypatch):
+    calls = []
+
+    class P:
+        returncode = 0
+        stdout = HEAP_TOOL_JSON
+
+    monkeypatch.setattr(fs.subprocess, "run", lambda cmd, **kw: (calls.append(cmd), P())[1])
+    classes, total = fs.collect_heap_classes(4242, Path("/m/tools/mouser-heap-classes"))
+    assert calls == [["sudo", "-n", "/m/tools/mouser-heap-classes", "--pid", "4242"]]
+    assert classes["CGEvent"] == 120 and total == 587427918
+
+
+def test_sample_heap_classes_without_passwordless_sudo_records_null_and_notes_once(
+        mocked_mac, tmp_path, monkeypatch, capsys):
+    fs = mocked_mac
+    monkeypatch.setenv("FLEET_MOUSER_ROOT", str(fake_mouser_root(tmp_path)))
+    monkeypatch.setattr(fs, "sudo_noninteractive_ok", lambda: False)
+    out = tmp_path / "nosudo"
+    out.mkdir()
+    # two targets per tick -> two samples, still exactly one notice
+    assert fs.main(["sample", "--label", "io.github.hughesyadaddy.mouser", "--label", "deskflow-core",
+                    "--exe", "/Applications/Mouser.app/Contents/MacOS/Mouser", "--exe", "/x/deskflow-core",
+                    "--start-soak", str(out), "--once", "--heap-classes"]) == 0
+    recs = [json.loads(ln) for f in sorted((out / "latest").glob("*.jsonl"))
+            for ln in f.read_text().splitlines()[1:]]
+    assert len(recs) == 2 and all(r["classes"] is None for r in recs)
+    err = capsys.readouterr().err
+    assert err.count("fleet-soak: note:") == 1
+    assert "passwordless sudo" in err and "mouser-heap-classes-soak.md" in err
+    # the tool was never invoked
+    assert not (tmp_path / "Mouser" / "tools" / "heap-classes.calls").exists()
+
+
+def test_sample_heap_classes_null_when_the_tool_fails_or_prints_junk(mocked_mac, tmp_path, monkeypatch):
+    # exit 2 = heap missing / cannot attach / process gone: a sample without classes, not a failure
+    fs = mocked_mac
+    monkeypatch.setenv("FLEET_MOUSER_ROOT", str(fake_mouser_root(tmp_path)))
+    out = tmp_path / "bad.jsonl"
+    monkeypatch.setenv("FAKE_HEAP_RC", "2")
+    assert fs.main(["sample", "--label", "mouser", "--exe", "/x/Mouser", "--out", str(out), "--once", "--heap-classes"]) == 0
+    monkeypatch.delenv("FAKE_HEAP_RC")
+    monkeypatch.setenv("FAKE_HEAP_CLASSES", "garbage")
+    assert fs.main(["sample", "--label", "mouser", "--exe", "/x/Mouser", "--out", str(out), "--once", "--heap-classes"]) == 0
+    recs = [json.loads(ln) for ln in out.read_text().splitlines()[1:]]
+    assert [r["classes"] for r in recs] == [None, None]
+
+
+def _with_classes(samples, growth_per_h: dict[str, float], base: dict[str, int]):
+    for s in samples:
+        h = (fs_ts(s["ts"])) / 3600
+        s["classes"] = {k: int(base[k] + growth_per_h.get(k, 0.0) * h) for k in base}
+    return samples
+
+
+def fs_ts(ts: str) -> float:
+    import datetime as dt
+
+    return dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp() - T0
+
+
+def test_report_class_slopes_pass_when_flat(fs, tmp_path, capsys):
+    samples = _with_classes(series(30, 0.0), {}, {"CGEvent": 100, "NSXPCConnection": 3})
+    p = write_jsonl(tmp_path / "flat-classes.jsonl", header(), samples)
+    code, res = report(fs, p, "--class-slope-max", "10", capsys=capsys)
+    assert code == 0, res
+    assert res["class_slopes_h"] == {"CGEvent": 0.0, "NSXPCConnection": 0.0}
+    assert res["class_samples"] == res["analyzed"]
+
+
+def test_report_class_slope_fails_when_a_class_grows_faster_than_the_limit(fs, tmp_path, capsys):
+    # NSXPCConnection leaks 40/h (the Leak B shape); CGEvent stays flat
+    samples = _with_classes(series(30, 0.0), {"NSXPCConnection": 40.0}, {"CGEvent": 100, "NSXPCConnection": 3})
+    p = write_jsonl(tmp_path / "leak-classes.jsonl", header(), samples)
+    code, res = report(fs, p, "--class-slope-max", "10", capsys=capsys)
+    assert code == 1
+    assert res["verdict"] == "FAIL"
+    assert res["class_slopes_h"]["NSXPCConnection"] == pytest.approx(40.0, abs=1.0)
+    assert res["class_slopes_h"]["CGEvent"] == pytest.approx(0.0, abs=0.01)
+    assert any("heap class NSXPCConnection" in f and "> 10.0/h" in f for f in res["failures"])
+    assert not any("CGEvent" in f for f in res["failures"])
+    # without the gate the same file passes
+    code, res = report(fs, p, capsys=capsys)
+    assert code == 0
+
+
+def test_report_class_slope_gate_fails_without_class_samples(fs, tmp_path, capsys):
+    p = write_jsonl(tmp_path / "no-classes.jsonl", header(), series(30, 0.0))
+    code, res = report(fs, p, "--class-slope-max", "10", capsys=capsys)
+    assert code == 1
+    assert any("no samples with `classes`" in f for f in res["failures"])
+    assert res["class_slopes_h"] == {}
+    # samples whose tool run failed (classes null) do not count either
+    samples = series(30, 0.0)
+    for s in samples:
+        s["classes"] = None
+    p = write_jsonl(tmp_path / "null-classes.jsonl", header(), samples)
+    code, res = report(fs, p, "--class-slope-max", "10", capsys=capsys)
+    assert code == 1 and res["class_samples"] == 0
+
+
+def test_report_text_output_lists_class_slopes(fs, tmp_path, capsys):
+    samples = _with_classes(series(30, 0.0), {"CGEvent": 2.0}, {"CGEvent": 100})
+    p = write_jsonl(tmp_path / "text-classes.jsonl", header(), samples)
+    assert fs.main(["report", "--in", str(p), "--class-slope-max", "10"]) == 0
+    out = capsys.readouterr().out
+    assert "classes/h: CGEvent=" in out
 
 
 def test_report_cpu_runs_and_counter_rates(fs, tmp_path, capsys):

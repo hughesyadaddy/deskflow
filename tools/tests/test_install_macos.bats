@@ -33,6 +33,26 @@ Identifier=deskflow-core
 Authority=Some Self-Signed Cert
 TeamIdentifier=not set'
 
+# Real team signature but signed without --options runtime (flags=0x0):
+# what hackintosh's pre-L3 build looked like.
+UNHARDENED_DV='Executable=/Applications/Deskflow.app/Contents/MacOS/deskflow-prio
+Identifier=org.deskflow.deskflow-prio
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=1234 flags=0x0(none) hashes=30+7 location=embedded
+Signature size=4795
+Authority=Apple Development: Alex Hughes (ABCDE12345)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=ABCDE12345
+Sealed Resources=none'
+
+# Per-binary codesign -dvvv override: write the DV text to
+# $SHIM_STATE/dv/<basename> and the shim answers with it for that file only.
+dv_for() {
+  mkdir -p "$SHIM_STATE/dv"
+  printf '%s\n' "$2" >"$SHIM_STATE/dv/$1"
+}
+
 setup() {
   TMP="$(mktemp -d "${BATS_TEST_TMPDIR:-${TMPDIR:-/tmp}}/install-macos.XXXXXX")"
   SHIMS="$TMP/bin"
@@ -65,6 +85,24 @@ if [[ "${1:-}" == "--install" ]]; then
   # deskflow-prio ships in the bundle (root LaunchDaemon, installed by deskflow-ctl prio).
   : > "$prefix/Deskflow.app/Contents/MacOS/deskflow-prio"
   chmod +x "$prefix/Deskflow.app/Contents/MacOS/deskflow-prio"
+  # macdeployqt output: a framework binary and a dylib the signature walk
+  # must cover, plus Resources/Headers files it must skip.
+  fw="$prefix/Deskflow.app/Contents/Frameworks"
+  mkdir -p "$fw/QtCore.framework/Versions/A/Resources" "$fw/QtCore.framework/Versions/A/Headers"
+  : > "$fw/QtCore.framework/Versions/A/QtCore"
+  chmod +x "$fw/QtCore.framework/Versions/A/QtCore"
+  : > "$fw/QtCore.framework/Versions/A/Resources/Info.plist"
+  : > "$fw/QtCore.framework/Versions/A/Headers/qglobal.h"
+  : > "$fw/libcrypto.3.dylib"
+  # Qt plugins and a Resources dylib: 22 of 60 Mach-Os in a real bundle live
+  # under PlugIns; both trees are part of the signature walk.
+  mkdir -p "$prefix/Deskflow.app/Contents/PlugIns/platforms" "$prefix/Deskflow.app/Contents/PlugIns/imageformats"
+  : > "$prefix/Deskflow.app/Contents/PlugIns/platforms/libqcocoa.dylib"
+  : > "$prefix/Deskflow.app/Contents/PlugIns/imageformats/libqbad.dylib"
+  : > "$prefix/Deskflow.app/Contents/Resources/libres.dylib"
+  # an executable script in Resources is not a Mach-O and must be skipped
+  printf '#!/bin/sh\n' > "$prefix/Deskflow.app/Contents/Resources/helper.sh"
+  chmod +x "$prefix/Deskflow.app/Contents/Resources/helper.sh"
 fi
 exit 0
 EOF
@@ -76,8 +114,13 @@ case "${1:-}" in
   -dvvv)
     # Real codesign prints -dvvv details to stderr. Plain -dv never prints
     # Authority= lines regardless of signature, which is why the real
-    # script uses -dvvv; the shim only answers that flag.
-    printf '%s\n' "${SHIM_CODESIGN_DV:-}" >&2
+    # script uses -dvvv; the shim only answers that flag. A per-binary
+    # override in $SHIM_STATE/dv/<basename> wins over SHIM_CODESIGN_DV.
+    if [[ -f "$SHIM_STATE/dv/$(basename "${2:-}")" ]]; then
+      cat "$SHIM_STATE/dv/$(basename "${2:-}")" >&2
+    else
+      printf '%s\n' "${SHIM_CODESIGN_DV:-}" >&2
+    fi
     exit "${SHIM_CODESIGN_DV_RC:-0}"
     ;;
 esac
@@ -139,6 +182,8 @@ EOF
   export DESKFLOW_BUILD_DIR="$BUILD"
   export DESKFLOW_INSTALL_APP="$APP"
   export SHIM_CODESIGN_DV="$SIGNED_DV"
+  # The fixtures above carry the test team; the real default is J5KPG8ZR5C.
+  export DESKFLOW_EXPECT_TEAM=ABCDE12345
   unset SHIM_CODESIGN_VERIFY_RC SHIM_CODESIGN_DV_RC SHIM_OMIT_BRIDGE
 }
 
@@ -171,6 +216,18 @@ log_lacks() {
   [[ "$output" == *"Codesign verify OK"* ]]
   [[ "$output" == *"Authority=Apple Development"* ]]
   [[ "$output" == *"TeamIdentifier=ABCDE12345"* ]]
+  # every Mach-O walked: 2 in Contents/MacOS + QtCore + libcrypto + 2 PlugIns + Resources dylib
+  # (framework Resources/Headers and the Resources shell script skipped)
+  [[ "$output" == *"sign: total=7 apple=7 adhoc=0 hardened=7"* ]]
+  grep -q '^codesign -dvvv .*/Contents/Frameworks/QtCore.framework/Versions/A/QtCore$' "$SHIM_LOG"
+  grep -q '^codesign -dvvv .*/Contents/Frameworks/libcrypto.3.dylib$' "$SHIM_LOG"
+  grep -q '^codesign -dvvv .*/Contents/PlugIns/platforms/libqcocoa.dylib$' "$SHIM_LOG"
+  grep -q '^codesign -dvvv .*/Contents/PlugIns/imageformats/libqbad.dylib$' "$SHIM_LOG"
+  grep -q '^codesign -dvvv .*/Contents/Resources/libres.dylib$' "$SHIM_LOG"
+  log_lacks "Versions/A/Resources/Info.plist"
+  log_lacks "Headers/qglobal.h"
+  log_lacks "Resources/helper.sh"
+  log_lacks "install-login-bridge-macos.sh"
   [ -f "$APP/Contents/MacOS/deskflow-core" ]
   # The signature is checked on the STAGED bundle, never on the live path.
   log_has "codesign --verify --deep --strict "
@@ -307,11 +364,72 @@ EOF
   log_lacks "launchctl bootstrap"
 }
 
-@test "ad-hoc signature (no Authority) exits 1" {
+@test "ad-hoc signature (Signature=adhoc) exits 1" {
   SHIM_CODESIGN_DV="$ADHOC_DV" run bash "$SCRIPT"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no Authority="* ]]
+  [[ "$output" == *"Signature=adhoc"* ]]
+  [[ "$output" == *"sign: total=7 apple=0 adhoc=7 hardened=0"* ]]
   log_lacks "launchctl bootstrap"
+}
+
+@test "an ad-hoc Mach-O anywhere in the bundle (one framework dylib) exits 1" {
+  dv_for libcrypto.3.dylib "$ADHOC_DV"
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Contents/Frameworks/libcrypto.3.dylib: Signature=adhoc"* ]]
+  [[ "$output" == *"sign: total=7 apple=6 adhoc=1 hardened=6"* ]]
+  [[ "$output" != *"Codesign verify OK"* ]]
+  log_lacks "launchctl bootstrap"
+  [ ! -e "${APP}.bak" ]
+}
+
+@test "an ad-hoc Qt plugin or Resources dylib exits 1 (PlugIns/Resources are walked)" {
+  dv_for libqbad.dylib "$ADHOC_DV"
+  dv_for libres.dylib "$ADHOC_DV"
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Contents/PlugIns/imageformats/libqbad.dylib: Signature=adhoc"* ]]
+  [[ "$output" == *"Contents/Resources/libres.dylib: Signature=adhoc"* ]]
+  [[ "$output" == *"sign: total=7 apple=5 adhoc=2 hardened=5"* ]]
+  log_lacks "launchctl bootstrap"
+}
+
+@test "a first-party binary without the hardened runtime exits 1" {
+  dv_for deskflow-prio "$UNHARDENED_DV"
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Contents/MacOS/deskflow-prio is not signed with the hardened runtime"* ]]
+  [[ "$output" == *"sign: total=7 apple=7 adhoc=0 hardened=6"* ]]
+  log_lacks "launchctl bootstrap"
+}
+
+@test "a bundled framework without the hardened runtime is accepted (only Contents/MacOS/* must be hardened)" {
+  dv_for QtCore "$UNHARDENED_DV"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"sign: total=7 apple=7 adhoc=0 hardened=6"* ]]
+  [[ "$output" == *"Codesign verify OK"* ]]
+}
+
+@test "a TeamIdentifier other than DESKFLOW_EXPECT_TEAM exits 1 (default J5KPG8ZR5C)" {
+  DESKFLOW_EXPECT_TEAM=OTHER99999 run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"TeamIdentifier=ABCDE12345 != expected OTHER99999"* ]]
+  log_lacks "launchctl bootstrap"
+  run grep -n 'DESKFLOW_EXPECT_TEAM:-J5KPG8ZR5C' "$SCRIPT"
+  [ "$status" -eq 0 ]
+}
+
+@test "a build tree marked ADHOC-DEV-BUILD is refused before any codesign call" {
+  : >"$BUILD/ADHOC-DEV-BUILD"
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"ADHOC-DEV-BUILD exists"* ]]
+  [[ "$output" == *"FLEET_ALLOW_ADHOC_DEV_BUILD=ON"* ]]
+  log_lacks "codesign --verify"
+  log_lacks "codesign -dvvv"
+  log_lacks "launchctl bootstrap"
+  [ ! -e "${APP}.bak" ]
 }
 
 @test "Authority without a TeamIdentifier exits 1" {

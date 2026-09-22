@@ -39,8 +39,14 @@ MOUSER_FORK_URL="${FLEET_MOUSER_FORK_URL:-https://github.com/hughesyadaddy/Mouse
 # caller -- can point real git/build/install operations at a real checkout
 # while under a test harness. BATS_TEST_FILENAME is set by bats for every
 # test, unconditionally.
+# Mouser's settings dir (core/config.py CONFIG_DIR on macOS) and its log; the
+# settings-survival proof copies/hashes files in the former and the native-tap
+# gate reads the latter. Overridable for tests only.
+MOUSER_SETTINGS_DIR="${MOUSER_SETTINGS_DIR:-$HOME/Library/Application Support/Mouser}"
+MOUSER_LOG="${MOUSER_LOG:-$HOME/Library/Logs/Mouser/mouser.log}"
+
 if [[ -n "${BATS_TEST_FILENAME:-}" ]]; then
-  for _sandbox_check_path in "$DESKFLOW_ROOT" "$MOUSER_ROOT"; do
+  for _sandbox_check_path in "$DESKFLOW_ROOT" "$MOUSER_ROOT" "$MOUSER_SETTINGS_DIR" "$MOUSER_LOG"; do
     case "$_sandbox_check_path" in
       "$TMPDIR"*|/tmp/*|/private/tmp/*|/private/var/folders/*|"${BATS_TMPDIR:-__unset__}"*|\
       "${BATS_RUN_TMPDIR:-__unset__}"*|"${BATS_TEST_TMPDIR:-__unset__}"*|"${BATS_FILE_TMPDIR:-__unset__}"*)
@@ -320,6 +326,135 @@ verify_login_bridge_plist() {
   rm -f "$rendered"
 }
 
+# --- Mouser settings-survival proof ----------------------------------------
+# Three checkpoints over $MOUSER_SETTINGS_DIR/{config.json,last_device.json}:
+# before the install, right after it (must be byte-identical: the installer
+# never touches settings) and after Mouser has run for FLEET_SETTINGS_SETTLE_S
+# (default 30) seconds. The last one may differ ONLY by an allowed migration:
+# config.json .version strictly increased and every pre-deploy key/value
+# (minus version) still present. last_device.json is Mouser's HID warm-path
+# cache (core/hid_gesture.py), rewritten when a device reconnects, so after
+# the run it is reported but not judged. Mouser's own save_config copies the
+# NEW file to config.json.bak (core/config.py), so the
+# config.json.pre-deploy-<ts> copy taken here is the authoritative restore
+# point (newest 5 kept). The verdict is printed as FLEET_SETTINGS=ok|changed|FAIL
+# for scripts/fleet-deploy.sh's settings column.
+SETTINGS_SETTLE_S="${FLEET_SETTINGS_SETTLE_S:-30}"
+MOUSER_SETTINGS_FILES="config.json last_device.json"
+
+mouser_settings_snapshot() { # -> one "<file>=<sha256|absent>" line per file
+  local f h
+  for f in $MOUSER_SETTINGS_FILES; do
+    if [[ -f "$MOUSER_SETTINGS_DIR/$f" ]]; then
+      h="$(shasum -a 256 "$MOUSER_SETTINGS_DIR/$f" | awk '{print $1}')"
+    else
+      h="absent"
+    fi
+    printf '%s=%s\n' "$f" "$h"
+  done
+}
+
+mouser_settings_diff() { # pre post -> "<file> <pre12> -> <post12>" lines (empty when identical)
+  local pre="$1" post="$2" f a b
+  for f in $MOUSER_SETTINGS_FILES; do
+    a="$(sed -n "s/^$f=//p" <<<"$pre")"
+    b="$(sed -n "s/^$f=//p" <<<"$post")"
+    [[ "$a" == "$b" ]] || printf '%s %s -> %s\n' "$f" "${a:0:12}" "${b:0:12}"
+  done
+}
+
+mouser_backup_config() { # copy config.json -> config.json.pre-deploy-<ts>, keep the newest 5
+  local cfg="$MOUSER_SETTINGS_DIR/config.json" dest
+  [[ -f "$cfg" ]] || { echo "none"; return 0; }
+  dest="$cfg.pre-deploy-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$cfg" "$dest"
+  # newest first by name (timestamp-sortable); drop everything past the 5th
+  ls -1 "$MOUSER_SETTINGS_DIR"/config.json.pre-deploy-* 2>/dev/null | sort -r | tail -n +6 | while IFS= read -r old; do
+    rm -f "$old"
+  done
+  echo "$dest"
+}
+
+# jq: .version strictly increased AND del(.version) of the pre-deploy config is
+# a (recursive) subset of the post-run config. Any parse problem -> not allowed.
+#
+# By design this rule refuses key REMOVALS and RENAMES (a pre-deploy key that
+# is gone or moved is a lost setting) and refuses same-version key ADDITIONS
+# (a rewrite without a migration is the app clobbering settings). A future
+# Mouser migration that legitimately removes or renames a key must bump this
+# deploy rule deliberately (e.g. an allowlist of removed keys per version)
+# in the same PR -- do not loosen the subset check to make a deploy pass.
+MOUSER_MIGRATION_JQ='
+  def subset($x; $y):
+    if ($x|type) == "object" then
+      (($y|type) == "object") and all($x|keys_unsorted[]; . as $k | ($y|has($k)) and subset($x[$k]; $y[$k]))
+    elif ($x|type) == "array" then
+      (($y|type) == "array") and (($x|length) == ($y|length)) and all(range($x|length); . as $i | subset($x[$i]; $y[$i]))
+    else $x == $y end;
+  ($a[0].version | numbers) as $pv | ($b[0].version | numbers) as $qv
+  | ($qv > $pv) and subset($a[0] | del(.version); $b[0])'
+
+mouser_config_migration_allowed() { # pre.json post.json -> 0 when allowed
+  [[ -f "$1" && -f "$2" ]] || return 1
+  jq -e -n --slurpfile a "$1" --slurpfile b "$2" "$MOUSER_MIGRATION_JQ" >/dev/null 2>&1
+}
+
+# After Mouser has run: prints ok | changed, or fails with a diff summary.
+mouser_settings_verdict() { # pre_snapshot post_snapshot pre_config_copy
+  local pre="$1" post="$2" pre_copy="$3" diff cfg_diff
+  diff="$(mouser_settings_diff "$pre" "$post")"
+  cfg_diff="$(grep '^config.json ' <<<"$diff" || true)" # fleet:allow grep no-match is the identical case
+  if [[ -z "$cfg_diff" ]]; then
+    [[ -z "$diff" ]] || echo "== [$HOST_TAG] Mouser cache rewritten while running (not judged): $(tr '\n' ';' <<<"$diff") ==" >&2
+    echo ok
+    return 0
+  fi
+  if [[ "$pre_copy" != "none" ]] && mouser_config_migration_allowed "$pre_copy" "$MOUSER_SETTINGS_DIR/config.json"; then
+    echo "== [$HOST_TAG] Mouser config.json migrated (version increased, pre-deploy keys preserved): $cfg_diff ==" >&2
+    echo changed
+    return 0
+  fi
+  echo "FLEET_SETTINGS=FAIL" >&2
+  fail "Mouser settings changed after ${SETTINGS_SETTLE_S}s of running and it is not an allowed migration" \
+    "(version must strictly increase and every pre-deploy key survive): $(tr '\n' ';' <<<"$diff")" \
+    "-- restore from $pre_copy"
+}
+
+# --- native-tap deploy gate (M4) -------------------------------------------
+# Mouser must come up on the native CGEventTap: within FLEET_NATIVE_TAP_TIMEOUT_S
+# (60) s of the install its log, past the byte offset recorded before the
+# install, must show 'CGEventTap created (native tap:' and must NOT show
+# 'CGEventTap enabled on its own run loop' (the PyObjC trampoline path that
+# leaks; see the fleet memory program).
+NATIVE_TAP_TIMEOUT_S="${FLEET_NATIVE_TAP_TIMEOUT_S:-60}"
+NATIVE_TAP_OK='CGEventTap created (native tap:'
+NATIVE_TAP_BAD='CGEventTap enabled on its own run loop'
+
+mouser_log_offset() { # -> byte size of the log (0 when absent)
+  stat -f %z "$MOUSER_LOG" 2>/dev/null || echo 0
+}
+
+wait_native_tap() { # offset -> 0 when the native tap line appeared past offset
+  local off="$1" deadline=$((SECONDS + NATIVE_TAP_TIMEOUT_S)) size tail_text
+  while :; do
+    size="$(mouser_log_offset)"
+    # rotated/truncated since the snapshot: read from the start
+    (( size < off )) && off=0
+    tail_text="$(tail -c +$((off + 1)) "$MOUSER_LOG" 2>/dev/null || true)" # fleet:allow log may not exist yet
+    if grep -qF "$NATIVE_TAP_BAD" <<<"$tail_text"; then
+      fail "Mouser came up on the PyObjC tap ('$NATIVE_TAP_BAD' in $MOUSER_LOG) -- the native tap dylib is missing or failed to load"
+    fi
+    if grep -qF "$NATIVE_TAP_OK" <<<"$tail_text"; then
+      echo "== [$HOST_TAG] Mouser native tap: $(grep -F "$NATIVE_TAP_OK" <<<"$tail_text" | tail -n 1) =="
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      fail "Mouser did not log '$NATIVE_TAP_OK' within ${NATIVE_TAP_TIMEOUT_S}s of the install (log: $MOUSER_LOG, offset $off)"
+    fi
+    sleep 1
+  done
+}
+
 deploy_mouser() {
   [[ "$DEPLOY_MOUSER" == "1" ]] || return 0
   [[ -d "$MOUSER_ROOT" ]] || fail "Mouser checkout missing at $MOUSER_ROOT (set FLEET_DEPLOY_MOUSER=0 to skip Mouser)"
@@ -349,6 +484,14 @@ deploy_mouser() {
     git log -1 --oneline
   fi
 
+  # Checkpoint 1: settings before anything is touched, the restore copy, and
+  # the log offset the native-tap gate reads from.
+  local pre_snap pre_copy log_off post_snap verdict
+  pre_snap="$(mouser_settings_snapshot)"
+  pre_copy="$(mouser_backup_config)"
+  log_off="$(mouser_log_offset)"
+  echo "== [$HOST_TAG] Mouser settings snapshot (pre-deploy): $(tr '\n' ' ' <<<"$pre_snap")backup=$pre_copy =="
+
   # MOUSER_RESTART=1 is scoped to the Mouser step only: the Mouser installer
   # owns Mouser's restart. The Deskflow step above never touches Mouser.
   if [[ "$KEYCHAIN_SSH_READY" == "1" ]]; then
@@ -358,6 +501,24 @@ deploy_mouser() {
     echo "== [$HOST_TAG] Mouser build + install (GUI session, MOUSER_RESTART=1) =="
     MOUSER_RESTART=1 python3 scripts/build_macos_gui_session.py
   fi
+
+  # Checkpoint 2: the installer must not have touched settings at all.
+  post_snap="$(mouser_settings_snapshot)"
+  if [[ "$post_snap" != "$pre_snap" ]]; then
+    echo "FLEET_SETTINGS=FAIL"
+    fail "Mouser settings changed by the install: $(mouser_settings_diff "$pre_snap" "$post_snap" | tr '\n' ';') -- restore from $pre_copy"
+  fi
+  echo "== [$HOST_TAG] Mouser settings identical after install =="
+
+  # Native-tap gate: the freshly installed Mouser must come up on the native tap.
+  wait_native_tap "$log_off"
+
+  # Checkpoint 3: after Mouser has run. Only an allowed migration may differ.
+  echo "== [$HOST_TAG] Mouser settings: waiting ${SETTINGS_SETTLE_S}s of Mouser running =="
+  sleep "$SETTINGS_SETTLE_S"
+  # (info lines go to stderr; only the verdict word is captured)
+  verdict="$(mouser_settings_verdict "$pre_snap" "$(mouser_settings_snapshot)" "$pre_copy")" || exit 1
+  echo "FLEET_SETTINGS=$verdict"
 }
 
 main() {

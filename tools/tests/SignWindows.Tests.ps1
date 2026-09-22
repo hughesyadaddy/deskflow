@@ -57,10 +57,11 @@ BeforeAll {
   }
 
   function Get-ValidSig {
-    param([string]$Thumb = $script:Tp)
+    param([string]$Thumb = $script:Tp, [bool]$Timestamped = $true)
     [pscustomobject]@{
       Status = 'Valid'; StatusMessage = 'Signature verified.'
       SignerCertificate = [pscustomobject]@{ Thumbprint = $Thumb }
+      TimeStamperCertificate = $(if ($Timestamped) { [pscustomobject]@{ Subject = 'CN=DigiCert Timestamp 2024' } } else { $null })
     }
   }
 }
@@ -69,6 +70,12 @@ Describe 'sign-windows.ps1' {
   BeforeEach {
     $script:SavedEnvTp = $env:DESKFLOW_SIGN_THUMBPRINT
     $env:DESKFLOW_SIGN_THUMBPRINT = $null
+    # The fixtures sign with $script:Tp, so make it the fleet cert for the
+    # suite; the fleet-cert tests below override this per case.
+    $script:SavedFleetTp = $env:DESKFLOW_FLEET_THUMBPRINT
+    $env:DESKFLOW_FLEET_THUMBPRINT = $script:Tp
+    $script:SavedFleetDeploy = $env:FLEET_DEPLOY
+    $env:FLEET_DEPLOY = $null
     $script:Root = Join-Path $TestDrive 'install'
     $script:Expected = New-FixtureTree -Base $script:Root
     $script:Kits = New-FakeKits -Base (Join-Path $TestDrive 'kits') -Versions @('10.0.19041.0', '10.0.26100.0', '10.0.22621.0')
@@ -81,6 +88,69 @@ Describe 'sign-windows.ps1' {
   }
   AfterEach {
     $env:DESKFLOW_SIGN_THUMBPRINT = $script:SavedEnvTp
+    $env:DESKFLOW_FLEET_THUMBPRINT = $script:SavedFleetTp
+    $env:FLEET_DEPLOY = $script:SavedFleetDeploy
+  }
+
+  Context 'fleet certificate' {
+    It 'defaults the fleet thumbprint to the self-signed fleet cert when nothing is configured' {
+      $env:DESKFLOW_FLEET_THUMBPRINT = $null
+      Resolve-FleetThumbprint -Explicit '' -FleetEnvPath $script:MissingEnv | Should -Be 'FBB49069A6C594E83714724217C7A5F54885FAEC'
+    }
+
+    It 'reads DESKFLOW_FLEET_THUMBPRINT from scripts/fleet.env (normalized) and prefers -FleetThumbprint' {
+      $env:DESKFLOW_FLEET_THUMBPRINT = $null
+      $fleetEnv = Join-Path $TestDrive 'fleet.env'
+      Set-Content -Path $fleetEnv -Value @('FLEET_BRANCH=main', "DESKFLOW_FLEET_THUMBPRINT=$($script:Tp.ToLowerInvariant())")
+      Resolve-FleetThumbprint -Explicit '' -FleetEnvPath $fleetEnv | Should -Be $script:Tp
+      Resolve-FleetThumbprint -Explicit '0000000000000000000000000000000000000000' -FleetEnvPath $fleetEnv |
+        Should -Be '0000000000000000000000000000000000000000'
+    }
+
+    It 'throws when the signing thumbprint is not the fleet cert (never signs)' {
+      $env:DESKFLOW_FLEET_THUMBPRINT = '0000000000000000000000000000000000000000'
+      { Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
+          -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false -FleetEnvFileArg $script:MissingEnv } |
+        Should -Throw -ExpectedMessage '*is not the fleet certificate*'
+      Should -Invoke Invoke-SignTool -Times 0 -Exactly
+    }
+
+    It 'refuses -AllowNoTimestamp under FLEET_DEPLOY=1 before touching anything' {
+      $env:FLEET_DEPLOY = '1'
+      { Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
+          -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false -NoTimestampOk $true } |
+        Should -Throw -ExpectedMessage '*-AllowNoTimestamp is refused under a fleet deploy*'
+      Should -Invoke Invoke-SignTool -Times 0 -Exactly
+      Should -Invoke Get-AuthenticodeSignature -Times 0 -Exactly
+    }
+
+    It 'still allows -AllowNoTimestamp outside a fleet deploy' {
+      $env:FLEET_DEPLOY = '0'
+      { Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
+          -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false -NoTimestampOk $true 3>$null } |
+        Should -Not -Throw
+    }
+
+    It 'throws when a fleet-signed file carries no RFC 3161 timestamp' {
+      $script:Bad = $script:Expected[2]
+      Mock Get-AuthenticodeSignature {
+        if ($FilePath -eq $script:Bad) { Get-ValidSig -Timestamped $false } else { Get-ValidSig }
+      }
+      { Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
+          -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false } |
+        Should -Throw -ExpectedMessage '*no RFC 3161 timestamp*'
+    }
+
+    It 'accepts a vendor-signed file without a timestamp' {
+      $script:Vendor = $script:Expected[1]
+      Mock Get-AuthenticodeSignature {
+        if ($FilePath -eq $script:Vendor) { Get-ValidSig -Thumb '1111111111111111111111111111111111111111' -Timestamped $false } else { Get-ValidSig }
+      }
+      { Invoke-SignWindows -Roots @($script:Root) -ThumbprintArg $script:Tp -SignToolArg '' `
+          -EnvFileArg $script:MissingEnv -Timestamp 'http://ts' -KitsRoot $script:Kits -OnlyVerify $false } |
+        Should -Not -Throw
+      Should -Invoke Invoke-SignTool -Times 0 -Exactly -ParameterFilter { $Arguments -contains $script:Vendor }
+    }
   }
 
   Context 'thumbprint resolution' {

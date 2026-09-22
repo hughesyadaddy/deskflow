@@ -143,35 +143,104 @@ start_deskflow() {
   fi
 }
 
-# Fatal unless the bundle verifies AND deskflow-core carries a real (non ad-hoc)
-# signature: an Authority chain and a TeamIdentifier. An ad-hoc or unsigned
-# install "works" once and then loses its Accessibility / Input Monitoring
-# grants on the next build, so it must never be reported as a success.
+# Fatal unless the bundle verifies AND every Mach-O in it carries a real (non
+# ad-hoc) signature from the expected team, with the hardened runtime on the
+# first-party binaries. An ad-hoc or unsigned install "works" once and then
+# loses its Accessibility / Input Monitoring grants on the next build, so it
+# must never be reported as a success. A build tree that CMake marked
+# ADHOC-DEV-BUILD (FLEET_ALLOW_ADHOC_DEV_BUILD=ON) is refused outright.
+EXPECT_TEAM="${DESKFLOW_EXPECT_TEAM:-J5KPG8ZR5C}"
+
+# Every Mach-O in the bundle, one path per line: Contents/MacOS/*, the dylibs
+# and executables under Contents/Frameworks, and every dylib or executable
+# Mach-O under Contents/PlugIns (libqcocoa, imageformats, tls backends: 22 of
+# the 60 Mach-Os in a real Deskflow.app) and Contents/Resources. Same
+# enumeration as tools/fleet-health macho_scan_cmd, so the deploy and the
+# health check agree on what "every Mach-O" means. Extension-less files are
+# only counted when `file` says Mach-O (scripts in Resources are skipped).
+bundle_machos() {
+  local app="$1" f
+  find "$app/Contents/MacOS" -type f 2>/dev/null
+  find "$app/Contents/Frameworks" -type f \( -name '*.dylib' -o -perm -u+x \) \
+    -not -path '*/Resources/*' -not -path '*/Headers/*' 2>/dev/null
+  find "$app/Contents/PlugIns" "$app/Contents/Resources" -type f \( -name '*.dylib' -o -perm +111 \) 2>/dev/null |
+    while IFS= read -r f; do
+      case "$f" in
+        *.dylib) printf '%s\n' "$f" ;;
+        *) file -b "$f" 2>/dev/null | grep -q 'Mach-O' && printf '%s\n' "$f" ;;
+      esac
+    done
+  return 0
+}
+
 verify_signature() {
   local app="$1"
-  local core="$app/Contents/MacOS/deskflow-core"
+  if [[ -e "$BUILD_DIR/ADHOC-DEV-BUILD" ]]; then
+    echo "error: $BUILD_DIR/ADHOC-DEV-BUILD exists — this tree was configured with FLEET_ALLOW_ADHOC_DEV_BUILD=ON (ad-hoc signing); reconfigure with -DAPPLE_CODESIGN_DEV=<identity> -DFLEET_STRICT_SIGNING=ON before installing" >&2
+    exit 1
+  fi
   if ! codesign --verify --deep --strict "$app"; then
     echo "error: codesign --verify --deep --strict failed for $app — installed bundle is unsigned or broken" >&2
     exit 1
   fi
-  # Plain `codesign -dv` never prints Authority= lines regardless of how the
-  # binary is signed -- that chain is only emitted at -vvv verbosity. Using
-  # plain -dv here made this check fail on every real (non-ad-hoc) signature.
-  local info
-  if ! info="$(codesign -dvvv "$core" 2>&1)"; then
-    echo "error: codesign -dvvv failed for $core" >&2
+  local total=0 apple=0 adhoc=0 hardened=0 problems=0
+  local bin info rel name
+  while IFS= read -r bin; do
+    [[ -n "$bin" ]] || continue
+    total=$((total + 1))
+    rel="${bin#"$app"/}"
+    name="$(basename "$bin")"
+    # Plain `codesign -dv` never prints Authority= lines regardless of how
+    # the binary is signed -- that chain is only emitted at -vvv verbosity.
+    if ! info="$(codesign -dvvv "$bin" 2>&1)"; then
+      echo "error: codesign -dvvv failed for $bin" >&2
+      exit 1
+    fi
+    if grep -q '^Signature=adhoc' <<<"$info"; then
+      adhoc=$((adhoc + 1))
+      echo "error: $rel: Signature=adhoc — ad-hoc signed (set DESKFLOW_CODESIGN_ID to a real identity)" >&2
+      problems=$((problems + 1))
+      continue
+    fi
+    if ! grep -q '^Authority=' <<<"$info"; then
+      echo "error: $rel has no Authority= (ad-hoc or unsigned) — set DESKFLOW_CODESIGN_ID to a real identity" >&2
+      problems=$((problems + 1))
+      continue
+    fi
+    local team
+    team="$(sed -n 's/^TeamIdentifier=//p' <<<"$info" | head -1)"
+    if [[ ! "$team" =~ ^[A-Z0-9]+$ ]]; then
+      echo "error: $rel has no TeamIdentifier= — not signed with a Developer certificate" >&2
+      problems=$((problems + 1))
+      continue
+    fi
+    if [[ "$team" != "$EXPECT_TEAM" ]]; then
+      echo "error: $rel TeamIdentifier=$team != expected $EXPECT_TEAM (DESKFLOW_EXPECT_TEAM)" >&2
+      problems=$((problems + 1))
+      continue
+    fi
+    apple=$((apple + 1))
+    # Hardened runtime: CodeDirectory ... flags=0x10000(runtime). Required on
+    # every first-party binary (Contents/MacOS/*); bundled Qt frameworks are
+    # signed by macdeployqt/re-seal and only need a real team signature.
+    if grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' <<<"$info"; then
+      hardened=$((hardened + 1))
+    elif [[ "$rel" == Contents/MacOS/* ]]; then
+      echo "error: $rel is not signed with the hardened runtime (CodeDirectory flags lack 'runtime'); sign with --options runtime" >&2
+      problems=$((problems + 1))
+    fi
+  done < <(bundle_machos "$app")
+  echo "sign: total=$total apple=$apple adhoc=$adhoc hardened=$hardened"
+  if [[ "$total" -eq 0 ]]; then
+    echo "error: no Mach-O found under $app/Contents/MacOS — not a built bundle" >&2
     exit 1
   fi
-  if ! grep -q '^Authority=' <<<"$info"; then
-    echo "error: $core has no Authority= (ad-hoc signature) — set DESKFLOW_CODESIGN_ID to a real identity" >&2
+  if [[ "$problems" -gt 0 ]]; then
+    echo "error: $problems Mach-O(s) in $app failed the signature gate (see above)" >&2
     exit 1
   fi
-  if ! grep -Eq '^TeamIdentifier=[A-Z0-9]+$' <<<"$info"; then
-    echo "error: $core has no TeamIdentifier= — not signed with a Developer certificate" >&2
-    exit 1
-  fi
-  echo "== Codesign verify OK =="
-  grep -E '^(Authority|TeamIdentifier)=' <<<"$info"
+  echo "== Codesign verify OK (team $EXPECT_TEAM, $hardened hardened) =="
+  codesign -dvvv "$app/Contents/MacOS/deskflow-core" 2>&1 | grep -E '^(Authority|TeamIdentifier)=' || true # fleet:allow informational echo of the chain already verified above
 }
 
 # Stage the new bundle somewhere it can be verified in full BEFORE the running

@@ -106,7 +106,7 @@ public:
   //! Options for the process-wide link (settings + version).
   static Options optionsFromSettings();
 
-  //! `~/Library/Application Support/Mouser/bridge.token`, `%LOCALAPPDATA%\Mouser\bridge.token`, ...
+  //! `~/Library/Application Support/Mouser/bridge.token`, `%APPDATA%\Mouser\bridge.token`, ...
   static std::string defaultTokenFile();
 
   static const char *roleName(Role role);

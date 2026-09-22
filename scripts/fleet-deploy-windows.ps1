@@ -16,6 +16,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $hostName = $env:COMPUTERNAME
+# Fleet-deploy context for everything this script invokes that signs
+# (build-windows.ps1 -Install, sign-windows.ps1): sign-windows.ps1 refuses
+# -AllowNoTimestamp while FLEET_DEPLOY=1, so an untimestamped signature can
+# never reach a fleet seat through here.
+$env:FLEET_DEPLOY = '1'
 
 if (-not $DeskflowRoot) {
   $DeskflowRoot = Join-Path $env:USERPROFILE 'Desktop\deskflow'
@@ -129,6 +134,141 @@ function Sync-MouserRepo {
   Invoke-Git log -1 --oneline
 }
 
+# --- Mouser settings-survival proof ------------------------------------------
+# Three checkpoints over %APPDATA%\Mouser\{config.json,last_device.json}
+# (core/config.py CONFIG_DIR on Windows): before the install, right after it
+# (must be byte-identical: the installer never touches settings) and after
+# Mouser has run for FLEET_SETTINGS_SETTLE_S (default 30) seconds. The last
+# one may differ ONLY by an allowed migration: config.json .version strictly
+# increased and every pre-deploy key/value (minus version) still present.
+# last_device.json is Mouser's HID warm-path cache, rewritten when a device
+# reconnects, so after the run it is reported but not judged. Mouser's own
+# save_config copies the NEW file to config.json.bak, so the
+# config.json.pre-deploy-<ts> copy taken here is the authoritative restore
+# point (newest 5 kept).
+$script:MouserSettingsFiles = @('config.json', 'last_device.json')
+
+function Get-MouserSettingsDir {
+  return (Join-Path $env:APPDATA 'Mouser')
+}
+
+function Get-MouserSettingsSnapshot {
+  param([string]$Dir)
+  $snap = [ordered]@{}
+  foreach ($n in $script:MouserSettingsFiles) {
+    $f = Join-Path $Dir $n
+    if (Test-Path -LiteralPath $f -PathType Leaf) {
+      $snap[$n] = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant()
+    } else {
+      $snap[$n] = 'absent'
+    }
+  }
+  return $snap
+}
+
+function Read-MouserConfigText {
+  param([string]$Dir)
+  $f = Join-Path $Dir 'config.json'
+  if (Test-Path -LiteralPath $f -PathType Leaf) { return (Get-Content -LiteralPath $f -Raw) }
+  return $null
+}
+
+function Backup-MouserConfig {
+  # config.json -> config.json.pre-deploy-<ts>; prune to the newest $Keep.
+  param([string]$Dir, [int]$Keep = 5, [string]$Stamp = '')
+  $cfg = Join-Path $Dir 'config.json'
+  if (-not (Test-Path -LiteralPath $cfg -PathType Leaf)) { return $null }
+  if (-not $Stamp) { $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss' }
+  $dest = Join-Path $Dir "config.json.pre-deploy-$Stamp"
+  Copy-Item -LiteralPath $cfg -Destination $dest -Force
+  $all = @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Name -like 'config.json.pre-deploy-*' } |
+    Sort-Object Name -Descending)
+  if ($all.Count -gt $Keep) {
+    $all | Select-Object -Skip $Keep | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+  }
+  return $dest
+}
+
+function Test-JsonSubset {
+  # $true when every key/value of $Pre (recursively) is present and equal in $Post.
+  param($Pre, $Post)
+  if ($Pre -is [System.Management.Automation.PSCustomObject]) {
+    if (-not ($Post -is [System.Management.Automation.PSCustomObject])) { return $false }
+    foreach ($prop in $Pre.PSObject.Properties) {
+      $pp = $Post.PSObject.Properties[$prop.Name]
+      if ($null -eq $pp) { return $false }
+      if (-not (Test-JsonSubset $prop.Value $pp.Value)) { return $false }
+    }
+    return $true
+  }
+  if ($Pre -is [System.Array]) {
+    if (-not ($Post -is [System.Array])) { return $false }
+    if ($Pre.Count -ne $Post.Count) { return $false }
+    for ($i = 0; $i -lt $Pre.Count; $i++) {
+      if (-not (Test-JsonSubset $Pre[$i] $Post[$i])) { return $false }
+    }
+    return $true
+  }
+  if ($null -eq $Pre) { return ($null -eq $Post) }
+  if ($null -eq $Post) { return $false }
+  return (("$Pre" -eq "$Post") -and ($Pre.GetType() -eq $Post.GetType()))
+}
+
+function Test-MouserConfigMigration {
+  # Allowed post-run change: .version strictly increased and del(.version) of
+  # the pre-deploy config is a subset of the post-run config.
+  param([string]$PreText, [string]$PostText)
+  if (-not $PreText -or -not $PostText) { return $false }
+  try {
+    $pre = $PreText | ConvertFrom-Json
+    $post = $PostText | ConvertFrom-Json
+    $preNoVersion = $PreText | ConvertFrom-Json
+  } catch { return $false }
+  $pv = $pre.PSObject.Properties['version']
+  $qv = $post.PSObject.Properties['version']
+  if ($null -eq $pv -or $null -eq $qv) { return $false }
+  if (-not ([int]$qv.Value -gt [int]$pv.Value)) { return $false }
+  $preNoVersion.PSObject.Properties.Remove('version')
+  return (Test-JsonSubset $preNoVersion $post)
+}
+
+function Get-MouserSettingsDiff {
+  param($Pre, $Post)
+  $diff = @()
+  foreach ($n in $Pre.Keys) {
+    if ("$($Pre[$n])" -ne "$($Post[$n])") {
+      $a = "$($Pre[$n])"; $b = "$($Post[$n])"
+      $diff += ('{0} {1} -> {2}' -f $n, $a.Substring(0, [Math]::Min(12, $a.Length)), $b.Substring(0, [Math]::Min(12, $b.Length)))
+    }
+  }
+  return $diff
+}
+
+function Assert-MouserSettingsIdentical {
+  param($Pre, $Post, [string]$Stage)
+  $diff = @(Get-MouserSettingsDiff $Pre $Post)
+  if ($diff.Count -gt 0) {
+    throw ("Mouser settings changed {0}: {1} (restore from config.json.pre-deploy-<ts>)" -f $Stage, ($diff -join '; '))
+  }
+}
+
+function Get-MouserSettingsVerdict {
+  # After Mouser has run: 'ok' (config.json identical), 'changed' (allowed
+  # migration only) or throw with a diff summary.
+  param($Pre, $Post, [string]$PreText, [string]$PostText)
+  $diff = @(Get-MouserSettingsDiff $Pre $Post)
+  $cfgChanged = @($diff | Where-Object { $_ -like 'config.json *' })
+  if ($cfgChanged.Count -eq 0) {
+    if ($diff.Count -gt 0) { Write-Host ("Mouser cache rewritten while running (not judged): {0}" -f ($diff -join '; ')) }
+    return 'ok'
+  }
+  if (Test-MouserConfigMigration -PreText $PreText -PostText $PostText) {
+    Write-Host ("Mouser config.json migrated (version increased, pre-deploy keys preserved): {0}" -f ($cfgChanged -join '; '))
+    return 'changed'
+  }
+  throw ("Mouser settings changed after 30 s of running and it is not an allowed migration (version must strictly increase and every pre-deploy key survive): {0} (restore from config.json.pre-deploy-<ts>)" -f ($diff -join '; '))
+}
+
 function Deploy-Mouser {
   if ($DeployMouser -ne 1) { return }
   if (-not (Test-Path $MouserRoot)) {
@@ -136,6 +276,14 @@ function Deploy-Mouser {
     return
   }
   Sync-MouserRepo
+
+  # Checkpoint 1: settings before anything is touched, plus the restore copy.
+  $settingsDir = Get-MouserSettingsDir
+  $preSnap = Get-MouserSettingsSnapshot $settingsDir
+  $preText = Read-MouserConfigText $settingsDir
+  $backup = Backup-MouserConfig -Dir $settingsDir
+  Write-Host ("== [{0}] Mouser settings snapshot (pre-deploy): config.json={1} last_device.json={2} backup={3} ==" -f `
+    $hostName, $preSnap['config.json'], $preSnap['last_device.json'], $(if ($backup) { $backup } else { 'none' }))
 
   # MOUSER_RESTART=1 is scoped to the Mouser step only: the Mouser installer
   # (build_and_install.py) owns Mouser's restart. Nothing in this script stops
@@ -165,12 +313,35 @@ function Deploy-Mouser {
     if ($null -eq $prevRestart) { Remove-Item Env:MOUSER_RESTART -ErrorAction SilentlyContinue } else { $env:MOUSER_RESTART = $prevRestart }
   }
 
+  # Checkpoint 2: the installer must not have touched settings at all.
+  try {
+    Assert-MouserSettingsIdentical $preSnap (Get-MouserSettingsSnapshot $settingsDir) 'by the install'
+  } catch {
+    Write-Host 'FLEET_SETTINGS=FAIL'
+    throw
+  }
+  Write-Host "== [$hostName] Mouser settings identical after install =="
+
   # Sign the PyInstaller output (Mouser.exe + every bundled .dll) with the
   # fleet cert. sign-windows.ps1 throws if the thumbprint/signtool are missing
   # or any file fails verification -- never ship an unsigned Mouser silently.
   $dist = Join-Path $MouserRoot 'dist\Mouser'
   if (-not (Test-Path $dist)) { throw "Mouser build output missing at $dist" }
   & (Join-Path $DeskflowRoot 'scripts\sign-windows.ps1') -Root $dist
+
+  # Checkpoint 3: after Mouser has run. Only an allowed migration may differ.
+  $settle = if ($env:FLEET_SETTINGS_SETTLE_S) { [int]$env:FLEET_SETTINGS_SETTLE_S } else { 30 }
+  Write-Host "== [$hostName] Mouser settings: waiting $settle s of Mouser running =="
+  Start-Sleep -Seconds $settle
+  $verdict = 'FAIL'
+  try {
+    $verdict = Get-MouserSettingsVerdict -Pre $preSnap -Post (Get-MouserSettingsSnapshot $settingsDir) `
+      -PreText $preText -PostText (Read-MouserConfigText $settingsDir)
+  } catch {
+    Write-Host 'FLEET_SETTINGS=FAIL'
+    throw
+  }
+  Write-Host "FLEET_SETTINGS=$verdict"
 }
 
 Write-Host "=== fleet-deploy-windows on $hostName ==="

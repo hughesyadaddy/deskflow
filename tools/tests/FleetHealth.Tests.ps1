@@ -7,9 +7,10 @@ BeforeAll {
   $script:Script = Join-Path (Split-Path -Parent $PSScriptRoot) "fleet-health.ps1"
   . $script:Script   # dot-sourced: the main block is guarded by InvocationName -ne "."
 
-  function New-FakeSig([string]$Status, [string]$Thumb) {
+  function New-FakeSig([string]$Status, [string]$Thumb, [bool]$Timestamped = $true) {
     $cert = if ($Thumb) { [pscustomobject]@{ Thumbprint = $Thumb } } else { $null }
-    [pscustomobject]@{ Status = $Status; SignerCertificate = $cert }
+    $ts = if ($Timestamped) { [pscustomobject]@{ Subject = "CN=DigiCert Timestamp 2024" } } else { $null }
+    [pscustomobject]@{ Status = $Status; SignerCertificate = $cert; TimeStamperCertificate = $ts }
   }
   function New-FakeFile([string]$Name) {
     [pscustomobject]@{ Name = $Name; FullName = "C:\Program Files\Deskflow\$Name" }
@@ -31,6 +32,36 @@ Describe "Test-Authenticode" {
   BeforeEach {
     Mock Test-Path { $true }
     Mock Get-ChildItem { @((New-FakeFile "deskflow.exe"), (New-FakeFile "deskflow-core.exe"), (New-FakeFile "Qt6Core.dll")) }
+    # The fixtures use $script:Thumb as the configured signing cert; make it
+    # the fleet cert for this block (the fleet-cert cases override per case).
+    $script:SavedFleetTp = $env:DESKFLOW_FLEET_THUMBPRINT
+    $env:DESKFLOW_FLEET_THUMBPRINT = $script:Thumb
+  }
+  AfterEach {
+    $env:DESKFLOW_FLEET_THUMBPRINT = $script:SavedFleetTp
+  }
+
+  It "defaults the fleet thumbprint to the self-signed fleet cert" {
+    $env:DESKFLOW_FLEET_THUMBPRINT = $null
+    Resolve-FleetThumbprint "" | Should -Be "FBB49069A6C594E83714724217C7A5F54885FAEC"
+    Resolve-FleetThumbprint "abcd" | Should -Be "ABCD"
+  }
+
+  It "fails when the configured signing thumbprint is not the fleet cert" {
+    Mock Get-AuthenticodeSignature { New-FakeSig "Valid" $script:Thumb }
+    $r = Test-Authenticode $script:Thumb @("C:\Program Files\Deskflow") "0000000000000000000000000000000000000000"
+    $r.status | Should -Be "FAIL"
+    $r.detail | Should -Match "is not the fleet certificate 0000000000000000000000000000000000000000"
+  }
+
+  It "fails on a fleet-signed binary without an RFC 3161 timestamp and names it" {
+    Mock Get-AuthenticodeSignature {
+      if ($LiteralPath -like "*deskflow-core.exe") { New-FakeSig "Valid" $script:Thumb $false } else { New-FakeSig "Valid" $script:Thumb }
+    }
+    $r = Test-Authenticode $script:Thumb @("C:\Program Files\Deskflow")
+    $r.status | Should -Be "FAIL"
+    $r.detail | Should -Match "deskflow-core.exe: no timestamp"
+    $r.detail | Should -Not -Match "deskflow.exe: no timestamp"
   }
 
   It "fails when no thumbprint is configured" {
@@ -40,11 +71,12 @@ Describe "Test-Authenticode" {
     $r.detail | Should -Match "DESKFLOW_SIGN_THUMBPRINT not set"
   }
 
-  It "passes when every binary is Valid with the fleet thumbprint (case-insensitive)" {
+  It "passes when every binary is Valid + timestamped with the fleet thumbprint (case-insensitive)" {
     Mock Get-AuthenticodeSignature { New-FakeSig "Valid" $script:Thumb.ToLower() }
     $r = Test-Authenticode $script:Thumb @("C:\Program Files\Deskflow")
     $r.status | Should -Be "PASS"
     $r.detail | Should -Match "3 binaries Valid"
+    $r.detail | Should -Match "3 fleet-signed \+ timestamped"
   }
 
   It "fails on a NotSigned binary and names it" {
@@ -57,11 +89,11 @@ Describe "Test-Authenticode" {
     $r.detail | Should -Not -Match "deskflow.exe"
   }
 
-  It "fails on a Valid signature from a different thumbprint" {
-    Mock Get-AuthenticodeSignature { New-FakeSig "Valid" "DEADBEEF" }
+  It "accepts a Valid signature from a different thumbprint as vendor-signed (even without a timestamp)" {
+    Mock Get-AuthenticodeSignature { New-FakeSig "Valid" "DEADBEEF" $false }
     $r = Test-Authenticode $script:Thumb @("C:\Program Files\Deskflow")
-    $r.status | Should -Be "FAIL"
-    $r.detail | Should -Match "thumbprint DEADBEEF"
+    $r.status | Should -Be "PASS"
+    $r.detail | Should -Match "3 vendor-signed"
   }
 
   It "fails when the install roots contain no binaries" {

@@ -17,13 +17,26 @@
 
 # Note: "-" is a truthy string to CMake's if(), so the include gate in the
 # top-level CMakeLists.txt does not filter an explicit ad-hoc identity.
+# Ad-hoc builds are opt-in twice over: FLEET_STRICT_SIGNING=OFF *and*
+# FLEET_ALLOW_ADHOC_DEV_BUILD=ON (the option and the ADHOC-DEV-BUILD marker
+# live in the top-level CMakeLists.txt, which also covers an *empty* identity
+# -- this file is only included for a non-empty one). An ad-hoc signature
+# changes on every build, which resets the app's TCC grants, so an ad-hoc
+# bundle must never reach a fleet seat.
 if("${APPLE_CODESIGN_DEV}" STREQUAL "" OR "${APPLE_CODESIGN_DEV}" STREQUAL "-")
   if(FLEET_STRICT_SIGNING)
     message(FATAL_ERROR
       "FLEET_STRICT_SIGNING=ON but APPLE_CODESIGN_DEV is empty or '-' (ad-hoc); "
       "MacCodesign.cmake requires a real developer identity.")
   endif()
-  message(WARNING "ad-hoc signing (FLEET_STRICT_SIGNING=OFF): codesign-dev target signs with '-'")
+  if(NOT FLEET_ALLOW_ADHOC_DEV_BUILD)
+    message(FATAL_ERROR
+      "APPLE_CODESIGN_DEV is empty or '-' (ad-hoc signing) and FLEET_ALLOW_ADHOC_DEV_BUILD is OFF. "
+      "Pass -DAPPLE_CODESIGN_DEV=<identity> (security find-identity -v -p codesigning), or for a "
+      "throwaway local build only -DFLEET_ALLOW_ADHOC_DEV_BUILD=ON (the build tree is then marked "
+      "ADHOC-DEV-BUILD and scripts/install-macos.sh refuses to install it).")
+  endif()
+  message(WARNING "ad-hoc signing (FLEET_STRICT_SIGNING=OFF, FLEET_ALLOW_ADHOC_DEV_BUILD=ON): codesign-dev target signs with '-'")
 endif()
 
 # The codesign invocations below run as add_custom_command steps, so a

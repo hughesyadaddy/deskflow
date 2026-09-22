@@ -175,6 +175,29 @@ if(APPLE AND BUILD_OSX_BUNDLE)
       "FLEET_STRICT_SIGNING=ON but APPLE_CODESIGN_DEV is empty or '-' (ad-hoc). "
       "Set DESKFLOW_CODESIGN_ID in .env and pass -DAPPLE_CODESIGN_DEV=<identity>.")
   endif()
+  # Even with strict signing OFF an ad-hoc build is refused unless explicitly
+  # allowed: its signature changes every build and resets the app's TCC
+  # grants. When allowed, <build>/ADHOC-DEV-BUILD marks the tree and
+  # scripts/install-macos.sh refuses to install from it.
+  option(FLEET_ALLOW_ADHOC_DEV_BUILD
+    "Allow an ad-hoc (APPLE_CODESIGN_DEV empty or '-') local dev build; writes <build>/ADHOC-DEV-BUILD which scripts/install-macos.sh refuses" OFF)
+  set(_fleet_adhoc_marker "${CMAKE_BINARY_DIR}/ADHOC-DEV-BUILD")
+  if(_fleet_adhoc_signing)
+    if(NOT FLEET_ALLOW_ADHOC_DEV_BUILD)
+      message(FATAL_ERROR
+        "APPLE_CODESIGN_DEV is empty or '-' (ad-hoc signing) and FLEET_ALLOW_ADHOC_DEV_BUILD is OFF. "
+        "Pass -DAPPLE_CODESIGN_DEV=<identity> (security find-identity -v -p codesigning), or for a "
+        "throwaway local build only -DFLEET_ALLOW_ADHOC_DEV_BUILD=ON (the build tree is then marked "
+        "ADHOC-DEV-BUILD and scripts/install-macos.sh refuses to install it).")
+    endif()
+    message(WARNING "ad-hoc dev build allowed (FLEET_ALLOW_ADHOC_DEV_BUILD=ON): writing ${_fleet_adhoc_marker}; scripts/install-macos.sh will refuse this tree")
+    file(WRITE "${_fleet_adhoc_marker}"
+      "ad-hoc dev build (APPLE_CODESIGN_DEV='${APPLE_CODESIGN_DEV}'): scripts/install-macos.sh refuses to install from this build tree\n")
+  else()
+    # A tree reconfigured with a real identity is no longer ad-hoc.
+    file(REMOVE "${_fleet_adhoc_marker}")
+  endif()
+  unset(_fleet_adhoc_marker)
 endif()
 
 include(cmake/Libraries.cmake)

@@ -25,8 +25,14 @@ ALLOWLIST = fh.load_identifier_allowlist()
 
 
 def codesign_block(path, identifier, team=TEAM, authority="Apple Development: Duff Hughes (ABCDE12345)",
-                   adhoc=False, verify_rc=0):
+                   adhoc=False, verify_rc=0, hardened=True):
     lines = [f"=== {path}", f"Executable={path}", f"Identifier={identifier}", "Format=Mach-O thin (arm64)"]
+    if adhoc:
+        lines += ["CodeDirectory v=20400 size=1234 flags=0x2(adhoc) hashes=30+7 location=embedded"]
+    elif hardened:
+        lines += ["CodeDirectory v=20500 size=1234 flags=0x10000(runtime) hashes=30+7 location=embedded"]
+    else:
+        lines += ["CodeDirectory v=20400 size=1234 flags=0x0(none) hashes=30+7 location=embedded"]
     if adhoc:
         lines += ["Signature=adhoc", "TeamIdentifier=not set"]
     else:
@@ -226,6 +232,73 @@ def test_sign_pass():
     results, _ = run_checks([mac()], mac_ok_table(), ["sign"])
     (r,) = results
     assert r.status == "PASS" and TEAM in r.detail
+    # machine-readable tail consumed by scripts/fleet-deploy.sh HEALTH_FOLD_JQ
+    assert r.detail.endswith("; apple=4 adhoc=0 hardened=true")
+
+
+def test_parse_macho_scan_reads_hardened_runtime_flag():
+    scan = (codesign_block("/Applications/Deskflow.app/Contents/MacOS/deskflow", "org.deskflow.deskflow")
+            + codesign_block("/Applications/Deskflow.app/Contents/MacOS/deskflow-prio", "org.deskflow.deskflow-prio",
+                             hardened=False)
+            + codesign_block("/Applications/Deskflow.app/Contents/MacOS/deskflow-core", "org.deskflow.deskflow-core",
+                             adhoc=True))
+    entries = fh.parse_macho_scan(scan)
+    assert [e.hardened for e in entries] == [True, False, False]
+    assert [e.adhoc for e in entries] == [False, False, True]
+    assert fh.sign_summary(entries, TEAM) == (2, 1, False)
+
+
+def test_sign_fails_on_unhardened_first_party_binary_with_counts():
+    # hackintosh's pre-L3 build: real team signature, flags=0x0
+    scan = good_scan() + codesign_block("/Applications/Deskflow.app/Contents/MacOS/deskflow-prio",
+                                        "org.deskflow.deskflow-prio", hardened=False)
+    t = mac_ok_table()
+    t[("macbookpro", fh.macho_scan_cmd())] = (0, scan, "")
+    results, _ = run_checks([mac()], t, ["sign"])
+    assert results[0].status == "FAIL"
+    assert "deskflow-prio: not hardened" in results[0].detail
+    assert results[0].detail.endswith("[apple=5 adhoc=0 hardened=false]")
+
+
+def test_sign_accepts_unhardened_bundled_framework():
+    scan = good_scan() + codesign_block("/Applications/Deskflow.app/Contents/Frameworks/QtSvg.framework/Versions/A/QtSvg",
+                                        "org.qt-project.QtSvg", hardened=False)
+    t = mac_ok_table()
+    t[("macbookpro", fh.macho_scan_cmd())] = (0, scan, "")
+    results, _ = run_checks([mac()], t, ["sign"])
+    assert results[0].status == "PASS" and results[0].detail.endswith("apple=5 adhoc=0 hardened=true")
+
+
+def test_scan_cmd_walks_plugins_and_resources_with_file_detection():
+    cmd = fh.macho_scan_cmd()
+    assert "/Applications/Deskflow.app/Contents/PlugIns" in cmd
+    assert "/Applications/Deskflow.app/Contents/Resources" in cmd
+    assert "-name '*.dylib' -o -perm +111" in cmd
+    assert "file -b" in cmd and "grep -q Mach-O" in cmd
+
+
+def test_adhoc_plugin_or_resources_dylib_fails_sign_and_no_adhoc():
+    scan = (good_scan()
+            + codesign_block("/Applications/Deskflow.app/Contents/PlugIns/imageformats/libqbad.dylib", "libqbad", adhoc=True)
+            + codesign_block("/Applications/Deskflow.app/Contents/Resources/libres.dylib", "libres", adhoc=True))
+    t = mac_ok_table()
+    t[("macbookpro", fh.macho_scan_cmd())] = (0, scan, "")
+    results, _ = run_checks([mac()], t, ["sign", "no-adhoc"])
+    by = {r.check: r for r in results}
+    assert by["sign"].status == "FAIL" and "libqbad.dylib: Signature=adhoc" in by["sign"].detail
+    assert by["sign"].detail.endswith("[apple=4 adhoc=2 hardened=true]")
+    assert by["no-adhoc"].status == "FAIL" and "libres.dylib" in by["no-adhoc"].detail
+
+
+def test_sign_reports_adhoc_count_in_tail():
+    scan = good_scan() + codesign_block("/Applications/Deskflow.app/Contents/Frameworks/libcrypto.3.dylib",
+                                        "libcrypto.3", adhoc=True)
+    t = mac_ok_table()
+    t[("macbookpro", fh.macho_scan_cmd())] = (0, scan, "")
+    results, _ = run_checks([mac()], t, ["sign"])
+    assert results[0].status == "FAIL"
+    assert "libcrypto.3.dylib: Signature=adhoc" in results[0].detail
+    assert results[0].detail.endswith("[apple=4 adhoc=1 hardened=true]")
 
 
 def test_sign_fails_on_wrong_authority():
