@@ -218,8 +218,8 @@ constexpr KeyButton buttonFor(uint32_t virtualKey)
 //! no KeyID maps to (Fn/Globe) exactly as the relay path would.
 struct InjectingKeyState : OSXKeyState
 {
-  using OSXKeyState::OSXKeyState;
   using OSXKeyState::fakeKey;
+  using OSXKeyState::OSXKeyState;
 };
 
 deskflow::KeyMap::Keystroke stroke(uint32_t virtualKey, bool press)
