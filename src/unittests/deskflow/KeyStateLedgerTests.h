@@ -33,4 +33,7 @@ private Q_SLOTS:
   void fakeKeyDown_doesNotClickCapsAgainAfterSetToggleState();
   void enable_sanitizesOnlyWhenNotEntered();
   void describeKey_printsCharacterWithItsCase();
+  void primarySweep_neverReleasesPhysicallyCapturedKey();
+  void postSwitchVerifier_keepsReassertedModifiers();
+  void postSwitchVerifier_keepsNothingAfterShiftReleased();
 };

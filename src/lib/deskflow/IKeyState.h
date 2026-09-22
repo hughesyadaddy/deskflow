@@ -182,10 +182,15 @@ public:
   ledger, nothing else. Unlike the full sweep it never reasons about
   freshness, so a modifier the user is physically holding at THIS keyboard
   cannot be swept -- safe to call while the user may be mid-gesture (return
-  to the primary, the post-switch verifier). Default does nothing.
+  to the primary, the post-switch verifier). Modifiers whose bit is in
+  \p keep are left in the ledger and NOT released: the post-switch verifier
+  passes the modifiers it re-asserted on enter for an ongoing shift-drag,
+  so closing a stuck Ctrl never drops the user's Shift with it (K4 audit
+  MED-3). Default does nothing.
   */
-  virtual void releaseInjectedKeys()
+  virtual void releaseInjectedKeys(KeyModifierMask keep = 0)
   {
+    (void)keep;
   }
 
   //! Fake ctrl+alt+del

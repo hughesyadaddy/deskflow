@@ -17,9 +17,13 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -40,6 +44,10 @@ constexpr uint8_t kHidLeftControl = 0x01;
 constexpr uint8_t kHidLeftShift = 0x02;
 constexpr uint8_t kHidLeftOption = 0x04;
 constexpr uint8_t kHidLeftCommand = 0x08;
+constexpr uint8_t kHidRightControl = 0x10;
+constexpr uint8_t kHidRightShift = 0x20;
+constexpr uint8_t kHidRightOption = 0x40;
+constexpr uint8_t kHidRightCommand = 0x80;
 
 // Deskflow KeyID and HID usage of Caps Lock.
 constexpr uint16_t kKeyIdCapsLock = 0xEFE5;
@@ -121,11 +129,25 @@ constexpr bool keyid_requires_shift(uint16_t key_id)
 }
 
 // Outcome of decide_letter_modifiers: the HID modifier byte to emit with the
-// key, and whether the target's Caps Lock must be toggled (one edge) FIRST so
-// that byte composes the intended character.
+// key-down report, the subset of it that belongs on the key's HELD ledger
+// entry, and whether the target's Caps Lock must be toggled (one edge) FIRST
+// so that byte composes the intended character.
+/*!
+modifierBits vs heldBits (K4 audit A-1/A-6): Shift that the bridge DERIVES
+for a key (the case of a letter, the shifted symbol behind a KeyID) is a
+property of that one key-down, not of the key while it stays held. The
+bridge ORs every ledger entry into each report, so a derived Shift stored on
+the ledger leaked into the next key's report -- with the server's Caps on,
+rolling over `k` then `1` typed `k!` -- and survived the server releasing
+its real Shift mid-repeat, so the repeated letter kept the wrong case. The
+ledger entry therefore carries heldBits (the mask's real modifiers only);
+the derived Shift rides on the key-down report alone, and the server's own
+Shift key-down/-up entries decide the case of everything after it.
+*/
 struct LetterDecision
 {
   uint8_t modifierBits = 0;
+  uint8_t heldBits = 0;
   bool capsEdge = false;
 };
 
@@ -169,6 +191,11 @@ Letters:
   'k' | 0 | 1 |     0     |   1   | local != 1
   'k' | 1 | 1 |     0     |   1   | local != 1   (caps+shift+k -> 'k')
 
+The 'K' | S=1 | M=1 row is unreachable from a macOS or Windows server (both
+compose Shift+Caps+k as lowercase 'k', so they send 'k'); if a server ever
+sent it, a relayed Shift key-down entry in the bridge's ledger would OR
+Shift back into the report through collect_held() and type 'k' anyway.
+
 Non-letters: unchanged behaviour -- the mask's modifier bits, plus Shift
 when the KeyID itself is a shifted character (keyid_requires_shift); never
 a caps edge. Caps Lock's own KeyID yields no modifier bits (it is an edge,
@@ -178,7 +205,8 @@ constexpr LetterDecision decide_letter_modifiers(uint16_t id16, uint32_t mask32,
 {
   LetterDecision d;
   if (!keyid_is_letter(id16)) {
-    d.modifierBits = key_down_modifier_bits(id16, mask32);
+    d.heldBits = key_down_modifier_bits(id16, mask32);
+    d.modifierBits = d.heldBits;
     if (keyid_requires_shift(id16))
       d.modifierBits |= kHidLeftShift;
     return d;
@@ -188,7 +216,10 @@ constexpr LetterDecision decide_letter_modifiers(uint16_t id16, uint32_t mask32,
   const bool wantUpper = keyid_is_upper_letter(id16) || (serverShift && !serverCaps);
   const bool shift = wantUpper != serverCaps;
   d.capsEdge = localCaps.has_value() && *localCaps != serverCaps;
-  d.modifierBits = mask_to_modifier_bits(mask32 & ~kMaskShift);
+  // The mask's own Shift is never stored on a letter: `shift` replaces it
+  // for this report, and the server's Shift key has its own ledger entry.
+  d.heldBits = mask_to_modifier_bits(mask32 & ~kMaskShift);
+  d.modifierBits = d.heldBits;
   if (shift)
     d.modifierBits |= kHidLeftShift;
   return d;
@@ -239,17 +270,116 @@ constexpr bool caps_sync_edge_needed(std::optional<bool> truth, bool desired)
   return truth.has_value() && *truth != desired;
 }
 
-// After the bridge emits a caps edge the OS-side readers (cg-flags,
-// IOHIDSystem) can lag the toggle by a few ms; a burst of letters arriving
-// in one TCP read would re-read the stale state and edge again. For
-// kCapsAssumeMs after an edge the bridge assumes the lock is what it just
-// set it to instead of re-reading.
-constexpr int64_t kCapsAssumeMs = 50;
+// Caps assumption after an edge the bridge emitted (K4 audit A-5).
+/*!
+The OS-side readers (cg-flags, IOHIDSystem) lag the toggle by a few ms; a
+burst of letters arriving in one TCP read would re-read the stale state and
+edge again. A blind 50 ms timer covered the common lag but nothing else: a
+slower WindowServer re-edged after 50 ms, and a reader that never saw the
+edge (a daemon reconnect, a lost report) was trusted again after 50 ms with
+no trace. Instead the bridge assumes the state it set UNTIL THE READER
+AGREES, bounded by kCapsAssumeMaxMs; if the reader never agrees inside that
+bound the assumption is dropped and the caller logs a source-disagreement
+line (never the values).
 
-constexpr bool caps_assumption_valid(int64_t now_ms, int64_t edge_ms, int64_t hold_ms = kCapsAssumeMs)
+  reader (OS)       | age (now - edge)      | result
+  ------------------+-----------------------+----------------------------
+  == assumed        | any                   | Confirmed (drop assumption,
+                    |                       |   the reader is current)
+  != assumed        | < max                 | Hold (stale reader: assume)
+  unreadable        | < max                 | Hold
+  != assumed        | >= max                | Expired (drop, log, trust OS)
+  unreadable        | >= max                | Expired
+  any               | clock went backwards  | Expired (never trust a
+                    |                       |   negative age)
+*/
+constexpr int64_t kCapsAssumeMaxMs = 300;
+
+enum class CapsAssumption
 {
-  return now_ms >= edge_ms && now_ms - edge_ms < hold_ms;
+  Hold,
+  Confirmed,
+  Expired
+};
+
+constexpr CapsAssumption resolve_caps_assumption(
+    bool assumed, std::optional<bool> reader, int64_t now_ms, int64_t edge_ms, int64_t max_ms = kCapsAssumeMaxMs
+)
+{
+  if (reader.has_value() && *reader == assumed)
+    return CapsAssumption::Confirmed;
+  if (now_ms < edge_ms || now_ms - edge_ms >= max_ms)
+    return CapsAssumption::Expired;
+  return CapsAssumption::Hold;
 }
+
+// Bounded drain of an asynchronous report queue (K4 review, A-4).
+/*!
+The bridge posts HID reports through a queue it does not own (the pqrs
+dispatcher, then an asio thread). A release report posted just before the
+process unwinds is only QUEUED: the dispatcher's terminate() exits without
+draining, so the empty report could be lost and the last key stay held on
+the virtual keyboard. The sink therefore enqueues a MARKER behind the
+report and the caller waits for it, bounded.
+
+The report's journey is nested: the first dispatcher job enqueues a second
+one (the local_datagram client's own hop) and only that one hands the
+bytes to the asio thread, whose teardown does drain. A marker enqueued
+once would run BEFORE the nested job (FIFO: [report1, marker] -> report1
+runs and appends report2 -> [marker, report2]). So the marker re-enqueues
+itself `hops` times; with kReportDrainHops = 2 it lands behind report2.
+enqueue_drain_marker is pure over an `enqueue` callback so that reasoning
+is unit-tested with a simulated FIFO; DrainGate is the bounded wait.
+*/
+constexpr int kReportDrainHops = 2;
+constexpr int64_t kReportDrainBoundMs = 250;
+
+// Enqueues a marker that re-enqueues itself until `hops` queue passes have
+// elapsed, then calls `done`. Returns false (and never calls `done`) when
+// `enqueue` refuses the marker (queue gone).
+inline bool enqueue_drain_marker(
+    const std::function<bool(std::function<void()>)> &enqueue, int hops, const std::function<void()> &done
+)
+{
+  if (hops <= 0) {
+    done();
+    return true;
+  }
+  return enqueue([enqueue, hops, done] { enqueue_drain_marker(enqueue, hops - 1, done); });
+}
+
+enum class DrainOutcome
+{
+  Drained,
+  TimedOut
+};
+
+// One-shot completion the marker signals from the queue thread; the caller
+// waits at most `bound_ms`. Shared between the two threads (hold it in a
+// shared_ptr when the queue may outlive the waiter).
+class DrainGate
+{
+public:
+  void complete()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!done_) {
+      done_ = true;
+      cv_.notify_all();
+    }
+  }
+  DrainOutcome wait(int64_t bound_ms)
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const bool ok = cv_.wait_for(lock, std::chrono::milliseconds(bound_ms), [this] { return done_; });
+    return ok ? DrainOutcome::Drained : DrainOutcome::TimedOut;
+  }
+
+private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool done_ = false;
+};
 
 // Relative motion chunking. Splits a delta into steps of at most max_chunk
 // counts each, preserving sign; 0 yields no steps. 400 -> 50 x 8.

@@ -90,10 +90,10 @@ public:
     ++sanitizeCalls;
     PlatformScreen::sanitizeInjectedKeys();
   }
-  void releaseInjectedKeys() override
+  void releaseInjectedKeys(KeyModifierMask keep = 0) override
   {
     ++releaseCalls;
-    PlatformScreen::releaseInjectedKeys();
+    PlatformScreen::releaseInjectedKeys(keep);
   }
   bool getClipboard(ClipboardID, IClipboard *) const override
   {

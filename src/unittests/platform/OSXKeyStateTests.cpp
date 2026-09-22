@@ -611,6 +611,92 @@ void OSXKeyStateTests::fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet(
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlternate | kCGEventFlagMaskShift));
 }
 
+void OSXKeyStateTests::primarySweepNeverReleasesPhysicallyCapturedShift()
+{
+  // K4 audit HIGH-1 (Pair C twin): on the PRIMARY the event tap reports the
+  // user's own Shift through onKey(). That key is captured, not injected,
+  // so the leave-time updateKeyState() and the disable-time fakeAllKeysUp()
+  // must not post a Shift UP for it -- they used to, which made the OS
+  // report Shift up mid-drag and lowercased every relayed letter until a
+  // re-press. A Shift WE injected is still released by the same path.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK; // the user holds Shift
+  keyState.setHooks(os.hooks());
+  keyState.updateKeyMap();
+  const KeyButton shiftButton = buttonFor(kVK_Shift);
+
+  // OSXScreen::onKey (flagsChanged on the primary) -> handleModifierKey -> onKey
+  keyState.onKey(shiftButton, true, KeyModifierShift);
+  QVERIFY(keyState.isKeyDown(shiftButton));
+  QVERIFY(keyState.injectedModifiers().empty());
+
+  // Screen::leavePrimary -> updateKeyState
+  keyState.updateKeyState();
+  for (const auto &p : os.posted) {
+    QVERIFY2(!(p.virtualKey == kVK_Shift && !p.down), "updateKeyState posted a Shift UP for a physical Shift");
+  }
+
+  // Screen::disable(primary) / PrimaryClient::releaseForwardedKeys -> fakeAllKeysUp
+  os.posted.clear();
+  keyState.onKey(shiftButton, true, KeyModifierShift);
+  keyState.fakeAllKeysUp();
+  for (const auto &p : os.posted) {
+    QVERIFY2(!(p.virtualKey == kVK_Shift && !p.down), "fakeAllKeysUp posted a Shift UP for a physical Shift");
+  }
+
+  // control: an INJECTED Shift is ledgered and released by the same sweep
+  os.posted.clear();
+  keyState.fakeKeyDown(kKeyShift_L, 0, 0x1F0, "en");
+  QVERIFY(!keyState.injectedModifiers().empty());
+  keyState.fakeAllKeysUp();
+  bool releasedInjected = false;
+  for (const auto &p : os.posted) {
+    releasedInjected |= (p.virtualKey == kVK_Shift && !p.down);
+  }
+  QVERIFY(releasedInjected);
+  QVERIFY(keyState.injectedModifiers().empty());
+}
+
+void OSXKeyStateTests::releaseInjectedKeysKeepsReassertedModifier()
+{
+  // K4 audit MED-3: the post-switch verifier closes the ledger but keeps
+  // the modifiers it re-asserted on enter (an ongoing shift-drag). With
+  // Shift and Cmd both ledgered and held, keep=Shift releases only Cmd and
+  // leaves Shift down AND in the ledger for its own release path.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  keyState.fakeKey(stroke(kVK_Shift, true));
+  keyState.fakeKey(stroke(kVK_Command, true));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Shift));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Command));
+  os.posted.clear();
+  os.osFlags = kCGEventFlagMaskCommand | kCGEventFlagMaskShift;
+
+  keyState.releaseInjectedKeys(KeyModifierShift);
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Command));
+  QVERIFY(!os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0);
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Shift));
+  QVERIFY(!keyState.injectedModifiers().contains(kVK_Command));
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift));
+
+  // a later keep-nothing release closes the rest
+  os.posted.clear();
+  keyState.releaseInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Shift));
+  QVERIFY(keyState.injectedModifiers().empty());
+}
+
 void OSXKeyStateTests::setToggleStateNoOpsWhenCapsMatches()
 {
   deskflow::KeyMap keyMap;

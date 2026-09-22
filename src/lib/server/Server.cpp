@@ -3005,6 +3005,11 @@ void Server::forceLeaveClient(const BaseClientProxy *client)
       rememberUndeliveredChordModClear();
       cancelChordRemapSession();
     }
+    // A Super held back by the deferral belongs to the screen we just lost:
+    // drop it whether or not a chord session was open (cancelChordRemapSession
+    // only ran in that case), or the next Super up would forward a phantom
+    // Win tap to the primary.
+    m_deferredSuper = {};
     // record new position (center of primary screen)
     m_primaryClient->getCursorCenter(m_x, m_y);
 

@@ -141,6 +141,21 @@ create_test(
 )
 target_include_directories(BridgeCalibrationTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-vhid-bridge")
 
+# The bridge itself (protocol reader, input ledger, report translation) is
+# driven through IReportSink with a recording sink; BridgeCore.cpp is SDK-
+# and IOKit-free but uses POSIX sockets, so this test builds on Unix only.
+if(UNIX)
+  create_test(
+    NAME BridgeTests
+    DEPENDS base
+    SOURCE apps/deskflow-vhid-bridge/BridgeTests.cpp
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/apps/deskflow-vhid-bridge"
+  )
+  target_sources(BridgeTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-vhid-bridge/BridgeCore.cpp")
+  target_include_directories(BridgeTests PRIVATE "${CMAKE_SOURCE_DIR}/src/apps/deskflow-vhid-bridge")
+  set_target_properties(BridgeTests PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
+endif()
+
 #make sure to use CI only plugin on Unix
 if (UNIX AND NOT APPLE)
   set(qPA_Platform "QT_QPA_PLATFORM=minimal")

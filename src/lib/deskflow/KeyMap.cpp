@@ -701,7 +701,17 @@ bool KeyMap::keysForKeyItem(
     const std::string &lang
 ) const
 {
-  static const KeyModifierMask s_notRequiredMask = KeyModifierAltGr | KeyModifierNumLock | KeyModifierScrollLock;
+  // Modifiers the "match desiredState as closely as possible" pass below
+  // never tries to flip. Caps Lock belongs here (K4 audit B-1): it is a LOCK
+  // whose state is taken as given (mapCommandKey masks it out of the desired
+  // mask for the same reason), so a key that is not caps-sensitive (Return,
+  // digits, arrows, Backspace) must not toggle the client's Caps Lock to
+  // match the server's mask and back -- that was two real OS caps edges per
+  // key whenever the two masks disagreed, and one debounced edge left the
+  // client permanently inverted. Keys that ARE caps-sensitive still get
+  // Caps matched by the required-state pass above.
+  static const KeyModifierMask s_notRequiredMask =
+      KeyModifierAltGr | KeyModifierNumLock | KeyModifierScrollLock | KeyModifierCapsLock;
 
   // add keystrokes to adjust the group
   if (group != keyItem.m_group) {
@@ -971,8 +981,10 @@ void KeyMap::addKeystrokes(
   case kKeystrokeModify:
   case kKeystrokeUnmodify:
     if (keyItem.m_lock) {
-      // we assume there's just one button for this modifier
-      if (m_halfDuplex.contains(button)) {
+      // we assume there's just one button for this modifier. Half-duplex is
+      // configured either by button (detected by deskflow) or by KeyID (the
+      // user's halfDuplexCapsLock/NumLock/ScrollLock options): honour both.
+      if (isHalfDuplex(keyItem.m_id, button)) {
         if (type == kKeystrokeModify) {
           // turn half-duplex toggle on (press)
           keystrokes.push_back(Keystroke(button, true, false, data));

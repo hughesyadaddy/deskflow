@@ -66,6 +66,13 @@ Checks:
                              bridge start reaching "virtual HID ready" within
                              30 s with no vhid connect_failed after it (else
                              the privileged parts are SKIP with the reason).
+                             Known gap, not checked: the bridge maps only the
+                             US-layout ASCII set, Backspace/Tab/Return/Enter,
+                             Escape, Insert/Delete, Home/End/Page keys, the
+                             arrows, F1-F24 and keypad digits/decimal; a
+                             login password containing a non-ASCII character
+                             (accents, other scripts), a dead key or a keypad
+                             operator cannot be typed through it.
 
 Environment overrides:
   DESKFLOW_EXPECT_AUTHORITY  expected `Authority=` prefix (default "Apple Development")

@@ -63,7 +63,7 @@ public:
   void clearStaleModifiers() override;
   void setToggleState(KeyModifierMask toggle, bool on) override;
   void sanitizeInjectedKeys() override;
-  void releaseInjectedKeys() override;
+  void releaseInjectedKeys(KeyModifierMask keep = 0) override;
 
   // IPlatformScreen overrides
   void enable() override = 0;

@@ -667,7 +667,16 @@ void Screen::handlePostSwitchVerifier()
     return;
   }
   LOG_WARN("[keys] stuck-release 0x%04x", held);
-  m_screen->releaseInjectedKeys();
+  // Close the ledger EXCEPT the modifiers we re-asserted on enter: those
+  // are the user's ongoing chord (a shift-drag across the crossing) with
+  // their own release path (keyUp / leaveSecondary), and m_reassertedModifiers
+  // keeps describing exactly what is still down. Releasing the whole ledger
+  // here dropped that Shift whenever some OTHER modifier read stuck.
+  KeyModifierMask keep = 0;
+  for (const auto &[bit, button] : m_reassertedModifiers) {
+    keep |= bit;
+  }
+  m_screen->releaseInjectedKeys(keep);
 }
 
 std::string Screen::getSecureInputApp() const

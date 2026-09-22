@@ -188,6 +188,7 @@ namespace {
 constexpr KeyButton kShiftButton = 0x38;
 constexpr KeyButton kCapsButton = 0x3A;
 constexpr KeyButton kKButton = 0x28;
+constexpr KeyButton kReturnButton = 0x24;
 
 // The shape a real US layout produces for one letter key: a Shift modifier,
 // a locking Caps Lock modifier, and 'k' / 'K' on the same button where the
@@ -330,6 +331,155 @@ void KeyMapTests::mapKey_upperLetterWithShiftAndCaps_noExtraCapsPress()
   QVERIFY(!hasStroke(strokes, kCapsButton, false));
   QVERIFY(!hasStroke(strokes, kShiftButton, true));
   QVERIFY((currentState & KeyModifierCapsLock) != 0);
+}
+
+// K4 audit B-1: a key that is NOT caps-sensitive (Return, digits, arrows,
+// Backspace) must never toggle the client's Caps Lock to match the server's
+// mask. Before the fix, keysForKeyItem's "match desiredState as closely as
+// possible" pass flipped Caps on the way in and keysToRestoreModifiers
+// flipped it back: two real OS caps edges per key whenever the two masks
+// disagreed, and a single debounced edge left the client inverted for good.
+void KeyMapTests::mapKey_capsInsensitiveKeyWithCapsMaskMismatch_noCapsStrokes_data()
+{
+  QTest::addColumn<KeyModifierMask>("currentState");
+  QTest::addColumn<KeyModifierMask>("desiredMask");
+  QTest::newRow("client caps off, server caps on") << KeyModifierMask{0} << KeyModifierMask{KeyModifierCapsLock};
+  QTest::newRow("client caps on, server caps off") << KeyModifierMask{KeyModifierCapsLock} << KeyModifierMask{0};
+}
+
+void KeyMapTests::mapKey_capsInsensitiveKeyWithCapsMaskMismatch_noCapsStrokes()
+{
+  QFETCH(KeyModifierMask, currentState);
+  QFETCH(KeyModifierMask, desiredMask);
+  const KeyModifierMask capsBefore = currentState & KeyModifierCapsLock;
+
+  KeyMap keyMap;
+  addLetterLayout(keyMap);
+  KeyMap::KeyItem ret;
+  ret.m_id = kKeyReturn;
+  ret.m_group = 0;
+  ret.m_button = kReturnButton;
+  keyMap.addKeyEntry(ret); // not caps-sensitive, not shift-sensitive
+  keyMap.finish();
+
+  KeyMap::Keystrokes keys;
+  KeyMap::ModifierToKeys activeModifiers;
+  const auto *item = keyMap.mapKey(keys, kKeyReturn, 0, activeModifiers, currentState, desiredMask, false, "en");
+  QVERIFY(item != nullptr);
+  QCOMPARE(item->m_button, kReturnButton);
+  const auto strokes = buttonStrokes(keys);
+  QVERIFY(hasStroke(strokes, kReturnButton, true));
+  QVERIFY(!hasStroke(strokes, kCapsButton, true));
+  QVERIFY(!hasStroke(strokes, kCapsButton, false));
+  // the tracked lock state is untouched too
+  QCOMPARE(currentState & KeyModifierCapsLock, capsBefore);
+}
+
+// K4 audit B-4: a lock modifier configured half-duplex by the USER (KeyID,
+// via halfDuplexCapsLock -> addHalfDuplexModifier) must be driven as
+// press-to-turn-on / release-to-turn-off, exactly like one deskflow
+// detected by button. Before the fix only the button set was consulted, so
+// the KeyID configuration produced a full click (press+release) on the way
+// in and another on the way out -- which on a half-duplex keyboard toggles
+// the lock twice.
+void KeyMapTests::mapKey_halfDuplexCapsByKeyId_pressThenReleaseAroundKey()
+{
+  auto layout = [](KeyMap &map) {
+    KeyMap::KeyItem caps;
+    caps.m_id = kKeyCapsLock;
+    caps.m_group = 0;
+    caps.m_button = kCapsButton;
+    caps.m_generates = KeyModifierCapsLock;
+    caps.m_lock = true;
+    map.addKeyEntry(caps);
+    // 'K' reachable only through Caps Lock on this layout
+    KeyMap::KeyItem k;
+    k.m_id = 'K';
+    k.m_group = 0;
+    k.m_button = kKButton;
+    k.m_required = KeyModifierCapsLock;
+    k.m_sensitive = KeyModifierCapsLock;
+    map.addKeyEntry(k);
+    map.finish();
+  };
+  auto capsStrokesAroundKey = [](const KeyMap::Keystrokes &keys, std::vector<ButtonStroke> &before,
+                                 std::vector<ButtonStroke> &after) {
+    bool seenKey = false;
+    for (const auto &s : buttonStrokes(keys)) {
+      if (s.button == kKButton && s.press) {
+        seenKey = true;
+        continue;
+      }
+      if (s.button == kCapsButton) {
+        (seenKey ? after : before).push_back(s);
+      }
+    }
+    return seenKey;
+  };
+
+  // Baseline: no half-duplex -> click Caps on (press, release) before the
+  // key and click it off (press, release) after.
+  {
+    KeyMap keyMap;
+    layout(keyMap);
+    KeyMap::Keystrokes keys;
+    KeyMap::ModifierToKeys activeModifiers;
+    KeyModifierMask currentState = 0;
+    QVERIFY(keyMap.mapKey(keys, 'K', 0, activeModifiers, currentState, 0, false, "en") != nullptr);
+    std::vector<ButtonStroke> before, after;
+    QVERIFY(capsStrokesAroundKey(keys, before, after));
+    QCOMPARE(before.size(), size_t(2));
+    QVERIFY(before[0].press && !before[1].press);
+    QCOMPARE(after.size(), size_t(2));
+    QVERIFY(after[0].press && !after[1].press);
+  }
+
+  // Half-duplex by KeyID -> press only before the key, release only after.
+  {
+    KeyMap keyMap;
+    layout(keyMap);
+    keyMap.addHalfDuplexModifier(kKeyCapsLock);
+    QVERIFY(keyMap.isHalfDuplex(kKeyCapsLock, 0));
+    KeyMap::Keystrokes keys;
+    KeyMap::ModifierToKeys activeModifiers;
+    KeyModifierMask currentState = 0;
+    QVERIFY(keyMap.mapKey(keys, 'K', 0, activeModifiers, currentState, 0, false, "en") != nullptr);
+    std::vector<ButtonStroke> before, after;
+    QVERIFY(capsStrokesAroundKey(keys, before, after));
+    QCOMPARE(before.size(), size_t(1));
+    QVERIFY(before[0].press);
+    QCOMPARE(after.size(), size_t(1));
+    QVERIFY(!after[0].press);
+  }
+}
+
+// Reviewer (K4 item 8, B-1): a key whose item REQUIRES Caps Lock (Turkish-F
+// dotted capital I, reachable only with the lock on) must still get the
+// Caps toggle -- required-state pass, not the s_notRequiredMask pass.
+void KeyMapTests::mapKey_capsRequiredKeyStillTogglesCaps()
+{
+  KeyMap keyMap;
+  addLetterLayout(keyMap);
+  KeyMap::KeyItem dottedI;
+  dottedI.m_id = 0x0130;
+  dottedI.m_group = 0;
+  dottedI.m_button = 0x22;
+  dottedI.m_required = KeyModifierCapsLock;
+  dottedI.m_sensitive = KeyModifierShift | KeyModifierCapsLock;
+  keyMap.addKeyEntry(dottedI);
+  keyMap.finish();
+
+  for (KeyModifierMask desired : {KeyModifierMask{0}, KeyModifierMask{KeyModifierCapsLock}}) {
+    KeyMap::Keystrokes keys;
+    KeyMap::ModifierToKeys activeModifiers;
+    KeyModifierMask currentState = 0;
+    const auto *item = keyMap.mapKey(keys, 0x0130, 0, activeModifiers, currentState, desired, false, "tr");
+    QVERIFY(item != nullptr);
+    QCOMPARE(item->m_button, KeyButton(0x22));
+    const auto strokes = buttonStrokes(keys);
+    QVERIFY(hasStroke(strokes, 0x22, true));
+    QVERIFY2(hasStroke(strokes, kCapsButton, true), "caps toggle missing for a caps-REQUIRED key");
+  }
 }
 
 void KeyMapTests::parseModifiers_plusKey_keepsPlusAsKey()

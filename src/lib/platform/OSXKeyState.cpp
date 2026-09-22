@@ -797,13 +797,18 @@ void OSXKeyState::noteHardwareModifierFlags(CGEventFlags flags, double now)
   }
 }
 
-void OSXKeyState::releaseLedgeredModifiers(CGEventFlags os)
+void OSXKeyState::releaseLedgeredModifiers(CGEventFlags os, CGEventFlags keep)
 {
   const std::set<uint8_t> injected = m_injectedModifiers;
   for (uint8_t virtualKey : injected) {
     const CGEventFlags flag = modifierFlagForVirtualKey(virtualKey);
     if (flag == 0) {
       m_injectedModifiers.erase(virtualKey);
+      continue;
+    }
+    if ((keep & flag) != 0) {
+      // re-asserted for the user's ongoing chord: stays down, stays ledgered
+      LOG_DEBUG("keeping re-asserted modifier 0x%02x", virtualKey);
       continue;
     }
     if (flag == kCGEventFlagMaskAlphaShift) {
@@ -834,13 +839,26 @@ void OSXKeyState::releaseLedgeredModifiers(CGEventFlags os)
   }
 }
 
-void OSXKeyState::releaseInjectedKeys()
+void OSXKeyState::releaseInjectedKeys(KeyModifierMask keep)
 {
   // Ledger only -- the strict subset of sanitizeInjectedKeys() that can
   // never touch a modifier the user is physically holding, whatever the
   // freshness clock says. Reseed first so the release carries real flags.
+  CGEventFlags keepFlags = 0;
+  if ((keep & KeyModifierShift) != 0) {
+    keepFlags |= kCGEventFlagMaskShift;
+  }
+  if ((keep & KeyModifierControl) != 0) {
+    keepFlags |= kCGEventFlagMaskControl;
+  }
+  if ((keep & KeyModifierAlt) != 0) {
+    keepFlags |= kCGEventFlagMaskAlternate;
+  }
+  if ((keep & KeyModifierSuper) != 0) {
+    keepFlags |= kCGEventFlagMaskCommand;
+  }
   reseedShadowFlagsFromOS();
-  releaseLedgeredModifiers(osModifierFlags());
+  releaseLedgeredModifiers(osModifierFlags(), keepFlags);
 }
 
 void OSXKeyState::sanitizeInjectedKeys()

@@ -41,6 +41,7 @@ endforeach()
 # `common`, which would pull Qt into the login-window bridge.
 add_executable(${target}
   deskflow-vhid-bridge.cpp
+  BridgeCore.cpp
   ${CMAKE_SOURCE_DIR}/src/lib/common/SingleInstanceLock.cpp
 )
 target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/src/lib)

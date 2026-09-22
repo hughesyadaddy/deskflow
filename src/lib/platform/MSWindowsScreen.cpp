@@ -253,7 +253,7 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
   if (m_isPrimary) {
     return;
   }
-  m_desks->sanitizeStaleModifiers(m_keyState != nullptr ? m_keyState->injectedModifierBits() : 0);
+  m_desks->sanitizeStaleModifiers(m_keyState != nullptr ? m_keyState->injectedModifierBits(false) : 0);
   if (m_keyState != nullptr) {
     // Second sweep from the other direction: the audit above skips what the
     // ledger says WE hold, but at this boundary the server holds nothing, so
@@ -336,9 +336,12 @@ void MSWindowsScreen::leave()
     // how a stuck Win outlived the visit. Shift is excluded by the audit
     // table, so local capitals are unaffected.
     m_desks->sanitizeStaleModifiers(0);
-    // ...and the ledger's own view, Shift included (the audit table has no
-    // Shift row; a Shift stranded by a lost UP is the "all capitals" bug).
-    m_keyState->sanitizeInjectedKeys();
+    // ...and the ledger's own view. Ledger ONLY (K4 audit MED-2): the full
+    // sanitize sweep always lists LSHIFT/RSHIFT as candidates and releases
+    // on GetAsyncKeyState truth, so a Shift the user is physically holding
+    // at this keyboard while the cursor leaves was released under them.
+    // A Shift stranded by a lost UP is still in the ledger and still closed.
+    m_keyState->releaseInjectedKeys();
   }
 
   if (m_isPrimary) {
@@ -1552,7 +1555,9 @@ void MSWindowsScreen::auditStaleModifiers()
   // injection reports its failures instead of dropping events silently,
   // should never happen. Correct it and say so loudly: a line here is a real
   // bug worth chasing, not routine housekeeping.
-  m_desks->sanitizeStaleModifiers(m_keyState->injectedModifierBits());
+  // Entered: every ledger entry vouches, however old (a macOS server never
+  // repeats modifiers); the grace window applies only at boundaries.
+  m_desks->sanitizeStaleModifiers(m_keyState->injectedModifierBits(m_isOnScreen));
 }
 
 void MSWindowsScreen::fixClipboardViewer()
