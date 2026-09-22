@@ -336,9 +336,12 @@ void MSWindowsScreen::leave()
     // how a stuck Win outlived the visit. Shift is excluded by the audit
     // table, so local capitals are unaffected.
     m_desks->sanitizeStaleModifiers(0);
-    // ...and the ledger's own view, Shift included (the audit table has no
-    // Shift row; a Shift stranded by a lost UP is the "all capitals" bug).
-    m_keyState->sanitizeInjectedKeys();
+    // ...and the ledger's own view. Ledger ONLY (K4 audit MED-2): the full
+    // sanitize sweep always lists LSHIFT/RSHIFT as candidates and releases
+    // on GetAsyncKeyState truth, so a Shift the user is physically holding
+    // at this keyboard while the cursor leaves was released under them.
+    // A Shift stranded by a lost UP is still in the ledger and still closed.
+    m_keyState->releaseInjectedKeys();
   }
 
   if (m_isPrimary) {

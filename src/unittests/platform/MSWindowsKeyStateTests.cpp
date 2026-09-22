@@ -104,6 +104,17 @@ void MSWindowsKeyStateTests::audit_entryPastGrace_isNoLongerProtected()
   QCOMPARE(bits, 1u << MSWindowsKeyState::modifierVkIndex(VK_LWIN));
 }
 
+void MSWindowsKeyStateTests::ledgerRelease_emptyLedgerIgnoresPhysicalShift()
+{
+  // K4 audit MED-2: the secondary's leave() uses the ledger-only release,
+  // which never lists Shift unless WE injected it -- so a Shift the user is
+  // physically holding while the cursor leaves is not a candidate at all.
+  const Ledger empty;
+  QVERIFY(MSWindowsKeyState::ledgerKeysToRelease(empty, 0).empty());
+  // (the full sweep, by contrast, always probes Shift)
+  QCOMPARE(MSWindowsKeyState::injectedKeysToRelease(empty, downTable({VK_LSHIFT})), std::vector<WORD>{VK_LSHIFT});
+}
+
 void MSWindowsKeyStateTests::ledgerRelease_keepsExcludedModifier()
 {
   // K4 audit MED-3: keep=Shift leaves a ledgered Shift (re-asserted on
