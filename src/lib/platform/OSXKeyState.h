@@ -94,6 +94,10 @@ public:
   void sanitizeInjectedKeys() override;
 
   CGEventFlags getModifierStateAsOSXFlags() const;
+  // Flags every posted key event carries: the shadow modifier state plus the
+  // device-dependent bits. Public so tests can assert what an injected
+  // letter would be composed against.
+  CGEventFlags getKeyboardEventFlags() const;
 
   //! Seams for headless unit tests
   /*!
@@ -187,8 +191,6 @@ private:
   // CGEventPost
   kern_return_t postHIDVirtualKey(uint8_t virtualKeyCode, bool postDown);
 
-  // Get keyboard event flags accorfing to keyboard modifiers
-  CGEventFlags getKeyboardEventFlags() const;
   CGEventFlags getDeviceDependedFlags() const;
 
   void setKeyboardModifiers(CGKeyCode virtualKey, bool keyDown);

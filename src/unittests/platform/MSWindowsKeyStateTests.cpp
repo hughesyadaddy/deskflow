@@ -26,6 +26,14 @@ constexpr ULONGLONG kGrace = MSWindowsKeyState::kInjectedModifierGraceMs;
 
 } // namespace
 
+// TODO(K1 cross-machine vector, needs a Windows build host): with VK_CAPITAL
+// toggled on, MSWindowsKeyState::getKeyID / mapKeyFromEvent for the K key
+// must yield KeyID 'K' (ToUnicodeEx composes the capital) AND carry
+// KeyModifierCapsLock in the reported mask, so a macOS client / the login
+// bridge see (id='K', mask=0x1000) and compose it without pressing Shift.
+// Mirror of KeyMapTests::mapKey_* and
+// OSXKeyStateTests::keyboardEventFlagsCarryShiftForUpperLetterWithCapsOn.
+
 void MSWindowsKeyStateTests::release_emptyLedgerNothingDown_releasesNothing()
 {
   const auto release = MSWindowsKeyState::injectedKeysToRelease(Ledger{}, downTable({}));

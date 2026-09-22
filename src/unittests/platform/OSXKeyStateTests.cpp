@@ -267,6 +267,65 @@ void OSXKeyStateTests::keyboardEventFlagsKeepDeviceBitsWithCapsOn()
   keyState.fakeKeyUp(1);
 }
 
+void OSXKeyStateTests::keyboardEventFlagsCarryShiftForUpperLetterWithCapsOn()
+{
+  // Cross-machine vector for the login-screen capitalization fix: the OS
+  // reports Caps Lock ON (the user left it on at this seat) while a server
+  // whose caps is off sends 'K' with Shift. The layout maps 'K' to the k
+  // key + Shift, so the client injects a Shift press and the letter must
+  // be posted with event flags carrying Shift on top of the OS caps state
+  // (never stripped because caps is on) -- that is what getKeyboardEventFlags()
+  // returns at the moment the letter goes out. All OS touch points are
+  // hooked: nothing is injected.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  OSXKeyState::Hooks hooks = os.hooks();
+  // Record, for the letter itself, the flags the real (unhooked) path would
+  // stamp on the CGEvent: the non-modifier hook is handed 0 by design.
+  hooks.postHIDKey = [&](uint8_t vk, bool down, CGEventFlags flags) {
+    os.posted.push_back({vk, down, vk == kVK_ANSI_K ? keyState.getKeyboardEventFlags() : flags});
+    return KERN_SUCCESS;
+  };
+  keyState.setHooks(hooks);
+  keyState.updateKeyMap();
+
+  os.osFlags = kCGEventFlagMaskAlphaShift;
+  os.capsOn = true;
+  keyState.updateKeyState();
+  QCOMPARE(keyState.getKeyboardEventFlags() & kCGEventFlagMaskAlphaShift, CGEventFlags(kCGEventFlagMaskAlphaShift));
+  QCOMPARE(keyState.getKeyboardEventFlags() & kCGEventFlagMaskShift, CGEventFlags(0));
+
+  keyState.fakeKeyDown(static_cast<KeyID>('K'), KeyModifierShift, 1, "en");
+
+  bool sawShiftDown = false;
+  bool sawLetter = false;
+  for (const PostedKey &p : os.posted) {
+    if (p.virtualKey == kVK_Shift && p.down) {
+      sawShiftDown = true;
+      QVERIFY((p.flags & kCGEventFlagMaskShift) != 0);
+      QVERIFY((p.flags & kCGEventFlagMaskAlphaShift) != 0);
+      QVERIFY((p.flags & NX_DEVICELSHIFTKEYMASK) != 0);
+    }
+    if (p.virtualKey == kVK_ANSI_K && p.down) {
+      sawLetter = true;
+      QVERIFY(sawShiftDown); // Shift lands before the letter
+      // The letter's flags: Shift held, OS caps still on, device bit set.
+      QVERIFY((p.flags & kCGEventFlagMaskShift) != 0);
+      QVERIFY((p.flags & kCGEventFlagMaskAlphaShift) != 0);
+      QVERIFY((p.flags & NX_DEVICELSHIFTKEYMASK) != 0);
+    }
+  }
+  QVERIFY(sawLetter);
+  QVERIFY(sawShiftDown);
+  QCOMPARE(os.capsSetCalls, 0); // no caps toggle to compose a capital
+
+  keyState.fakeKeyUp(1);
+  QCOMPARE(keyState.getKeyboardEventFlags() & kCGEventFlagMaskShift, CGEventFlags(0));
+  QVERIFY(keyState.injectedModifiers().empty());
+}
+
 void OSXKeyStateTests::sanitizeReleasesOnlyInjectedModifiers()
 {
   deskflow::KeyMap keyMap;

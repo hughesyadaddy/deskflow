@@ -5,11 +5,14 @@
 // Usage: deskflow-vhid-bridge <server_hosts> <client_screen_name>
 //          [port [width height [scale_factor]]]
 //          [--size=WxH] [--scale=S] [--scale-fixed] [--calibrate] [--coord-port=N]
-//          [--debug-keys]
+//          [--vhid-wait-s=N] [--debug-keys]
 //
-// Logging never includes key ids, masks or anything else decodable to typed
-// text: at the login window that stream is the password. --debug-keys adds
-// per-key lines carrying only button/usage/held counts and is for diagnosis
+// Logging never includes key ids, usages, buttons or anything else decodable
+// to typed text: at the login window that stream is the password. --debug-keys
+// adds per-key lines carrying only the held count (never the key, and not
+// the modifier mask/byte either: per-key Shift is a password's case pattern),
+// plus per-session counters (letters shifted/unshifted, caps edges) that are
+// always printed at Enter/Leave/disconnect; it is for diagnosis
 // only, never for a production plist.
 //
 // The bridge only injects while the console user is loginwindow. When a user
@@ -51,10 +54,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -108,10 +113,24 @@ namespace hr = pqrs::karabiner::driverkit::virtual_hid_device_driver::hid_report
 using Clock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 
+// Local wall-clock prefix (ISO 8601 with offset). launchd's StandardErrorPath
+// adds no timestamps of its own, and fleet-health measures the gap between
+// the bridge's start and its "virtual HID ready" line from these.
+std::string log_timestamp()
+{
+  const std::time_t now = std::time(nullptr);
+  std::tm local{};
+  ::localtime_r(&now, &local);
+  char buf[40];
+  if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &local) == 0)
+    return "0000-00-00T00:00:00+0000";
+  return buf;
+}
+
 void log_line(const std::string &message)
 {
   // stderr is captured by the LaunchDaemon log; stdout is reserved for none.
-  std::string line = "[bridge] " + message + "\n";
+  std::string line = log_timestamp() + " [bridge] " + message + "\n";
   ::write(STDERR_FILENO, line.data(), line.size());
 }
 
@@ -743,12 +762,20 @@ public:
     pqrs::dispatcher::extra::initialize_shared_dispatcher();
     client_ = std::make_unique<pqrs::karabiner::driverkit::virtual_hid_device_service::client>();
     client_->connected.connect([this] {
+      // A (re)connect means the daemon re-created the virtual keyboard: any
+      // IOHIDServiceClient we resolved for the old one is stale, so drop it
+      // and let the next caps query re-resolve.
+      {
+        std::lock_guard<std::mutex> lock(keyboard_service_mutex_);
+        keyboard_service_ = HidServiceHandle{};
+        keyboard_service_logged_miss_ = false;
+      }
       pqrs::karabiner::driverkit::virtual_hid_device_service::virtual_hid_keyboard_parameters p;
       p.set_country_code(pqrs::hid::country_code::us);
       client_->async_virtual_hid_keyboard_initialize(p);
       client_->async_virtual_hid_pointing_initialize();
     });
-    client_->connect_failed.connect([](auto &&ec) { log_line("vhid connect_failed: " + std::to_string(ec.value())); });
+    client_->connect_failed.connect([this](auto &&ec) { note_connect_failed(ec.value()); });
     client_->virtual_hid_keyboard_ready.connect([this](bool r) { keyboard_ready_ = r; });
     client_->virtual_hid_pointing_ready.connect([this](bool r) { pointing_ready_ = r; });
   }
@@ -766,15 +793,79 @@ public:
     client_->async_start();
   }
 
+  bool ready() const
+  {
+    return keyboard_ready_ && pointing_ready_;
+  }
+
+  // The pqrs client retries its connect every second and reports each miss;
+  // at a login window that waits for the daemon that was ~86k lines/day.
+  // Log the first failure, then at most one line per kConnectFailedLogEvery
+  // carrying the count of the ones suppressed in between.
+  static constexpr auto kConnectFailedLogEvery = std::chrono::seconds(60);
+
+  void note_connect_failed(int ec)
+  {
+    std::lock_guard<std::mutex> lock(connect_failed_mutex_);
+    const auto now = Clock::now();
+    if (connect_failed_logged_ && now - last_connect_failed_log_ < kConnectFailedLogEvery) {
+      ++connect_failed_suppressed_;
+      return;
+    }
+    std::string line = "vhid connect_failed: " + std::to_string(ec);
+    if (connect_failed_suppressed_ > 0)
+      line += " (" + std::to_string(connect_failed_suppressed_) + " more suppressed in the last 60s)";
+    log_line(line);
+    connect_failed_logged_ = true;
+    connect_failed_suppressed_ = 0;
+    last_connect_failed_log_ = now;
+  }
+
+  // Waits up to `timeout` for both virtual devices; returns early (false)
+  // on SIGTERM so an unbounded wait still exits promptly.
   bool wait_ready(milliseconds timeout)
   {
     Clock::time_point deadline = Clock::now() + timeout;
     while (Clock::now() < deadline) {
-      if (keyboard_ready_ && pointing_ready_)
+      if (ready())
         return true;
+      if (g_stop.load())
+        return false;
       std::this_thread::sleep_for(milliseconds(20));
     }
-    return keyboard_ready_ && pointing_ready_;
+    return ready();
+  }
+
+  // Caps Lock state as reported by the Karabiner VIRTUAL keyboard's own
+  // service ("HIDCapsLockState"). This is the keyboard the bridge itself
+  // toggles, so it is the least trustworthy of the three sources and is
+  // consulted last. The service handle lives here (not in a process-lifetime
+  // static) so a daemon reconnect resets it and it is re-resolved.
+  std::optional<bool> caps_lock_state_from_virtual_keyboard()
+  {
+    std::lock_guard<std::mutex> lock(keyboard_service_mutex_);
+    if (!keyboard_service_.service) {
+      keyboard_service_ = find_karabiner_service(
+          kKarabinerKeyboardProductId, kHIDPage_GenericDesktop, kHIDUsage_GD_Keyboard, "keyboard",
+          !keyboard_service_logged_miss_
+      );
+      keyboard_service_logged_miss_ = true;
+    }
+    if (!keyboard_service_.service)
+      return std::nullopt;
+    cf_ptr<CFTypeRef> value(
+        IOHIDServiceClientCopyProperty(keyboard_service_.service, CFSTR(kIOHIDServiceCapsLockStateKey))
+    );
+    if (!value)
+      return std::nullopt;
+    if (CFGetTypeID(value.get()) == CFBooleanGetTypeID())
+      return CFBooleanGetValue(static_cast<CFBooleanRef>(value.get()));
+    if (CFGetTypeID(value.get()) == CFNumberGetTypeID()) {
+      int v = 0;
+      if (CFNumberGetValue(static_cast<CFNumberRef>(value.get()), kCFNumberIntType, &v))
+        return v != 0;
+    }
+    return std::nullopt;
   }
 
   void post_keyboard(uint8_t modifier_bits, const std::set<uint16_t> &keys)
@@ -806,6 +897,15 @@ private:
   std::unique_ptr<pqrs::karabiner::driverkit::virtual_hid_device_service::client> client_;
   std::atomic<bool> keyboard_ready_{false};
   std::atomic<bool> pointing_ready_{false};
+  // Resolved lazily by caps_lock_state_from_virtual_keyboard(); reset by the
+  // `connected` slot (dispatcher thread), hence the mutex.
+  std::mutex keyboard_service_mutex_;
+  HidServiceHandle keyboard_service_;
+  bool keyboard_service_logged_miss_ = false;
+  std::mutex connect_failed_mutex_;
+  bool connect_failed_logged_ = false;
+  unsigned long connect_failed_suppressed_ = 0;
+  Clock::time_point last_connect_failed_log_{};
 };
 
 // ---------------------------------------------------------------------------
@@ -926,48 +1026,8 @@ std::optional<uint16_t> special_keyid_to_usage(uint16_t key_id)
   }
 }
 
-// True for KeyIDs that name a character reachable only with shift on the US
-// layout: uppercase letters and the shifted symbol row/pairs. The KeyID is
-// the character the server wants typed, so shift is implied even when the
-// protocol modifier mask lacks it (e.g. uppercase composed via caps lock).
-bool keyid_requires_shift(uint16_t key_id)
-{
-  if (key_id >= 'A' && key_id <= 'Z')
-    return true;
-  switch (key_id) {
-  case '!':
-  case '@':
-  case '#':
-  case '$':
-  case '%':
-  case '^':
-  case '&':
-  case '*':
-  case '(':
-  case ')':
-  case '_':
-  case '+':
-  case '{':
-  case '}':
-  case '|':
-  case ':':
-  case '"':
-  case '~':
-  case '<':
-  case '>':
-  case '?':
-    return true;
-  default:
-    return false;
-  }
-}
-
-// True for KeyIDs naming an alphabetic character. Caps Lock affects ONLY
-// these on the US layout, so only these need caps-aware shift handling.
-bool keyid_is_letter(uint16_t key_id)
-{
-  return (key_id >= 'A' && key_id <= 'Z') || (key_id >= 'a' && key_id <= 'z');
-}
+// keyid_requires_shift / keyid_is_letter / decide_letter_modifiers live in
+// BridgeCalibration.h (pure, unit tested).
 
 // Live Caps Lock state of THIS machine.
 /*!
@@ -976,13 +1036,18 @@ LOWERCASE, so the shift decision for letters depends on the target's caps
 state -- and a relayed caps press must only emit a toggle edge when the
 target's lock state differs from what the server wants. Three sources, in
 order:
-  1. IOHIDServiceClient "HIDCapsLockState" on the Karabiner virtual keyboard
-     (modern per-service API; needs no exclusive connection).
+  1. CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & AlphaShift --
+     WindowServer's view of the real lock state, the one the login window
+     composes against; reachable from the bridge at the login window.
   2. A fresh legacy IOHIDSystem kIOHIDParamConnectType open +
      IOHIDGetModifierLockState. Fails with kIOReturnExclusiveAccess on every
      LoginWindow run after the first on macOS 26, but is cheap to try.
-  3. CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & AlphaShift --
-     WindowServer's view, reachable from the bridge at the login window.
+  3. IOHIDServiceClient "HIDCapsLockState" on the Karabiner virtual keyboard,
+     LAST: it is the device the bridge itself toggles (sync_caps_lock), so its
+     value can lag or disagree with the system after an edge. Consulting it
+     first (from a process-lifetime cache) made every relayed letter come out
+     lowercase whenever it held a wrong `true`. The handle now lives on the
+     VirtualHidSink and is reset on every daemon (re)connect.
 state is nullopt only when none of them can answer.
 */
 #pragma clang diagnostic push
@@ -1005,33 +1070,6 @@ std::optional<bool> caps_state_legacy_iohidsystem()
 }
 #pragma clang diagnostic pop
 
-std::optional<bool> caps_state_virtual_keyboard_service()
-{
-  // Cached: the virtual keyboard outlives the bridge process, and this is
-  // consulted on every relayed letter. Re-resolved only while unresolved.
-  static HidServiceHandle h;
-  static bool logged_miss = false;
-  if (!h.service) {
-    h = find_karabiner_service(
-        kKarabinerKeyboardProductId, kHIDPage_GenericDesktop, kHIDUsage_GD_Keyboard, "keyboard", !logged_miss
-    );
-    logged_miss = true;
-  }
-  if (!h.service)
-    return std::nullopt;
-  cf_ptr<CFTypeRef> value(IOHIDServiceClientCopyProperty(h.service, CFSTR(kIOHIDServiceCapsLockStateKey)));
-  if (!value)
-    return std::nullopt;
-  if (CFGetTypeID(value.get()) == CFBooleanGetTypeID())
-    return CFBooleanGetValue(static_cast<CFBooleanRef>(value.get()));
-  if (CFGetTypeID(value.get()) == CFNumberGetTypeID()) {
-    int v = 0;
-    if (CFNumberGetValue(static_cast<CFNumberRef>(value.get()), kCFNumberIntType, &v))
-      return v != 0;
-  }
-  return std::nullopt;
-}
-
 std::optional<bool> caps_state_cg_flags()
 {
   const CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
@@ -1048,14 +1086,14 @@ struct CapsTruth
   const char *source = "none";
 };
 
-CapsTruth target_caps_lock_state()
+CapsTruth target_caps_lock_state(VirtualHidSink &sink)
 {
-  if (auto s = caps_state_virtual_keyboard_service())
-    return {s, "vkbd-service"};
-  if (auto s = caps_state_legacy_iohidsystem())
-    return {s, "iohidsystem"};
   if (auto s = caps_state_cg_flags())
     return {s, "cg-flags"};
+  if (auto s = caps_state_legacy_iohidsystem())
+    return {s, "iohidsystem"};
+  if (auto s = sink.caps_lock_state_from_virtual_keyboard())
+    return {s, "vkbd-service"};
   return {};
 }
 
@@ -1179,6 +1217,7 @@ public:
   {
     if (!handshake(socket))
       return;
+    letters_shifted_ = letters_unshifted_ = caps_edges_ = 0;
     release_all();
     while (!must_pause()) {
       std::optional<std::vector<uint8_t>> message = socket.read_message();
@@ -1189,6 +1228,7 @@ public:
       warn_stuck_keys();
     }
     release_all();
+    log_line("disconnect; " + keys_summary());
   }
 
 private:
@@ -1230,7 +1270,7 @@ private:
     if (any) {
       log_line(
           "WARNING: " + std::to_string(held_keys_.size()) + " key(s) in held_keys_, some > 10s:" + summary +
-          " (Leave/close will release)"
+          " (Leave/close will release); " + keys_summary()
       );
     }
   }
@@ -1286,6 +1326,7 @@ private:
       return on_enter(body);
     if (body_has_code(body, proto::kLeave)) {
       release_all();
+      log_line("leave; " + keys_summary());
       return true;
     }
     if (body_has_code(body, proto::kMouseMove))
@@ -1396,12 +1437,28 @@ private:
       return true;
     // Logs the host's crossing point against our reported size: if the host ever
     // drives near a boundary the bridge can't reach, the mismatch shows up here.
+    // CINN = x, y, seq (4 bytes), modifier mask: the server's toggle state at
+    // the crossing. Sync this machine's Caps Lock to it now so the first
+    // letter is composed against the right lock state, not whatever a
+    // previous session (or the user at the keyboard) left behind.
+    r.skip(4);
+    std::optional<int16_t> mask = r.i16();
     log_line(
         "enter " + std::to_string(*x) + "," + std::to_string(*y) + " of " + std::to_string(screen_w_) + "x" +
-        std::to_string(screen_h_)
+        std::to_string(screen_h_) + "; " + keys_summary()
     );
     warp_to(*x, *y);
+    if (r.ok() && mask)
+      sync_caps_lock(0, static_cast<uint32_t>(static_cast<uint16_t>(*mask)));
     return true;
+  }
+
+  // Per-session observability without keystrokes: how letters were composed
+  // and how often the target's Caps Lock had to be toggled.
+  std::string keys_summary() const
+  {
+    return "[keys] session letters shifted=" + std::to_string(letters_shifted_) +
+           " unshifted=" + std::to_string(letters_unshifted_) + " caps-edges=" + std::to_string(caps_edges_);
   }
 
   bool on_mouse_abs(const std::vector<uint8_t> &body)
@@ -1540,7 +1597,7 @@ private:
     // same button with an identical entry -> no HID edge -> no toggle. Also
     // handle a mask-only event (id 0 with the caps bit): same sync logic.
     if (id16 == bridge_logic::kKeyIdCapsLock || (id16 == 0 && (mask32 & bridge_logic::kMaskCapsLock))) {
-      sync_caps_lock(id16, mask32, button);
+      sync_caps_lock(id16, mask32);
       return true;
     }
     HeldKey entry;
@@ -1552,42 +1609,40 @@ private:
     } else {
       std::optional<uint16_t> usage = translate_key(id16);
       if (!usage) {
-        log_keys("unmapped key btn=" + std::to_string(button));
+        log_keys("unmapped key");
         return true;
       }
       entry.usage = usage;
-      entry.modifier_bits = bridge_logic::key_down_modifier_bits(id16, mask32);
-      // The KeyID already names the character the server wants typed; a
-      // shifted character must carry shift even when the protocol mask
-      // lacks it (caps-lock-composed uppercase, relay-normalized masks).
-      //
-      // Letters are caps-sensitive: macOS composes caps+shift as LOWERCASE,
-      // so with caps ON the shift decision INVERTS -- an uppercase letter
-      // needs NO shift and a lowercase letter needs one. Ignoring this made
-      // every relayed letter come out inverted whenever caps was on at the
-      // login window (where the user cannot see or fix it).
-      //
-      // For letters the KeyID + caps truth decide shift OUTRIGHT (the mask's
-      // shift bit is dropped): the log showed 'K' relayed with Shift while
-      // caps was on, which macOS composes as lowercase. Non-letters keep the
-      // mask's shift (shift+arrow selection etc.) and only ever gain it.
-      bool wantShift = keyid_requires_shift(id16);
-      if (keyid_is_letter(id16)) {
-        const CapsTruth truth = target_caps_lock_state();
-        if (truth.state.value_or(false)) {
-          wantShift = !wantShift;
-        }
-        entry.modifier_bits &= static_cast<uint8_t>(~static_cast<uint8_t>(hr::modifier::left_shift));
-      }
-      if (wantShift) {
-        entry.modifier_bits |= static_cast<uint8_t>(hr::modifier::left_shift);
+      // The KeyID already names the character the server wants typed; the
+      // usage is always the unshifted key, so case lives in the modifier
+      // byte and the target's Caps Lock. Letters are caps-sensitive (macOS
+      // composes caps+shift as LOWERCASE): bridge_logic::decide_letter_modifiers
+      // derives Shift from the KeyID, the server's Shift/Caps bits and this
+      // machine's caps truth, and asks for a caps edge first whenever the
+      // two lock states disagree (at most one edge per key-down). Non-letters
+      // keep the mask's modifiers and gain Shift for shifted symbols.
+      const bool is_letter = bridge_logic::keyid_is_letter(id16);
+      CapsTruth truth;
+      if (is_letter)
+        truth = read_caps_truth();
+      const bridge_logic::LetterDecision decision =
+          bridge_logic::decide_letter_modifiers(id16, mask32, is_letter ? truth.state : std::nullopt);
+      if (decision.capsEdge)
+        sync_caps_lock(0, mask32, truth);
+      entry.modifier_bits = decision.modifierBits;
+      if (is_letter) {
+        if (entry.modifier_bits & static_cast<uint8_t>(hr::modifier::left_shift))
+          ++letters_shifted_;
+        else
+          ++letters_unshifted_;
       }
     }
     held_keys_[button] = entry;
-    log_keys(
-        "key down btn=" + std::to_string(button) + " usage=0x" + to_hex(entry.usage.value_or(0)) +
-        " held=" + std::to_string(held_keys_.size())
-    );
+    // Diagnostic only (--debug-keys): held count and nothing else. Not the
+    // key id, usage or button (the typed text), and not the mask or modifier
+    // byte either -- per-key Shift is the case pattern of a password. Case
+    // composition is observable only through the session counters.
+    log_keys("key down held=" + std::to_string(held_keys_.size()));
     emit_keyboard();
     return true;
   }
@@ -1597,18 +1652,50 @@ private:
   // no modifiers, the currently held keys untouched) only when they differ.
   // When the truth is unreadable, emit the edge unconditionally -- one edge
   // per press is the best approximation of a real keyboard.
-  void sync_caps_lock(uint16_t key_id, uint32_t mask, int16_t button)
+  void sync_caps_lock(uint16_t key_id, uint32_t mask)
+  {
+    sync_caps_lock(key_id, mask, read_caps_truth());
+  }
+
+  // This machine's caps truth: the state we just set, for kCapsAssumeMs
+  // after an edge we emitted; otherwise the OS (target_caps_lock_state).
+  CapsTruth read_caps_truth()
+  {
+    if (assumed_caps_) {
+      const auto now_ms = std::chrono::duration_cast<milliseconds>(Clock::now().time_since_epoch()).count();
+      const auto edge_ms = std::chrono::duration_cast<milliseconds>(assumed_caps_at_.time_since_epoch()).count();
+      if (bridge_logic::caps_assumption_valid(now_ms, edge_ms))
+        return {assumed_caps_, "assumed-after-edge"};
+      assumed_caps_.reset();
+    }
+    return target_caps_lock_state(sink_);
+  }
+
+  // Same, with a truth the caller already read (one read per key-down).
+  // key_id == kKeyIdCapsLock is a real caps press: with the truth unknown
+  // one edge per press is the best approximation of a keyboard. key_id == 0
+  // is a SYNC (Enter, mask-only event, pre-letter): with the truth unknown
+  // it must do nothing -- a blind edge would toggle the real lock and invert
+  // every following letter.
+  void sync_caps_lock(uint16_t key_id, uint32_t mask, const CapsTruth &truth)
   {
     const bool desired = bridge_logic::desired_caps_from_mask(mask);
-    const CapsTruth truth = target_caps_lock_state();
-    const bool emit = bridge_logic::caps_edge_needed(truth.state, desired);
+    const bool is_press = key_id == bridge_logic::kKeyIdCapsLock;
+    const bool emit = is_press ? bridge_logic::caps_edge_needed(truth.state, desired)
+                               : bridge_logic::caps_sync_edge_needed(truth.state, desired);
     log_keys(
-        "caps " + std::string(key_id == 0 ? "mask-only" : "down") + " btn=" + std::to_string(button) +
-        " desired=" + (desired ? "on" : "off") + " truth=" + (truth.state ? (*truth.state ? "on" : "off") : "unknown") +
-        " (" + truth.source + ") -> " + (emit ? "EDGE" : "skip")
+        "caps " + std::string(key_id == 0 ? "sync" : "down") + " desired=" + (desired ? "on" : "off") +
+        " truth=" + (truth.state ? (*truth.state ? "on" : "off") : "unknown") + " (" + truth.source + ") -> " +
+        (emit ? "EDGE" : "skip")
     );
     if (!emit)
       return;
+    ++caps_edges_;
+    // The OS readers lag the toggle; for the next kCapsAssumeMs the lock IS
+    // what we just set (see read_caps_truth), so a letter burst in the same
+    // TCP read cannot edge twice.
+    assumed_caps_ = desired;
+    assumed_caps_at_ = Clock::now();
     // Edge = held report + caps, then the held report without it. Modifiers of
     // the held keys stay as they are; the caps usage itself carries none.
     uint8_t modifiers = 0;
@@ -1631,10 +1718,8 @@ private:
     const uint16_t usage = was_held ? it->second.usage.value_or(0) : 0;
     if (was_held)
       held_keys_.erase(it);
-    log_keys(
-        "key up btn=" + std::to_string(button) + " usage=0x" + to_hex(usage) + (was_held ? "" : " (not held)") +
-        " held=" + std::to_string(held_keys_.size())
-    );
+    (void)usage;
+    log_keys(std::string("key up") + (was_held ? "" : " (not held)") + " held=" + std::to_string(held_keys_.size()));
     if (id16 == bridge_logic::kKeyIdCapsLock)
       return true; // edge already emitted on the down
     emit_keyboard();
@@ -1782,7 +1867,13 @@ private:
   int calibration_attempts_ = 0;
   bool closed_loop_disabled_ = false;
   int saturated_residuals_ = 0;
-
+  // Session counters (reset per connection), printed by keys_summary().
+  unsigned long letters_shifted_ = 0;
+  unsigned long letters_unshifted_ = 0;
+  unsigned long caps_edges_ = 0;
+  // Lock state assumed right after an edge we emitted (read_caps_truth).
+  std::optional<bool> assumed_caps_;
+  Clock::time_point assumed_caps_at_{};
 };
 
 } // namespace
@@ -1807,6 +1898,10 @@ int main(int argc, char **argv)
   std::optional<double> flag_scale;
   std::optional<uint16_t> flag_coord_port;
   bool scale_fixed = false, calibrate = false;
+  // Seconds to wait for the Karabiner daemon; 0 = forever (the default: at a
+  // cold-boot login window the daemon comes up after us, and the pqrs client
+  // retries its connect internally).
+  long vhid_wait_s = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg.rfind("--size=", 0) == 0) {
@@ -1839,6 +1934,14 @@ int main(int argc, char **argv)
       calibrate = true; // the default; accepted so plists can say so explicitly
     } else if (arg == "--debug-keys") {
       g_debug_keys = true;
+    } else if (arg.rfind("--vhid-wait-s=", 0) == 0) {
+      char *end = nullptr;
+      const long parsed = std::strtol(arg.c_str() + 14, &end, 10);
+      if (end == arg.c_str() + 14 || *end != '\0' || parsed < 0) {
+        log_line("invalid --vhid-wait-s (expected a non-negative integer): " + arg);
+        return 2;
+      }
+      vhid_wait_s = parsed;
     } else {
       positional.push_back(arg);
     }
@@ -1852,7 +1955,7 @@ int main(int argc, char **argv)
     log_line(
         "usage: deskflow-vhid-bridge <server_hosts> <client_screen_name> "
         "[port [width height [scale_factor]]] [--size=WxH] [--scale=S] [--scale-fixed] [--calibrate] "
-        "[--coord-port=N] [--debug-keys]"
+        "[--coord-port=N] [--vhid-wait-s=N] [--debug-keys]"
     );
     return 2;
   }
@@ -1871,6 +1974,9 @@ int main(int argc, char **argv)
   if (const auto msg = SingleInstanceLock::lastMessage(); !msg.empty()) {
     log_line(msg);
   }
+  // fleet-health keys off this line: "virtual HID ready" must follow it
+  // within 30 s, with no vhid connect_failed in between.
+  log_line("starting pid=" + std::to_string(::getpid()));
 
   // Comma-separated server candidates: in auto-switch mode only the elected
   // server listens, so the bridge cycles the list until one accepts.
@@ -1945,9 +2051,38 @@ int main(int argc, char **argv)
 
   VirtualHidSink sink;
   sink.start();
-  if (!sink.wait_ready(milliseconds(10000))) {
-    log_line("virtual HID device not ready (is the Karabiner daemon running?)");
-    return 1;
+  // Wait for the daemon: unbounded by default (launchd starts us at the
+  // login window before the Karabiner daemon is listening -- the old 10 s
+  // bail-out logged "connect_failed: 61" and exited 1 into a KeepAlive
+  // respawn loop). Progress is logged (5 s, then 60 s); --vhid-wait-s=N bounds it.
+  {
+    const Clock::time_point started = Clock::now();
+    long last_logged_s = 0;
+    while (!sink.ready()) {
+      if (g_stop.load()) {
+        log_line("stopping (signal) while waiting for the virtual HID daemon");
+        return 0;
+      }
+      sink.wait_ready(milliseconds(1000));
+      if (sink.ready())
+        break;
+      const long elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started).count();
+      if (vhid_wait_s > 0 && elapsed_s >= vhid_wait_s) {
+        log_line(
+            "virtual HID device not ready after " + std::to_string(elapsed_s) +
+            "s (is the Karabiner daemon running?); giving up (--vhid-wait-s=" + std::to_string(vhid_wait_s) + ")"
+        );
+        return 1;
+      }
+      // Every 5 s for the first minute, then every 60 s: together with the
+      // rate-limited connect_failed line that is ~2 lines/min, so the
+      // "starting" line stays within fleet-health's reach for hours.
+      const long progress_every_s = elapsed_s < 60 ? 5 : 60;
+      if (elapsed_s - last_logged_s >= progress_every_s) {
+        last_logged_s = elapsed_s;
+        log_line("waiting for virtual HID daemon (" + std::to_string(elapsed_s) + "s)");
+      }
+    }
   }
   {
     std::string hosts;

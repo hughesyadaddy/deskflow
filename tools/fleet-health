@@ -43,11 +43,14 @@ Checks:
                              that is running but silently in legacy/off mode.
   loginbridge                the LoginWindow bridge agent (macOS): the plist
                              exists and lints, its program is the installed
-                             bundle's deskflow-vhid-bridge, the log is mode 600
-                             and holds no keystrokes, and -- when passwordless
-                             sudo is available -- launchctl reports the agent
-                             in the loginwindow domain (else that part is SKIP
-                             with the reason).
+                             bundle's deskflow-vhid-bridge and it passes
+                             --calibrate, the log is mode 600 and holds no
+                             keystrokes, and -- when passwordless sudo is
+                             available -- launchctl reports the agent in the
+                             loginwindow domain and the log shows the newest
+                             bridge start reaching "virtual HID ready" within
+                             30 s with no vhid connect_failed after it (else
+                             the privileged parts are SKIP with the reason).
 
 Environment overrides:
   DESKFLOW_EXPECT_AUTHORITY  expected `Authority=` prefix (default "Apple Development")
@@ -114,6 +117,13 @@ LOGIN_BRIDGE_PLIST = f"/Library/LaunchAgents/{LOGIN_BRIDGE_LABEL}.plist"
 LOGIN_BRIDGE_BIN = "/Applications/Deskflow.app/Contents/MacOS/deskflow-vhid-bridge"
 LOGIN_BRIDGE_LOG = "/var/log/deskflow-vhid-bridge.log"
 LOGIN_BRIDGE_KEYSTROKE_MARK = "key down id="
+# Bridge log lines are "<ISO-8601 local> [bridge] <message>" (deskflow-vhid-bridge.cpp log_line).
+LOGIN_BRIDGE_START_MARK = "[bridge] starting"
+LOGIN_BRIDGE_READY_MARK = "virtual HID ready"
+LOGIN_BRIDGE_CONNECT_FAILED_MARK = "vhid connect_failed"
+LOGIN_BRIDGE_READY_MAX_S = 30
+LOGIN_BRIDGE_SINCE_START_MAX_LINES = 400
+LOGIN_BRIDGE_CALIBRATE_FLAG = "--calibrate"
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
@@ -401,6 +411,85 @@ def login_bridge_keystroke_cmd(log: str = LOGIN_BRIDGE_LOG, mark: str = LOGIN_BR
     # The log is root:0600, so the grep needs sudo too. grep -c exits 1 on zero
     # matches; the count on stdout is what matters.
     return f"sudo -n grep -c {shlex.quote(mark)} {shlex.quote(log)}"
+
+
+def login_bridge_calibrate_cmd(plist: str = LOGIN_BRIDGE_PLIST, flag: str = LOGIN_BRIDGE_CALIBRATE_FLAG) -> str:
+    """Count of --calibrate occurrences in the (world-readable) plist; grep -c exits 1 on zero."""
+    return f"grep -c -- {shlex.quote(flag)} {shlex.quote(plist)}"
+
+
+def login_bridge_log_since_start_cmd(log: str = LOGIN_BRIDGE_LOG,
+                                     max_lines: int = LOGIN_BRIDGE_SINCE_START_MAX_LINES) -> str:
+    """Lines from the NEWEST '[bridge] starting' line to EOF (whole file scanned, so the
+    start line can never scroll out of a fixed tail), capped at max_lines after the
+    start plus every later 'vhid connect_failed' line (those decide the verdict)."""
+    # root:0600 again; the output is parsed by parse_login_bridge_log.
+    awk = ("/\\[bridge\\] starting/{n=0; buf=\"\"} "
+           f"{{if (n<{int(max_lines)} || /{LOGIN_BRIDGE_CONNECT_FAILED_MARK}/) buf=buf $0 \"\\n\"; n++}} "
+           "END{printf \"%s\", buf}")
+    return f"sudo -n awk '{awk}' {shlex.quote(log)}"
+
+
+_BRIDGE_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})")
+
+
+def _bridge_line_epoch(line: str) -> Optional[float]:
+    """Seconds since the epoch of a bridge log line's local timestamp, or None (untimestamped/old build)."""
+    m = _BRIDGE_TS_RE.match(line)
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(g) for g in m.groups())
+    # Local time on both the bridge and this parser only ever differ by
+    # whole seconds within one machine's log, so a naive calendar works.
+    import calendar
+    return float(calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0)))
+
+
+def parse_login_bridge_log(text: str, max_ready_s: int = LOGIN_BRIDGE_READY_MAX_S) -> Tuple[bool, str]:
+    """(pass, detail) for the tail of the login bridge log.
+
+    PASS iff the newest "[bridge] starting" line (the command already cut
+    the log there) is followed by a
+    "virtual HID ready" line at most max_ready_s later and no
+    "vhid connect_failed" appears after that ready line. A start with no
+    ready line yet is the cold-boot/daemon-down case the unbounded wait
+    reports as "waiting for virtual HID daemon (Ns)" -- that is a FAIL
+    naming the wait. Untimestamped lines come from a pre-K3 bridge build.
+    """
+    lines = text.splitlines()
+    start_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if LOGIN_BRIDGE_START_MARK in lines[i]:
+            start_idx = i
+            break
+    if start_idx is None:
+        return False, f"no '{LOGIN_BRIDGE_START_MARK}' line in the log (bridge never started, or pre-K3 build)"
+    start_epoch = _bridge_line_epoch(lines[start_idx])
+    if start_epoch is None:
+        return False, "bridge start line has no timestamp (pre-K3 bridge build; redeploy)"
+    ready_idx = None
+    for i in range(start_idx + 1, len(lines)):
+        if LOGIN_BRIDGE_READY_MARK in lines[i]:
+            ready_idx = i
+            break
+    if ready_idx is None:
+        waiting = [ln for ln in lines[start_idx + 1:] if "waiting for virtual HID daemon" in ln]
+        if waiting:
+            m = re.search(r"\((\d+)s\)", waiting[-1])
+            return False, f"bridge started but not ready: still waiting for the virtual HID daemon ({m.group(1) if m else '?'}s)"
+        return False, "bridge started but no 'virtual HID ready' line after it"
+    ready_epoch = _bridge_line_epoch(lines[ready_idx])
+    if ready_epoch is None:
+        return False, "ready line has no timestamp (pre-K3 bridge build; redeploy)"
+    took = ready_epoch - start_epoch
+    if took < 0:
+        return False, f"ready line is {-took:.0f}s BEFORE the start line (clock jump or interleaved logs)"
+    if took > max_ready_s:
+        return False, f"virtual HID ready {took:.0f}s after start (want <= {max_ready_s}s)"
+    failed_after = sum(1 for ln in lines[ready_idx + 1:] if LOGIN_BRIDGE_CONNECT_FAILED_MARK in ln)
+    if failed_after:
+        return False, f"{failed_after} '{LOGIN_BRIDGE_CONNECT_FAILED_MARK}' line(s) after virtual HID ready"
+    return True, f"virtual HID ready {took:.0f}s after start, no connect_failed since"
 
 
 def ps1_cmd(root: str, checks: Sequence[str], thumbprint: str, port: int, peers: Sequence[str]) -> str:
@@ -697,6 +786,11 @@ class FleetHealth:
             problems.append(f"{LOGIN_BRIDGE_PLIST} missing or does not lint: {(err or out).strip()[:120] or f'rc={rc}'}")
         elif out.strip() != LOGIN_BRIDGE_BIN:
             problems.append(f"plist program {out.strip() or '?'} != {LOGIN_BRIDGE_BIN}")
+        else:
+            rc, out, err = self.runner(host, login_bridge_calibrate_cmd())
+            count = out.strip().splitlines()[-1] if out.strip() else ""
+            if not count.isdigit() or int(count) < 1:
+                problems.append(f"plist lacks {LOGIN_BRIDGE_CALIBRATE_FLAG} (re-run scripts/install-login-bridge-macos.sh)")
         rc, out, err = self.runner(host, login_bridge_log_mode_cmd())
         if rc != 0:
             problems.append(f"{LOGIN_BRIDGE_LOG} missing (rc={rc})")
@@ -705,6 +799,7 @@ class FleetHealth:
         rc, _, _ = self.runner(host, sudo_probe_cmd())
         sudo_ok = rc == 0
         agent = ""
+        ready = ""
         if sudo_ok:
             rc, out, err = self.runner(host, login_bridge_agent_cmd())
             if rc != 0:
@@ -718,14 +813,24 @@ class FleetHealth:
                 problems.append(f"keystroke grep failed: {(err or out).strip()[:80] or f'rc={rc}'}")
             elif int(count) > 0:
                 problems.append(f"{count} '{LOGIN_BRIDGE_KEYSTROKE_MARK}' lines in {LOGIN_BRIDGE_LOG} (keystrokes logged)")
+            rc, out, err = self.runner(host, login_bridge_log_since_start_cmd())
+            if rc != 0:
+                problems.append(f"log read failed: {(err or out).strip()[:80] or f'rc={rc}'}")
+            else:
+                ok, detail = parse_login_bridge_log(out)
+                if ok:
+                    ready = detail
+                else:
+                    problems.append(detail)
         if problems:
             self._add(host, "loginbridge", FAIL, "; ".join(problems))
         elif not sudo_ok:
             self._add(host, "loginbridge", SKIP,
-                      "plist lints + program ok, log mode 600; agent state and keystroke grep need "
-                      "passwordless sudo (sudo -n failed)")
+                      "plist lints + program ok + --calibrate, log mode 600; agent state, keystroke grep and "
+                      "ready-time need passwordless sudo (sudo -n failed)")
         else:
-            self._add(host, "loginbridge", PASS, f"plist lints, program ok, log 600 with 0 keystrokes, {agent}")
+            self._add(host, "loginbridge", PASS,
+                      f"plist lints, program ok, --calibrate, log 600 with 0 keystrokes, {agent}, {ready}")
 
     def check_mesh_leg_mac(self, src: Host, dst: Host) -> None:
         rc, out, err = self.runner(src, nc_cmd(dst.addr, self.mesh_port))

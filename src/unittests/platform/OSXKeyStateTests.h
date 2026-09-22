@@ -24,6 +24,7 @@ private Q_SLOTS:
   // headless: every OS touch point is hooked, nothing is injected
   void shadowFlagsReseedFromOsOnUpdateKeyState();
   void keyboardEventFlagsKeepDeviceBitsWithCapsOn();
+  void keyboardEventFlagsCarryShiftForUpperLetterWithCapsOn();
   void sanitizeReleasesOnlyInjectedModifiers();
   void sanitizeSkipsModifiersOsReportsUp();
   void sanitizeReleasesStaleModifiersWithoutRecentHardwarePress();

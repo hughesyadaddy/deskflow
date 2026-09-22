@@ -21,6 +21,9 @@ private Q_SLOTS:
   void findBestKey_noRequiredDown_cannotMatch();
   void isCommand();
   void mapkey();
+  void mapKey_upperLetterWithoutShiftInMask_pressesShift();
+  void mapKey_lowerLetterWithShiftDesired_noShiftKeystroke();
+  void mapKey_upperLetterWithShiftAndCaps_noExtraCapsPress();
   void parseModifiers_plusKey_keepsPlusAsKey();
   void parseKey_plusSymbol_parsesAsAsciiKey();
 
