@@ -141,6 +141,8 @@ class BridgeTests : public QObject
 
 private Q_SLOTS:
   void init();
+  void rolloverUnderServerCapsDoesNotLeakDerivedShift();
+  void shiftReleaseMidHoldDropsDerivedShift();
   void escapeBurstReleasesBeforeStop();
   void cheapSpecialKeysAreMapped();
   void unmappedKeyPostsNothing();
@@ -173,6 +175,59 @@ void BridgeTests::init()
 {
   g_debug_keys = false;
   g_stop.store(false);
+}
+
+// A-1: with the server's Caps on, `k` needs a derived Shift (caps+shift
+// composes lowercase). That Shift belongs to the `k` report only: rolling
+// over to `1` while `k` is still held must not type `!`.
+void BridgeTests::rolloverUnderServerCapsDoesNotLeakDerivedShift()
+{
+  Fixture f;
+  f.sink.caps = [] { return std::optional<bool>{true}; }; // local caps on, agrees with the server
+  QVERIFY(f.keyDown('k', bridge_logic::kMaskCapsLock, 10));
+  QVERIFY(!f.sink.kb.empty());
+  QVERIFY((f.sink.kb.back().mods & bridge_logic::kHidLeftShift) != 0);
+  QVERIFY(f.sink.kb.back().keys.contains(kUsageK));
+  QCOMPARE(f.sink.capsEdges(), 0);
+
+  QVERIFY(f.keyDown('1', bridge_logic::kMaskCapsLock, 11));
+  const auto &r = f.sink.kb.back();
+  QCOMPARE(int(r.mods & bridge_logic::kHidLeftShift), 0);
+  QVERIFY(r.keys.contains(kUsageK));
+  QVERIFY(r.keys.contains(kUsage1));
+
+  // releasing `1` re-posts the ledger: still no Shift on the held `k`
+  QVERIFY(f.keyUp('1', bridge_logic::kMaskCapsLock, 11));
+  QCOMPARE(int(f.sink.kb.back().mods), 0);
+  QCOMPARE(f.sink.kb.back().keys, std::set<uint16_t>{kUsageK});
+  QVERIFY(f.keyUp('k', bridge_logic::kMaskCapsLock, 10));
+  QCOMPARE(int(f.sink.kb.back().mods), 0);
+  QVERIFY(f.sink.kb.back().keys.empty());
+}
+
+// A-6 (same root cause): the server releases its real Shift while `K` is
+// still held (auto-repeat continues as `k` there). The next report must
+// drop Shift so the repeated letter changes case with the server.
+void BridgeTests::shiftReleaseMidHoldDropsDerivedShift()
+{
+  Fixture f;
+  f.sink.caps = [] { return std::optional<bool>{false}; };
+  QVERIFY(f.keyDown(kKeyIdShiftL, bridge_logic::kMaskShift, 20));
+  QCOMPARE(int(f.sink.kb.back().mods), int(bridge_logic::kHidLeftShift));
+  QVERIFY(f.keyDown('K', bridge_logic::kMaskShift, 10));
+  QVERIFY((f.sink.kb.back().mods & bridge_logic::kHidLeftShift) != 0);
+  QVERIFY(f.sink.kb.back().keys.contains(kUsageK));
+
+  QVERIFY(f.keyUp(kKeyIdShiftL, 0, 20));
+  QCOMPARE(int(f.sink.kb.back().mods & bridge_logic::kHidLeftShift), 0);
+  QCOMPARE(f.sink.kb.back().keys, std::set<uint16_t>{kUsageK});
+
+  // a repeat posts nothing; the key up empties the report
+  const size_t before = f.sink.kb.size();
+  QVERIFY(f.bridge.on_key_repeat(key_body(proto::kKeyRepeat, 'k', 0, 10)));
+  QCOMPARE(f.sink.kb.size(), before);
+  QVERIFY(f.keyUp('k', 0, 10));
+  QVERIFY(f.sink.kb.back().keys.empty());
 }
 
 // A-4: the 4x Esc rescue must not exit the process before the release

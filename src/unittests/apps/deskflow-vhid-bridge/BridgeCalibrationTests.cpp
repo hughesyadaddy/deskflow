@@ -36,6 +36,7 @@ private Q_SLOTS:
   void capsSyncTable_data();
   void capsSyncTable();
   void capsAssumptionWindow();
+  void derivedShiftIsNotHeld();
 
   // -- chunking ------------------------------------------------------------
   void chunk400Is50x8();
@@ -252,6 +253,33 @@ void BridgeCalibrationTests::capsAssumptionWindow()
   QVERIFY(!caps_assumption_valid(5000, 1000));
   QVERIFY(!caps_assumption_valid(999, 1000));
   QVERIFY(caps_assumption_valid(1000 + 199, 1000, 200));
+}
+
+void BridgeCalibrationTests::derivedShiftIsNotHeld()
+{
+  // A-1: the derived Shift rides on the key-down report (modifierBits),
+  // never on the ledger entry (heldBits); real modifiers stay on both.
+  auto d = decide_letter_modifiers('K', 0, std::nullopt);
+  QCOMPARE(d.modifierBits, kHidLeftShift);
+  QCOMPARE(d.heldBits, uint8_t{0});
+  d = decide_letter_modifiers('k', kMaskShift, std::nullopt); // the mask's Shift is not stored on a letter either
+  QCOMPARE(d.modifierBits, kHidLeftShift);
+  QCOMPARE(d.heldBits, uint8_t{0});
+  d = decide_letter_modifiers('k', kMaskCapsLock, std::nullopt); // caps on: lowercase needs Shift, one report only
+  QCOMPARE(d.modifierBits, kHidLeftShift);
+  QCOMPARE(d.heldBits, uint8_t{0});
+  d = decide_letter_modifiers('k', kMaskControl, std::nullopt); // ctrl is real: held
+  QCOMPARE(d.modifierBits, kHidLeftControl);
+  QCOMPARE(d.heldBits, kHidLeftControl);
+  d = decide_letter_modifiers('!', 0, std::nullopt); // shifted symbol: derived
+  QCOMPARE(d.modifierBits, kHidLeftShift);
+  QCOMPARE(d.heldBits, uint8_t{0});
+  d = decide_letter_modifiers('!', kMaskShift, std::nullopt); // the mask's Shift on a non-letter is real
+  QCOMPARE(d.modifierBits, kHidLeftShift);
+  QCOMPARE(d.heldBits, kHidLeftShift);
+  d = decide_letter_modifiers('1', kMaskShift | kMaskAlt, std::nullopt);
+  QCOMPARE(d.modifierBits, uint8_t(kHidLeftShift | kHidLeftOption));
+  QCOMPARE(d.heldBits, uint8_t(kHidLeftShift | kHidLeftOption));
 }
 
 void BridgeCalibrationTests::chunk400Is50x8()

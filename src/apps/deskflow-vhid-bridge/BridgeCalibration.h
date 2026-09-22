@@ -125,11 +125,25 @@ constexpr bool keyid_requires_shift(uint16_t key_id)
 }
 
 // Outcome of decide_letter_modifiers: the HID modifier byte to emit with the
-// key, and whether the target's Caps Lock must be toggled (one edge) FIRST so
-// that byte composes the intended character.
+// key-down report, the subset of it that belongs on the key's HELD ledger
+// entry, and whether the target's Caps Lock must be toggled (one edge) FIRST
+// so that byte composes the intended character.
+/*!
+modifierBits vs heldBits (K4 audit A-1/A-6): Shift that the bridge DERIVES
+for a key (the case of a letter, the shifted symbol behind a KeyID) is a
+property of that one key-down, not of the key while it stays held. The
+bridge ORs every ledger entry into each report, so a derived Shift stored on
+the ledger leaked into the next key's report -- with the server's Caps on,
+rolling over `k` then `1` typed `k!` -- and survived the server releasing
+its real Shift mid-repeat, so the repeated letter kept the wrong case. The
+ledger entry therefore carries heldBits (the mask's real modifiers only);
+the derived Shift rides on the key-down report alone, and the server's own
+Shift key-down/-up entries decide the case of everything after it.
+*/
 struct LetterDecision
 {
   uint8_t modifierBits = 0;
+  uint8_t heldBits = 0;
   bool capsEdge = false;
 };
 
@@ -182,7 +196,8 @@ constexpr LetterDecision decide_letter_modifiers(uint16_t id16, uint32_t mask32,
 {
   LetterDecision d;
   if (!keyid_is_letter(id16)) {
-    d.modifierBits = key_down_modifier_bits(id16, mask32);
+    d.heldBits = key_down_modifier_bits(id16, mask32);
+    d.modifierBits = d.heldBits;
     if (keyid_requires_shift(id16))
       d.modifierBits |= kHidLeftShift;
     return d;
@@ -192,7 +207,10 @@ constexpr LetterDecision decide_letter_modifiers(uint16_t id16, uint32_t mask32,
   const bool wantUpper = keyid_is_upper_letter(id16) || (serverShift && !serverCaps);
   const bool shift = wantUpper != serverCaps;
   d.capsEdge = localCaps.has_value() && *localCaps != serverCaps;
-  d.modifierBits = mask_to_modifier_bits(mask32 & ~kMaskShift);
+  // The mask's own Shift is never stored on a letter: `shift` replaces it
+  // for this report, and the server's Shift key has its own ledger entry.
+  d.heldBits = mask_to_modifier_bits(mask32 & ~kMaskShift);
+  d.modifierBits = d.heldBits;
   if (shift)
     d.modifierBits |= kHidLeftShift;
   return d;

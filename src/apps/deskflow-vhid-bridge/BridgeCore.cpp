@@ -824,6 +824,7 @@ bool Bridge::on_key_down(const std::vector<uint8_t> &body)
   HeldKey entry;
   entry.key_id = id16;
   entry.since = now_();
+  uint8_t report_bits = 0; // this report only (A-1): the derived Shift
   uint8_t modifier_bit = modifier_keyid_to_bit(id16);
   if (modifier_bit != 0) {
     entry.modifier_bits = modifier_bit;
@@ -842,6 +843,12 @@ bool Bridge::on_key_down(const std::vector<uint8_t> &body)
     // machine's caps truth, and asks for a caps edge first whenever the
     // two lock states disagree (at most one edge per key-down). Non-letters
     // keep the mask's modifiers and gain Shift for shifted symbols.
+    //
+    // The DERIVED Shift is posted with this key-down only; the ledger entry
+    // keeps the real modifiers (heldBits). Storing the derived Shift on the
+    // entry leaked it into every later report while the key stayed held:
+    // with the server's Caps on, rolling over `k` then `1` typed `k!`, and a
+    // Shift released mid-repeat left the repeated letter in the wrong case.
     const bool is_letter = bridge_logic::keyid_is_letter(id16);
     CapsTruth truth;
     if (is_letter)
@@ -850,9 +857,10 @@ bool Bridge::on_key_down(const std::vector<uint8_t> &body)
         bridge_logic::decide_letter_modifiers(id16, mask32, is_letter ? truth.state : std::nullopt);
     if (decision.capsEdge)
       sync_caps_lock(0, mask32, truth);
-    entry.modifier_bits = decision.modifierBits;
+    entry.modifier_bits = decision.heldBits;
+    report_bits = static_cast<uint8_t>(decision.modifierBits & ~decision.heldBits);
     if (is_letter) {
-      if (entry.modifier_bits & bridge_logic::kHidLeftShift)
+      if (decision.modifierBits & bridge_logic::kHidLeftShift)
         ++letters_shifted_;
       else
         ++letters_unshifted_;
@@ -864,7 +872,7 @@ bool Bridge::on_key_down(const std::vector<uint8_t> &body)
   // byte either -- per-key Shift is the case pattern of a password. Case
   // composition is observable only through the session counters.
   log_keys("key down held=" + std::to_string(held_keys_.size()));
-  emit_keyboard();
+  emit_keyboard(report_bits);
   return true;
 }
 

@@ -245,6 +245,8 @@ public:
 private:
   // One held key/modifier, keyed by the Deskflow physical button id so that
   // key-up matches key-down even if the reported KeyID changed meanwhile.
+  // modifier_bits are the REAL modifiers only (the mask's ctrl/alt/cmd, or
+  // the bit of a modifier key): a derived Shift never lives here (A-1).
   struct HeldKey
   {
     std::optional<uint16_t> usage; // none for pure modifier keys
@@ -280,7 +282,7 @@ private:
   bool parse_key(const std::vector<uint8_t> &body, int16_t &key_id, int16_t &mask, int16_t &button);
   std::optional<uint16_t> translate_key(uint16_t key_id);
   void collect_held(uint8_t &modifiers, std::set<uint16_t> &keys) const;
-  // Posts the ledger (plus extra_modifier_bits for this report only).
+  // Posts the ledger; extra_modifier_bits ride on THIS report only (A-1).
   void emit_keyboard(uint8_t extra_modifier_bits = 0);
   void emit_counts(int dx, int dy);
   void emit_slam(int dx, int dy);
