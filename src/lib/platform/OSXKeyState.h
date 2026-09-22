@@ -121,6 +121,10 @@ public:
     // replaces monotonicSeconds() (the clock sanitizeInjectedKeys() judges
     // hardware-modifier freshness with)
     std::function<double()> monotonicNow;
+    // replaces IsSecureEventInputEnabled(): while a password field owns
+    // input the event tap sees no keyboard events at all, so the freshness
+    // clock has no data and the stale-modifier sweep must not judge
+    std::function<bool()> secureInputEnabled;
   };
   void setHooks(Hooks hooks);
 
@@ -143,6 +147,22 @@ public:
 
   //! Which OS X modifier flag a modifier virtual key drives (0 if none)
   static CGEventFlags modifierFlagForVirtualKey(uint8_t virtualKey);
+
+  //! Tell the freshness clock whether hardware flagsChanged events can
+  //! currently reach noteHardwareModifierFlags() at all (the event tap is
+  //! installed and enabled). sanitizeInjectedKeys() judges a modifier stale
+  //! only when hardware has been observable for the whole
+  //! kHardwareModifierFreshS window: a tap that was down (epoch teardown,
+  //! disabled-by-timeout) or blind (secure input) leaves the stamps old for
+  //! a key the user is really holding. Safe to call from the tap thread.
+  void noteHardwareObservation(bool observing, double now);
+
+  //! True when hardware presses have been observable for \p seconds up to
+  //! \p at (see noteHardwareObservation)
+  bool hardwareObservableFor(double seconds, double at) const;
+
+  //! Whether a password field currently owns keyboard input (hookable)
+  bool secureInputEnabled() const;
 
 protected:
   // KeyState overrides
@@ -212,6 +232,31 @@ private:
   // next posted event carries the real global flags, not stale ones.
   void reseedShadowFlagsFromOS();
 
+  // Shadow modifier flags from an explicit flag word (what we just posted
+  // as the global flags, so getKeyboardEventFlags() agrees with the OS).
+  void setShadowFlags(CGEventFlags flags);
+
+  // The global flag word a modifier virtual key's Down/Up must carry.
+  // IOHIDPostEvent(..., kIOHIDSetGlobalEventFlags) REPLACES the system's
+  // modifier flags with the word we post, so: LIVE OS flags for every bit
+  // that is not ours (a physical key the shadow never saw survives), the
+  // LEDGER for ours. Every modifier we hold (m_injectedModifiers) is forced
+  // on, the key being posted is forced to its new state, and a key whose Up
+  // we posted but the OS has not adopted yet (m_pendingReleases) is forced
+  // off -- otherwise a Shift-Up / Control-Down pair posted back-to-back
+  // re-asserted the Shift the live read still showed. The generic bit is
+  // cleared only when no right-hand device bit still holds it; a Caps Up
+  // keeps the lock state.
+  //
+  // Same-side limitation: we only ever post the LEFT virtual keys, and the
+  // device bits cannot tell our left Shift from the user's left Shift. A
+  // physical left Shift held while we release our injected left Shift is
+  // cleared with it (it self-corrects on the user's next Shift edge); only
+  // a right-hand modifier is protected through a release of ours.
+  CGEventFlags modifierEventFlags(uint8_t virtualKey, bool down) const;
+  static CGEventFlags leftDeviceBitForVirtualKey(uint8_t virtualKey);
+  static CGEventFlags rightDeviceBitForVirtualKey(uint8_t virtualKey);
+
   // Caps lock state via IOHIDSystem (hookable). Return false when unknown.
   bool getCapsLockState(bool &on) const;
   bool setCapsLockState(bool on);
@@ -261,6 +306,10 @@ private:
   // modifier virtual keys this process posted Down for and has not yet
   // posted Up for; the only modifiers sanitizeInjectedKeys() may release.
   std::set<uint8_t> m_injectedModifiers;
+  // modifier virtual keys whose Up we posted and whose left device bit the
+  // live flags still showed at the last post (the OS had not adopted it);
+  // forced off in modifierEventFlags() until the live flags drop it
+  std::set<uint8_t> m_pendingReleases;
   // monotonic time a hardware flagsChanged last carried each modifier's
   // side-specific device bit (shift, control, alt, super); written on the
   // event-tap thread, read by sanitizeInjectedKeys()
@@ -268,5 +317,11 @@ private:
       std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(),
       std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest()
   };
+  // whether hardware flagsChanged events can reach the freshness clock, and
+  // since when (monotonic seconds). Defaults to "observable since forever"
+  // so a bare OSXKeyState (tests, tools) keeps the sweep; OSXScreen owns
+  // the real value around the event tap's lifetime.
+  std::atomic<bool> m_hardwareObservable{true};
+  std::atomic<double> m_hardwareObservableSince{std::numeric_limits<double>::lowest()};
   Hooks m_hooks;
 };

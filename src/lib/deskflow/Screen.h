@@ -299,6 +299,13 @@ public:
   static constexpr double kPostSwitchFirstCheckS = 0.25;
   static constexpr double kPostSwitchSecondCheckS = 2.0;
 
+  //! Delay (seconds) after a secondary's enable() before the K2 sweep for
+  //! modifiers stranded by a crashed previous instance runs. The platform's
+  //! freshness clock needs its full window (OSXKeyState::kHardwareModifierFreshS,
+  //! 2 s) of live event-tap observation before it can judge, so an
+  //! immediate sweep right after the tap is created can never release.
+  static constexpr double kEnableSweepDelayS = 2.5;
+
 protected:
   void enablePrimary();
   void enableSecondary();
@@ -347,6 +354,13 @@ private:
   void handlePostSwitchVerifier();
   EventQueueTimer *m_postSwitchTimer = nullptr;
   int m_postSwitchPass = 0;
+
+  // Delayed K2 sweep (secondary only): armed by enable() while not entered,
+  // cancelled by enter()/disable(); runs sanitizeInjectedKeys() only if the
+  // screen is still not entered (the platform declines under secure input).
+  void armEnableSweep();
+  void cancelEnableSweep();
+  EventQueueTimer *m_enableSweepTimer = nullptr;
   std::chrono::steady_clock::time_point m_enteredAt{};
   std::chrono::steady_clock::time_point m_lastKeyDownAt{};
 };

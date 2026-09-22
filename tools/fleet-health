@@ -158,6 +158,11 @@ CORE_LOG = "~/Library/Deskflow/deskflow-core.log"
 # and the level each is logged at.
 KEYS_STUCK_MARK = "[keys] stuck-release"   # WARNING
 KEYS_HELD_MARK = "[keys] post-switch held="  # INFO
+# K5 (src/lib/platform/OSXKeyState.cpp): the stale-modifier sweep declined to
+# judge because a password field owned input or the tap was not up for the
+# whole freshness window. Informational: counted, never a failure.
+KEYS_SWEEP_SKIPPED_MARK = "[keys] stale-modifier sweep skipped"  # INFO
+KEYS_SECURE_INPUT_MARK = "[keys] secure-input="  # INFO (OSXScreen)
 KEYS_WINDOW_H = 24
 # src/lib/common/LogLevel.h order: quietest first.
 LOG_LEVELS = ("FATAL", "ERROR", "WARNING", "INFO", "DEBUG", "VERBOSE")
@@ -557,7 +562,8 @@ def keys_log_cmd(conf: str = CORE_CONF, default_log: str = CORE_LOG) -> str:
         "test -d \"$d\" || { echo \"no log dir $d\" >&2; exit 4; }; "
         "test -f \"$f\" || { echo \"missing $f (toFile off?)\" >&2; exit 3; }; "
         "echo \"level=${lvl:-INFO}\"; "
-        f"grep -h -F -e '{KEYS_STUCK_MARK}' -e '{KEYS_HELD_MARK}' \"$f\" \"$f\".1 \"$f\".2 \"$f\".3 2>/dev/null"
+        f"grep -h -F -e '{KEYS_STUCK_MARK}' -e '{KEYS_HELD_MARK}' -e '{KEYS_SWEEP_SKIPPED_MARK}'"
+        f" -e '{KEYS_SECURE_INPUT_MARK}' \"$f\" \"$f\".1 \"$f\".2 \"$f\".3 2>/dev/null"
         " | head -n 20000; exit 0"
     )
     return "sh -c " + shlex.quote(script)
@@ -610,7 +616,11 @@ def parse_keys_log(output: str, now: Optional[datetime] = None, window_h: int = 
     stamped.sort(key=lambda p: p[0])
     stuck = [ln for _, ln in stamped if KEYS_STUCK_MARK in ln]
     held = [ln for _, ln in stamped if KEYS_HELD_MARK in ln]
+    skipped = sum(1 for _, ln in stamped if KEYS_SWEEP_SKIPPED_MARK in ln)
+    secure = sum(1 for _, ln in stamped if KEYS_SECURE_INPUT_MARK in ln)
     note = f"; {unstamped} unstamped line(s) ignored" if unstamped else ""
+    if skipped or secure:
+        note += f"; sweep-skipped={skipped} secure-input-samples={secure}"
     if stuck:
         return FAIL, (f"{len(stuck)} '{KEYS_STUCK_MARK}' in {window_h}h "
                       f"(verifier had to release a modifier; newest: {stuck[-1][:100]}){note}")

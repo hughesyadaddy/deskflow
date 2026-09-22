@@ -664,6 +664,112 @@ void OSXKeyState::reseedShadowFlagsFromOS()
   LOG_DEBUG("reseeded shadow modifier flags from os: 0x%llx", static_cast<unsigned long long>(os));
 }
 
+void OSXKeyState::setShadowFlags(CGEventFlags flags)
+{
+  m_shiftPressed = (flags & kCGEventFlagMaskShift) != 0;
+  m_controlPressed = (flags & kCGEventFlagMaskControl) != 0;
+  m_altPressed = (flags & kCGEventFlagMaskAlternate) != 0;
+  m_superPressed = (flags & kCGEventFlagMaskCommand) != 0;
+  m_capsPressed = (flags & kCGEventFlagMaskAlphaShift) != 0;
+}
+
+CGEventFlags OSXKeyState::leftDeviceBitForVirtualKey(uint8_t virtualKey)
+{
+  switch (virtualKey) {
+  case s_shiftVK:
+    return NX_DEVICELSHIFTKEYMASK;
+  case s_controlVK:
+    return NX_DEVICELCTLKEYMASK;
+  case s_altVK:
+    return NX_DEVICELALTKEYMASK;
+  case s_superVK:
+    return NX_DEVICELCMDKEYMASK;
+  default:
+    return 0;
+  }
+}
+
+CGEventFlags OSXKeyState::rightDeviceBitForVirtualKey(uint8_t virtualKey)
+{
+  switch (virtualKey) {
+  case s_shiftVK:
+    return NX_DEVICERSHIFTKEYMASK;
+  case s_controlVK:
+    return NX_DEVICERCTLKEYMASK;
+  case s_altVK:
+    return NX_DEVICERALTKEYMASK;
+  case s_superVK:
+    return NX_DEVICERCMDKEYMASK;
+  default:
+    return 0;
+  }
+}
+
+CGEventFlags OSXKeyState::modifierEventFlags(uint8_t virtualKey, bool down) const
+{
+  CGEventFlags flags = osModifierFlags();
+  const auto force = [&flags](uint8_t vk, bool on) {
+    const CGEventFlags generic = modifierFlagForVirtualKey(vk);
+    if (generic == kCGEventFlagMaskAlphaShift) {
+      // Caps is a lock: the Down asserts the flag (the OS toggles the lock
+      // on the press); the Up carries whatever lock state the OS reports.
+      if (on) {
+        flags |= generic;
+      }
+      return;
+    }
+    const CGEventFlags left = leftDeviceBitForVirtualKey(vk);
+    const CGEventFlags right = rightDeviceBitForVirtualKey(vk);
+    if (on) {
+      flags |= generic | left;
+      return;
+    }
+    flags &= ~left;
+    if ((flags & right) == 0) {
+      flags &= ~generic;
+    }
+  };
+
+  // ledger first: what we hold stays on, what we released stays off ...
+  for (const uint8_t vk : m_pendingReleases) {
+    if (vk != virtualKey) {
+      force(vk, false);
+    }
+  }
+  for (const uint8_t vk : m_injectedModifiers) {
+    if (vk != virtualKey) {
+      force(vk, true);
+    }
+  }
+  // ... and the key being posted takes its new state last
+  force(virtualKey, down);
+  return flags;
+}
+
+bool OSXKeyState::secureInputEnabled() const
+{
+  if (m_hooks.secureInputEnabled) {
+    return m_hooks.secureInputEnabled();
+  }
+  return IsSecureEventInputEnabled();
+}
+
+void OSXKeyState::noteHardwareObservation(bool observing, double now)
+{
+  if (observing && !m_hardwareObservable.load(std::memory_order_relaxed)) {
+    m_hardwareObservableSince.store(now, std::memory_order_relaxed);
+  }
+  m_hardwareObservable.store(observing, std::memory_order_relaxed);
+}
+
+bool OSXKeyState::hardwareObservableFor(double seconds, double at) const
+{
+  if (!m_hardwareObservable.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  return (at - m_hardwareObservableSince.load(std::memory_order_relaxed)) >= seconds;
+}
+
 bool OSXKeyState::getCapsLockState(bool &on) const
 {
   if (m_hooks.getCapsLockState) {
@@ -730,6 +836,12 @@ void OSXKeyState::setToggleState(KeyModifierMask bit, bool on)
     actual = (osModifierFlags() & kCGEventFlagMaskAlphaShift) != 0;
   }
   m_capsPressed = actual;
+  if (actual != on) {
+    // macOS applies a hold requirement to Caps on some keyboards; an
+    // instantaneous synthetic press can be dropped. Say so rather than
+    // letting the shadow and the OS disagree silently.
+    LOG_WARN("[keys] caps lock still %s after fallback press (wanted %s)", actual ? "on" : "off", on ? "on" : "off");
+  }
   // ... and the tracked mask too. mapKey() decides from m_mask whether a key
   // needs Caps flipped; leaving it stale after applying the lock made the
   // first letter with Caps in its mask click Caps a second time (inverted
@@ -882,9 +994,27 @@ void OSXKeyState::sanitizeInjectedKeys()
   //
   // A held key emits ONE flagsChanged, so a >kHardwareModifierFreshS hold
   // reads as stale here. This sweep therefore belongs only at boundaries
-  // where the user cannot be mid-gesture at this keyboard (enable, lock/
-  // unlock, wake, clear-all); enter/leave/verifier use releaseInjectedKeys().
+  // where the user cannot be mid-gesture at this keyboard (screen enable);
+  // lock/unlock/wake, disable, clear-all, enter/leave and the verifier use
+  // releaseInjectedKeys().
+  //
+  // K5: the freshness verdict is only meaningful if a hardware press COULD
+  // have stamped the clock. Two cases where it cannot, and where the user
+  // is typically typing at this very keyboard: a password field owns
+  // input (secure event input blinds every tap; that is the lock screen,
+  // sudo, 1Password...), and the tap has not been up for the whole window
+  // (epoch restart, disabled-by-timeout). Releasing a physically held
+  // Shift there replaced the global flags with Shift OFF under the user's
+  // fingers -- lowercase at the prompt until the next physical re-press.
   const double at = now();
+  if (secureInputEnabled()) {
+    LOG_INFO("[keys] stale-modifier sweep skipped: a password field owns input (hardware presses invisible)");
+    return;
+  }
+  if (!hardwareObservableFor(kHardwareModifierFreshS, at)) {
+    LOG_INFO("[keys] stale-modifier sweep skipped: hardware not observable for %.0f s", kHardwareModifierFreshS);
+    return;
+  }
   for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
     const auto vk = static_cast<uint8_t>(virtualKey);
     const CGEventFlags flag = modifierFlagForVirtualKey(vk);
@@ -950,8 +1080,30 @@ void OSXKeyState::setKeyboardModifiers(CGKeyCode virtualKey, bool keyDown)
 
 kern_return_t OSXKeyState::postHIDVirtualKey(uint8_t virtualKey, bool postDown)
 {
+  // A modifier post carries the global flag word the OS will adopt
+  // (kIOHIDSetGlobalEventFlags): derive it from the live flags so a
+  // physical modifier the shadow never saw survives, then make the shadow
+  // agree so every following non-modifier post composes the same way.
+  CGEventFlags modifierFlags = 0;
+  if (isModifier(virtualKey)) {
+    // Drop pending releases the OS has adopted (left device bit gone from
+    // the live read); everything else keeps being forced off.
+    const CGEventFlags live = osModifierFlags();
+    for (auto it = m_pendingReleases.begin(); it != m_pendingReleases.end();) {
+      const CGEventFlags left = leftDeviceBitForVirtualKey(*it);
+      it = (left == 0 || (live & left) == 0) ? m_pendingReleases.erase(it) : std::next(it);
+    }
+    modifierFlags = modifierEventFlags(virtualKey, postDown);
+    setShadowFlags(modifierFlags);
+    if (postDown) {
+      m_pendingReleases.erase(virtualKey);
+    } else if (const CGEventFlags left = leftDeviceBitForVirtualKey(virtualKey); left != 0 && (live & left) != 0) {
+      m_pendingReleases.insert(virtualKey);
+    }
+  }
+
   if (m_hooks.postHIDKey) {
-    return m_hooks.postHIDKey(virtualKey, postDown, isModifier(virtualKey) ? getKeyboardEventFlags() : 0);
+    return m_hooks.postHIDKey(virtualKey, postDown, modifierFlags);
   }
 
   NXEventData event;
@@ -964,8 +1116,9 @@ kern_return_t OSXKeyState::postHIDVirtualKey(uint8_t virtualKey, bool postDown)
     // the default zero value is interpreted as the 'a' key by some input methods (e.g. Chinese).
     event.key.keyCode = virtualKey;
     if (isModifier(virtualKey)) {
-      result =
-          IOHIDPostEvent(driver, NX_FLAGSCHANGED, {0, 0}, &event, kNXEventDataVersion, getKeyboardEventFlags(), true);
+      result = IOHIDPostEvent(
+          driver, NX_FLAGSCHANGED, {0, 0}, &event, kNXEventDataVersion, modifierFlags, kIOHIDSetGlobalEventFlags
+      );
     } else {
       const auto eventType = postDown ? NX_KEYDOWN : NX_KEYUP;
       result = IOHIDPostEvent(driver, eventType, {0, 0}, &event, kNXEventDataVersion, 0, false);

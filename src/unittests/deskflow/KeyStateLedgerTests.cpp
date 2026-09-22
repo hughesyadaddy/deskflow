@@ -548,10 +548,12 @@ void KeyStateLedgerTests::leaveSecondary_releasesEverySyntheticKey()
   QCOMPARE(f.platform->count(PlatformCall::Kind::AllKeysUp), 1);
 }
 
-void KeyStateLedgerTests::disablePrimary_releasesInjectedKeysAndSanitizes()
+void KeyStateLedgerTests::disablePrimary_releasesInjectedKeysLedgerOnly()
 {
   // A primary is never a target, yet relayed keys are injected into its OS.
-  // Teardown must release them and give the platform a chance to sweep.
+  // Teardown must release them -- and ONLY them (K5): the user sits at the
+  // primary and an epoch teardown lands at any moment, mid-password with
+  // Shift held included, so the freshness sweep (Sanitize) must not run.
   EventQueue events;
   auto *platform = new FakePlatformScreen(&events, true);
   {
@@ -563,8 +565,69 @@ void KeyStateLedgerTests::disablePrimary_releasesInjectedKeysAndSanitizes()
     screen.disable();
 
     QCOMPARE(platform->count(PlatformCall::Kind::AllKeysUp), 1);
-    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 1);
+    QCOMPARE(platform->count(PlatformCall::Kind::ReleaseInjected), 1);
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 0);
     // ~Screen deletes platform
+  }
+}
+
+void KeyStateLedgerTests::enable_secondaryRepeatsSweepAfterFreshnessWindow()
+{
+  // K5 review (2): the immediate enable-time sweep runs before the platform
+  // can have observed any hardware (the tap was just created), so it can
+  // never release a modifier stranded by a crashed previous instance. A
+  // one-shot re-runs it once the freshness window has elapsed, provided
+  // nobody has entered meanwhile.
+  EventQueue events;
+  auto *platform = new FakePlatformScreen(&events, false);
+  {
+    deskflow::Screen client(platform, &events);
+    client.enable();
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 1);
+
+    pumpUntil(events, deskflow::Screen::kEnableSweepDelayS + 3.0, [&] {
+      return platform->count(PlatformCall::Kind::Sanitize) >= 2;
+    });
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 2);
+
+    // one-shot: nothing further
+    pumpUntil(events, 0.3, [] { return false; });
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 2);
+  }
+
+  // a primary never arms it (the user's hands are on that keyboard)
+  auto *primary = new FakePlatformScreen(&events, true);
+  {
+    deskflow::Screen screen(primary, &events);
+    screen.enable();
+    pumpUntil(events, deskflow::Screen::kEnableSweepDelayS + 1.0, [] { return false; });
+    QCOMPARE(primary->count(PlatformCall::Kind::Sanitize), 0);
+  }
+}
+
+void KeyStateLedgerTests::enable_delayedSweepCancelledByEnterAndDisable()
+{
+  // The server entered before the delay elapsed: it may be holding a chord
+  // here, so the delayed sweep must not fire. Disable cancels it too.
+  EventQueue events;
+  {
+    auto *platform = new FakePlatformScreen(&events, false);
+    deskflow::Screen client(platform, &events);
+    client.enable();
+    client.enter(0);
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 1);
+    pumpUntil(events, deskflow::Screen::kEnableSweepDelayS + 1.0, [] { return false; });
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 1);
+    QVERIFY(client.leave());
+  }
+  {
+    auto *platform = new FakePlatformScreen(&events, false);
+    deskflow::Screen client(platform, &events);
+    client.enable();
+    client.disable();
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 1);
+    pumpUntil(events, deskflow::Screen::kEnableSweepDelayS + 1.0, [] { return false; });
+    QCOMPARE(platform->count(PlatformCall::Kind::Sanitize), 1);
   }
 }
 
