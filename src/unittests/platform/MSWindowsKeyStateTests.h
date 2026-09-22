@@ -20,6 +20,9 @@ private Q_SLOTS:
   void release_shiftIsAlwaysACandidate();
   void release_orderIsAscendingVk();
 
+  // releaseInjectedKeys(): ledger only, keep-filtered
+  void ledgerRelease_keepsExcludedModifier();
+
   // audit skip expiry
   void audit_freshEntry_isProtected();
   void audit_entryAtGrace_isStillProtected();

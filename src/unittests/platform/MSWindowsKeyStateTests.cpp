@@ -104,6 +104,17 @@ void MSWindowsKeyStateTests::audit_entryPastGrace_isNoLongerProtected()
   QCOMPARE(bits, 1u << MSWindowsKeyState::modifierVkIndex(VK_LWIN));
 }
 
+void MSWindowsKeyStateTests::ledgerRelease_keepsExcludedModifier()
+{
+  // K4 audit MED-3: keep=Shift leaves a ledgered Shift (re-asserted on
+  // enter for an ongoing drag) in place and releases only the rest.
+  Ledger ledger{{VK_LSHIFT, 10000}, {VK_LCONTROL, 10000}, {VK_LWIN, 10000}};
+  const std::vector<WORD> expected{VK_LWIN, VK_LCONTROL}; // ascending VK
+  QCOMPARE(MSWindowsKeyState::ledgerKeysToRelease(ledger, KeyModifierShift), expected);
+  const std::vector<WORD> all{VK_LSHIFT, VK_LWIN, VK_LCONTROL};
+  QCOMPARE(MSWindowsKeyState::ledgerKeysToRelease(ledger, 0), all);
+}
+
 void MSWindowsKeyStateTests::audit_shiftNeverReachesAuditTable()
 {
   // Shift is tracked (so the boundary sweep can see it) but its bits sit

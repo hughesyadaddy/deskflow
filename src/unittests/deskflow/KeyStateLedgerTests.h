@@ -34,4 +34,5 @@ private Q_SLOTS:
   void enable_sanitizesOnlyWhenNotEntered();
   void describeKey_printsCharacterWithItsCase();
   void primarySweep_neverReleasesPhysicallyCapturedKey();
+  void postSwitchVerifier_keepsReassertedModifiers();
 };

@@ -660,6 +660,43 @@ void OSXKeyStateTests::primarySweepNeverReleasesPhysicallyCapturedShift()
   QVERIFY(keyState.injectedModifiers().empty());
 }
 
+void OSXKeyStateTests::releaseInjectedKeysKeepsReassertedModifier()
+{
+  // K4 audit MED-3: the post-switch verifier closes the ledger but keeps
+  // the modifiers it re-asserted on enter (an ongoing shift-drag). With
+  // Shift and Cmd both ledgered and held, keep=Shift releases only Cmd and
+  // leaves Shift down AND in the ledger for its own release path.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  keyState.fakeKey(stroke(kVK_Shift, true));
+  keyState.fakeKey(stroke(kVK_Command, true));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Shift));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Command));
+  os.posted.clear();
+  os.osFlags = kCGEventFlagMaskCommand | kCGEventFlagMaskShift;
+
+  keyState.releaseInjectedKeys(KeyModifierShift);
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Command));
+  QVERIFY(!os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0);
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Shift));
+  QVERIFY(!keyState.injectedModifiers().contains(kVK_Command));
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift));
+
+  // a later keep-nothing release closes the rest
+  os.posted.clear();
+  keyState.releaseInjectedKeys();
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Shift));
+  QVERIFY(keyState.injectedModifiers().empty());
+}
+
 void OSXKeyStateTests::setToggleStateNoOpsWhenCapsMatches()
 {
   deskflow::KeyMap keyMap;

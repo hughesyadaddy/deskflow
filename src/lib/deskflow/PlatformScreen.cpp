@@ -98,9 +98,9 @@ void PlatformScreen::sanitizeInjectedKeys()
   getKeyState()->sanitizeInjectedKeys();
 }
 
-void PlatformScreen::releaseInjectedKeys()
+void PlatformScreen::releaseInjectedKeys(KeyModifierMask keep)
 {
-  getKeyState()->releaseInjectedKeys();
+  getKeyState()->releaseInjectedKeys(keep);
 }
 
 std::string PlatformScreen::sidesMaskToString(uint32_t sides)

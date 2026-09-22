@@ -1211,6 +1211,23 @@ uint32_t MSWindowsKeyState::injectedModifierBits() const
   return injectedModifierBits(m_injectedModifiers, GetTickCount64());
 }
 
+std::vector<WORD> MSWindowsKeyState::ledgerKeysToRelease(const InjectedModifierMap &ledger, KeyModifierMask keep)
+{
+  // modifierVkIndex order: LWIN RWIN LMENU RMENU LCONTROL RCONTROL LSHIFT RSHIFT
+  static const KeyModifierMask kBitForIndex[] = {KeyModifierSuper,   KeyModifierSuper,   KeyModifierAlt,
+                                                 KeyModifierAlt,     KeyModifierControl, KeyModifierControl,
+                                                 KeyModifierShift,   KeyModifierShift};
+  std::vector<WORD> release;
+  for (const auto &[vk, stampMs] : ledger) { // std::map: ascending VK
+    const int index = modifierVkIndex(vk);
+    if (index >= 0 && (keep & kBitForIndex[index]) != 0) {
+      continue; // re-asserted for the user's ongoing chord
+    }
+    release.push_back(vk);
+  }
+  return release;
+}
+
 std::vector<WORD> MSWindowsKeyState::injectedKeyCandidates(const InjectedModifierMap &ledger)
 {
   // Shift is always a candidate here even though the periodic audit never
@@ -1261,16 +1278,15 @@ void MSWindowsKeyState::sanitizeInjectedKeys()
   }
 }
 
-void MSWindowsKeyState::releaseInjectedKeys()
+void MSWindowsKeyState::releaseInjectedKeys(KeyModifierMask keep)
 {
   // Ledger only: no Shift/Win extras and no freshness reasoning, so a
   // modifier the user is physically holding at this keyboard is never a
-  // candidate. The desk thread still probes each VK (GetAsyncKeyState on
-  // the input desktop) and trims the list to what it actually released.
-  std::vector<WORD> vks;
-  for (const auto &[vk, stampMs] : m_injectedModifiers) {
-    vks.push_back(vk);
-  }
+  // candidate; entries in `keep` (re-asserted on enter for the user's
+  // ongoing chord) stay down. The desk thread still probes each VK
+  // (GetAsyncKeyState on the input desktop) and trims the list to what it
+  // actually released.
+  std::vector<WORD> vks = ledgerKeysToRelease(m_injectedModifiers, keep);
   if (vks.empty()) {
     return;
   }

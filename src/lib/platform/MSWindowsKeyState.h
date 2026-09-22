@@ -77,6 +77,11 @@ public:
 
   //! Index of \p vk in the tracked-modifier table, or -1.
   static int modifierVkIndex(WORD vk);
+
+  //! Pure decision logic for releaseInjectedKeys(): the ledger's VKs minus
+  //! those whose modifier bit is in \p keep, ascending. Never adds Shift or
+  //! anything else the ledger does not hold (K4 audit MED-2/MED-3).
+  static std::vector<WORD> ledgerKeysToRelease(const InjectedModifierMap &ledger, KeyModifierMask keep);
   MSWindowsKeyState(
       MSWindowsDesks *desks, void *eventTarget, IEventQueue *events, std::vector<std::string> layouts,
       bool isLangSyncEnabled
@@ -189,7 +194,7 @@ public:
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
   void setToggleState(KeyModifierMask bit, bool on) override;
   void sanitizeInjectedKeys() override;
-  void releaseInjectedKeys() override;
+  void releaseInjectedKeys(KeyModifierMask keep = 0) override;
 
   // KeyState overrides
   void onKey(KeyButton button, bool down, KeyModifierMask newState) override;

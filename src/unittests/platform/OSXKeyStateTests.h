@@ -35,6 +35,7 @@ private Q_SLOTS:
   void releaseInjectedKeysReleasesLedgeredCmd();
   void fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet();
   void primarySweepNeverReleasesPhysicallyCapturedShift();
+  void releaseInjectedKeysKeepsReassertedModifier();
   void setToggleStateNoOpsWhenCapsMatches();
   void setToggleStateDrivesCapsViaLockStateApi();
   void setToggleStateFallsBackToFakeCapsPress();

@@ -19,6 +19,7 @@
 #include <QCoreApplication>
 #include <QTemporaryDir>
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -35,6 +36,7 @@ struct PlatformCall
     AllKeysUp,
     SetToggle,
     Sanitize,
+    ReleaseInjected,
   };
   Kind kind;
   KeyID id = kKeyNone;
@@ -170,6 +172,10 @@ public:
   void sanitizeInjectedKeys() override
   {
     calls.push_back({PlatformCall::Kind::Sanitize});
+  }
+  void releaseInjectedKeys(KeyModifierMask keep = 0) override
+  {
+    calls.push_back({PlatformCall::Kind::ReleaseInjected, kKeyNone, 0, keep});
   }
 
   // IPlatformScreen
@@ -340,6 +346,17 @@ void addCapsLayout(deskflow::KeyMap &map)
   upperA.m_sensitive = KeyModifierShift | KeyModifierCapsLock;
   map.addKeyEntry(upperA);
   map.finish();
+}
+
+template <typename Done> void pumpUntil(EventQueue &events, double seconds, Done done)
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+  while (!done() && std::chrono::steady_clock::now() < deadline) {
+    Event event;
+    if (events.getEvent(event, 0.05)) {
+      events.dispatchEvent(event);
+    }
+  }
 }
 
 struct SecondaryFixture
@@ -725,6 +742,38 @@ void KeyStateLedgerTests::primarySweep_neverReleasesPhysicallyCapturedKey()
   QCOMPARE(ks.strokes.size(), size_t(2));
   QVERIFY(ks.strokes[0].first == kShift && ks.strokes[0].second);
   QVERIFY(ks.strokes[1].first == kShift && !ks.strokes[1].second);
+}
+
+void KeyStateLedgerTests::postSwitchVerifier_keepsReassertedModifiers()
+{
+  // K4 audit MED-3: the user crosses with Shift held (re-asserted on enter)
+  // and some OTHER modifier reads stuck (the OS still holds Ctrl, nothing
+  // typed). Pass 2 must close the ledger EXCEPT the re-asserted Shift --
+  // it used to release everything, dropping the user's shift-drag.
+  SecondaryFixture f;
+  f.platform->osModifiers = 0;
+  f.screen->enter(KeyModifierShift);
+  const auto *down = f.platform->find(PlatformCall::Kind::KeyDown);
+  QVERIFY(down != nullptr);
+  QCOMPARE(down->id, KeyID(kKeyShift_L));
+  f.platform->calls.clear();
+
+  // now the OS reports Shift (ours) and a stale Ctrl
+  f.platform->osModifiers = KeyModifierShift | KeyModifierControl;
+  pumpUntil(f.events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 3.0, [&] {
+    return f.platform->count(PlatformCall::Kind::ReleaseInjected) > 0;
+  });
+  QCOMPARE(f.platform->count(PlatformCall::Kind::ReleaseInjected), 1);
+  const auto *release = f.platform->find(PlatformCall::Kind::ReleaseInjected);
+  QVERIFY(release != nullptr);
+  QCOMPARE(release->mask, KeyModifierMask(KeyModifierShift)); // kept: the re-asserted Shift
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyUp), 0);   // Shift itself untouched
+
+  // ... and the re-asserted Shift still has its own release path
+  f.platform->calls.clear();
+  f.screen->keyUp(kKeyShift_L, 0, 0x2A);
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyUp), 1);
+  QVERIFY(f.screen->leave());
 }
 
 QTEST_MAIN(KeyStateLedgerTests)
