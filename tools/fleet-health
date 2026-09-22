@@ -634,6 +634,10 @@ class MachO:
     adhoc: bool
     verify_rc: int
     verify_out: str
+    hardened: bool = False  # CodeDirectory flags=...(runtime)
+
+
+_CD_FLAGS = re.compile(r"^CodeDirectory .*flags=0x[0-9a-fA-F]+\(([^)]*)\)")
 
 
 def parse_macho_scan(output: str) -> List[MachO]:
@@ -645,7 +649,7 @@ def parse_macho_scan(output: str) -> List[MachO]:
             if cur:
                 entries.append(_finish(cur))
             cur = {"path": line[4:].strip(), "auth": [], "team": "", "id": "", "adhoc": False,
-                   "vrc": 1, "vout": []}
+                   "vrc": 1, "vout": [], "hardened": False}
             in_verify = False
             continue
         if cur is None:
@@ -668,6 +672,9 @@ def parse_macho_scan(output: str) -> List[MachO]:
             cur["id"] = line[len("Identifier="):].strip()
         elif line.startswith("Signature=adhoc"):
             cur["adhoc"] = True
+        elif line.startswith("CodeDirectory "):
+            m = _CD_FLAGS.match(line)
+            cur["hardened"] = bool(m and "runtime" in m.group(1).split(","))
     if cur:
         entries.append(_finish(cur))
     return entries
@@ -675,7 +682,18 @@ def parse_macho_scan(output: str) -> List[MachO]:
 
 def _finish(c: dict) -> MachO:
     return MachO(c["path"], c["auth"], c["team"], c["id"], c["adhoc"], c["vrc"],
-                 "\n".join(c["vout"]).strip())
+                 "\n".join(c["vout"]).strip(), c["hardened"])
+
+
+def sign_summary(entries: Sequence["MachO"], expect_team: str) -> Tuple[int, int, bool]:
+    """(apple, adhoc, hardened): apple = non-adhoc Mach-Os signed by the expected
+    team, adhoc = Signature=adhoc count, hardened = every first-party
+    (Contents/MacOS/*) Mach-O carries the hardened runtime flag."""
+    apple = sum(1 for e in entries if not e.adhoc and e.authorities and e.team == expect_team)
+    adhoc = sum(1 for e in entries if e.adhoc)
+    first_party = [e for e in entries if is_first_party(e.path)]
+    hardened = bool(first_party) and all(e.hardened for e in first_party)
+    return apple, adhoc, hardened
 
 
 def load_identifier_allowlist(path: Path = IDENTIFIERS_FILE) -> List[str]:
@@ -758,17 +776,29 @@ class FleetHealth:
         problems = []
         for e in entries:
             name = Path(e.path).name
+            if e.adhoc:
+                problems.append(f"{name}: Signature=adhoc")
             if not any(a.startswith(expect_auth) for a in e.authorities):
                 problems.append(f"{name}: no Authority={expect_auth}*")
             if not e.team or e.team != expect_team:
                 problems.append(f"{name}: TeamIdentifier={e.team or 'not set'} != {expect_team or '?'}")
             if e.verify_rc != 0:
                 problems.append(f"{name}: verify --deep --strict rc={e.verify_rc}")
+            # Hardened runtime is required on first-party binaries only; bundled
+            # Qt frameworks are re-sealed by cmake --install with --options
+            # runtime too, but only Contents/MacOS/* is gated (matches
+            # scripts/install-macos.sh verify_signature).
+            if is_first_party(e.path) and not e.hardened:
+                problems.append(f"{name}: not hardened (CodeDirectory flags lack runtime)")
+        apple, adhoc, hardened = sign_summary(entries, expect_team or "")
+        # Machine-readable tail, parsed by scripts/fleet-deploy.sh HEALTH_FOLD_JQ
+        # into the per-seat apple/adhoc/hardened columns.
+        summary = f"apple={apple} adhoc={adhoc} hardened={'true' if hardened else 'false'}"
         if problems:
-            self._add(host, "sign", FAIL, "; ".join(problems))
+            self._add(host, "sign", FAIL, "; ".join(problems) + f" [{summary}]")
         else:
             self._add(host, "sign", PASS,
-                      f"{len(entries)} Mach-Os signed by {expect_auth}* team {expect_team}")
+                      f"{len(entries)} Mach-Os signed by {expect_auth}* team {expect_team}; {summary}")
 
     def check_no_adhoc(self, host: Host) -> None:
         entries = self._scan_or_fail(host, "no-adhoc")

@@ -52,6 +52,9 @@ printf '%s\t%s\n' "$target" "$*" >> "$SHIM_LOG/ssh.log"
 case " ${SHIM_SSH_DOWN:-} " in *" $target "*) exit 255 ;; esac
 case " ${SHIM_SSH_FAIL:-} " in *" $target "*) exit 7 ;; esac
 case "$*" in *rev-parse*) echo "cafe0000$(printf '%s' "$target" | cksum | cut -c1-8)" ;; esac
+# A deploy command's seat output: SHIM_SSH_SETTINGS_<host> fakes the
+# FLEET_SETTINGS=... marker the per-OS scripts print for Mouser.
+case "$*" in *fleet-deploy-*) h="${target#*@}"; v="$(eval "printf '%s' \"\${SHIM_SSH_SETTINGS_$h:-}\"")"; [ -n "$v" ] && echo "== seat output ==" && echo "FLEET_SETTINGS=$v" ;; esac
 exit 0
 EOF
   cat > "$SHIM/git" <<'EOF'
@@ -69,6 +72,9 @@ if [ "$1" = "-euo" ] && [ "$3" = "-c" ]; then
   printf '%s\n' "$4" >> "$SHIM_LOG/local-cmd.log"
   exec "$REAL_BASH" -euo pipefail -c "$4"
 fi
+# The local seat script (a stub in $REPO/scripts) really runs so a test can
+# make it print the FLEET_SETTINGS marker.
+case "$1" in *fleet-deploy-macos.sh) exec "$REAL_BASH" "$@" ;; esac
 exit 0
 EOF
   chmod +x "$SHIM"/*
@@ -231,10 +237,10 @@ have_real_flock() { command -v flock >/dev/null 2>&1; }
   [ ! -e "$REPO/tools/state/last-good.json" ]
 }
 
-@test "the per-host table has the seven columns" {
+@test "the per-host table has the eleven columns (signing counts + settings)" {
   run_deploy
   [ "$status" -eq 0 ]
-  [[ "$output" == *"host         | app      | commit       | signed-by                | tcc    | mesh   | result"* ]]
+  [[ "$output" == *"host         | app      | commit       | signed-by                | apple | adhoc | hard  | tcc    | mesh   | settings | result"* ]]
   [[ "$output" == *"tiny11       | deskflow | cafe0000"* ]]
   [[ "$output" == *"macbookpro   | mouser   | beef00000000"* ]]
 }
@@ -444,14 +450,14 @@ EOF
 }
 
 REAL_HEALTH_OK='{"ok": true, "results": [
-  {"host":"hackintosh","check":"sign","status":"PASS","detail":"12 Mach-Os signed by Apple Development* team ABCDE12345"},
+  {"host":"hackintosh","check":"sign","status":"PASS","detail":"12 Mach-Os signed by Apple Development* team ABCDE12345; apple=12 adhoc=0 hardened=true"},
   {"host":"hackintosh","check":"no-adhoc","status":"PASS","detail":"12 Mach-Os, none ad-hoc"},
   {"host":"hackintosh","check":"identifiers","status":"PASS","detail":"12 identifiers stable/allowlisted"},
   {"host":"hackintosh","check":"tcc","status":"PASS","detail":"4 rows cert-based; AX+ListenEvent granted; --check-permissions ok"},
   {"host":"hackintosh","check":"session","status":"PASS","detail":"io.github.hughesyadaddy.mouser loaded; Deskflow GUI running"},
   {"host":"hackintosh","check":"mesh","status":"PASS","detail":"hackintosh -> macbookpro (macbookpro:24800) ok"},
   {"host":"hackintosh","check":"mesh","status":"PASS","detail":"hackintosh -> tiny11 (tiny11:24800) ok"},
-  {"host":"macbookpro","check":"sign","status":"PASS","detail":"12 Mach-Os signed by Apple Development* team ABCDE12345"},
+  {"host":"macbookpro","check":"sign","status":"PASS","detail":"12 Mach-Os signed by Apple Development* team ABCDE12345; apple=12 adhoc=0 hardened=true"},
   {"host":"macbookpro","check":"tcc","status":"PASS","detail":"4 rows cert-based"},
   {"host":"macbookpro","check":"mesh","status":"PASS","detail":"macbookpro -> hackintosh (hackintosh:24800) ok"},
   {"host":"macbookpro","check":"mesh","status":"PASS","detail":"macbookpro -> tiny11 (tiny11:24800) ok"},
@@ -467,11 +473,69 @@ REAL_HEALTH_OK='{"ok": true, "results": [
   run_deploy --self-test --json "$WORK/st.json"
   [ "$status" -eq 0 ]
   jq -e '.ok == true' "$WORK/st.json" >/dev/null
-  jq -e '.hosts[] | select(.id=="hackintosh" and .app=="deskflow") | .signedBy == "12 Mach-Os signed by Apple Development* team ABCDE12345" and .tcc == "PASS" and .mesh == "PASS"' "$WORK/st.json" >/dev/null
-  # Windows: `sign` is SKIP, so signed-by falls back to the authenticode detail
-  jq -e '.hosts[] | select(.id=="tiny11" and .app=="mouser") | .signedBy == "3 files signed by thumbprint 0123" and .tcc == "SKIP" and .mesh == "PASS" and .result == "ok"' "$WORK/st.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="hackintosh" and .app=="deskflow") | .signedBy == "12 Mach-Os signed by Apple Development* team ABCDE12345; apple=12 adhoc=0 hardened=true" and .tcc == "PASS" and .mesh == "PASS"' "$WORK/st.json" >/dev/null
+  # the apple/adhoc/hardened tail of the sign detail becomes three columns
+  jq -e '.hosts[] | select(.id=="hackintosh" and .app=="deskflow") | .apple == "12" and .adhoc == "0" and .hardened == "true"' "$WORK/st.json" >/dev/null
+  # Windows: `sign` is SKIP, so signed-by falls back to the authenticode detail; no Mach-O counts
+  jq -e '.hosts[] | select(.id=="tiny11" and .app=="mouser") | .signedBy == "3 files signed by thumbprint 0123" and .tcc == "SKIP" and .mesh == "PASS" and .result == "ok" and .apple == "-" and .adhoc == "-" and .hardened == "-"' "$WORK/st.json" >/dev/null
   jq -e '[.hosts[] | .result] | all(. == "ok")' "$WORK/st.json" >/dev/null
-  [[ "$output" == *"| 12 Mach-Os signed by App | PASS   | PASS   | ok"* ]]  # signed-by column is 24 chars wide
+  [[ "$output" == *"| 12 Mach-Os signed by App | 12    | 0     | true  | PASS   | PASS   | -        | ok"* ]]  # signed-by column is 24 chars wide
+}
+
+@test "--self-test fails the run when a Mac seat has adhoc>0 even though fleet-health scored the host ok" {
+  printf '%s' "$REAL_HEALTH_OK" | jq -c '
+    .results |= map(if .host == "macbookpro" and .check == "sign" then .detail = "libcrypto.3.dylib: Signature=adhoc [apple=11 adhoc=1 hardened=true]" else . end)' \
+    | write_real_health 0
+  run_deploy --self-test --json "$WORK/st.json"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' "$WORK/st.json" >/dev/null
+  jq -e '[.hosts[] | select(.id=="macbookpro") | .result] | all(. == "unhealthy")' "$WORK/st.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="macbookpro" and .app=="deskflow") | .adhoc == "1" and .apple == "11" and .hardened == "true"' "$WORK/st.json" >/dev/null
+  jq -e '[.hosts[] | select(.id!="macbookpro") | .result] | all(. == "ok")' "$WORK/st.json" >/dev/null
+  [[ "$output" == *"| 11    | 1     | true  |"* ]]
+}
+
+@test "--self-test fails the run when a Mac seat reports hardened=false (hackintosh flags=0x0 build)" {
+  printf '%s' "$REAL_HEALTH_OK" | jq -c '
+    .results |= map(if .host == "hackintosh" and .check == "sign" then .detail = "deskflow-prio: not hardened (CodeDirectory flags lack runtime) [apple=12 adhoc=0 hardened=false]" else . end)' \
+    | write_real_health 0
+  run_deploy --self-test --json "$WORK/st.json"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' "$WORK/st.json" >/dev/null
+  jq -e '[.hosts[] | select(.id=="hackintosh") | .result] | all(. == "unhealthy")' "$WORK/st.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="hackintosh" and .app=="mouser") | .hardened == "false" and .adhoc == "0"' "$WORK/st.json" >/dev/null
+  [[ "$output" == *"| 12    | 0     | false |"* ]]
+}
+
+@test "the settings column carries each seat's FLEET_SETTINGS marker on the mouser row (ok / changed)" {
+  printf '#!/usr/bin/env bash\necho "== Mouser settings proof =="\necho "FLEET_SETTINGS=changed"\n' >"$REPO/scripts/fleet-deploy-macos.sh"
+  SHIM_SSH_SETTINGS_hackintosh=ok SHIM_SSH_SETTINGS_tiny11=ok run_deploy --json "$WORK/r.json"
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true' "$WORK/r.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="macbookpro" and .app=="mouser") | .settings == "changed" and .result == "ok"' "$WORK/r.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="hackintosh" and .app=="mouser") | .settings == "ok"' "$WORK/r.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="tiny11" and .app=="mouser") | .settings == "ok"' "$WORK/r.json" >/dev/null
+  jq -e '[.hosts[] | select(.app=="deskflow") | .settings] | all(. == "-")' "$WORK/r.json" >/dev/null
+  [[ "$output" == *"macbookpro   | mouser   | beef00000000 | -                        | -     | -     | -     | -      | -      | changed  | ok"* ]]
+  # the seat's own output still reaches the terminal
+  [[ "$output" == *"== Mouser settings proof =="* ]]
+}
+
+@test "a seat reporting FLEET_SETTINGS=FAIL fails the run even when its script exited 0" {
+  SHIM_SSH_SETTINGS_tiny11=FAIL run_deploy --json "$WORK/r.json"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' "$WORK/r.json" >/dev/null
+  jq -e '.hosts[] | select(.id=="tiny11" and .app=="mouser") | .settings == "FAIL" and .result == "settings-fail"' "$WORK/r.json" >/dev/null
+  jq -e '[.hosts[] | select(.id!="tiny11") | .result] | all(. == "ok")' "$WORK/r.json" >/dev/null
+  # no last-good is recorded for a seat that lost settings
+  run jq -e '.tiny11' "$REPO/tools/state/last-good.json"
+  [ "$status" -ne 0 ]
+}
+
+@test "a seat without the marker (no Mouser / old script) shows '-' for settings" {
+  run_deploy --deskflow-only --json "$WORK/r.json"
+  [ "$status" -eq 0 ]
+  jq -e '[.hosts[] | .settings] | all(. == "-")' "$WORK/r.json" >/dev/null
 }
 
 @test "--self-test marks a host unhealthy when any of its real results is FAIL (one mesh leg is enough)" {

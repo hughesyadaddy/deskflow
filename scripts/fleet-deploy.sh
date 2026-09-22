@@ -361,12 +361,36 @@ run_ssh() {
 # ---------------------------------------------------------------------------
 HOST_RC=0
 HOST_RESULT=""
+# Settings-survival verdict printed by the seat scripts (fleet-deploy-macos.sh
+# deploy_mouser / fleet-deploy-windows.ps1 Deploy-Mouser) as a
+# `FLEET_SETTINGS=ok|changed|FAIL` line: ok = Mouser's config hashes were
+# identical at all three checkpoints, changed = only an allowed migration
+# (.version strictly increased, pre-deploy keys all preserved), FAIL = the
+# deploy lost or rewrote settings (the seat script also exits non-zero).
+HOST_SETTINGS="-"
+
+# Run a seat command, mirroring its output to the terminal and to $1 so the
+# machine-readable markers can be read back. pipefail keeps the command's
+# exit code (tee always exits 0).
+run_logged() { # logfile cmd... -> exit code of cmd
+  local log="$1"; shift
+  local rc=0
+  "$@" 2>&1 | tee -a "$log" || rc=$?
+  return "$rc"
+}
+
+settings_from_log() { # logfile -> ok|changed|FAIL|-
+  local v
+  v="$(grep -o 'FLEET_SETTINGS=[A-Za-z]*' "$1" 2>/dev/null | tail -n 1 | cut -d= -f2)"
+  printf '%s' "${v:--}"
+}
 
 deploy_host() { # index dref mref
   local i="$1" dref="$2" mref="$3"
   local id="${P_ID[$i]}" target="${P_TARGET[$i]}" os="${P_OS[$i]}"
-  local dpath="${P_DESKFLOW[$i]}" mpath="${P_MOUSER[$i]}" rc=0 cmd
-  HOST_RC=0; HOST_RESULT="ok"
+  local dpath="${P_DESKFLOW[$i]}" mpath="${P_MOUSER[$i]}" rc=0 cmd log
+  HOST_RC=0; HOST_RESULT="ok"; HOST_SETTINGS="-"
+  log="$(mktemp "${TMPDIR:-/tmp}/fleet-deploy-${id}.XXXXXX")"
 
   if [[ "$target" == "local" ]]; then
     [[ "$os" == "macos" ]] || die "local seat '$id' is $os — run scripts/fleet-deploy.ps1 there"
@@ -378,8 +402,9 @@ deploy_host() { # index dref mref
       echo ">>> LOCAL deploy: $id"
       cmd="$(sh_exports "$dpath" "$mpath" "$dref" "$mref"); $(sh_git_sync "$dpath" "$dref")$(sh_mouser_sync "$mpath" "$mref") && bash '${ROOT}/scripts/fleet-deploy-macos.sh'"
     fi
-    bash -euo pipefail -c "$cmd" || rc=$?
+    run_logged "$log" bash -euo pipefail -c "$cmd" || rc=$?
     if [[ "$rc" != 0 ]]; then HOST_RC="$rc"; HOST_RESULT="fail($rc)"; fi
+    HOST_SETTINGS="$(settings_from_log "$log")"; rm -f "$log"
     return 0
   fi
 
@@ -408,9 +433,10 @@ deploy_host() { # index dref mref
     fi
   fi
 
-  run_ssh "$target" "$cmd" || rc=$?
+  run_logged "$log" run_ssh "$target" "$cmd" || rc=$?
   if [[ "$rc" == 255 ]]; then HOST_RC=255; HOST_RESULT="unreachable(ssh 255)"
   elif [[ "$rc" != 0 ]]; then HOST_RC="$rc"; HOST_RESULT="fail($rc)"; fi
+  HOST_SETTINGS="$(settings_from_log "$log")"; rm -f "$log"
   return 0
 }
 
@@ -434,31 +460,39 @@ health_host() { # id -> exit code of tools/fleet-health --host id (0 when absent
 
 # Fold fleet-health's real JSON ({ok, results:[{host,check,status,detail}]})
 # into one row per host: signedBy = detail of `sign` (Windows: `authenticode`),
+# apple/adhoc/hardened = the `apple=N adhoc=N hardened=true|false` tail that
+# tools/fleet-health check_sign appends to its detail (Windows: "-"),
 # tcc/mesh = status of those checks (any FAIL leg fails mesh), ok = no FAIL for
 # that host. The legacy {hosts:[{id,signedBy,tcc,mesh,ok}]} shape is still accepted.
 HEALTH_FOLD_JQ='
+  def signcounts($d):
+    (($d // "") | capture("apple=(?<apple>[0-9]+) adhoc=(?<adhoc>[0-9]+) hardened=(?<hardened>true|false)")?) // {};
   def fold($h):
     [.results[] | select(.host == $h)] as $rs
     | if ($rs | length) == 0 then {}
-      else {
+      else (($rs | map(select(.check == "sign" and .status != "SKIP")) | .[0].detail) // null) as $sd
+      | {
         signedBy: (($rs | map(select((.check == "sign" or .check == "authenticode") and .status != "SKIP")) | .[0].detail) // "-"),
         tcc: (($rs | map(select(.check == "tcc")) | .[0].status) // "-"),
         mesh: (($rs | map(select(.check == "mesh")) | if length == 0 then null elif any(.status == "FAIL") then "FAIL" else .[0].status end) // "-"),
         ok: ($rs | all(.status != "FAIL"))
-      } end;
+      } + signcounts($sd) end;
   (if (.results? // null) != null then fold($h)
    elif (.hosts? // null) != null then ((.hosts | map(select((.id // .host) == $h)) | .[0]) // {})
    else (.[$h] // {}) end)
-  | [(.signedBy // .signed_by // "-"), (.tcc // "-"), (.mesh // "-"), (if has("ok") then (.ok|tostring) else "-" end)]
+  | [(.signedBy // .signed_by // "-"), (.apple // "-"), (.adhoc // "-"), (.hardened // "-"),
+     (.tcc // "-"), (.mesh // "-"), (if has("ok") then (.ok|tostring) else "-" end)]
   | map(tostring) | join("\t")'
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 R_ID=(); R_APP=(); R_COMMIT=(); R_RESULT=(); R_SIGNED=(); R_TCC=(); R_MESH=(); R_TARGET=()
+R_APPLE=(); R_ADHOC=(); R_HARD=(); R_SETTINGS=()
 ALL_OK=1
 
-add_row() { R_ID+=("$1"); R_TARGET+=("$2"); R_APP+=("$3"); R_COMMIT+=("$4"); R_RESULT+=("$5"); R_SIGNED+=("-"); R_TCC+=("-"); R_MESH+=("-"); }
+# $6 = settings verdict of the seat run (ok | changed | FAIL | -), see deploy_host.
+add_row() { R_ID+=("$1"); R_TARGET+=("$2"); R_APP+=("$3"); R_COMMIT+=("$4"); R_RESULT+=("$5"); R_SIGNED+=("-"); R_TCC+=("-"); R_MESH+=("-"); R_APPLE+=("-"); R_ADHOC+=("-"); R_HARD+=("-"); R_SETTINGS+=("${6:--}"); }
 
 apps_enabled() {
   local a=()
@@ -487,12 +521,16 @@ for i in "${!P_ID[@]}"; do
 
   deploy_host "$i" "$dref" "$mref"
   result="$HOST_RESULT"
-  if [[ "$HOST_RC" == 0 && "$PULL_ONLY" == 0 ]]; then
+  settings="$HOST_SETTINGS"
+  # A seat reporting FAIL for settings survival never counts as a good deploy,
+  # even if its script somehow exited 0.
+  if [[ "$settings" == "FAIL" && "$result" == "ok" ]]; then result="settings-fail"; fi
+  if [[ "$HOST_RC" == 0 && "$PULL_ONLY" == 0 && "$result" == "ok" ]]; then
     if health_host "$id"; then
       for app in $APPS; do
         if [[ "$app" == deskflow ]]; then c="$(head_commit "$i" "${P_DESKFLOW[$i]}")"; else c="$(head_commit "$i" "${P_MOUSER[$i]}")"; fi
         [[ "$c" != unknown ]] && record_last_good "$id" "$app" "$c"
-        add_row "$id" "${P_TARGET[$i]}" "$app" "$c" "$result"
+        add_row "$id" "${P_TARGET[$i]}" "$app" "$c" "$result" "$( [[ "$app" == mouser ]] && printf '%s' "$settings" || printf -- '-' )"
       done
       continue
     fi
@@ -502,7 +540,7 @@ for i in "${!P_ID[@]}"; do
   for app in $APPS; do
     c="-"
     [[ "$HOST_RC" == 0 ]] && { if [[ "$app" == deskflow ]]; then c="$(head_commit "$i" "${P_DESKFLOW[$i]}")"; else c="$(head_commit "$i" "${P_MOUSER[$i]}")"; fi; }
-    add_row "$id" "${P_TARGET[$i]}" "$app" "$c" "$result"
+    add_row "$id" "${P_TARGET[$i]}" "$app" "$c" "$result" "$( [[ "$app" == mouser ]] && printf '%s' "$settings" || printf -- '-' )"
   done
 done
 
@@ -516,8 +554,11 @@ if [[ "$SELF_TEST" == 1 ]]; then
     if [[ -n "$hj" ]] && printf '%s' "$hj" | jq -e . >/dev/null 2>&1; then
       for r in "${!R_ID[@]}"; do
         line="$(printf '%s' "$hj" | jq -r --arg h "${R_ID[$r]}" "$HEALTH_FOLD_JQ")"
-        IFS=$'\t' read -r s t m ok <<<"$line"
-        R_SIGNED[r]="$s"; R_TCC[r]="$t"; R_MESH[r]="$m"
+        IFS=$'\t' read -r s ap ad hd t m ok <<<"$line"
+        R_SIGNED[r]="$s"; R_APPLE[r]="$ap"; R_ADHOC[r]="$ad"; R_HARD[r]="$hd"; R_TCC[r]="$t"; R_MESH[r]="$m"
+        # An ad-hoc Mach-O or an unhardened first-party binary on a Mac seat is
+        # a failed deploy regardless of how fleet-health scored the host.
+        if [[ "$ad" != "-" && "$ad" -gt 0 ]] || [[ "$hd" == "false" ]]; then ok=false; fi
         if [[ "$ok" == "false" ]]; then ALL_OK=0; [[ "${R_RESULT[$r]}" == ok ]] && R_RESULT[r]="unhealthy"; fi
       done
     fi
@@ -531,11 +572,11 @@ fi
 # Report
 # ---------------------------------------------------------------------------
 echo
-printf '%-12s | %-8s | %-12s | %-24s | %-6s | %-6s | %s\n' host app commit signed-by tcc mesh result
-printf '%-12s-+-%-8s-+-%-12s-+-%-24s-+-%-6s-+-%-6s-+-%s\n' ------------ -------- ------------ ------------------------ ------ ------ ------
+printf '%-12s | %-8s | %-12s | %-24s | %-5s | %-5s | %-5s | %-6s | %-6s | %-8s | %s\n' host app commit signed-by apple adhoc hard tcc mesh settings result
+printf '%-12s-+-%-8s-+-%-12s-+-%-24s-+-%-5s-+-%-5s-+-%-5s-+-%-6s-+-%-6s-+-%-8s-+-%s\n' ------------ -------- ------------ ------------------------ ----- ----- ----- ------ ------ -------- ------
 for r in "${!R_ID[@]}"; do
-  printf '%-12s | %-8s | %-12.12s | %-24.24s | %-6.6s | %-6.6s | %s\n' \
-    "${R_ID[$r]}" "${R_APP[$r]}" "${R_COMMIT[$r]}" "${R_SIGNED[$r]}" "${R_TCC[$r]}" "${R_MESH[$r]}" "${R_RESULT[$r]}"
+  printf '%-12s | %-8s | %-12.12s | %-24.24s | %-5.5s | %-5.5s | %-5.5s | %-6.6s | %-6.6s | %-8.8s | %s\n' \
+    "${R_ID[$r]}" "${R_APP[$r]}" "${R_COMMIT[$r]}" "${R_SIGNED[$r]}" "${R_APPLE[$r]}" "${R_ADHOC[$r]}" "${R_HARD[$r]}" "${R_TCC[$r]}" "${R_MESH[$r]}" "${R_SETTINGS[$r]}" "${R_RESULT[$r]}"
 done
 
 if [[ -n "$JSON_OUT" ]]; then
@@ -543,7 +584,8 @@ if [[ -n "$JSON_OUT" ]]; then
   for r in "${!R_ID[@]}"; do
     rows+="$(jq -cn --arg id "${R_ID[$r]}" --arg t "${R_TARGET[$r]}" --arg a "${R_APP[$r]}" --arg c "${R_COMMIT[$r]}" \
       --arg s "${R_SIGNED[$r]}" --arg tcc "${R_TCC[$r]}" --arg m "${R_MESH[$r]}" --arg res "${R_RESULT[$r]}" \
-      '{id:$id,target:$t,app:$a,commit:$c,signedBy:$s,tcc:$tcc,mesh:$m,result:$res}')"$'\n'
+      --arg ap "${R_APPLE[$r]}" --arg ad "${R_ADHOC[$r]}" --arg hd "${R_HARD[$r]}" --arg st "${R_SETTINGS[$r]}" \
+      '{id:$id,target:$t,app:$a,commit:$c,signedBy:$s,apple:$ap,adhoc:$ad,hardened:$hd,tcc:$tcc,mesh:$m,settings:$st,result:$res}')"$'\n'
   done
   emit_json "$(printf '%s' "$rows" | jq -cs --argjson ok "$([[ "$ALL_OK" == 1 ]] && echo true || echo false)" '{ok:$ok,hosts:.}')"
 fi
