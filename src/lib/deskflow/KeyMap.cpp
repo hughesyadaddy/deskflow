@@ -649,13 +649,21 @@ int32_t KeyMap::findBestKey(const KeyEntryList &entryList, KeyModifierMask desir
     }
   }
 
-  // choose the item that requires the fewest modifier changes
-  int32_t bestCount = 32;
+  // choose the item that requires the fewest modifier changes. Flipping a
+  // LOCK (Caps/Num/Scroll) costs two keystrokes -- the toggle and the
+  // restoring toggle after the key -- and flaps state the user can see, so
+  // it weighs double: 'K' on a client whose Caps is on must use the Caps
+  // entry (no strokes) rather than toggle Caps off, press Shift and toggle
+  // Caps back, which a list-order tie used to pick.
+  static const KeyModifierMask s_lockMask = KeyModifierCapsLock | KeyModifierNumLock | KeyModifierScrollLock;
+  // An item that needs every bit changed is unmatchable (was `< 32`); the
+  // weighted maximum is 32 plus one extra per lock bit.
+  int32_t bestCount = 32 + getNumModifiers(s_lockMask);
   int32_t bestIndex = -1;
   for (int32_t i = 0; i < (int32_t)entryList.size(); ++i) {
     const KeyItem &item = entryList[i].back();
     KeyModifierMask change = ((item.m_required ^ desiredState) & item.m_sensitive);
-    int32_t n = getNumModifiers(change);
+    int32_t n = getNumModifiers(change & ~s_lockMask) + 2 * getNumModifiers(change & s_lockMask);
     if (n < bestCount) {
       bestCount = n;
       bestIndex = i;

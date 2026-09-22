@@ -26,6 +26,9 @@ private Q_SLOTS:
   void capsEntryNeverCarriesShift();
   void capsMaskBitNeverBecomesModifier();
   void desiredCapsFromMask();
+  void keyIdHelpers();
+  void letterModifiers_data();
+  void letterModifiers();
 
   // -- caps decision table -------------------------------------------------
   void capsDecisionTable_data();
@@ -99,6 +102,88 @@ void BridgeCalibrationTests::desiredCapsFromMask()
   QVERIFY(!desired_caps_from_mask(kMaskShift));
   QVERIFY(desired_caps_from_mask(kMaskCapsLock));
   QVERIFY(desired_caps_from_mask(kMaskCapsLock | kMaskShift));
+}
+
+void BridgeCalibrationTests::keyIdHelpers()
+{
+  QVERIFY(keyid_is_letter('a') && keyid_is_letter('z') && keyid_is_letter('A') && keyid_is_letter('Z'));
+  QVERIFY(!keyid_is_letter('1') && !keyid_is_letter('!') && !keyid_is_letter(kKeyIdCapsLock));
+  QVERIFY(keyid_is_upper_letter('K') && !keyid_is_upper_letter('k'));
+  QVERIFY(keyid_requires_shift('K') && keyid_requires_shift('!') && keyid_requires_shift('?'));
+  QVERIFY(!keyid_requires_shift('k') && !keyid_requires_shift('1') && !keyid_requires_shift(' '));
+  QVERIFY(!keyid_requires_shift(kKeyIdCapsLock));
+}
+
+// The letter rule (BridgeCalibration.h, decide_letter_modifiers):
+//   wantUpper = isUpper(id) || (Shift && !Caps); shift = wantUpper XOR Caps;
+//   capsEdge  = local caps known && local != server's caps bit.
+// local: -1 unknown, 0 off, 1 on.
+void BridgeCalibrationTests::letterModifiers_data()
+{
+  QTest::addColumn<uint16_t>("id");
+  QTest::addColumn<uint32_t>("mask");
+  QTest::addColumn<int>("local");
+  QTest::addColumn<uint8_t>("bits");
+  QTest::addColumn<bool>("edge");
+  const uint8_t none = 0;
+  // The rows from the fleet-hardening plan.
+  QTest::newRow("0x0044 'D' / shift -> shift") << uint16_t{0x0044} << kMaskShift << -1 << kHidLeftShift << false;
+  QTest::newRow("0x0021 '!' / shift -> shift (non-letter)")
+      << uint16_t{0x0021} << kMaskShift << -1 << kHidLeftShift << false;
+  QTest::newRow("'k' / shift -> shift (base id, shift held)")
+      << uint16_t{'k'} << kMaskShift << -1 << kHidLeftShift << false;
+  QTest::newRow("'K' / none -> shift (caps-composed upper)") << uint16_t{'K'} << uint32_t{0} << -1 << kHidLeftShift
+                                                             << false;
+  QTest::newRow("'K' / caps -> no shift") << uint16_t{'K'} << kMaskCapsLock << -1 << none << false;
+  QTest::newRow("'K' / caps, local off -> no shift + edge")
+      << uint16_t{'K'} << kMaskCapsLock << 0 << none << true;
+  QTest::newRow("'K' / caps, local on -> no shift, no edge")
+      << uint16_t{'K'} << kMaskCapsLock << 1 << none << false;
+  QTest::newRow("'K' / none, local on -> shift + edge") << uint16_t{'K'} << uint32_t{0} << 1 << kHidLeftShift << true;
+  QTest::newRow("'K' / none, local off -> shift, no edge")
+      << uint16_t{'K'} << uint32_t{0} << 0 << kHidLeftShift << false;
+  QTest::newRow("'k' / caps -> shift (caps+shift composes lowercase)")
+      << uint16_t{'k'} << kMaskCapsLock << -1 << kHidLeftShift << false;
+  // Shift+Caps on the server composed 'k': with the target's caps on (M=1)
+  // lowercase needs Shift held, so the byte is 0x02 -- the plan's row said
+  // 0x00, which with caps on would type 'K'; the rule's algebra
+  // (shift = wantUpper XOR M = 0 XOR 1) is what keeps it lowercase.
+  QTest::newRow("'k' / shift+caps (0x1001) -> shift") << uint16_t{'k'} << (kMaskShift | kMaskCapsLock) << -1
+                                                      << kHidLeftShift << false;
+  QTest::newRow("'k' / none -> none") << uint16_t{'k'} << uint32_t{0} << -1 << none << false;
+  QTest::newRow("'k' / none, local on -> none + edge") << uint16_t{'k'} << uint32_t{0} << 1 << none << true;
+  QTest::newRow("CapsLock id / caps -> none, no edge") << kKeyIdCapsLock << kMaskCapsLock << 0 << none << false;
+  QTest::newRow("CapsLock id / shift+caps -> none, no edge")
+      << kKeyIdCapsLock << (kMaskShift | kMaskCapsLock) << 1 << none << false;
+  // Other modifiers pass through for letters; the mask's Shift does not.
+  QTest::newRow("ctrl+'k' keeps ctrl") << uint16_t{'k'} << kMaskControl << -1 << kHidLeftControl << false;
+  QTest::newRow("ctrl+shift+'K' keeps ctrl, shift from rule")
+      << uint16_t{'K'} << (kMaskControl | kMaskShift) << -1 << uint8_t(kHidLeftControl | kHidLeftShift) << false;
+  QTest::newRow("ctrl+'K' / caps -> ctrl only") << uint16_t{'K'} << (kMaskControl | kMaskCapsLock) << 1
+                                                << kHidLeftControl << false;
+  QTest::newRow("alt+super+'k' -> option+command")
+      << uint16_t{'k'} << (kMaskAlt | kMaskSuper) << -1 << uint8_t(kHidLeftOption | kHidLeftCommand) << false;
+  // Non-letters ignore caps entirely: mask bits, plus shift for shifted symbols.
+  QTest::newRow("'1' / caps, local off -> none, no edge") << uint16_t{'1'} << kMaskCapsLock << 0 << none << false;
+  QTest::newRow("'!' / none -> shift implied") << uint16_t{'!'} << uint32_t{0} << -1 << kHidLeftShift << false;
+  QTest::newRow("ctrl+'1' keeps ctrl") << uint16_t{'1'} << kMaskControl << 1 << kHidLeftControl << false;
+  QTest::newRow("Left arrow / shift keeps shift (selection)")
+      << uint16_t{0xEF51} << kMaskShift << -1 << kHidLeftShift << false;
+}
+
+void BridgeCalibrationTests::letterModifiers()
+{
+  QFETCH(uint16_t, id);
+  QFETCH(uint32_t, mask);
+  QFETCH(int, local);
+  QFETCH(uint8_t, bits);
+  QFETCH(bool, edge);
+  std::optional<bool> localCaps;
+  if (local >= 0)
+    localCaps = (local == 1);
+  const LetterDecision d = decide_letter_modifiers(id, mask, localCaps);
+  QCOMPARE(d.modifierBits, bits);
+  QCOMPARE(d.capsEdge, edge);
 }
 
 void BridgeCalibrationTests::capsDecisionTable_data()
