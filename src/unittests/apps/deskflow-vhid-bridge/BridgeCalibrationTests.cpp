@@ -33,6 +33,9 @@ private Q_SLOTS:
   // -- caps decision table -------------------------------------------------
   void capsDecisionTable_data();
   void capsDecisionTable();
+  void capsSyncTable_data();
+  void capsSyncTable();
+  void capsAssumptionWindow();
 
   // -- chunking ------------------------------------------------------------
   void chunk400Is50x8();
@@ -206,6 +209,49 @@ void BridgeCalibrationTests::capsDecisionTable()
   if (truth >= 0)
     t = (truth == 1);
   QCOMPARE(caps_edge_needed(t, desired), emit);
+}
+
+// Enter / mask-only sync vs a real caps press with the truth unknown: the
+// press edges (best effort), the sync must NOT (it would toggle the real
+// lock and invert every following letter).
+void BridgeCalibrationTests::capsSyncTable_data()
+{
+  QTest::addColumn<int>("truth"); // -1 unknown, 0 off, 1 on
+  QTest::addColumn<bool>("desired");
+  QTest::addColumn<bool>("syncEmit");
+  QTest::addColumn<bool>("pressEmit");
+  QTest::newRow("unknown/off: sync skip, press edge") << -1 << false << false << true;
+  QTest::newRow("unknown/on: sync skip, press edge") << -1 << true << false << true;
+  QTest::newRow("off/on: both edge") << 0 << true << true << true;
+  QTest::newRow("on/off: both edge") << 1 << false << true << true;
+  QTest::newRow("off/off: both skip") << 0 << false << false << false;
+  QTest::newRow("on/on: both skip") << 1 << true << false << false;
+}
+
+void BridgeCalibrationTests::capsSyncTable()
+{
+  QFETCH(int, truth);
+  QFETCH(bool, desired);
+  QFETCH(bool, syncEmit);
+  QFETCH(bool, pressEmit);
+  std::optional<bool> t;
+  if (truth >= 0)
+    t = (truth == 1);
+  QCOMPARE(caps_sync_edge_needed(t, desired), syncEmit);
+  QCOMPARE(caps_edge_needed(t, desired), pressEmit);
+}
+
+void BridgeCalibrationTests::capsAssumptionWindow()
+{
+  // Right after an edge, and up to (not including) kCapsAssumeMs later, the
+  // bridge trusts the state it set; afterwards it re-reads the OS. A clock
+  // that went backwards never validates.
+  QVERIFY(caps_assumption_valid(1000, 1000));
+  QVERIFY(caps_assumption_valid(1000 + kCapsAssumeMs - 1, 1000));
+  QVERIFY(!caps_assumption_valid(1000 + kCapsAssumeMs, 1000));
+  QVERIFY(!caps_assumption_valid(5000, 1000));
+  QVERIFY(!caps_assumption_valid(999, 1000));
+  QVERIFY(caps_assumption_valid(1000 + 199, 1000, 200));
 }
 
 void BridgeCalibrationTests::chunk400Is50x8()

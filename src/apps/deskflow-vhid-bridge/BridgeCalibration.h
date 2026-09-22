@@ -222,6 +222,35 @@ constexpr bool caps_edge_needed(std::optional<bool> truth, bool desired)
   return *truth != desired;
 }
 
+// Caps Lock SYNC (Enter, mask-only events): no key was pressed, so with the
+// truth unknown there is nothing to approximate -- a blind edge would toggle
+// the target's real lock and invert every following letter. Edge only when
+// the truth is known and differs.
+/*!
+  truth    | desired | action
+  ---------+---------+-------
+  unknown  | any     | skip
+  off      | on      | emit
+  on       | off     | emit
+  same     |         | skip
+*/
+constexpr bool caps_sync_edge_needed(std::optional<bool> truth, bool desired)
+{
+  return truth.has_value() && *truth != desired;
+}
+
+// After the bridge emits a caps edge the OS-side readers (cg-flags,
+// IOHIDSystem) can lag the toggle by a few ms; a burst of letters arriving
+// in one TCP read would re-read the stale state and edge again. For
+// kCapsAssumeMs after an edge the bridge assumes the lock is what it just
+// set it to instead of re-reading.
+constexpr int64_t kCapsAssumeMs = 50;
+
+constexpr bool caps_assumption_valid(int64_t now_ms, int64_t edge_ms, int64_t hold_ms = kCapsAssumeMs)
+{
+  return now_ms >= edge_ms && now_ms - edge_ms < hold_ms;
+}
+
 // Relative motion chunking. Splits a delta into steps of at most max_chunk
 // counts each, preserving sign; 0 yields no steps. 400 -> 50 x 8.
 constexpr int kMaxChunk = 8;

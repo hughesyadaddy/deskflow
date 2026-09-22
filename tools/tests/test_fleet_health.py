@@ -144,7 +144,7 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.login_bridge_agent_cmd()): (0, LOGIN_BRIDGE_PRINT, ""),
         (hid, fh.login_bridge_keystroke_cmd()): (1, "0\n", ""),
         (hid, fh.login_bridge_calibrate_cmd()): (0, "1\n", ""),
-        (hid, fh.login_bridge_log_tail_cmd()): (0, LOGIN_BRIDGE_LOG_OK, ""),
+        (hid, fh.login_bridge_log_since_start_cmd()): (0, LOGIN_BRIDGE_LOG_OK, ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, fh.DEFAULT_MESH_PORT))] = (0, "", "")
@@ -574,7 +574,9 @@ def test_loginbridge_cmds_target_root_paths_and_use_sudo_n_only():
     assert fh.login_bridge_agent_cmd() == "sudo -n launchctl print loginwindow/org.deskflow.vhid-bridge"
     assert fh.login_bridge_keystroke_cmd() == "sudo -n grep -c 'key down id=' /var/log/deskflow-vhid-bridge.log"
     assert fh.login_bridge_calibrate_cmd() == "grep -c -- --calibrate /Library/LaunchAgents/org.deskflow.vhid-bridge.plist"
-    assert fh.login_bridge_log_tail_cmd() == "sudo -n tail -n 400 /var/log/deskflow-vhid-bridge.log"
+    cmd = fh.login_bridge_log_since_start_cmd()
+    assert cmd.startswith("sudo -n awk '") and cmd.endswith("' /var/log/deskflow-vhid-bridge.log")
+    assert "/\\[bridge\\] starting/{n=0; buf=\"\"}" in cmd and "n<400" in cmd and "vhid connect_failed" in cmd
     # never an interactive sudo in any command string the tool ships
     import re as _re
     for m in _re.finditer(r'f?"([^"\n]*sudo[^"\n]*)"', TOOL.read_text()):
@@ -588,7 +590,7 @@ def test_loginbridge_pass_reports_pid_and_zero_keystrokes():
     assert "agent pid 611" in results[0].detail and "0 keystrokes" in results[0].detail
     assert "--calibrate" in results[0].detail and "virtual HID ready 7s after start" in results[0].detail
     assert ("macbookpro", fh.login_bridge_keystroke_cmd()) in runner.calls
-    assert ("macbookpro", fh.login_bridge_log_tail_cmd()) in runner.calls
+    assert ("macbookpro", fh.login_bridge_log_since_start_cmd()) in runner.calls
 
 
 def test_parse_login_bridge_log_uses_newest_start_and_ready_pair():
@@ -637,15 +639,34 @@ def test_loginbridge_fails_when_plist_lacks_calibrate_or_log_shows_slow_daemon()
     assert results[0].status == "FAIL" and "plist lacks --calibrate" in results[0].detail
 
     t = mac_ok_table()
-    t[("macbookpro", fh.login_bridge_log_tail_cmd())] = (
+    t[("macbookpro", fh.login_bridge_log_since_start_cmd())] = (
         0, LOGIN_BRIDGE_LOG_OK + "2026-09-22T09:03:00-0400 [bridge] vhid connect_failed: 61\n", "")
     results, _ = run_checks([mac()], t, ["loginbridge"])
     assert results[0].status == "FAIL" and "after virtual HID ready" in results[0].detail
 
     t = mac_ok_table()
-    t[("macbookpro", fh.login_bridge_log_tail_cmd())] = (1, "", "tail: /var/log/deskflow-vhid-bridge.log: No such file")
+    t[("macbookpro", fh.login_bridge_log_since_start_cmd())] = (1, "", "tail: /var/log/deskflow-vhid-bridge.log: No such file")
     results, _ = run_checks([mac()], t, ["loginbridge"])
-    assert results[0].status == "FAIL" and "log tail failed" in results[0].detail
+    assert results[0].status == "FAIL" and "log read failed" in results[0].detail
+
+
+def test_login_bridge_since_start_awk_cuts_at_newest_start_and_keeps_late_connect_failed(tmp_path):
+    # Run the real awk program (without sudo) over a log where the newest start
+    # is followed by more than the cap and a late connect_failed past it.
+    import subprocess
+    log = tmp_path / "bridge.log"
+    body = LOGIN_BRIDGE_LOG_OK + "".join(
+        f"2026-09-22T09:0{1 + i // 60}:{i % 60:02d}-0400 [bridge] enter 1,1 of 2x2; [keys] session letters shifted=0 unshifted=0 caps-edges=0\n"
+        for i in range(500)) + "2026-09-22T10:00:00-0400 [bridge] vhid connect_failed: 61\n"
+    log.write_text(body)
+    cmd = fh.login_bridge_log_since_start_cmd(str(log), max_lines=20).replace("sudo -n ", "", 1)
+    out = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True).stdout
+    lines = out.splitlines()
+    assert lines[0].endswith("[bridge] starting pid=611")
+    assert "starting pid=400" not in out
+    assert len(lines) == 20 + 1 and lines[-1].endswith("vhid connect_failed: 61")
+    ok, detail = fh.parse_login_bridge_log(out)
+    assert not ok and "after virtual HID ready" in detail
 
 
 def test_loginbridge_skips_privileged_parts_without_passwordless_sudo():
@@ -656,7 +677,7 @@ def test_loginbridge_skips_privileged_parts_without_passwordless_sudo():
     assert "passwordless sudo" in results[0].detail and "log mode 600" in results[0].detail
     assert ("macbookpro", fh.login_bridge_agent_cmd()) not in runner.calls
     assert ("macbookpro", fh.login_bridge_keystroke_cmd()) not in runner.calls
-    assert ("macbookpro", fh.login_bridge_log_tail_cmd()) not in runner.calls
+    assert ("macbookpro", fh.login_bridge_log_since_start_cmd()) not in runner.calls
     # the unprivileged --calibrate check still ran
     assert ("macbookpro", fh.login_bridge_calibrate_cmd()) in runner.calls
     # unprivileged problems still FAIL even without sudo

@@ -122,7 +122,7 @@ LOGIN_BRIDGE_START_MARK = "[bridge] starting"
 LOGIN_BRIDGE_READY_MARK = "virtual HID ready"
 LOGIN_BRIDGE_CONNECT_FAILED_MARK = "vhid connect_failed"
 LOGIN_BRIDGE_READY_MAX_S = 30
-LOGIN_BRIDGE_LOG_TAIL_LINES = 400
+LOGIN_BRIDGE_SINCE_START_MAX_LINES = 400
 LOGIN_BRIDGE_CALIBRATE_FLAG = "--calibrate"
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
 
@@ -418,9 +418,16 @@ def login_bridge_calibrate_cmd(plist: str = LOGIN_BRIDGE_PLIST, flag: str = LOGI
     return f"grep -c -- {shlex.quote(flag)} {shlex.quote(plist)}"
 
 
-def login_bridge_log_tail_cmd(log: str = LOGIN_BRIDGE_LOG, lines: int = LOGIN_BRIDGE_LOG_TAIL_LINES) -> str:
-    # root:0600 again; the tail is parsed by parse_login_bridge_log.
-    return f"sudo -n tail -n {int(lines)} {shlex.quote(log)}"
+def login_bridge_log_since_start_cmd(log: str = LOGIN_BRIDGE_LOG,
+                                     max_lines: int = LOGIN_BRIDGE_SINCE_START_MAX_LINES) -> str:
+    """Lines from the NEWEST '[bridge] starting' line to EOF (whole file scanned, so the
+    start line can never scroll out of a fixed tail), capped at max_lines after the
+    start plus every later 'vhid connect_failed' line (those decide the verdict)."""
+    # root:0600 again; the output is parsed by parse_login_bridge_log.
+    awk = ("/\\[bridge\\] starting/{n=0; buf=\"\"} "
+           f"{{if (n<{int(max_lines)} || /{LOGIN_BRIDGE_CONNECT_FAILED_MARK}/) buf=buf $0 \"\\n\"; n++}} "
+           "END{printf \"%s\", buf}")
+    return f"sudo -n awk '{awk}' {shlex.quote(log)}"
 
 
 _BRIDGE_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})")
@@ -441,7 +448,8 @@ def _bridge_line_epoch(line: str) -> Optional[float]:
 def parse_login_bridge_log(text: str, max_ready_s: int = LOGIN_BRIDGE_READY_MAX_S) -> Tuple[bool, str]:
     """(pass, detail) for the tail of the login bridge log.
 
-    PASS iff the newest "[bridge] starting" line is followed by a
+    PASS iff the newest "[bridge] starting" line (the command already cut
+    the log there) is followed by a
     "virtual HID ready" line at most max_ready_s later and no
     "vhid connect_failed" appears after that ready line. A start with no
     ready line yet is the cold-boot/daemon-down case the unbounded wait
@@ -455,7 +463,7 @@ def parse_login_bridge_log(text: str, max_ready_s: int = LOGIN_BRIDGE_READY_MAX_
             start_idx = i
             break
     if start_idx is None:
-        return False, f"no '{LOGIN_BRIDGE_START_MARK}' line in the log tail (bridge never started, or pre-K3 build)"
+        return False, f"no '{LOGIN_BRIDGE_START_MARK}' line in the log (bridge never started, or pre-K3 build)"
     start_epoch = _bridge_line_epoch(lines[start_idx])
     if start_epoch is None:
         return False, "bridge start line has no timestamp (pre-K3 bridge build; redeploy)"
@@ -805,9 +813,9 @@ class FleetHealth:
                 problems.append(f"keystroke grep failed: {(err or out).strip()[:80] or f'rc={rc}'}")
             elif int(count) > 0:
                 problems.append(f"{count} '{LOGIN_BRIDGE_KEYSTROKE_MARK}' lines in {LOGIN_BRIDGE_LOG} (keystrokes logged)")
-            rc, out, err = self.runner(host, login_bridge_log_tail_cmd())
+            rc, out, err = self.runner(host, login_bridge_log_since_start_cmd())
             if rc != 0:
-                problems.append(f"log tail failed: {(err or out).strip()[:80] or f'rc={rc}'}")
+                problems.append(f"log read failed: {(err or out).strip()[:80] or f'rc={rc}'}")
             else:
                 ok, detail = parse_login_bridge_log(out)
                 if ok:
