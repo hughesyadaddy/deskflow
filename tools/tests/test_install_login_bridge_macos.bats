@@ -44,7 +44,7 @@ case "$1" in
 esac
 exit 0
 EOF
-  export PATH="$SHIMS:$PATH"
+  export PATH="$SHIMS:$BATS_TEST_DIRNAME/fakebin:$PATH"  # fakebin: sudo must never be real
 }
 
 teardown() { rm -rf "$TMP"; }

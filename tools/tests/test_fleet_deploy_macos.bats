@@ -158,7 +158,7 @@ echo "sleep $*" >> "$SHIM_LOG"
 exit 0
 EOF
 
-  export PATH="$SHIMS:$PATH"
+  export PATH="$SHIMS:$BATS_TEST_DIRNAME/fakebin:$PATH"  # fakebin: sudo must never be real
   export FLEET_DESKFLOW_ROOT="$FAKE_ROOT"
   export FLEET_MOUSER_ROOT="$MOUSER"
   unset FLEET_BRANCH FLEET_DEPLOY_MOUSER FLEET_DEPLOY_DESKFLOW FLEET_RECONFIGURE FLEET_SKIP_GIT_PULL

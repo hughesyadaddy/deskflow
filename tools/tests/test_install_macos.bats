@@ -178,7 +178,7 @@ EOF
 exit 0
 EOF
 
-  export PATH="$SHIMS:$PATH"
+  export PATH="$SHIMS:$BATS_TEST_DIRNAME/fakebin:$PATH"  # fakebin: sudo must never be real
   export DESKFLOW_BUILD_DIR="$BUILD"
   export DESKFLOW_INSTALL_APP="$APP"
   export SHIM_CODESIGN_DV="$SIGNED_DV"

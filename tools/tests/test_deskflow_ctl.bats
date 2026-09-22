@@ -108,7 +108,7 @@ echo "osascript $*" >> "$SHIM_LOG"
 exit 0
 EOF
 
-  export PATH="$SHIMS:$PATH"
+  export PATH="$SHIMS:$BATS_TEST_DIRNAME/fakebin:$PATH"  # fakebin: sudo must never be real
   export DESKFLOW_INSTALL_APP="$APP"
   export DESKFLOW_CTL_AGENT_DIR="$TMP/LaunchAgents"
   export DESKFLOW_CTL_DAEMON_DIR="$TMP/LaunchDaemons"
