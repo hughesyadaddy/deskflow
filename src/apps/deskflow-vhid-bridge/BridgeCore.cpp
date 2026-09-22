@@ -894,18 +894,33 @@ void Bridge::sync_caps_lock(uint16_t key_id, uint32_t mask)
   sync_caps_lock(key_id, mask, read_caps_truth());
 }
 
-// This machine's caps truth: the state we just set, for kCapsAssumeMs
-// after an edge we emitted; otherwise the OS (IReportSink::caps_lock_state).
+// This machine's caps truth. After an edge we emitted, the state we set is
+// assumed until the OS reader agrees with it (bounded by kCapsAssumeMaxMs,
+// A-5); otherwise the OS (IReportSink::caps_lock_state).
 CapsTruth Bridge::read_caps_truth()
 {
-  if (assumed_caps_) {
-    const auto now_ms = std::chrono::duration_cast<milliseconds>(now_().time_since_epoch()).count();
-    const auto edge_ms = std::chrono::duration_cast<milliseconds>(assumed_caps_at_.time_since_epoch()).count();
-    if (bridge_logic::caps_assumption_valid(now_ms, edge_ms))
-      return {assumed_caps_, "assumed-after-edge"};
+  CapsTruth os = sink_.caps_lock_state();
+  if (!assumed_caps_)
+    return os;
+  const auto now_ms = std::chrono::duration_cast<milliseconds>(now_().time_since_epoch()).count();
+  const auto edge_ms = std::chrono::duration_cast<milliseconds>(assumed_caps_at_.time_since_epoch()).count();
+  switch (bridge_logic::resolve_caps_assumption(*assumed_caps_, os.state, now_ms, edge_ms)) {
+  case bridge_logic::CapsAssumption::Hold:
+    return {assumed_caps_, "assumed-after-edge"};
+  case bridge_logic::CapsAssumption::Confirmed:
     assumed_caps_.reset();
+    return os;
+  case bridge_logic::CapsAssumption::Expired:
+    break;
   }
-  return sink_.caps_lock_state();
+  assumed_caps_.reset();
+  // Never the values: whether the two disagreed is diagnosable, which way
+  // is the lock state of a password being typed.
+  log_line(
+      std::string("caps: OS reader (") + os.source + ") did not confirm the last emitted edge within " +
+      std::to_string(bridge_logic::kCapsAssumeMaxMs) + " ms (source disagreement); trusting the reader"
+  );
+  return os;
 }
 
 // Same, with a truth the caller already read (one read per key-down).
@@ -928,9 +943,9 @@ void Bridge::sync_caps_lock(uint16_t key_id, uint32_t mask, const CapsTruth &tru
   if (!emit)
     return;
   ++caps_edges_;
-  // The OS readers lag the toggle; for the next kCapsAssumeMs the lock IS
-  // what we just set (see read_caps_truth), so a letter burst in the same
-  // TCP read cannot edge twice.
+  // The OS readers lag the toggle; until one of them agrees (bounded, see
+  // read_caps_truth) the lock IS what we just set, so a letter burst in the
+  // same TCP read cannot edge twice.
   assumed_caps_ = desired;
   assumed_caps_at_ = now_();
   // Edge = held report + caps, then the held report without it. Modifiers of

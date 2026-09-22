@@ -146,6 +146,8 @@ private Q_SLOTS:
   void stuckKeyWarningCarriesNoButtonId();
   void keysSummaryHidesLetterCountsByDefault();
   void escapeBurstReleasesBeforeStop();
+  void capsAssumptionHoldsUntilReaderAgrees();
+  void capsAssumptionExpiresWithDisagreementLine();
   void cheapSpecialKeysAreMapped();
   void unmappedKeyPostsNothing();
 
@@ -329,6 +331,60 @@ void BridgeTests::escapeBurstReleasesBeforeStop()
   QCOMPARE(int(f.sink.pt.back().dx), 0);
   QVERIFY(f.bridge.held_keys_.empty());
   g_stop.store(false);
+}
+
+// A-5: after an emitted caps edge the bridge assumes the state it set until
+// the OS reader agrees. A reader that stays stale for 80 ms yields exactly
+// one edge for the whole burst.
+void BridgeTests::capsAssumptionHoldsUntilReaderAgrees()
+{
+  Fixture f;
+  bool reader = false; // local caps off ...
+  f.sink.caps = [&] { return std::optional<bool>{reader}; };
+  // ... but the server's caps is on: `K` asks for an edge first
+  QVERIFY(f.keyDown('K', bridge_logic::kMaskCapsLock, 10));
+  QCOMPARE(f.sink.capsEdges(), 1);
+  QVERIFY(f.bridge.assumed_caps_.has_value());
+  QVERIFY(f.keyUp('K', bridge_logic::kMaskCapsLock, 10));
+
+  // the reader lags for 80 ms: no second edge
+  for (int ms : {10, 40, 80}) {
+    f.now = Clock::time_point(std::chrono::seconds(1000)) + std::chrono::milliseconds(ms);
+    QVERIFY(f.keyDown('a', bridge_logic::kMaskCapsLock, 11));
+    QVERIFY(f.keyUp('a', bridge_logic::kMaskCapsLock, 11));
+    QCOMPARE(f.sink.capsEdges(), 1);
+    QVERIFY(f.bridge.assumed_caps_.has_value());
+  }
+  // the reader catches up: assumption confirmed and dropped, still one edge
+  reader = true;
+  f.now += std::chrono::milliseconds(20);
+  LogCapture log;
+  QVERIFY(f.keyDown('b', bridge_logic::kMaskCapsLock, 12));
+  QCOMPARE(f.sink.capsEdges(), 1);
+  QVERIFY(!f.bridge.assumed_caps_.has_value());
+  QVERIFY(!log.any("did not confirm"));
+}
+
+// A-5: a reader that never agrees inside kCapsAssumeMaxMs drops the
+// assumption, logs one source-disagreement line without the values, and
+// the OS reader is trusted again (so the next letter edges once more).
+void BridgeTests::capsAssumptionExpiresWithDisagreementLine()
+{
+  Fixture f;
+  f.sink.caps = [] { return std::optional<bool>{false}; };
+  QVERIFY(f.keyDown('K', bridge_logic::kMaskCapsLock, 10));
+  QVERIFY(f.keyUp('K', bridge_logic::kMaskCapsLock, 10));
+  QCOMPARE(f.sink.capsEdges(), 1);
+
+  f.now += std::chrono::milliseconds(bridge_logic::kCapsAssumeMaxMs);
+  LogCapture log;
+  QVERIFY(f.keyDown('a', bridge_logic::kMaskCapsLock, 11));
+  QVERIFY(log.any("did not confirm the last emitted edge"));
+  QVERIFY(log.any("source disagreement"));
+  QVERIFY(log.any("(test-reader)"));
+  const std::string msgs = log.messages();
+  QVERIFY(msgs.find("=on") == std::string::npos && msgs.find("=off") == std::string::npos);
+  QCOMPARE(f.sink.capsEdges(), 2);
 }
 
 // A-7: the cheap extra mappings.

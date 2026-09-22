@@ -317,7 +317,8 @@ private:
   unsigned long letters_shifted_ = 0;
   unsigned long letters_unshifted_ = 0;
   unsigned long caps_edges_ = 0;
-  // Lock state assumed right after an edge we emitted (read_caps_truth).
+  // Lock state assumed right after an edge we emitted, until the OS reader
+  // agrees or kCapsAssumeMaxMs passes (read_caps_truth, A-5).
   std::optional<bool> assumed_caps_;
   Clock::time_point assumed_caps_at_{};
 };

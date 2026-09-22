@@ -261,16 +261,47 @@ constexpr bool caps_sync_edge_needed(std::optional<bool> truth, bool desired)
   return truth.has_value() && *truth != desired;
 }
 
-// After the bridge emits a caps edge the OS-side readers (cg-flags,
-// IOHIDSystem) can lag the toggle by a few ms; a burst of letters arriving
-// in one TCP read would re-read the stale state and edge again. For
-// kCapsAssumeMs after an edge the bridge assumes the lock is what it just
-// set it to instead of re-reading.
-constexpr int64_t kCapsAssumeMs = 50;
+// Caps assumption after an edge the bridge emitted (K4 audit A-5).
+/*!
+The OS-side readers (cg-flags, IOHIDSystem) lag the toggle by a few ms; a
+burst of letters arriving in one TCP read would re-read the stale state and
+edge again. A blind 50 ms timer covered the common lag but nothing else: a
+slower WindowServer re-edged after 50 ms, and a reader that never saw the
+edge (a daemon reconnect, a lost report) was trusted again after 50 ms with
+no trace. Instead the bridge assumes the state it set UNTIL THE READER
+AGREES, bounded by kCapsAssumeMaxMs; if the reader never agrees inside that
+bound the assumption is dropped and the caller logs a source-disagreement
+line (never the values).
 
-constexpr bool caps_assumption_valid(int64_t now_ms, int64_t edge_ms, int64_t hold_ms = kCapsAssumeMs)
+  reader (OS)       | age (now - edge)      | result
+  ------------------+-----------------------+----------------------------
+  == assumed        | any                   | Confirmed (drop assumption,
+                    |                       |   the reader is current)
+  != assumed        | < max                 | Hold (stale reader: assume)
+  unreadable        | < max                 | Hold
+  != assumed        | >= max                | Expired (drop, log, trust OS)
+  unreadable        | >= max                | Expired
+  any               | clock went backwards  | Expired (never trust a
+                    |                       |   negative age)
+*/
+constexpr int64_t kCapsAssumeMaxMs = 300;
+
+enum class CapsAssumption
 {
-  return now_ms >= edge_ms && now_ms - edge_ms < hold_ms;
+  Hold,
+  Confirmed,
+  Expired
+};
+
+constexpr CapsAssumption resolve_caps_assumption(
+    bool assumed, std::optional<bool> reader, int64_t now_ms, int64_t edge_ms, int64_t max_ms = kCapsAssumeMaxMs
+)
+{
+  if (reader.has_value() && *reader == assumed)
+    return CapsAssumption::Confirmed;
+  if (now_ms < edge_ms || now_ms - edge_ms >= max_ms)
+    return CapsAssumption::Expired;
+  return CapsAssumption::Hold;
 }
 
 // Relative motion chunking. Splits a delta into steps of at most max_chunk

@@ -35,7 +35,8 @@ private Q_SLOTS:
   void capsDecisionTable();
   void capsSyncTable_data();
   void capsSyncTable();
-  void capsAssumptionWindow();
+  void capsAssumptionResolution_data();
+  void capsAssumptionResolution();
   void derivedShiftIsNotHeld();
 
   // -- chunking ------------------------------------------------------------
@@ -242,19 +243,42 @@ void BridgeCalibrationTests::capsSyncTable()
   QCOMPARE(caps_edge_needed(t, desired), pressEmit);
 }
 
-void BridgeCalibrationTests::capsAssumptionWindow()
+// A-5: after an emitted edge the bridge assumes the state it set UNTIL the
+// OS reader agrees, bounded by kCapsAssumeMaxMs. reader: -1 unreadable,
+// 0 off, 1 on; the assumed state is always `on` here.
+void BridgeCalibrationTests::capsAssumptionResolution_data()
 {
-  // Right after an edge, and up to (not including) kCapsAssumeMs later, the
-  // bridge trusts the state it set; afterwards it re-reads the OS. A clock
-  // that went backwards never validates.
-  QVERIFY(caps_assumption_valid(1000, 1000));
-  QVERIFY(caps_assumption_valid(1000 + kCapsAssumeMs - 1, 1000));
-  QVERIFY(!caps_assumption_valid(1000 + kCapsAssumeMs, 1000));
-  QVERIFY(!caps_assumption_valid(5000, 1000));
-  QVERIFY(!caps_assumption_valid(999, 1000));
-  QVERIFY(caps_assumption_valid(1000 + 199, 1000, 200));
+  QTest::addColumn<int>("reader");
+  QTest::addColumn<int64_t>("ageMs");
+  QTest::addColumn<int>("result"); // 0 Hold, 1 Confirmed, 2 Expired
+  QTest::newRow("agrees at once") << 1 << int64_t{0} << 1;
+  QTest::newRow("agrees late") << 1 << int64_t{250} << 1;
+  QTest::newRow("agrees after the bound") << 1 << int64_t{5000} << 1;
+  QTest::newRow("stale at 0") << 0 << int64_t{0} << 0;
+  QTest::newRow("stale at 10") << 0 << int64_t{10} << 0;
+  QTest::newRow("stale at 40") << 0 << int64_t{40} << 0;
+  QTest::newRow("stale at 80 (old 50 ms timer would re-edge)") << 0 << int64_t{80} << 0;
+  QTest::newRow("stale at 299") << 0 << int64_t{299} << 0;
+  QTest::newRow("stale at 300 -> expired") << 0 << int64_t{300} << 2;
+  QTest::newRow("stale much later -> expired") << 0 << int64_t{4000} << 2;
+  QTest::newRow("unreadable within") << -1 << int64_t{100} << 0;
+  QTest::newRow("unreadable at bound -> expired") << -1 << int64_t{300} << 2;
+  QTest::newRow("clock went backwards -> expired") << 0 << int64_t{-1} << 2;
 }
 
+void BridgeCalibrationTests::capsAssumptionResolution()
+{
+  QFETCH(int, reader);
+  QFETCH(int64_t, ageMs);
+  QFETCH(int, result);
+  const std::optional<bool> r = reader < 0 ? std::optional<bool>{} : std::optional<bool>{reader == 1};
+  const auto got = resolve_caps_assumption(true, r, 1000 + ageMs, 1000);
+  QCOMPARE(int(got), result);
+  QCOMPARE(int64_t{kCapsAssumeMaxMs}, int64_t{300});
+}
+
+// A stale reader for 80 ms yields exactly one edge: simulate the bridge's
+// per-key decision over a burst after one edge at t=0.
 void BridgeCalibrationTests::derivedShiftIsNotHeld()
 {
   // A-1: the derived Shift rides on the key-down report (modifierBits),
@@ -280,6 +304,18 @@ void BridgeCalibrationTests::derivedShiftIsNotHeld()
   d = decide_letter_modifiers('1', kMaskShift | kMaskAlt, std::nullopt);
   QCOMPARE(d.modifierBits, uint8_t(kHidLeftShift | kHidLeftOption));
   QCOMPARE(d.heldBits, uint8_t(kHidLeftShift | kHidLeftOption));
+
+  // one edge for a stale burst: edge at t=0 (assumed on), reader says off
+  // at 10/40/80 ms -> Hold each time (no re-edge), agrees at 100 -> done.
+  int edges = 1;
+  bool assumed = true;
+  for (int64_t t : {10, 40, 80}) {
+    if (resolve_caps_assumption(assumed, false, t, 0) != CapsAssumption::Hold) {
+      ++edges;
+    }
+  }
+  QCOMPARE(resolve_caps_assumption(assumed, true, 100, 0), CapsAssumption::Confirmed);
+  QCOMPARE(edges, 1);
 }
 
 void BridgeCalibrationTests::chunk400Is50x8()
