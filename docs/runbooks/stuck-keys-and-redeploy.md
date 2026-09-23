@@ -220,9 +220,12 @@ tools/fleet-health --check all --host all
 tools/fleet-health --check loginbridge --host <mac>   # plist lints, program = installed bundle, log 600, 0 keystrokes;
                                                       # agent pid needs passwordless sudo, else SKIP with reason
 # memory: no growth over 24 h (Mouser ≤200 MB with the window closed, ≤350 open,
-# ≤0.1 MB/h; leak-class counts flat). Needs `sudo -n heap` on the seat for classes.
-tools/fleet-soak --hosts hackintosh,macbookpro --heap-classes --out soak.jsonl   # leave running 24 h
-tools/fleet-soak report --in soak.jsonl --proc mouser --window 24 --slope-max 0.1 --cap 200 --class-slope-max 10
+# ≤0.1 MB/h; leak-class counts flat). Install the sampler once per Mac seat
+# (user agent; recipe in tools/launchd/com.fleet.soak.plist; --heap-classes
+# needs the sudoers line from docs/runbooks/mouser-heap-classes-soak.md):
+ssh <mac> 'cd ~/Desktop/deskflow && sed -e "s#__REPO__#$PWD#g" -e "s#__HOME__#$HOME#g" tools/launchd/com.fleet.soak.plist > ~/Library/LaunchAgents/com.fleet.soak.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet.soak.plist; launchctl kickstart gui/$(id -u)/com.fleet.soak'
+# after ≥24 h (72 h for the full contract), on each Mac:
+ssh <mac> 'cd ~/Desktop/deskflow && tools/fleet-soak report --in harness/soak/latest/$(hostname -s | tr A-Z a-z)-mouser.jsonl --proc mouser --window 24 --min-hours 24 --slope-max 0.1 --cap 200 --class-slope-max 10'
 ssh <mac> 'grep "\[mem\]" ~/Library/Logs/Mouser/mouser.log | tail -3'   # growth_mb_h and passthrough_guard_skipped
 # capitalization + stuck keys
 ssh <mac> 'grep -c "stuck-release" ~/Library/Deskflow/deskflow-core.log'           # want 0
