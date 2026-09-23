@@ -297,8 +297,10 @@ function Deploy-Mouser {
       Invoke-Native -Label 'Mouser build (build-mouser.bat)' -FilePath 'cmd.exe' -ArgumentList @('/c', $bat)
     } else {
       Set-Location $MouserRoot
+      # Highest installed 3.x wins (Python313 before Python312); the venv must match
+      # Mouser's .python-version or build_and_install.py's provenance gate refuses it.
       $py = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty FullName
+        Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
       if (-not $py) { throw 'Python not found for Mouser' }
       $venvPy = Join-Path $MouserRoot '.venv\Scripts\python.exe'
       if (-not (Test-Path (Join-Path $MouserRoot '.venv'))) {
