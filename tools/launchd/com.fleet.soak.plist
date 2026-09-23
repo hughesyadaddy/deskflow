@@ -57,6 +57,7 @@
     <string>--once</string>
     <string>--interval</string>
     <string>60</string>
+    <string>--heap-classes</string>
     <string>--soak</string>
     <string>__REPO__/harness/soak</string>
     <string>--label</string>
