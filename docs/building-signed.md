@@ -114,8 +114,13 @@ cd ../Mouser
 MOUSER_SIGN_IDENTITY="$IDENTITY" ./build_macos_app.sh   # -> dist/Mouser.app
 ```
 
-Unset, it builds unsigned (ad-hoc) — fine functionally, but the TCC-stability
-argument above applies to Mouser too (it needs Input Monitoring).
+Unset (or `-`), `scripts/build_and_install.py` **refuses to build**
+(`EXIT_NO_SIGN_IDENTITY`); ad-hoc Mouser bundles are never installed. The
+identity is read from `Mouser/.env.local` (`MOUSER_SIGN_IDENTITY=<sha1>`),
+and after `codesign --verify` the installer walks every Mach-O in
+`dist/Mouser.app` (MacOS, Frameworks, PlugIns, Resources) requiring
+`TeamIdentifier=J5KPG8ZR5C`, no ad-hoc, and hardened runtime on
+`Contents/MacOS/*` before touching `/Applications`.
 
 ## Fleet deploy (all seats at once)
 
@@ -137,10 +142,41 @@ Two rules for `scripts/fleet.env`:
   on macOS, `$env:COMPUTERNAME` on Windows, lowercased) — never from the file.
   The `FLEET_SSH_<LOCAL_ID>` entry on each seat **must be `local`**; the other
   hosts get their SSH target. So the file differs by exactly one line per seat.
-- **No keychain passwords.** `FLEET_KEYCHAIN_PASSWORD_*` and the
-  `unlock_keychain` path are gone. Unlocking a login keychain over SSH does not
-  give `codesign` a usable identity anyway. `tools/fleet-doctor` fails if any
-  `KEYCHAIN_PASSWORD` key exists in `scripts/fleet.env*`.
+- **No keychain passwords in `scripts/fleet.env`.** `FLEET_KEYCHAIN_PASSWORD_*`
+  is gone from the shared file and `tools/fleet-doctor` fails if any
+  `KEYCHAIN_PASSWORD` key exists in `scripts/fleet.env*`. The per-seat
+  `.env` (mode 600, never shared) may hold `DESKFLOW_KEYCHAIN_PASSWORD`; see
+  "Signing over SSH" below.
+
+### Signing over SSH — the two credential routes (macOS)
+
+`codesign` needs the private key's ACL to allow it *and* the login keychain to
+be unlocked. An SSH session gets neither by default, so
+`scripts/fleet-deploy-macos.sh` picks one of two routes, in this order:
+
+1. **`.env` password route (preferred, unattended).** If the seat's
+   `~/Desktop/deskflow/.env` contains `DESKFLOW_KEYCHAIN_PASSWORD=<login
+   password>` — the file **must** be mode `600` or the deploy refuses —
+   `prepare_keychain_for_ssh` runs `security unlock-keychain` and
+   `security set-key-partition-list -S apple-tool:,apple:,codesign:` on the
+   login keychain, proves it with a `codesign` probe on a temp copy of
+   `/bin/ls`, then **unsets the variable** so no child process (cmake,
+   Python, Mouser's installer) ever sees it. Every later `codesign` runs
+   directly in the SSH session. Mouser is built by
+   `scripts/build_and_install.py` in the same session.
+2. **GUI-session route (fallback).** Without the password, every step that
+   touches the keychain is relayed by `tools/fleet-gui-exec.py` into the
+   logged-in console session (Terminal + System Events Automation must be
+   granted once, and the console user must be logged in — a locked screen is
+   fine, a logged-out seat is not). Mouser goes through
+   `scripts/build_macos_gui_session.py`. Slower and interactive-dependent;
+   kept for seats without a `.env` password.
+
+Windows needs neither: `DESKFLOW_SIGN_THUMBPRINT` names a cert already in the
+user's store and `signtool` runs in the SSH session (High-Integrity admin).
+
+Which route ran is visible in the deploy log: `keychain: unlocked for SSH
+(probe ok)` vs `gui-exec: routing <step> through the console session`.
 
 ### How a macOS build actually runs: GUI-session routing
 

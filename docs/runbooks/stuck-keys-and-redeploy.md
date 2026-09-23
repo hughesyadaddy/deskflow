@@ -92,9 +92,13 @@ Prerequisites on the target seat (once):
 - `Mouser/.env.local`: `MOUSER_SIGN_IDENTITY=<same sha1>` (macOS).
 - Both branches pushed: deskflow `origin/fleet/memory-program`,
   Mouser `fork/fleet/memory-program`.
-- macOS over SSH: the console user must be logged in and Terminal +
-  System Events Automation granted (the build routes through the GUI session
-  because the login keychain cannot be unlocked over SSH).
+- macOS over SSH, one of (see `docs/building-signed.md` → "Signing over SSH"):
+  - **preferred:** `deskflow/.env` also holds `DESKFLOW_KEYCHAIN_PASSWORD=<login
+    password>` and the file is `chmod 600` — signing then runs unattended in
+    the SSH session and nothing is routed through the GUI; or
+  - **fallback:** the console user is logged in and Terminal + System Events
+    Automation are granted, so `tools/fleet-gui-exec.py` can relay the
+    keychain steps into the console session.
 
 ### Windows (`tiny11`)
 
@@ -185,6 +189,24 @@ scripts/fleet-deploy.sh --self-test --json out.json && jq .ok out.json
 tools/fleet-health --check all --host all
 ```
 
+### What the deploy gates on (2026-09-22 build)
+
+Per macOS seat, in this order, all fatal unless noted: strict-signed build →
+`install-macos.sh` verifies **every Mach-O** (no ad-hoc, `TeamIdentifier`
+J5KPG8ZR5C, hardened runtime on `Contents/MacOS/*`, PlugIns/Resources
+included) → swap → `deskflow-ctl start` → Mouser: three sha256 checkpoints of
+`~/Library/Application Support/Mouser/{config.json,last_device.json}`
+(before install / after install / 30 s after restart; a change is allowed only
+when `version` increased and the old keys are a subset) with
+`config.json.pre-deploy-<ts>` kept ×5 → the Mouser log must show
+`CGEventTap created (native tap:` within 60 s and never `enabled on its own run
+loop` (Python-tap fallback = the leaking path; deploy fails) → **last**:
+`deskflow-ctl retire` + `deskflow-ctl assert-single`; a failure here prints a
+`#### HUMAN STEP REQUIRED on <seat>` block (Login Items to remove, root-owned
+leftovers, bridge reinstall) and exits non-zero **after** everything is
+installed. The controller's report has `apple|adhoc|hard|settings` columns
+and `ALL_OK=0` on any ad-hoc, non-hardened, or settings mismatch.
+
 ## 3. Verify after deploy
 
 ```bash
@@ -197,6 +219,14 @@ ssh <mac> 'launchctl print gui/$(id -u)/io.github.hughesyadaddy.deskflow-converg
 tools/fleet-health --check all --host all
 tools/fleet-health --check loginbridge --host <mac>   # plist lints, program = installed bundle, log 600, 0 keystrokes;
                                                       # agent pid needs passwordless sudo, else SKIP with reason
+# memory: no growth over 24 h (Mouser ≤200 MB with the window closed, ≤350 open,
+# ≤0.1 MB/h; leak-class counts flat). Needs `sudo -n heap` on the seat for classes.
+tools/fleet-soak --hosts hackintosh,macbookpro --heap-classes --out soak.jsonl   # leave running 24 h
+tools/fleet-soak report --in soak.jsonl --proc mouser --window 24 --slope-max 0.1 --cap 200 --class-slope-max 10
+ssh <mac> 'grep "\[mem\]" ~/Library/Logs/Mouser/mouser.log | tail -3'   # growth_mb_h and passthrough_guard_skipped
+# capitalization + stuck keys
+ssh <mac> 'grep -c "stuck-release" ~/Library/Deskflow/deskflow-core.log'           # want 0
+ssh <mac> 'sudo -n grep "\[keys\] session" /var/log/deskflow-vhid-bridge.log | tail -3'  # after one login-window use
 # Windows service recovery
 ssh tiny11 'sc.exe qfailure Deskflow'                 # RESTART actions 1000/5000/30000 ms
 ssh tiny11 'powershell -NoProfile -Command "Test-Path C:\ProgramData\Deskflow"'
