@@ -1294,8 +1294,12 @@ def test_converge_registered_mac_only_with_repo_free_commands():
     assert fh.converge_health_cmd() == ("f=\"$HOME\"/'Library/Application Support/Deskflow/health.json'; "
                                         'test -f "$f" && echo "mtime=$(stat -f %m "$f") now=$(date +%s)"')
     cmd = fh.launchd_plists_tcc_cmd()
-    assert cmd.startswith("grep -H -n -E '<string>[^<]*(/Desktop|/Documents|/Downloads)(/|<)' "
-                          '"$HOME"/Library/LaunchAgents/*.plist /Library/LaunchAgents/*.plist /Library/LaunchDaemons/*.plist')
+    assert cmd.startswith("grep -H -n -i -E '<string>[^<]*(/Desktop|/Documents|/Downloads|/Library/Mobile Documents|/Volumes)(/|<)' "
+                          '"$HOME"/Library/LaunchAgents/io.github.hughesyadaddy.*.plist '
+                          '"$HOME"/Library/LaunchAgents/org.deskflow.*.plist "$HOME"/Library/LaunchAgents/com.fleet.*.plist '
+                          '/Library/LaunchAgents/io.github.hughesyadaddy.*.plist')
+    assert "/Library/LaunchDaemons/com.fleet.*.plist" in cmd
+    assert "/*.plist" not in cmd   # fleet labels only: a third party's plist is never scanned
     assert cmd.endswith("| wc -l | tr -d ' ')\"")
     assert "sudo" not in cmd
     # the check never runs anything from a checkout (that is the bug it hunts)
@@ -1315,9 +1319,18 @@ def test_parse_launchctl_print_and_program():
     assert fh.parse_mtime_now("garbage\n") == (None, ["garbage"])
     assert fh.converge_eperm_path(f"/bin/bash: {DESKTOP_CTL}: Operation not permitted") == DESKTOP_CTL
     assert fh.converge_eperm_path("/bin/bash: /x/y: Permission denied") == "/x/y"
+    assert fh.converge_eperm_path("/bin/sh: /x/y: Permission denied") == "/x/y"
     assert fh.converge_eperm_path("== deskflow-ctl: converge: nothing to do ==") is None
+    # shape-specific: a tick that ran and died on its own redirection is not TCC on its program
+    assert fh.converge_eperm_path(f"{SAFE_CTL}: line 810: /Users/alexhughes/Library/Application Support/Deskflow/.tmp: "
+                                  "Permission denied") is None
+    assert fh.converge_eperm_path("/bin/bash: line 810: /x/.tmp: Permission denied") is None
     assert fh.tcc_protected(DESKTOP_CTL) and fh.tcc_protected("/Users/x/Documents/a") and fh.tcc_protected("/Users/x/Downloads")
+    # APFS is case-insensitive; iCloud Drive and removable volumes are guarded too
+    assert fh.tcc_protected("/Users/x/desktop/bin") and fh.tcc_protected("/Users/x/Library/Mobile Documents/com~apple~CloudDocs/a")
+    assert fh.tcc_protected("/Volumes/Stick/a")
     assert not fh.tcc_protected(SAFE_CTL) and not fh.tcc_protected("/Applications/Deskflow.app/Contents/MacOS/Deskflow")
+    assert not fh.tcc_protected("/Users/x/Desktopish/a")
 
 
 def test_converge_pass_on_safe_copy_fresh_health_clean_plists():
@@ -1325,7 +1338,7 @@ def test_converge_pass_on_safe_copy_fresh_health_clean_plists():
     assert [r.check for r in results] == ["converge"]
     assert results[0].status == "PASS", results[0].detail
     assert f"program {SAFE_CTL}" in results[0].detail and "health.json 60s old" in results[0].detail
-    assert "7 installed plists free of" in results[0].detail
+    assert "7 installed fleet plists free of" in results[0].detail
     for name in ("converge_agent_cmd", "converge_log_cmd", "converge_health_cmd", "launchd_plists_tcc_cmd"):
         assert ("macbookpro", getattr(fh, name)()) in runner.calls
 
@@ -1361,13 +1374,24 @@ def test_converge_log_evidence_alone_fails_and_expires_after_ten_minutes():
     assert results[0].status == "PASS", results[0].detail
 
 
-def test_converge_fails_on_any_installed_plist_under_protected_folder():
+def test_converge_polices_fleet_plists_only_and_ignores_third_party_plists():
+    # The scan itself globs only the fleet's labels in each launchd dir (the class of report noise
+    # 986d456f5 removed from `identifiers`: a third party's plist is never this tool's business).
+    cmd = fh.launchd_plists_tcc_cmd()
+    for d in ('"$HOME"/Library/LaunchAgents', "/Library/LaunchAgents", "/Library/LaunchDaemons"):
+        for g in ("io.github.hughesyadaddy.*.plist", "org.deskflow.*.plist", "com.fleet.*.plist"):
+            assert f"{d}/{g}" in cmd
+    assert "/*.plist" not in cmd
+    # A hit on a fleet plist is a finding; a hit on a foreign plist (should a scan ever return one) is not.
     hit = ("/Users/alexhughes/Library/LaunchAgents/com.fleet.soak.plist:55:    <string>/Users/alexhughes/Desktop/deskflow/tools/fleet-soak</string>\n"
            "/Library/LaunchDaemons/com.example.backup.plist:9:    <string>/Users/alexhughes/Documents/backup.sh</string>\nscanned=9\n")
     results, _ = run_checks([mac()], converge_table(launchd_plists_tcc_cmd=(0, hit, "")), ["converge"])
     assert results[0].status == "FAIL"
-    assert results[0].detail.count("launchd plist points into a TCC-protected folder") == 2
-    assert "com.fleet.soak.plist:55:" in results[0].detail and "com.example.backup.plist:9:" in results[0].detail
+    assert results[0].detail.count("launchd plist points into a TCC-protected folder") == 1
+    assert "com.fleet.soak.plist:55:" in results[0].detail and "com.example.backup" not in results[0].detail
+    only_foreign = "/Library/LaunchDaemons/com.example.backup.plist:9:    <string>/Users/alexhughes/Documents/backup.sh</string>\nscanned=9\n"
+    results, _ = run_checks([mac()], converge_table(launchd_plists_tcc_cmd=(0, only_foreign, "")), ["converge"])
+    assert results[0].status == "PASS", results[0].detail
     assert "converge agent cannot execute" not in results[0].detail
 
 

@@ -176,11 +176,20 @@ CONVERGE_EPERM_WINDOW_S = 600
 CONVERGE_HEALTH_MAX_AGE_S = 600
 CONVERGE_LOG_TAIL_LINES = 5
 LAUNCHD_PLIST_DIRS = ("~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons")
-# A plist <string> value under a TCC-protected user folder (any account, ~ or $HOME spelling).
-TCC_PROTECTED_STRING_RE = r"<string>[^<]*(/Desktop|/Documents|/Downloads)(/|<)"
-_TCC_PROTECTED_PATH_RE = re.compile(r"/(Desktop|Documents|Downloads)(/|$)")
-# What launchd's shell prints when TCC refuses the script: "/bin/bash: <path>: Operation not permitted".
-_CONVERGE_EPERM_RE = re.compile(r"^(?P<shell>[^:]+): (?P<path>.+): (Operation not permitted|Permission denied)\s*$")
+# Only the fleet's own labels are policed (the globs scripts/deskflow-ctl installed_plists_tcc_hits
+# uses): a third party's plist under ~/Documents is not this tool's business -- the same class of
+# report noise 986d456f5 removed from `identifiers` (22 false FAILs on bundled dylibs).
+FLEET_PLIST_GLOBS = ("io.github.hughesyadaddy.*.plist", "org.deskflow.*.plist", "com.fleet.*.plist")
+_FLEET_PLIST_RE = re.compile(r"^(io\.github\.hughesyadaddy\.|org\.deskflow\.|com\.fleet\.)[^/]*\.plist$")
+# A plist <string> value under a TCC-protected folder (any account, ~ or $HOME spelling): ~/Desktop,
+# ~/Documents, ~/Downloads, iCloud Drive, /Volumes. Matched case-insensitively (grep -i, re.I): APFS is.
+TCC_PROTECTED_STRING_RE = r"<string>[^<]*(/Desktop|/Documents|/Downloads|/Library/Mobile Documents|/Volumes)(/|<)"
+_TCC_PROTECTED_PATH_RE = re.compile(r"/(Desktop|Documents|Downloads|Library/Mobile Documents|Volumes)(/|$)", re.IGNORECASE)
+# What launchd's shell prints when TCC refuses the script it was handed: "/bin/bash: <path>: Operation
+# not permitted" (exit 126). Shape-specific: a tick's own "<script>: line N: <file>: Permission denied"
+# (its redirection, not its program) is not this.
+_CONVERGE_EPERM_RE = re.compile(r"^(?P<shell>(?:/[^:]*/)?(?:bash|sh|zsh|dash|env)): (?P<path>/[^:]+): "
+                                r"(Operation not permitted|Permission denied)\s*$")
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
 # The core's own rotated log on macOS: Deskflow.conf `[log] toFile=true
 # file=...` (FileLogOutputter, generations file.1 .. file.3). launchd's
@@ -539,12 +548,14 @@ def converge_health_cmd(path: str = CONVERGE_HEALTH_JSON) -> str:
     return f'f={f}; test -f "$f" && echo "mtime=$(stat -f %m "$f") now=$(date +%s)"'
 
 
-def launchd_plists_tcc_cmd(dirs: Sequence[str] = LAUNCHD_PLIST_DIRS) -> str:
-    """grep -H -n of every <string> in any installed launchd plist that points under ~/Desktop,
-    ~/Documents or ~/Downloads (a launchd job gets EPERM there), then "scanned=<plist count>"."""
-    globs = " ".join(_home_path(d) + "/*.plist" for d in dirs)
-    return (f"grep -H -n -E {shlex.quote(TCC_PROTECTED_STRING_RE)} {globs} 2>/dev/null; "
-            f"echo \"scanned=$(ls {globs} 2>/dev/null | wc -l | tr -d ' ')\"")
+def launchd_plists_tcc_cmd(dirs: Sequence[str] = LAUNCHD_PLIST_DIRS,
+                           globs: Sequence[str] = FLEET_PLIST_GLOBS) -> str:
+    """grep -H -n -i of every <string> in an installed FLEET launchd plist (our labels only, never a
+    third party's) that points into a TCC-protected folder (a launchd job gets EPERM there), then
+    "scanned=<plist count>"."""
+    paths = " ".join(_home_path(d) + "/" + g for d in dirs for g in globs)
+    return (f"grep -H -n -i -E {shlex.quote(TCC_PROTECTED_STRING_RE)} {paths} 2>/dev/null; "
+            f"echo \"scanned=$(ls {paths} 2>/dev/null | wc -l | tr -d ' ')\"")
 
 
 def parse_launchctl_print(text: str) -> Dict[str, object]:
@@ -593,13 +604,16 @@ def parse_mtime_now(text: str) -> Tuple[Optional[int], List[str]]:
 
 
 def converge_eperm_path(line: str) -> Optional[str]:
-    """The path in a "<shell>: <path>: Operation not permitted" line (TCC seen from launchd), else None."""
+    """The path in a "/bin/bash: <path>: Operation not permitted" line (TCC seen from launchd: the shell
+    itself refused at its script), else None -- a "<script>: line N: <file>: Permission denied" from a
+    tick that ran is not that."""
     m = _CONVERGE_EPERM_RE.match(line.strip())
     return m.group("path") if m else None
 
 
 def tcc_protected(path: str) -> bool:
-    """True for a path under ~/Desktop, ~/Documents or ~/Downloads (any account, ~/$HOME spelling)."""
+    """True for a path under ~/Desktop, ~/Documents, ~/Downloads, iCloud Drive or /Volumes (any
+    account, ~/$HOME spelling, any case: APFS is case-insensitive)."""
     return bool(_TCC_PROTECTED_PATH_RE.search(path))
 
 
@@ -1146,7 +1160,7 @@ class FleetHealth:
                 evidence.append("launchd last exit code 126")
             if prog and tcc_protected(prog):
                 tcc_path = tcc_path or prog
-                evidence.append("program is under ~/Desktop, ~/Documents or ~/Downloads")
+                evidence.append("program is under ~/Desktop, ~/Documents, ~/Downloads, iCloud Drive or /Volumes")
             runs = info["runs"]
             notes.append(f"agent loaded ({info['state'] or '?'}, runs={runs if runs is not None else '?'}), "
                          f"program {prog or '?'}")
@@ -1181,9 +1195,13 @@ class FleetHealth:
             if ln.startswith("scanned="):
                 scanned = ln[len("scanned="):].strip()
                 continue
+            # The scan globs fleet labels only; should a hit on anything else ever come back, it is
+            # still not a finding (a third party's plist is never this tool's business).
+            if not _FLEET_PLIST_RE.match(ln.split(":", 1)[0].rsplit("/", 1)[-1]):
+                continue
             problems.append(f"launchd plist points into a TCC-protected folder (EPERM for launchd, no prompt): "
                             f"{ln.strip()}")
-        notes.append(f"{scanned} installed plists free of ~/Desktop|~/Documents|~/Downloads")
+        notes.append(f"{scanned} installed fleet plists free of ~/Desktop|~/Documents|~/Downloads|iCloud Drive|/Volumes")
         if problems:
             self._add(host, "converge", FAIL, "; ".join(problems))
         else:
