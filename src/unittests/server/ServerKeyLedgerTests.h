@@ -30,4 +30,7 @@ private Q_SLOTS:
   void switch_releasesBeforeLeave();
   void enterPrimary_releasesOnlyInjectedLedger();
   void enterSecondary_logsStuckReleaseWhenModifierPersists();
+  // D5: withheld Super never leaks into following keys' masks or as a lone UP
+  void deferredSuper_consumedByChord_stripsSuperFromFollowingKeys();
+  void deferredSuper_holdThroughChord_noSuperUpWithoutDown();
 };

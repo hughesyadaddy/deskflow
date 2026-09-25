@@ -27,6 +27,7 @@
 
 #include <chrono>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1009,4 +1010,116 @@ void ServerKeyLedgerTests::enterSecondary_logsStuckReleaseWhenModifierPersists()
 
   QVERIFY(screen.leave());
   screen.disable();
+}
+
+namespace {
+
+//! A chord screen: the remote is named after kDefaultChordRemapScreen so
+//! Config seeds the default tiny11 chord table (Super+Q -> Alt+F4 momentary,
+//! Super+T -> Ctrl+T hold-through) and the server defers Super on it.
+struct ChordFixture
+{
+  EventQueue events;
+  deskflow::server::Config config;
+  TestPlatformScreen *platform = nullptr;
+  deskflow::Screen *screen = nullptr;
+  PrimaryClient *primary = nullptr;
+
+  ChordFixture() : config(&events)
+  {
+  }
+
+  void init()
+  {
+    const std::string conf = std::string("section: screens\n\tserver:\n\t") + deskflow::server::kDefaultChordRemapScreen +
+                             ":\nend\n\nsection: links\nend\n\nsection: options\nend\n\n";
+    std::istringstream in(conf);
+    deskflow::server::ConfigReadContext context(in);
+    config.read(context);
+    QVERIFY(!config.getChordRemaps().empty());
+    platform = new TestPlatformScreen(&events);
+    screen = new deskflow::Screen(platform, &events);
+    primary = new PrimaryClient("server", screen);
+  }
+};
+
+constexpr KeyButton kButtonSuper = 0x7D;
+constexpr KeyButton kButtonQ = 0x10;
+constexpr KeyButton kButtonT = 0x14;
+constexpr KeyID kKeyQ = static_cast<KeyID>('q');
+constexpr KeyID kKeyT = static_cast<KeyID>('t');
+
+} // namespace
+
+void ServerKeyLedgerTests::deferredSuper_consumedByChord_stripsSuperFromFollowingKeys()
+{
+  // D5 (live 2026-09-25): Super held, Super+Q fires its chord (Super never
+  // forwarded), then 'a' is pressed in the same physical hold. The primary
+  // still reports Super in the mask, but the client never got a Super down
+  // -- relaying the mask made it tap Win around 'a', which a target-side
+  // hook (PowerToys KBM) remapped, stranding Ctrl.
+  ChordFixture f;
+  f.init();
+  RecordingClient remote(deskflow::server::kDefaultChordRemapScreen);
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace(remote.getName(), &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    remote.keys.clear();
+
+    server.onKeyDown(kKeySuper_L, KeyModifierSuper, kButtonSuper, "en", nullptr);
+    QVERIFY(remote.keys.empty()); // deferred
+    server.onKeyDown(kKeyQ, KeyModifierSuper, kButtonQ, "en", nullptr);
+    server.onKeyUp(kKeyQ, KeyModifierSuper, kButtonQ, nullptr);
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyF4), 1);
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeySuper_L), 0);
+    remote.keys.clear();
+
+    server.onKeyDown(kKeyA, KeyModifierSuper, kButtonA, "en", nullptr);
+    server.onKeyRepeat(kKeyA, KeyModifierSuper, 1, kButtonA, "en");
+    server.onKeyUp(kKeyA, KeyModifierSuper, kButtonA, nullptr);
+    QCOMPARE(remote.keys.size(), 3u);
+    for (const auto &k : remote.keys) {
+      QCOMPARE(k.id, kKeyA);
+      QCOMPARE(k.mask & KeyModifierSuper, static_cast<KeyModifierMask>(0));
+    }
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeySuper_L), 0);
+
+    server.onKeyUp(kKeySuper_L, 0, kButtonSuper, nullptr);
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeySuper_L), 0);
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeySuper_L), 0);
+
+    server.m_clients.erase(remote.getName());
+  }
+}
+
+void ServerKeyLedgerTests::deferredSuper_holdThroughChord_noSuperUpWithoutDown()
+{
+  // D5: Super+T is a hold-through chord (Ctrl held on the target for the
+  // session). Releasing Super ends the session; the Super UP itself must not
+  // be relayed -- its DOWN was never sent, and the client logged
+  // "key up Super_L" with no matching down (a Win tap to a target-side hook).
+  ChordFixture f;
+  f.init();
+  RecordingClient remote(deskflow::server::kDefaultChordRemapScreen);
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace(remote.getName(), &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    remote.keys.clear();
+
+    server.onKeyDown(kKeySuper_L, KeyModifierSuper, kButtonSuper, "en", nullptr);
+    server.onKeyDown(kKeyT, KeyModifierSuper, kButtonT, "en", nullptr);
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeySetModifiers), 1);
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyT), 1);
+    server.onKeyUp(kKeyT, KeyModifierSuper, kButtonT, nullptr);
+    remote.keys.clear();
+
+    server.onKeyUp(kKeySuper_L, 0, kButtonSuper, nullptr);
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyClearModifiers), 1); // session ended
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeySuper_L), 0);
+    QVERIFY(!server.isActiveChordRemapSession());
+
+    server.m_clients.erase(remote.getName());
+  }
 }

@@ -152,9 +152,27 @@ public:
   //! Returns false when the event was DROPPED and is not held.
   bool fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool isAutoRepeat) const;
 
+  //! Request/result of one stale-modifier audit pass (desk thread, sync).
+  struct StaleModifierAudit
+  {
+    uint32_t heldByUsBits = 0;  //!< ledger bits: rows this client holds, never released
+    bool entered = false;       //!< true: the 1 s audit (graced, D3); false: boundary sweep (immediate)
+    uint64_t lastSuperChordMs = 0; //!< MSWindowsKeyState::lastInjectedSuperChordMs() (Win rows only)
+    std::vector<WORD> released; //!< OUT: VKs whose UP was injected
+  };
+
   //! Release stale physically-held modifiers on the input-desktop-bound desk
   //! thread (synchronous). See deskSanitizeStaleModifiers in the .cpp.
-  void sanitizeStaleModifiers(uint32_t heldByUsBits) const;
+  /*!
+  Returns the VKs actually released so the caller can close its ledger for
+  them (D1). \p entered false = boundary (enable/enter/leave): every
+  non-ledgered held row is released at once. \p entered true = the periodic
+  audit: a row is released only after two consecutive sightings; the
+  LWIN/RWIN rows additionally wait until no Win+key was injected within
+  deskflow::platform::kAuditQuietMs (D3). Alt/Ctrl rows get no quiet
+  window, so a stuck one is released even while the user keeps typing.
+  */
+  std::vector<WORD> sanitizeStaleModifiers(uint32_t heldByUsBits, bool entered, uint64_t lastSuperChordMs) const;
 
   //! Release each VK in \p vks that the input desktop still reports held.
   /*!

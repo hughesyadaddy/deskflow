@@ -608,6 +608,13 @@ private:
   //! (never forward Super), a real Win+key combo (forward Super late, then
   //! the key), or a deliberate lone tap (forward down+up on release; Start
   //! menu is then intended).
+  //!
+  //! Known asymmetry (D5): the decision is made once per hold, on the FIRST
+  //! key. Cmd+L before any chord in this hold is a real Win combo -> the
+  //! withheld Super is forwarded late and the client gets Win+L (lock).
+  //! Cmd+H then Cmd+L in one hold: the chord consumes the hold, so Super is
+  //! stripped from every later key and the client gets a bare `l`. Releasing
+  //! and re-pressing Cmd starts a fresh, undecided hold.
   struct DeferredSuper
   {
     bool active = false;          //!< physical Super is held, down not yet decided
@@ -617,6 +624,14 @@ private:
     KeyButton button = 0;
   };
   DeferredSuper m_deferredSuper;
+
+  //! D5: the physical Super is held but its down was never forwarded
+  //! (undecided, or consumed by a chord), so no outgoing mask may carry
+  //! KeyModifierSuper unless a chord remap put it there.
+  bool superWithheld() const
+  {
+    return m_deferredSuper.active && !m_deferredSuper.emitted;
+  }
 
   //! True when \p screen has at least one chord-remap entry (caseless).
   bool screenHasChordRemaps(const std::string &screen) const;

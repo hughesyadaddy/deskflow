@@ -81,6 +81,23 @@ inline KeyModifierMask effectiveChordRemapMask(KeyModifierMask mask, KeyModifier
   return (mask & ~kChordRemapMods) | heldOutMods;
 }
 
+//! D5: outgoing mask for a key sent while a deferred Super is WITHHELD --
+//! still undecided, or consumed by a chord that already fired -- and the key
+//! itself was not chord-remapped.
+/*!
+The physical Super is still held, so the primary reports KeyModifierSuper
+in \p mask; but the client never received a Super down, so it would tap Win
+around the key (KeyMap::keysForModifierState) -- and a third-party hook on
+the target (PowerToys Keyboard Manager, AutoHotkey) then sees Win+<key> and
+applies ITS remap, stranding modifiers (live 2026-09-25). A remapped key
+keeps its mask: the chord table produced it deliberately (Super+H ->
+Win+Down needs the Super).
+*/
+inline KeyModifierMask maskWithoutWithheldSuper(KeyModifierMask mask, bool superWithheld, bool remapped)
+{
+  return (superWithheld && !remapped) ? (mask & ~KeyModifierSuper) : mask;
+}
+
 inline bool applyChordRemap(
     KeyID &id, KeyModifierMask &mask, const std::vector<ChordRemapEntry> &table, const std::string &screen
 )
