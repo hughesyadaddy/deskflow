@@ -1247,3 +1247,15 @@ def test_notify_macos_uses_osascript_only_on_darwin(monkeypatch):
     fh.notify_macos("fleet-health macbookpro", 'session PASS -> FAIL: "gui" down')
     assert calls and calls[0][0] == "osascript"
     assert 'display notification "session PASS -> FAIL: \\"gui\\" down" with title "fleet-health macbookpro"' in calls[0][2]
+
+
+def test_macho_scan_cmd_parses_under_bin_sh():
+    """/bin/sh on macOS is bash 3.2, whose $( ... ) parser chokes on unbalanced
+    `)` in case patterns; the live 'sign' check ran the scan through sh -c and
+    failed with a syntax error on 2026-09-25. Keep the command sh -n clean."""
+    import subprocess, sys
+    if sys.platform != "darwin":
+        return
+    cmd = fh.macho_scan_cmd(["/Applications/Deskflow.app", "/Applications/Mouser.app"])
+    r = subprocess.run(["/bin/sh", "-n", "-c", cmd], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr

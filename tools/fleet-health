@@ -321,7 +321,7 @@ def macho_scan_cmd(apps: Sequence[str] = MAC_APPS, extra: Sequence[str] = MAC_EX
         finds.append(
             f"find {shlex.quote(plugins)} {shlex.quote(resources)} -type f "
             f"\\( -name '*.dylib' -o -perm +111 \\) 2>/dev/null | while IFS= read -r m; do "
-            'case "$m" in *.dylib) echo "$m";; *) file -b "$m" 2>/dev/null | grep -q Mach-O && echo "$m";; esac; done'
+            'case "$m" in (*.dylib) echo "$m";; (*) file -b "$m" 2>/dev/null | grep -q Mach-O && echo "$m";; esac; done'
         )
     for path in extra:
         finds.append(f"ls {shlex.quote(path)} 2>/dev/null")
