@@ -70,7 +70,8 @@ RelayKeyEvent relayEventFromMessage(const Message &message)
 
 Coordinator::Coordinator(CoordinatorConfig config)
     : m_config(std::move(config)),
-      m_election(m_config.selfName, m_config.tuning, monotonicSeconds)
+      m_election(m_config.selfName, m_config.tuning, monotonicSeconds),
+      m_escSettleTimer([this] { settleEscBurst(); })
 {
   m_fleetState.peers.reserve(m_config.peers.size());
   for (const auto &peer : m_config.peers) {
@@ -122,6 +123,12 @@ void fleetRescueThunk()
     g_rescueCoordinator->requestFleetRescue();
   }
 }
+void fleetStopAllThunk()
+{
+  if (g_rescueCoordinator != nullptr) {
+    g_rescueCoordinator->requestFleetStopAll();
+  }
+}
 } // namespace
 
 bool Coordinator::start()
@@ -131,6 +138,7 @@ bool Coordinator::start()
   }
   g_rescueCoordinator = this;
   setFleetRescueHandler(&fleetRescueThunk);
+  setFleetStopAllHandler(&fleetStopAllThunk);
   for (auto &[name, outbox] : m_outboxes) {
     outbox->start();
   }
@@ -152,8 +160,10 @@ void Coordinator::stop()
 {
   if (g_rescueCoordinator == this) {
     setFleetRescueHandler(nullptr);
+    setFleetStopAllHandler(nullptr);
     g_rescueCoordinator = nullptr;
   }
+  m_escSettleTimer.cancel();
   {
     std::scoped_lock lock{m_mutex};
     m_workerStop = true;
@@ -620,6 +630,13 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
     break;
   }
 
+  case Message::Type::StopAll:
+    // Never re-broadcast (the originator fanned out); requestLocalStopAll
+    // itself ignores repeats, so duplicate deliveries cannot loop.
+    LOG_INFO("coordination: fleet stop-all received -- stopping every Deskflow instance and service here");
+    requestLocalStopAll();
+    break;
+
   case Message::Type::Status: {
     std::string snapshot;
     {
@@ -773,20 +790,29 @@ KeyForwardResult Coordinator::sendKeyForward(
     return KeyForwardResult::Local;
   }
 
-  // Observe Downs (including when routing is Local) so 5× Esc still works
-  // while the cursor is on this machine. Swallowed = eat this Esc WITHOUT
-  // recording it as held on a peer (its Up then stays local).
+  // Observe Downs (including when routing is Local) so the Esc rescue still
+  // works while the cursor is on this machine. Nothing fires on a press:
+  // the burst is decided once it has ended (RescueBurst; the settle timer
+  // calls settleEscBurst). From the 5th tap on the burst is a rescue in
+  // progress, so those Escs are Swallowed = eaten WITHOUT recording them as
+  // held on a peer (their Ups then stay local).
   if (phase == Message::KeyPhase::Down) {
-    bool triggered = false;
+    RescueAction closed = RescueAction::None;
+    bool swallow = false;
     {
       std::scoped_lock lock{m_mutex};
-      triggered = m_escTapRescue.noteEscDown(id, mask);
+      const auto now = EscTapRescue::Clock::now();
+      closed = m_escTapRescue.noteKeyDown(id, mask, now);
+      swallow = m_escTapRescue.swallowing();
+      if (m_escTapRescue.pending()) {
+        m_escSettleTimer.arm(m_escTapRescue.deadline());
+      }
     }
-    if (triggered) {
-      // Fleet-wide: this path is what sees the taps at a login screen (the
-      // elevated/secure-desktop core runs as a client epoch), and the wedged
-      // machine is usually a different one.
-      requestFleetRescue();
+    if (closed != RescueAction::None) {
+      // A stale burst the settle timer missed: its decision is still owed.
+      fireRescueAction(closed);
+    }
+    if (swallow) {
       return KeyForwardResult::Swallowed;
     }
   }
@@ -928,6 +954,83 @@ void Coordinator::requestFleetRescue()
   // keyboard hook (5x Esc) so nothing here may block.
   sendLineToPeers(line);
   requestLocalCoreRestart();
+}
+
+void Coordinator::settleEscBurst(EscTapRescue::Clock::time_point now)
+{
+  RescueAction action = RescueAction::None;
+  {
+    std::scoped_lock lock{m_mutex};
+    action = m_escTapRescue.settle(now);
+  }
+  fireRescueAction(action);
+}
+
+void Coordinator::fireRescueAction(RescueAction action)
+{
+  switch (action) {
+  case RescueAction::Restart:
+    // Fleet-wide: this path is what sees the taps at a login screen (the
+    // elevated/secure-desktop core runs as a client epoch), and the wedged
+    // machine is usually a different one.
+    LOG_INFO("keyboard rescue: 5x Esc burst ended -- requesting a fleet restart");
+    requestFleetRescue();
+    break;
+  case RescueAction::StopAll:
+    LOG_INFO("keyboard rescue: 10x Esc burst ended -- requesting a fleet stop-all");
+    requestFleetStopAll();
+    break;
+  default:
+    break;
+  }
+}
+
+void Coordinator::requestFleetStopAll()
+{
+  std::string line;
+  {
+    std::scoped_lock lock{m_mutex};
+    if (m_quit || m_stopAllTriggered) {
+      LOG_DEBUG("coordination: fleet stop-all already requested; ignoring repeat");
+      return;
+    }
+    m_stopAllTriggered = true;
+    line = protocol::encodeStopAll(m_config.token);
+  }
+  LOG_INFO("coordination: fleet stop-all -- stopping every Deskflow instance and service on every seat");
+  // Same boundary as the rescue: nothing forwarded before this is worth
+  // delivering after it, and every forwarded hold is re-labelled Local so
+  // its Up passes here (the peers' cores are going away).
+  for (auto &[name, outbox] : m_outboxes) {
+    outbox->discardKeys();
+  }
+  m_keyboardRelay->releaseForwardedLocally();
+  // Peers first (posted to the lanes, never blocking); the local executor
+  // runs on its own thread and takes far longer than a LAN delivery.
+  sendLineToPeers(line);
+  runLocalStopAll();
+}
+
+void Coordinator::requestLocalStopAll()
+{
+  {
+    std::scoped_lock lock{m_mutex};
+    if (m_stopAllTriggered) {
+      LOG_DEBUG("coordination: stop-all already in progress on this seat; ignoring repeat");
+      return;
+    }
+    m_stopAllTriggered = true;
+  }
+  runLocalStopAll();
+}
+
+void Coordinator::runLocalStopAll()
+{
+  if (m_localStopAllHook) {
+    m_localStopAllHook();
+    return;
+  }
+  deskflow::coordination::requestLocalStopAll(m_config.selfName);
 }
 
 bool Coordinator::isKnownPeer(const std::string &name) const

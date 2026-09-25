@@ -41,6 +41,10 @@ void DaemonIpcServer::processCommand(QLocalSocket *clientSocket, const QString &
     LOG_DEBUG("daemon ipc server got restart core message");
     Q_EMIT restartProcessRequested();
     writeToClientSocket(clientSocket, kAckMessage);
+  } else if (command == QStringLiteral("stopAll")) {
+    LOG_DEBUG("daemon ipc server got stop-all message");
+    Q_EMIT stopAllRequested();
+    writeToClientSocket(clientSocket, kAckMessage);
   } else if (command == QStringLiteral("logPath")) {
     LOG_DEBUG("daemon ipc server got log path request");
     writeToClientSocket(clientSocket, QStringLiteral("logPath=%1").arg(m_logFilename.toUtf8()));

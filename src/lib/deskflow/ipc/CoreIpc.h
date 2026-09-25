@@ -15,3 +15,7 @@ void ipcSendConnectionState(deskflow::core::ConnectionState state);
 
 //! Soft-restart local core via GUI (`restartCore`) or stop when no GUI client.
 void ipcRequestLocalCoreRestart();
+
+//! 10x Esc stop-all (Windows): ask the daemon to stop every Deskflow
+//! process and the service; without a daemon, stop the GUI and this core.
+void ipcRequestLocalStopAll();

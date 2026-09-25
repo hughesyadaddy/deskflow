@@ -230,6 +230,26 @@ The elected server is authoritative: each newer fragment replaces
 coordinator emits `CoordinationFleetStateChanged`; the first non-empty
 `links[]` also emits `CoordinationTopologyReady`.
 
+### `rescue` / `stopall` — keyboard rescue broadcasts
+
+```json
+{"t": "rescue", "token": "<optional>"}
+{"t": "stopall", "token": "<optional>"}
+```
+
+Sent by the seat whose keyboard saw a plain-Esc burst, to every configured
+peer, once the burst has ended (700 ms of silence; taps ≤ 800 ms apart).
+`rescue` (5–9 taps): the receiver restarts its local core (deduplicated for
+2 s: older peers send each line to both `ip` and `lan`). `stopall` (10+
+taps): the receiver logs `WARNING: [rescue] 10x Esc: stopping ALL Deskflow
+instances and services on <seat>` and stops every Deskflow instance and
+service it owns (macOS: quit-intent + launchd bootout of converge, GUI,
+strays, then the core; Windows: daemon `stopAll` IPC → every core/GUI under
+the install root, then a clean service stop). Never re-broadcast; a seat
+already stopping ignores repeats. `stopall` is a v2 extension without a
+version bump: a peer that predates it decodes the line as Invalid and the
+transport drops it silently (same path as any unknown `t`).
+
 Legacy `cursor` and `keyfwd` messages are dropped at the transport (the
 connection stays open for pipelined valid messages). Stragglers that can
 only speak mesh v1 must upgrade; rolling the fleet back means installing

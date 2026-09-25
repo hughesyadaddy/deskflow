@@ -8,6 +8,8 @@
 #include "DaemonApp.h"
 
 #include "arch/Arch.h"
+#include "base/Event.h"
+#include "base/EventTypes.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "base/LogOutputters.h"
@@ -30,6 +32,7 @@
 #include <QCoreApplication>
 #include <QFileInfo>
 #include <QSettings>
+#include <QSysInfo>
 
 using namespace deskflow::core;
 
@@ -140,6 +143,39 @@ void DaemonApp::restartWatchdogProcess() const
 #endif
 }
 
+void DaemonApp::stopAllProcesses()
+{
+#if defined(Q_OS_WIN)
+  QString seat;
+  if (!m_configFile.isEmpty() && !m_configFile.startsWith(QStringLiteral("\\\\")) &&
+      !m_configFile.startsWith(QStringLiteral("//"))) {
+    seat = QSettings(m_configFile, QSettings::IniFormat).value(Settings::Core::ComputerName).toString();
+  }
+  if (seat.isEmpty()) {
+    seat = QSysInfo::machineHostName();
+  }
+  // The WARNING line goes first, before anything is touched.
+  LOG_WARN("[rescue] 10x Esc: stopping ALL Deskflow instances and services on %s", qPrintable(seat));
+
+  // Clears the command (nothing is relaunched, daemon/configFile stays
+  // persisted for the next `deskflow-ctl.ps1 start`), queues the stop of
+  // the watchdog-owned core and terminates every deskflow-core.exe /
+  // deskflow.exe under the install root in every session.
+  m_pWatchdog->requestStopAll(QCoreApplication::applicationDirPath().toStdWString());
+
+  // Clean self-stop: the event loop ends, mainLoop() returns s_exitSuccess,
+  // and ArchDaemonWindows reports SERVICE_STOPPED with dwWin32ExitCode =
+  // NO_ERROR. The SCM recovery actions deskflow-ctl.ps1 configures
+  // (`sc failure ... restart/1000/restart/5000/restart/30000` +
+  // `failureflag 1`) fire only when the process dies without reporting
+  // SERVICE_STOPPED or reports it with a non-zero exit code, so this stop
+  // stays down until `deskflow-ctl.ps1 start`.
+  m_events.addEvent(Event(EventTypes::Quit));
+#else
+  LOG_ERR("stop-all not implemented on this platform");
+#endif
+}
+
 void DaemonApp::clearSettings()
 {
   LOG_INFO("clearing daemon settings");
@@ -169,6 +205,9 @@ void DaemonApp::connectIpcServer(const ipc::DaemonIpcServer *ipcServer) const
   connect(
       ipcServer, &ipc::DaemonIpcServer::restartProcessRequested, this, &DaemonApp::restartWatchdogProcess,
       Qt::DirectConnection
+  );
+  connect(
+      ipcServer, &ipc::DaemonIpcServer::stopAllRequested, this, &DaemonApp::stopAllProcesses, Qt::DirectConnection
   );
 }
 

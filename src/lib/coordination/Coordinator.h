@@ -176,6 +176,11 @@ public:
   //! left the actually-broken peer stuck.
   void requestFleetRescue();
 
+  //! Fleet-wide stop-all (10x Esc): tell every peer to stop every Deskflow
+  //! instance and service on its seat, then do the same here. Once per
+  //! process: a seat that is already stopping ignores repeats.
+  void requestFleetStopAll();
+
   //! Receiver side of the KeyClearAll boundary resync (mesh v2).
   /*!
   A peer that forwarded keys to this machine lost the ability to release
@@ -219,6 +224,14 @@ private:
   KeyForwardResult
   sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
   void requestLocalCoreRestart();
+  //! Stop this seat (m_localStopAllHook in tests, else the process-wide
+  //! executor); guarded so it runs at most once per process.
+  void requestLocalStopAll();
+  void runLocalStopAll();
+  //! Settle poll for the Esc burst (RescueSettleTimer thread, or tests
+  //! with an injected clock): decides and fires the burst's action.
+  void settleEscBurst(EscTapRescue::Clock::time_point now = EscTapRescue::Clock::now());
+  void fireRescueAction(RescueAction action);
 
   bool isKnownPeer(const std::string &name) const;
   bool relayPassThroughLocal();
@@ -281,9 +294,16 @@ private:
   //! When the last fleet rescue was accepted (guarded by m_mutex).
   double m_lastRescueAt = -1.0e9;
   std::function<void(const std::string &)> m_keyClearAllHandler; //!< guarded by m_mutex
+  //! Esc burst counter (guarded by m_mutex; fed from the keyboard hook).
   EscTapRescue m_escTapRescue;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
   std::function<void()> m_localCoreRestartHook;
+  //! When set (unit tests), used instead of the process-wide stop-all.
+  std::function<void()> m_localStopAllHook;
+  //! Set once a stop-all was requested or received (guarded by m_mutex).
+  bool m_stopAllTriggered = false;
+  //! Wakes settleEscBurst() once the burst has been silent for kSettleMs.
+  RescueSettleTimer m_escSettleTimer;
   std::set<std::string> m_versionMismatchPeers;
   //! Last wake action per peer (rate limit; guarded by m_mutex).
   std::map<std::string, std::chrono::steady_clock::time_point> m_lastWakeAt;

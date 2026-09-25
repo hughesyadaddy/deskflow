@@ -131,6 +131,23 @@ public:
   void requestRestart();
 
   /**
+   * @brief Stop-all (10x Esc): stop every Deskflow process under @p installRoot and never respawn.
+   *
+   * Clears the command (nothing is relaunched; daemon/configFile stays
+   * persisted for the next explicit start), queues the graceful stop of the
+   * watchdog-owned core, and terminates every deskflow-core.exe /
+   * deskflow.exe whose image lives under the install root, in every session
+   * (a SYSTEM login-screen core in session 0 and the user's GUI included).
+   * The daemon then quits its event loop and reports SERVICE_STOPPED.
+   */
+  void requestStopAll(const std::wstring &installRoot);
+
+  /**
+   * @brief Terminate every Deskflow core/GUI process under @p installRoot, in every session (never self).
+   */
+  static void terminateProcessesUnderRoot(const std::wstring &installRoot);
+
+  /**
    * @brief Stop the main loop and output loop threads.
    */
   void stop();

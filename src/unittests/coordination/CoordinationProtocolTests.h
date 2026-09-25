@@ -15,6 +15,8 @@ private Q_SLOTS:
   void claimRoundTrip();
   void promoteRoundTrip();
   void rescueRoundTrip();
+  void stopAllRoundTrip();
+  void unknownKindDecodesInvalidForForwardCompat();
   void statusRoundTrip();
   void decodesLegacyCoordinatorClaim();
   void toleratesStringSequenceNumbers();

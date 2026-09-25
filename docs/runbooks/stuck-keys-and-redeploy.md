@@ -84,6 +84,58 @@ lock/unlock/wake and at core start.
 ssh <mac> 'sudo launchctl kickstart -k loginwindow/org.deskflow.vhid-bridge'
 ```
 
+### 1d. Keyboard rescue from any keyboard: 5×Esc restarts, 10×Esc stops everything
+
+Tap plain **Esc** (no Shift/Ctrl/Alt/Cmd; Caps/Num state is ignored) in a
+burst, each tap within 800 ms of the previous. The burst is decided **only
+once it has ended** (700 ms without another Esc) -- nothing fires on the 5th
+press, so heading for 10 never restarts you on the way:
+
+| Taps in the burst | Effect on **every seat** (mesh broadcast; the seat that saw the taps included) |
+|---|---|
+| 1–4 | nothing |
+| **5–9** | `fleet keyboard rescue`: every seat restarts its local core (today's behaviour; GUI `restartCore` / Windows daemon relaunch / launchd) |
+| **10+** | **stop-all**: every seat logs `WARNING: [rescue] 10x Esc: stopping ALL Deskflow instances and services on <seat>` and then stops every Deskflow instance and service it owns (Mouser untouched) |
+
+From the 5th tap on, the Escs stay off the wire (a rescue in progress is not
+typed into the remote app). A non-Esc key abandons the burst.
+
+What stop-all does per seat:
+
+- **macOS**: writes `~/Library/Application Support/Deskflow/quit-intent`
+  (the same sentinel `deskflow-ctl stop` writes, so converge/KeepAlive leave
+  everything down), then runs the launchd-safe `~/Library/Deskflow/bin/deskflow-ctl stop`
+  when present, else in-process: `launchctl bootout gui/$UID/` converge →
+  GUI → SIGTERM/SIGKILL any stray bundle `Deskflow`/`deskflow-core` (this
+  user, by executable path) → core (itself) last. The login-window bridge
+  (`loginwindow/org.deskflow.vhid-bridge`, root) keeps running -- it is out
+  of reach without root, and it is what still gives you a cursor there.
+- **Windows** (`tiny11`): the core sends the `Deskflow` service `stopAll`;
+  the daemon terminates every `deskflow-core.exe` and `deskflow.exe` under
+  the install root in **every session** (the SYSTEM login-screen core too),
+  then stops itself cleanly. It reports `SERVICE_STOPPED` with
+  `dwWin32ExitCode = NO_ERROR`, and the SCM recovery actions
+  `deskflow-ctl.ps1 start` configures (`sc failure … restart/1000/5000/30000`
+  + `failureflag 1`) fire only on a crash or a non-zero exit code -- so the
+  service stays stopped. If the core cannot reach the daemon it kills the
+  GUI under the install root and exits itself.
+- **Mouser** is a separate app and is never touched. (A future
+  `[coordination] rescueStopsMouser=false` may opt it in; not implemented.)
+- A seat that is already stopping ignores repeats; a peer that predates the
+  `stopall` mesh message ignores it (no mesh version bump).
+
+Bring it back:
+
+```bash
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl start'          # clears quit-intent, bootstraps core → GUI → converge
+ssh tiny11 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\alexh\Desktop\deskflow\scripts\deskflow-ctl.ps1 start'
+```
+
+Log lines to grep: `keyboard rescue: 5x Esc burst ended` /
+`10x Esc burst ended` on the seat that saw the taps,
+`coordination: fleet keyboard rescue received` / `fleet stop-all received`
+on the others, `[rescue]` for every stop-all step.
+
 ## 2. Redeploy one seat from the branch
 
 Prerequisites on the target seat (once):
