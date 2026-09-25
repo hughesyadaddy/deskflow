@@ -392,6 +392,15 @@ function Get-DeskflowScheduledTasks {
   foreach ($t in $tasks) {
     if ($t.TaskName -eq 'DeskflowCtlLaunch') { continue }
     foreach ($a in @($t.Actions)) {
+      # Actions come back as CimInstance of varying CIM class; only
+      # MSFT_TaskExecAction carries `Execute`. On a stock Windows box the
+      # majority of scheduled-task actions are MSFT_TaskComHandlerAction
+      # (COM handlers -- .NET NGEN, BitLocker, WindowsAI\Recall, etc, 163 of
+      # 314 actions on a fresh tiny11 install) and reading `.Execute` on one
+      # throws "The property 'Execute' cannot be found on this object."
+      # Reproduced live; not tiny11-specific -- this would throw on any
+      # Windows seat with COM-handler tasks (i.e. all of them).
+      if ($a.CimClass.CimClassName -ne 'MSFT_TaskExecAction') { continue }
       $exe = [string]$a.Execute
       if ($exe -match '(?i)deskflow') {
         $rows += [pscustomobject]@{ TaskName = $t.TaskName; TaskPath = $t.TaskPath; Execute = $exe; State = [string]$t.State }
