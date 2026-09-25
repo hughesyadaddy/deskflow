@@ -295,12 +295,15 @@ sh_path() { printf '%s' "${1/#\~/\$HOME}"; }
 sh_git_sync() { # path ref -> POSIX sh fragment
   local path ref="$2"; path="$(sh_path "$1")"
   if [[ -z "$ref" ]]; then
-    printf 'cd "%s" && git fetch origin && git checkout "%s" && git pull --ff-only origin "%s"' \
-      "$path" "$FLEET_BRANCH" "$FLEET_BRANCH"
+    # Fetch only the deployed branch: a wholesale `git fetch` fails on a
+    # case-insensitive filesystem when the remote holds refs differing only
+    # by case (2026-09-25: Mouser fork test-MxM4 vs test-mxm4).
+    printf 'cd "%s" && git fetch origin "%s" && git checkout "%s" && git pull --ff-only origin "%s"' \
+      "$path" "$FLEET_BRANCH" "$FLEET_BRANCH" "$FLEET_BRANCH"
   elif [[ "$ref" == "HEAD" ]]; then
     printf 'cd "%s"' "$path"
   else
-    printf 'cd "%s" && git fetch origin && git checkout --detach "%s"' "$path" "$ref"
+    printf 'cd "%s" && { git fetch origin "%s" || git fetch origin "%s"; } && git checkout --detach "%s"' "$path" "$ref" "$FLEET_BRANCH" "$ref"
   fi
 }
 sh_mouser_sync() { # path ref -> fragment (empty only for HEAD)
@@ -313,11 +316,11 @@ sh_mouser_sync() { # path ref -> fragment (empty only for HEAD)
   local add_remote
   add_remote="git -C \"${path}\" remote get-url fork >/dev/null 2>&1 || git -C \"${path}\" remote add fork \"${FLEET_MOUSER_FORK_URL:-https://github.com/hughesyadaddy/Mouser.git}\""
   if [[ -z "$ref" ]]; then
-    printf ' && if [ -d "%s/.git" ]; then %s && git -C "%s" fetch fork && git -C "%s" checkout "%s" && git -C "%s" pull --ff-only fork "%s"; fi' \
-      "$path" "$add_remote" "$path" "$path" "$branch" "$path" "$branch"
+    printf ' && if [ -d "%s/.git" ]; then %s && git -C "%s" fetch fork "%s" && git -C "%s" checkout "%s" && git -C "%s" pull --ff-only fork "%s"; fi' \
+      "$path" "$add_remote" "$path" "$branch" "$path" "$branch" "$path" "$branch"
   else
-    printf ' && if [ -d "%s/.git" ]; then %s && git -C "%s" fetch fork && git -C "%s" checkout --detach "%s"; fi' \
-      "$path" "$add_remote" "$path" "$path" "$ref"
+    printf ' && if [ -d "%s/.git" ]; then %s && { git -C "%s" fetch fork "%s" || git -C "%s" fetch fork "%s"; } && git -C "%s" checkout --detach "%s"; fi' \
+      "$path" "$add_remote" "$path" "$ref" "$path" "$branch" "$path" "$ref"
   fi
 }
 sh_exports() { # deskflow_path mouser_path dref mref
@@ -327,12 +330,12 @@ sh_exports() { # deskflow_path mouser_path dref mref
 ps_git_sync() { # path ref -> PowerShell fragment
   local path="$1" ref="$2"
   if [[ -z "$ref" ]]; then
-    printf "git fetch origin; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git checkout '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git pull --ff-only origin '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " \
-      "$FLEET_BRANCH" "$FLEET_BRANCH"
+    printf "git fetch origin '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git checkout '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git pull --ff-only origin '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " \
+      "$FLEET_BRANCH" "$FLEET_BRANCH" "$FLEET_BRANCH"
   elif [[ "$ref" == "HEAD" ]]; then
     printf ''
   else
-    printf "git fetch origin; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; git checkout --detach '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " "$ref"
+    printf "git fetch origin '%s'; if (\$LASTEXITCODE) { git fetch origin '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE } }; git checkout --detach '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " "$ref" "$FLEET_BRANCH" "$ref"
   fi
 }
 ps_mouser_sync() { # path ref -> PowerShell fragment (empty only for HEAD / mouser disabled)
@@ -340,8 +343,8 @@ ps_mouser_sync() { # path ref -> PowerShell fragment (empty only for HEAD / mous
   local url="${FLEET_MOUSER_FORK_URL:-https://github.com/hughesyadaddy/Mouser.git}" g
   [[ "$DEPLOY_MOUSER" == 1 && "$ref" != "HEAD" ]] || return 0
   g="git -C '${path}'"
-  printf "if (Test-Path '%s/.git') { %s remote get-url fork; if (\$LASTEXITCODE) { %s remote add fork '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE } }; %s fetch fork; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " \
-    "$path" "$g" "$g" "$url" "$g"
+  printf "if (Test-Path '%s/.git') { %s remote get-url fork; if (\$LASTEXITCODE) { %s remote add fork '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE } }; %s fetch fork '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; " \
+    "$path" "$g" "$g" "$url" "$g" "${ref:-$branch}"
   if [[ -z "$ref" ]]; then
     printf "%s checkout '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE }; %s pull --ff-only fork '%s'; if (\$LASTEXITCODE) { exit \$LASTEXITCODE } }; " "$g" "$branch" "$g" "$branch"
   else
@@ -411,7 +414,7 @@ deploy_host() { # index dref mref
   if [[ "$os" == "windows" ]]; then
     echo ">>> SSH deploy: $id ($target)"
     if [[ "$PULL_ONLY" == 1 ]]; then
-      cmd="cd /d \"${dpath}\" && git fetch origin && git checkout ${FLEET_BRANCH} && git pull --ff-only origin ${FLEET_BRANCH} && git log -1 --oneline"
+      cmd="cd /d \"${dpath}\" && git fetch origin ${FLEET_BRANCH} && git checkout ${FLEET_BRANCH} && git pull --ff-only origin ${FLEET_BRANCH} && git log -1 --oneline"
     else
       local ps
       ps="\$ErrorActionPreference='Stop'; "

@@ -187,11 +187,15 @@ git_pull_deskflow() {
     echo "== [$HOST_TAG] deskflow: building checked-out HEAD =="
   elif [[ -n "$ref" ]]; then
     echo "== [$HOST_TAG] deskflow checkout --detach $ref =="
-    git fetch origin
+    # Fetch only what we deploy: a wholesale fetch fails outright on a
+    # case-insensitive filesystem when the remote holds refs that differ
+    # only by case (seen 2026-09-25 on the Mouser fork), and a deploy has
+    # no business updating every remote ref anyway.
+    git fetch origin "$ref" || git fetch origin "$BRANCH"
     git checkout --detach "$ref"
   else
     echo "== [$HOST_TAG] deskflow pull ($BRANCH) =="
-    git fetch origin
+    git fetch origin "$BRANCH"
     git checkout "$BRANCH"
     git pull --ff-only origin "$BRANCH"
   fi
@@ -473,11 +477,11 @@ deploy_mouser() {
       echo "== [$HOST_TAG] Mouser: building checked-out HEAD =="
     elif [[ -n "$ref" ]]; then
       echo "== [$HOST_TAG] Mouser checkout --detach $ref =="
-      git fetch fork
+      git fetch fork "$ref" || git fetch fork "$MOUSER_BRANCH"
       git checkout --detach "$ref"
     else
       echo "== [$HOST_TAG] Mouser pull (fork/$MOUSER_BRANCH) =="
-      git fetch fork
+      git fetch fork "$MOUSER_BRANCH"
       git checkout "$MOUSER_BRANCH"
       git pull --ff-only fork "$MOUSER_BRANCH"
     fi
