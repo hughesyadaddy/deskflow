@@ -754,6 +754,35 @@ bool OSXKeyState::secureInputEnabled() const
   return IsSecureEventInputEnabled();
 }
 
+// K6 note: three DISTINCT secure-input/session-boundary code paths exist and
+// this function backs only one of them.
+//   - login window (PR3): the vhid-bridge's own caps-aware Shift logic, not
+//     this process at all.
+//   - lock/unlock/wake, local keyboard (K5): OSXScreenImpl's observers post
+//     EventTypes::OsxScreenResyncKeyState, handled in OSXScreen's
+//     constructor (OSXScreen.mm ~303-308) -- logSecureInputState() then
+//     m_keyState->releaseInjectedKeys(), ledger only.
+//   - mid-session secure-input transitions (K6, this fix): OSXScreen's
+//     secureInputPollTick(), armed by armSecureInputTimer() in enable() and
+//     cancelled in disable(), polls this function (via
+//     IsSecureEventInputEnabled(), not through this getter -- OSXScreen owns
+//     the poll, not OSXKeyState) at OSXScreen::kSecureInputPollSec while
+//     m_isOnScreen; see OSXScreen::SecureInputTransition /
+//     OSXScreen::secureInputWatchTick(). This is the boundary sweep's blind
+//     spot: sanitizeInjectedKeys() only ever runs from Screen::enable() and
+//     its delayed startup timer, both gated on !m_entered, so a
+//     SecurityAgent/admin-auth dialog popping up while already entered and
+//     typing got none of K5's protection and left no log line -- until now.
+//
+// What remains UNCONFIRMED: whether wrong-case capitalization actually
+// happens INSIDE a live SecurityAgent dialog. No repro exists (triggering
+// one needs a real admin password, out of scope for this fix). This change
+// closes the architectural gap -- the mid-session transition now gets the
+// same ledger-only release K5 uses at every other boundary, and it is now
+// observable in the log -- but does not itself prove or fix a live-dialog
+// wrong-case bug. If one is ever reported, start from the freeze/log
+// capture this now provides.
+
 void OSXKeyState::noteHardwareObservation(bool observing, double now)
 {
   if (observing && !m_hardwareObservable.load(std::memory_order_relaxed)) {

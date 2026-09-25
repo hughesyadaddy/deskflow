@@ -219,6 +219,15 @@ private:
   void postKeyboardKey(CGKeyCode virtualKey, bool keyDown);
 
   // OS truth for the modifier flags (hookable)
+  //
+  // K6 investigation finding: CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState)
+  // is a direct HID-state poll, not an event-tap read, and Apple does not
+  // document it as blinded by secure input (unlike the event tap, which
+  // secureInputEnabled() exists to work around). No evidence was found
+  // either way from a real SecurityAgent dialog. Do NOT add a secure-input
+  // branch here (or in modifierEventFlags() below) on that assumption alone
+  // -- if a future incident shows this call going stale/wrong under secure
+  // input, that would be new evidence, not something this comment predicts.
   CGEventFlags osModifierFlags() const;
 
   // Post the Up for every ledgered modifier the OS (\p os) still reports
@@ -253,6 +262,10 @@ private:
   // physical left Shift held while we release our injected left Shift is
   // cleared with it (it self-corrects on the user's next Shift edge); only
   // a right-hand modifier is protected through a release of ours.
+  //
+  // K6: this is the live per-keystroke path (every posted key composes its
+  // flags here) and it has NO secure-input awareness -- see the comment on
+  // osModifierFlags() above for why that is deliberate, not an oversight.
   CGEventFlags modifierEventFlags(uint8_t virtualKey, bool down) const;
   static CGEventFlags leftDeviceBitForVirtualKey(uint8_t virtualKey);
   static CGEventFlags rightDeviceBitForVirtualKey(uint8_t virtualKey);

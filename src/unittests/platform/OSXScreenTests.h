@@ -14,4 +14,10 @@ class OSXScreenTests : public QObject
 private Q_SLOTS:
   void clipboardChangeCountGate();
   void wheelLinesFromEvent_integerWinsBelowOneLine();
+  // K6: mid-session secure-input watcher decision logic
+  void secureInputWatchTick_noneWhenNotEntered();
+  void secureInputWatchTick_noneWithoutTransition();
+  void secureInputWatchTick_reportsFalseToTrueEdge();
+  void secureInputWatchTick_reportsTrueToFalseEdge();
+  void secureInputPollCadence_boundedToAtMostOneHertz();
 };

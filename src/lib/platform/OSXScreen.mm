@@ -919,6 +919,13 @@ void OSXScreen::enable()
     }
   });
 
+  // K6: mid-session secure-input watcher (see class docs). Boundary-only
+  // sweep already fires once at enable() (logSecureInputState() below) and
+  // via the delayed enable-sweep while not entered; this covers the case
+  // neither one does: a SecurityAgent/admin-auth dialog appearing while
+  // already entered and typing.
+  armSecureInputTimer();
+
   if (m_isPrimary) {
     // FIXME -- start watching jump zones
 
@@ -1020,6 +1027,8 @@ void OSXScreen::disable()
     m_axTimer = nullptr;
   }
 
+  cancelSecureInputTimer();
+
   m_isOnScreen = m_isPrimary;
 }
 
@@ -1110,6 +1119,54 @@ void OSXScreen::armClipboardTimer()
   m_clipboardTimer = m_events->newTimer(interval, nullptr);
   m_clipboardTimerInterval = interval;
   m_events->addHandler(EventTypes::Timer, m_clipboardTimer, [this](const auto &) { clipboardPollTick(); });
+}
+
+void OSXScreen::armSecureInputTimer()
+{
+  cancelSecureInputTimer();
+  m_secureInputTimer = m_events->newTimer(kSecureInputPollSec, nullptr);
+  if (m_secureInputTimer == nullptr) {
+    return; // event queues without timers (test doubles)
+  }
+  m_events->addHandler(EventTypes::Timer, m_secureInputTimer, [this](const auto &) { secureInputPollTick(); });
+}
+
+void OSXScreen::cancelSecureInputTimer()
+{
+  if (m_secureInputTimer == nullptr) {
+    return;
+  }
+  m_events->removeHandler(EventTypes::Timer, m_secureInputTimer);
+  m_events->deleteTimer(m_secureInputTimer);
+  m_secureInputTimer = nullptr;
+}
+
+void OSXScreen::secureInputPollTick()
+{
+  // K6: the boundary sweep (Screen::enable()'s sanitizeInjectedKeys() and its
+  // delayed timer) only ever runs while NOT entered; this tick only acts
+  // while entered, so the two can never fire on the same edge.
+  const bool isOn = IsSecureEventInputEnabled();
+  switch (secureInputWatchTick(m_isOnScreen, m_secureInputLogged, isOn)) {
+  case SecureInputTransition::TurnedOn:
+    // Log unconditionally so a mid-session transition always leaves
+    // evidence, matching the "[keys] secure-input=on/off" marker
+    // tools/fleet-health already greps for.
+    logSecureInputState();
+    break;
+  case SecureInputTransition::TurnedOff:
+    logSecureInputState();
+    // The password field just let go. Same ledger-only release K5 already
+    // runs at every boundary (enterPrimary, leaveSecondary, the post-switch
+    // verifier, the OsxScreenResyncKeyState handler above): a modifier held
+    // down when the dialog opened and released while it was still up (or
+    // the reverse) must never be judged by the freshness sweep -- the user
+    // may be mid-gesture at this very keyboard.
+    m_keyState->releaseInjectedKeys();
+    break;
+  case SecureInputTransition::None:
+    break;
+  }
 }
 
 void OSXScreen::clipboardPollTick()
