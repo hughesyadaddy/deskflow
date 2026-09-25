@@ -55,6 +55,7 @@ public:
 //
 
 ArchMultithreadPosix *ArchMultithreadPosix::s_instance = nullptr;
+ArchMultithreadPosix::NetworkDataCleanup ArchMultithreadPosix::s_networkDataCleanup = nullptr;
 
 ArchMultithreadPosix::ArchMultithreadPosix()
 {
@@ -111,6 +112,22 @@ void ArchMultithreadPosix::setNetworkDataForCurrentThread(void *data)
   std::scoped_lock lock{m_threadMutex};
   ArchThreadImpl *thread = find(pthread_self());
   thread->m_networkData = data;
+}
+
+bool ArchMultithreadPosix::attachNetworkDataForThread(ArchThread thread, void *data)
+{
+  assert(thread != nullptr);
+  std::scoped_lock lock{m_threadMutex};
+  if (thread->m_networkData != nullptr) {
+    return false;
+  }
+  thread->m_networkData = data;
+  return true;
+}
+
+void ArchMultithreadPosix::setNetworkDataCleanup(NetworkDataCleanup cleanup)
+{
+  s_networkDataCleanup = cleanup;
 }
 
 void *ArchMultithreadPosix::getNetworkDataForThread(ArchThread thread)
@@ -339,10 +356,20 @@ void ArchMultithreadPosix::closeThread(ArchThread thread)
     }
 
     // remove thread from list
+    void *networkData = nullptr;
     {
       std::scoped_lock lock{m_threadMutex};
       assert(findNoRef(thread->m_thread) == thread);
       erase(thread);
+      networkData = thread->m_networkData;
+      thread->m_networkData = nullptr;
+    }
+
+    // release the thread's poll-unblock pipe (ArchNetworkBSD): it used to
+    // leak two fds per thread that ever polled, e.g. every SocketMultiplexer
+    // of every auto-mode epoch.
+    if (networkData != nullptr && s_networkDataCleanup != nullptr) {
+      s_networkDataCleanup(networkData);
     }
 
     // done with thread

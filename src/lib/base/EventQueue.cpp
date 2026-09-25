@@ -16,7 +16,9 @@
 #include "mt/Lock.h"
 #include "mt/Mutex.h"
 
+#include <cstdio>
 #include <stdexcept>
+#include <string>
 
 // interrupt handler.  this just adds a quit event to the queue.
 static void interrupt(Arch::ThreadSignal, void *data)
@@ -406,12 +408,27 @@ void *EventQueue::getSystemTarget()
 
 void EventQueue::waitForReady() const
 {
-  double timeout = Arch::time() + 10;
-  Lock lock(m_readyMutex);
+  waitForReady(kReadyTimeoutS);
+}
 
-  while (!m_readyCondVar->wait()) {
-    if (Arch::time() > timeout) {
-      throw std::runtime_error("event queue is not ready within 5 sec");
+void EventQueue::waitForReady(double timeoutS) const
+{
+  // Ready means loop() has run (the buffer is initialised); the flag is
+  // never cleared, so once this queue has looped -- every auto-mode epoch
+  // after the first -- callers must return at once. The old version only
+  // returned on a *signal*, so a worker thread created while the queue was
+  // already ready (or in an epoch that failed before its loop) waited the
+  // full timeout and died by exception.
+  const double deadline = Arch::time() + timeoutS;
+  Lock lock(m_readyMutex);
+  while (!(*m_readyCondVar)) {
+    // wait() wakes every 100 ms (cancellation point) and reports whether a
+    // signal arrived; the flag, not the signal, is the condition.
+    m_readyCondVar->wait(0.1);
+    if (!(*m_readyCondVar) && Arch::time() > deadline) {
+      char bound[32];
+      std::snprintf(bound, sizeof(bound), "%g", timeoutS);
+      throw std::runtime_error(std::string("event queue is not ready within ") + bound + " sec");
     }
   }
 }

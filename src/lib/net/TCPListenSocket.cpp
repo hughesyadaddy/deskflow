@@ -97,21 +97,58 @@ void *TCPListenSocket::getEventTarget() const
 
 std::unique_ptr<IDataSocket> TCPListenSocket::accept()
 {
-  std::unique_ptr<IDataSocket> socket;
-  try {
-    socket = std::make_unique<TCPSocket>(m_events, m_socketMultiplexer, ARCH->acceptSocket(m_socket, nullptr));
-    setListeningJob();
-    return socket;
-  } catch (ArchNetworkException &) {
-    if (socket) {
-      setListeningJob();
-    }
+  ListenRearm rearm{*this};
+  ArchSocket raw = acceptRaw();
+  if (raw == nullptr) {
     return nullptr;
-  } catch (std::exception &ex) {
-    if (socket) {
+  }
+  try {
+    return std::make_unique<TCPSocket>(m_events, m_socketMultiplexer, raw);
+  } catch (std::exception &e) {
+    // The connection was accepted but could not be set up: typically a
+    // SocketCreateException because the peer already reset it (a wedge
+    // probe closes with SO_LINGER 0, so TCP_NODELAY fails with ECONNRESET).
+    // This used to be rethrown -- sliced to a bare std::exception -- out of
+    // the server's event loop, which ended the epoch and leaked its listener.
+    LOG_WARN("rejected incoming connection: %s", e.what());
+    return nullptr;
+  }
+}
+
+ArchSocket TCPListenSocket::acceptRaw()
+{
+  ArchSocket listening = nullptr;
+  {
+    std::scoped_lock lock{m_mutex};
+    listening = m_socket;
+  }
+  if (listening == nullptr) {
+    return nullptr; // closed underneath a queued ListenSocketConnecting
+  }
+  try {
+    // nullptr when nothing is waiting (EAGAIN); never hand that to a socket.
+    return ARCH->acceptSocket(listening, nullptr);
+  } catch (ArchNetworkException &e) {
+    // ECONNABORTED and friends: the peer went away between the poll and
+    // the accept. Nothing to adopt; the listener is re-armed by the caller.
+    LOG_DEBUG("accept failed: %s", e.what());
+    return nullptr;
+  }
+}
+
+void TCPListenSocket::rearmListening()
+{
+  // serviceListening() dropped the multiplexer job when the connection
+  // arrived ("stop polling until the client accepts"); without this the
+  // listener is never polled again and the server is alive but accepts
+  // nothing -- for every outcome of accept(), not only the happy path.
+  try {
+    std::scoped_lock lock{m_mutex};
+    if (m_socket != nullptr) {
       setListeningJob();
     }
-    throw ex;
+  } catch (std::exception &e) {
+    LOG_WARN("cannot resume listening for clients: %s", e.what());
   }
 }
 

@@ -37,3 +37,12 @@ create_test(
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/base"
 )
 
+
+# K8: waitForReady() honours the ready flag (no thread deaths across epochs).
+create_test(
+  NAME EventQueueReadyTests
+  DEPENDS base
+  LIBS arch mt
+  SOURCE EventQueueReadyTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/base"
+)

@@ -67,7 +67,26 @@ void ArchNetworkBSD::Deps::testCancelThread()
 
 void ArchNetworkBSD::init()
 {
-  // do nothing
+  installThreadCleanup();
+}
+
+void ArchNetworkBSD::installThreadCleanup()
+{
+  // Arch::init() exists only on Windows; on Unix nobody calls init(), so the
+  // constructor installs this. The multithread base is constructed first
+  // (Arch's base order) and the hook is static anyway.
+  ArchMultithreadPosix::setNetworkDataCleanup(&ArchNetworkBSD::releaseUnblockPipe);
+}
+
+void ArchNetworkBSD::releaseUnblockPipe(void *data)
+{
+  auto *unblockPipe = static_cast<int *>(data);
+  if (unblockPipe == nullptr) {
+    return;
+  }
+  close(unblockPipe[0]);
+  close(unblockPipe[1]);
+  delete[] unblockPipe;
 }
 
 ArchSocket ArchNetworkBSD::newSocket(AddressFamily family, SocketType type)
@@ -714,9 +733,17 @@ const int *ArchNetworkBSD::getUnblockPipeForThread(ArchThread thread)
     if (pipe(unblockPipe) != -1) {
       try {
         setBlockingOnSocket(unblockPipe[0], false);
-        mt->setNetworkDataForCurrentThread(unblockPipe);
+        // The pipe belongs to the thread being unblocked, not to whoever
+        // asked (addSocket/removeSocket run on the event thread on the
+        // multiplexer thread's behalf). It is closed with that thread's
+        // record (releaseUnblockPipe). Lost the race with the thread
+        // creating its own? Keep theirs, drop ours.
+        if (!mt->attachNetworkDataForThread(thread, unblockPipe)) {
+          releaseUnblockPipe(unblockPipe);
+          unblockPipe = static_cast<int *>(mt->getNetworkDataForThread(thread));
+        }
       } catch (...) {
-        delete[] unblockPipe;
+        releaseUnblockPipe(unblockPipe);
         unblockPipe = nullptr;
       }
     } else {

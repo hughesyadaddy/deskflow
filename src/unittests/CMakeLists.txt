@@ -109,6 +109,16 @@ create_test(
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/net"
 )
 
+# K8: accept() never throws for a bad peer and re-arms; listener/multiplexer
+# teardown is fd-neutral (real loopback sockets, no HID, no windows).
+create_test(
+  NAME TCPListenSocketTests
+  DEPENDS net
+  LIBS base arch mt io ${socket_extra_libs}
+  SOURCE lib/net/TCPListenSocketTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/net"
+)
+
 # App-level tests for deskflow-core. AutoModeRunner's flip gate is
 # header-only, so the test needs only the header path and coordination.
 create_test(

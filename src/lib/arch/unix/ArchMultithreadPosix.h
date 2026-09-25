@@ -44,6 +44,22 @@ public:
 
   void setNetworkDataForCurrentThread(void *);
 
+  //! Attach \p data to \p thread unless it already carries network data.
+  /*!
+  Returns true when \p data was attached; false when the thread already
+  had data (the caller keeps ownership of \p data and should release it).
+  Unlike setNetworkDataForCurrentThread() this targets the thread the data
+  is FOR, not the caller: the poll-unblock pipe created on another
+  thread's behalf used to land on the caller's own record, overwriting
+  (and leaking) whatever pipe the caller already had.
+  */
+  bool attachNetworkDataForThread(ArchThread thread, void *data);
+
+  //! Release hook for a thread's network data, run when the thread record
+  //! is destroyed (last reference closed). Installed by the network layer.
+  using NetworkDataCleanup = void (*)(void *);
+  static void setNetworkDataCleanup(NetworkDataCleanup cleanup);
+
   //@}
   //! @name accessors
   //@{
@@ -99,6 +115,7 @@ private:
   using ThreadList = std::list<ArchThread>;
 
   static ArchMultithreadPosix *s_instance;
+  static NetworkDataCleanup s_networkDataCleanup;
 
   bool m_newThreadCalled = false;
 

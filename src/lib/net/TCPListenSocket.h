@@ -44,6 +44,24 @@ public:
 protected:
   void setListeningJob();
 
+  //! Accept the waiting connection; nullptr (never a throw) when there is
+  //! none or the accept itself failed.
+  ArchSocket acceptRaw();
+
+  //! Put the listen socket back under the multiplexer after an accept
+  //! attempt (any outcome). No-op once closed; never throws.
+  void rearmListening();
+
+  //! Scope guard: re-arm listening on every exit path of accept().
+  struct ListenRearm
+  {
+    TCPListenSocket &listen;
+    ~ListenRearm()
+    {
+      listen.rearmListening();
+    }
+  };
+
   ArchSocket socket() const
   {
     return m_socket;

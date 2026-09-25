@@ -49,6 +49,14 @@ public:
   void *getSystemTarget() override;
   void waitForReady() const override;
 
+  //! Default bound for waitForReady(): a queue that has not started its
+  //! loop after this long is a wiring bug, not a slow start.
+  static constexpr double kReadyTimeoutS = 30.0;
+
+  //! waitForReady() with an explicit bound (seconds); throws
+  //! std::runtime_error when the queue has not looped by then.
+  void waitForReady(double timeoutS) const;
+
 private:
   const EventHandler *getHandler(EventTypes type, void *target) const;
   uint32_t saveEvent(Event &&event);

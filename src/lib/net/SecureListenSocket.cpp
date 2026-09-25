@@ -10,6 +10,7 @@
 #include "SecureSocket.h"
 #include "arch/Arch.h"
 #include "arch/ArchException.h"
+#include "base/Log.h"
 #include "common/Settings.h"
 #include "net/SocketMultiplexer.h"
 
@@ -30,14 +31,14 @@ SecureListenSocket::SecureListenSocket(
 
 std::unique_ptr<IDataSocket> SecureListenSocket::accept()
 {
-  std::unique_ptr<SecureSocket> secureSocket;
+  ListenRearm rearm{*this};
+  ArchSocket raw = acceptRaw();
+  if (raw == nullptr) {
+    return nullptr;
+  }
   try {
-    secureSocket = std::make_unique<SecureSocket>(
-        events(), socketMultiplexer(), ARCH->acceptSocket(socket(), nullptr), m_securityLevel
-    );
+    auto secureSocket = std::make_unique<SecureSocket>(events(), socketMultiplexer(), raw, m_securityLevel);
     secureSocket->initSsl(true);
-
-    setListeningJob();
 
     // default location of the TLS cert file in users dir
     if (!secureSocket->loadCertificate(Settings::value(Settings::Security::Certificate).toString())) {
@@ -47,15 +48,10 @@ std::unique_ptr<IDataSocket> SecureListenSocket::accept()
     secureSocket->secureAccept();
 
     return secureSocket;
-  } catch (ArchNetworkException &) {
-    if (secureSocket) {
-      setListeningJob();
-    }
+  } catch (std::exception &e) {
+    // One bad connection must never escape the server's event loop (see
+    // TCPListenSocket::accept); the listener is re-armed by the guard.
+    LOG_WARN("rejected incoming tls connection: %s", e.what());
     return nullptr;
-  } catch (std::exception &ex) {
-    if (secureSocket) {
-      setListeningJob();
-    }
-    throw ex;
   }
 }

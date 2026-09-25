@@ -60,6 +60,7 @@ public:
 
   explicit ArchNetworkBSD(std::shared_ptr<Deps> deps = std::make_shared<Deps>()) : m_pDeps(deps)
   {
+    installThreadCleanup();
   }
   ArchNetworkBSD(ArchNetworkBSD const &) = delete;
   ArchNetworkBSD(ArchNetworkBSD &&) = delete;
@@ -103,6 +104,10 @@ public:
 private:
   const int *getUnblockPipe();
   const int *getUnblockPipeForThread(ArchThread);
+  //! Close and free a thread's poll-unblock pipe (thread record cleanup).
+  static void releaseUnblockPipe(void *data);
+  //! Register releaseUnblockPipe with the multithread layer.
+  static void installThreadCleanup();
   void setBlockingOnSocket(int fd, bool blocking) const;
   [[noreturn]] void throwError(int) const override;
   [[noreturn]] void throwNameError(int) const override;

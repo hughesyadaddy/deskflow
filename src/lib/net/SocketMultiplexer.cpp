@@ -52,8 +52,13 @@ SocketMultiplexer::~SocketMultiplexer()
   // when it is owned by an event still queued across an auto-mode role switch;
   // without this, that socket's later close() would call removeSocket() on
   // freed memory -- the EXC_BAD_ACCESS in Mutex::lock() on role churn.
+  // A socket that already called removeSocket() is still in the map (the
+  // job slot is nulled; the service thread erases the entry on its next
+  // pass) and may be destroyed by now: a listener torn down right before
+  // its multiplexer (ServerApp::cleanupServer() then ~App) is exactly that.
+  // Touching it was a use-after-free that crashed epoch teardown at random.
   for (const auto &[socket, jobCursor] : m_socketJobMap) {
-    if (socket != nullptr) {
+    if (socket != nullptr && *jobCursor != nullptr) {
       socket->onMultiplexerShutdown();
     }
   }
