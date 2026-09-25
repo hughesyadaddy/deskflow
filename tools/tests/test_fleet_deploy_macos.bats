@@ -12,10 +12,22 @@ BRIDGE_PLIST='<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>Label</key><string>org.deskflow.vhid-bridge</string></dict></plist>'
 
 stub_bridge_renderer() {
-  # Stand-in for scripts/install-login-bridge-macos.sh --dry-run: logs its
-  # argv + env and prints $1 (a plist) on stdout.
-  printf '#!/usr/bin/env bash\necho "install-login-bridge-macos.sh $* APP=${DESKFLOW_INSTALL_APP:-unset}" >> "$SHIM_LOG"\n[[ "$*" == *--dry-run* ]] || { echo "must be dry-run" >&2; exit 99; }\ncat <<'"'"'PL'"'"'\n%s\nPL\n' "$1" >"$FAKE_ROOT/scripts/install-login-bridge-macos.sh"
+  # Stand-in for scripts/install-login-bridge-macos.sh: logs its argv + env;
+  # --dry-run prints $1 (a plist) on stdout, a plain call (only ever reached
+  # through the sudo shim) installs it at $DESKFLOW_LOGIN_BRIDGE_PLIST.
+  printf '#!/usr/bin/env bash\necho "install-login-bridge-macos.sh $* APP=${DESKFLOW_INSTALL_APP:-unset}" >> "$SHIM_LOG"\nleak_check install-login-bridge-macos.sh\nif [[ "$*" != *--dry-run* ]]; then printf '"'"'%%s\\n'"'"' "$(cat <<'"'"'PL'"'"'\n%s\nPL\n)" >"$DESKFLOW_LOGIN_BRIDGE_PLIST"; echo "== Installed $DESKFLOW_LOGIN_BRIDGE_PLIST =="; exit 0; fi\ncat <<'"'"'PL'"'"'\n%s\nPL\n' "$1" "$1" >"$FAKE_ROOT/scripts/install-login-bridge-macos.sh"
 }
+
+# Every child (cmake, python3, the installers, deskflow-ctl, sudo, the bridge
+# renderer) proves it inherited no password: a LEAK line in the shim log
+# fails the test that asserts log_lacks LEAK.
+leak_check() {
+  [[ -n "${DESKFLOW_KEYCHAIN_PASSWORD:-}" ]] && echo "LEAK: $1 saw DESKFLOW_KEYCHAIN_PASSWORD" >> "$SHIM_LOG"
+  [[ -n "${DESKFLOW_SUDO_PASSWORD:-}" ]] && echo "LEAK: $1 saw DESKFLOW_SUDO_PASSWORD" >> "$SHIM_LOG"
+  local v; for v in ${!FLEET_SEAT_PASSWORD_@}; do echo "LEAK: $1 saw $v" >> "$SHIM_LOG"; done
+  return 0
+}
+export -f leak_check
 
 
 setup() {
@@ -34,6 +46,7 @@ setup() {
   cat >"$FAKE_ROOT/scripts/install-macos.sh" <<'STUB'
 #!/usr/bin/env bash
 echo "install-macos.sh $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"
+leak_check install-macos.sh
 if [[ -n "${SHIM_INSTALL_ASSERT_PROBLEMS:-}" ]]; then
   echo "deskflow-ctl assert-single: FAIL"
   printf '  %s\n' "$SHIM_INSTALL_ASSERT_PROBLEMS"
@@ -43,21 +56,51 @@ STUB
   # ... and deskflow-ctl: retire (exit 2 tolerated) then the ONE fatal
   # assert-single at the very end of the deploy. SHIM_CTL_ASSERT_RC=1 fakes a
   # seat with human steps left; the stub prints them like the real ctl.
+  # --sudo-stdin (the deploy's unattended path) reads ONE stdin line, records
+  # it in $SHIM_STATE/ctl-stdin.<verb> and, for retire, clears the simulated
+  # root-owned leftovers ($SHIM_CTL_RETIRE_RC=2 models them being present; a
+  # successful sudo retire drops $SHIM_STATE/root-files so assert-single no
+  # longer reports them). SHIM_CTL_ASSERT_PROBLEMS overrides the default two
+  # problem lines; SHIM_CTL_SUDO_RC fakes a failing --sudo-stdin.
   cat >"$FAKE_ROOT/scripts/deskflow-ctl" <<'STUB'
 #!/usr/bin/env bash
 echo "deskflow-ctl $* APP=${DESKFLOW_INSTALL_APP:-unset}" >> "$SHIM_LOG"
+leak_check deskflow-ctl
+sudo_stdin=0
+for a in "$@"; do [[ "$a" == --sudo-stdin ]] && sudo_stdin=1; done
+if (( sudo_stdin )); then
+  IFS= read -rs pw || pw=""
+  printf '%s\n' "$pw" >> "$SHIM_STATE/ctl-stdin.$1"
+  [[ "${SHIM_CTL_SUDO_RC:-0}" == 0 ]] || { echo "deskflow-ctl: $1: a root step failed under sudo -S" >&2; exit "${SHIM_CTL_SUDO_RC}"; }
+fi
+[[ "${SHIM_CTL_RETIRE_RC:-0}" == 2 && ! -e "$SHIM_STATE/root-files-cleared" ]] && root_files=1 || root_files=0
 case "$1" in
+  prio)
+    if (( sudo_stdin )); then echo "== deskflow-ctl: prio: system/io.github.hughesyadaddy.deskflow-prio bootstrapped (sudo -S, password on stdin) =="; else echo "== deskflow-ctl: prio: system/io.github.hughesyadaddy.deskflow-prio needs root; run once as admin: =="; fi
+    exit 0 ;;
   retire)
-    if [[ "${SHIM_CTL_RETIRE_RC:-0}" == 2 ]]; then
+    if (( root_files )) && (( sudo_stdin )); then
+      touch "$SHIM_STATE/root-files-cleared"
+      echo "== deskflow-ctl: retire: removed /usr/local/bin/deskflow-prio-apply.sh (sudo -S, password on stdin) =="
+      echo "== deskflow-ctl: retire: nothing left to retire =="
+      exit 0
+    fi
+    if (( root_files )); then
       echo "== deskflow-ctl: retire: root-owned retired files remain; run once as admin: =="
       echo '  sudo rm -f "/usr/local/bin/deskflow-prio-apply.sh"'
+      exit 2
     fi
-    exit "${SHIM_CTL_RETIRE_RC:-0}" ;;
+    echo "== deskflow-ctl: retire: nothing left to retire =="
+    exit 0 ;;
   assert-single)
     if [[ "${SHIM_CTL_ASSERT_RC:-0}" != 0 ]]; then
       echo "deskflow-ctl assert-single: FAIL" >&2
-      echo "  login-items audit FAIL: enabled BTM app record launches \"Deskflow\" beside the LaunchAgent: 2.io.github.hughesyadaddy.deskflow" >&2
-      echo "  retired file present: /usr/local/bin/deskflow-prio-apply.sh (deskflow-ctl retire)" >&2
+      if [[ -n "${SHIM_CTL_ASSERT_PROBLEMS:-}" ]]; then
+        printf '  %s\n' "$SHIM_CTL_ASSERT_PROBLEMS" >&2
+      else
+        echo "  login-items audit FAIL: enabled BTM app record launches \"Deskflow\" beside the LaunchAgent: 2.io.github.hughesyadaddy.deskflow" >&2
+        (( root_files )) && echo "  retired file present: /usr/local/bin/deskflow-prio-apply.sh (deskflow-ctl retire)" >&2
+      fi
     fi
     exit "${SHIM_CTL_ASSERT_RC:-0}" ;;
   login-items)
@@ -68,6 +111,10 @@ STUB
   chmod +x "$FAKE_ROOT/scripts/deskflow-ctl"
   # ... and the login-bridge renderer (--dry-run); the installed plist is a tmp path.
   export DESKFLOW_LOGIN_BRIDGE_PLIST="$TMP/org.deskflow.vhid-bridge.plist"
+  # ... the bridge log the deploy may chmod/scrub through sudo (sandbox path;
+  # the script refuses the real /var/log path under bats)
+  export DESKFLOW_LOGIN_BRIDGE_LOG="$TMP/log/deskflow-vhid-bridge.log"
+  mkdir -p "$TMP/log"
   stub_bridge_renderer "$BRIDGE_PLIST"
   printf '%s\n' "$BRIDGE_PLIST" >"$DESKFLOW_LOGIN_BRIDGE_PLIST"
   : >"$MOUSER/scripts/build_macos_gui_session.py"
@@ -81,6 +128,12 @@ STUB
 
   make_shim cmake <<'EOF'
 echo "cmake $*" >> "$SHIM_LOG"
+leak_check cmake
+if [[ "${1:-}" == "-S" && -n "${SHIM_CMAKE_FAIL_ONCE:-}" && ! -e "$SHIM_STATE/cmake-failed-once" ]]; then
+  touch "$SHIM_STATE/cmake-failed-once"
+  echo "CMake Error: generator does not match the generator used previously" >&2
+  exit 1
+fi
 if [[ "${1:-}" == "-S" ]]; then
   id=""; strict=""
   for a in "$@"; do
@@ -114,9 +167,19 @@ EOF
   # only permitted verbs are the keychain preparation ones, and only when a
   # password is configured (SHIM_SECURITY_RC fakes a wrong password).
   make_shim security <<'EOF'
-echo "security $1 $2 <redacted> $4 $5 $6 $7 $8" >> "$SHIM_LOG"
+# argv logged with every -p / -k value redacted: `security` is the ONE child
+# that legitimately takes the keychain password on argv (documented); the
+# argv_lacks_secret assertions below must therefore never see it here.
+logged=(); redact=0
+for a in "$@"; do
+  if (( redact )); then logged+=("<redacted>"); redact=0; else logged+=("$a"); fi
+  case "$a" in -p|-k) redact=1 ;; esac
+done
+echo "security ${logged[*]}" >> "$SHIM_LOG"
+leak_check security
 case "${1:-}" in
-  unlock-keychain|set-key-partition-list) exit "${SHIM_SECURITY_RC:-0}" ;;
+  unlock-keychain) printf '%s\n' "$3" >> "$SHIM_STATE/keychain-pw"; exit "${SHIM_SECURITY_RC:-0}" ;;
+  set-key-partition-list) exit "${SHIM_SECURITY_RC:-0}" ;;
 esac
 echo "security $1 must never be called by fleet-deploy-macos.sh" >&2
 exit 1
@@ -135,6 +198,7 @@ EOF
   # SHIM_PYTHON_WRITE_CONFIG, rewrites config.json the way a bad installer would.
   make_shim python3 <<'EOF'
 echo "python3 $* MOUSER_RESTART=${MOUSER_RESTART:-unset}" >> "$SHIM_LOG"
+leak_check python3
 if [[ "${1:-}" == *fleet-gui-exec.py ]]; then
   shift
   while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done
@@ -158,7 +222,38 @@ echo "sleep $*" >> "$SHIM_LOG"
 exit 0
 EOF
 
-  export PATH="$SHIMS:$BATS_TEST_DIRNAME/fakebin:$PATH"  # fakebin: sudo must never be real
+  # sudo: the deploy's only escalation is `sudo -S -p '' -k cmd...` with the
+  # password on stdin. The shim logs the argv (which must never hold the
+  # password), records each stdin line in $SHIM_STATE/sudo-stdin.log,
+  # rejects anything but SHIM_SUDO_EXPECT_PW when that is set (a wrong
+  # password), and otherwise execs the command as this user -- every path it
+  # touches is a sandbox path. It shadows tools/tests/fakebin/sudo (exit 97).
+  make_shim sudo <<'EOF'
+opts=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -S|-k) opts+=("$1"); shift ;;
+    -p) opts+=("$1" "$2"); shift 2 ;;
+    *) break ;;
+  esac
+done
+echo "sudo ${opts[*]} $*" >> "$SHIM_LOG"
+leak_check sudo
+pw=""
+if [[ " ${opts[*]} " == *" -S "* ]]; then
+  IFS= read -r pw || pw=""
+  printf '%s\n' "$pw" >> "$SHIM_STATE/sudo-stdin.log"
+else
+  echo "LEAK: sudo called without -S (interactive prompt possible)" >> "$SHIM_LOG"
+fi
+if [[ -n "${SHIM_SUDO_EXPECT_PW:-}" && "$pw" != "$SHIM_SUDO_EXPECT_PW" ]]; then
+  echo "Sorry, try again." >&2
+  exit 1
+fi
+exec "$@"
+EOF
+
+  export PATH="$SHIMS:$BATS_TEST_DIRNAME/fakebin:$PATH"  # fakebin: any other sudo must never be real
   export FLEET_DESKFLOW_ROOT="$FAKE_ROOT"
   export FLEET_MOUSER_ROOT="$MOUSER"
   unset FLEET_BRANCH FLEET_DEPLOY_MOUSER FLEET_DEPLOY_DESKFLOW FLEET_RECONFIGURE FLEET_SKIP_GIT_PULL
@@ -166,6 +261,9 @@ EOF
   unset SHIM_CMAKE_RC SHIM_CODESIGN_VERIFY_RC SHIM_GIT_PULL_RC SHIM_PYTHON_RC SHIM_SECURITY_RC
   unset SHIM_CTL_RETIRE_RC SHIM_CTL_ASSERT_RC SHIM_INSTALL_ASSERT_PROBLEMS
   unset SHIM_MOUSER_LOG_APPEND SHIM_PYTHON_WRITE_CONFIG SHIM_SLEEP_CONFIG SHIM_SLEEP_DEVICE FLEET_NATIVE_TAP_TIMEOUT_S
+  unset SHIM_SUDO_EXPECT_PW SHIM_CMAKE_FAIL_ONCE SHIM_CTL_ASSERT_PROBLEMS SHIM_CTL_SUDO_RC
+  unset DESKFLOW_KEYCHAIN_PASSWORD DESKFLOW_SUDO_PASSWORD
+  unset ${!FLEET_SEAT_PASSWORD_@}
 }
 
 # Mouser config fixtures (core/config.py shape, version 12).
@@ -225,6 +323,23 @@ script_lacks() {
   fi
 }
 
+# $output assertions that FAIL the test: under bash 3.2 a false `[[ ... ]]`
+# in the middle of a @test body is silently ignored by bats, a function
+# returning 1 is not.
+out_has() {
+  if [[ "$output" != *"$1"* ]]; then
+    echo "expected in output: $1" >&2
+    return 1
+  fi
+}
+out_lacks() {
+  if [[ "$output" == *"$1"* ]]; then
+    echo "unexpected in output: $1" >&2
+    return 1
+  fi
+}
+count_in_output() { grep -cF -- "$1" <<<"$output" || true; }
+
 # --- identity -----------------------------------------------------------------
 
 @test "unset DESKFLOW_CODESIGN_ID (no .env) exits 1 before configuring" {
@@ -262,11 +377,15 @@ script_lacks() {
   script_lacks 'find-identity.*awk'
 }
 
-@test "the keychain password is read from the seat .env only, never from fleet.env" {
+@test "the passwords are resolved in load_dotenv, consumed once, and never expanded by any build/install step" {
   script_lacks 'FLEET_KEYCHAIN_PASSWORD'
-  # exactly one consumer: prepare_keychain_for_ssh reads it, then unsets it
-  [ "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'DESKFLOW_KEYCHAIN_PASSWORD')" -le 4 ]
-  grep -q 'unset DESKFLOW_KEYCHAIN_PASSWORD' "$SCRIPT"
+  grep -q 'unset DESKFLOW_KEYCHAIN_PASSWORD DESKFLOW_SUDO_PASSWORD' "$SCRIPT"
+  # No expansion of either variable anywhere after the credential block:
+  # from git_pull_deskflow() to the end of the script only ROOT_PW (a plain
+  # shell variable) is ever used.
+  [ "$(sed -n '/^git_pull_deskflow()/,$p' "$SCRIPT" | grep -v '^[[:space:]]*#' | grep -cE '\$\{?DESKFLOW_(KEYCHAIN|SUDO)_PASSWORD')" -eq 0 ]
+  # and ROOT_PW is never exported
+  [ "$(grep -cE 'export[^#]*ROOT_PW' "$SCRIPT")" -eq 0 ]
 }
 
 @test "every remaining '|| true' is tagged fleet:allow" {
@@ -409,10 +528,16 @@ script_lacks() {
   verify_line="$(grep -n '^codesign --verify' "$SHIM_LOG" | cut -d: -f1)"
   render_line="$(grep -n '^install-login-bridge-macos.sh' "$SHIM_LOG" | cut -d: -f1)"
   [ "$verify_line" -lt "$render_line" ]
-  # this script never escalates (sudo only ever appears inside the printed hint)
-  script_lacks '^[[:space:]]*sudo[[:space:]]'
-  script_lacks '(\||&&|;)[[:space:]]*sudo[[:space:]]'
+  # the ONLY escalation in this script is sudo_stdin's `sudo -S -p '' -k`
+  # (password on stdin, cached credentials ignored); never a plain sudo that
+  # could prompt.
+  # (lines that merely PRINT a sudo command for a human -- echo/printf/the
+  # ROOT_STEPS list -- are not invocations)
+  [ "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -E "(^|[|&;{(])[[:space:]]*sudo[[:space:]]" | grep -vE '^[[:space:]]*(echo|printf|ROOT_STEPS\+=)' | grep -c .)" -eq 1 ]
+  [ "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cF -- "| sudo -S -p '' -k \"\$@\"")" -eq 1 ]
   [ "$(cat "$DESKFLOW_LOGIN_BRIDGE_PLIST")" = "$BRIDGE_PLIST" ]
+  # and without a password nothing was escalated
+  log_lacks "sudo"
 }
 
 @test "a stale or missing bridge plist prints the root step (no sudo here) and the deploy still succeeds" {
@@ -756,7 +881,7 @@ gui_runner_present() {
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
   log_has "security unlock-keychain -p <redacted>"
-  log_has "security set-key-partition-list -S <redacted>"
+  log_has "security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <redacted>"
   grep -q '^codesign --force --sign ABCDEF0123456789 .*deskflow-sign-probe\.' "$SHIM_LOG"
   log_lacks "fleet-gui-exec.py"
   log_has "python3 scripts/build_and_install.py"
@@ -825,4 +950,291 @@ EOF
   log_lacks "security"
   log_has "fleet-gui-exec.py"
   log_has "build_macos_gui_session.py"
+}
+
+# --- unattended root steps: DESKFLOW_SUDO_PASSWORD / FLEET_SEAT_PASSWORD_<id> ---
+# The sudo shim in setup() executes each root step as this user against
+# sandbox paths, logs the argv (which must never carry the password) and
+# records every stdin line it was fed in $SHIM_STATE/sudo-stdin.log.
+
+write_env_lines() { # lines... -> .env, mode 600
+  printf '%s\n' "$@" >"$FAKE_ROOT/.env"
+  chmod 600 "$FAKE_ROOT/.env"
+}
+
+write_bridge_log() { # mode -> a bridge log with one keystroke line among three others
+  printf '%s\n' '2026-09-25T10:00:00 [bridge] starting' '2026-09-25T10:00:01 [keys] key down id=65' \
+    '2026-09-25T10:00:01 [keys] key up id=65' '2026-09-25T10:00:02 [bridge] ready' >"$DESKFLOW_LOGIN_BRIDGE_LOG"
+  chmod "$1" "$DESKFLOW_LOGIN_BRIDGE_LOG"
+}
+
+sudo_stdin_all() { # pw -> 0 when sudo received at least one stdin line and every one equals pw
+  if [ ! -s "$SHIM_STATE/sudo-stdin.log" ]; then
+    echo "sudo never received a stdin line" >&2
+    return 1
+  fi
+  if grep -vxF -- "$1" "$SHIM_STATE/sudo-stdin.log" | grep -q .; then
+    echo "sudo received a stdin line other than the expected password" >&2
+    return 1
+  fi
+}
+
+argv_lacks_secret() { # pw -> 0 when no shim-log line (the argv of every child) contains pw
+  if grep -qF -- "$1" "$SHIM_LOG"; then
+    echo "a password appeared on a child's argv (shim log)" >&2
+    return 1
+  fi
+}
+
+seat_id() { hostname -s | tr '[:upper:]' '[:lower:]'; }
+
+reset_shim_state() { rm -rf "$SHIM_STATE"; mkdir -p "$SHIM_STATE"; : >"$SHIM_LOG"; }
+
+@test "with DESKFLOW_SUDO_PASSWORD every root step runs here through sudo -S (password on stdin, never argv) and the run exits 0" {
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_KEYCHAIN_PASSWORD=s3cret-pw" "DESKFLOW_SUDO_PASSWORD=r00t-pw"
+  echo "<plist>old</plist>" >"$DESKFLOW_LOGIN_BRIDGE_PLIST"   # stale LoginWindow bridge plist
+  write_bridge_log 644                                          # world-readable log holding a keystroke line
+  export SHIM_CTL_RETIRE_RC=2 SHIM_SUDO_EXPECT_PW=r00t-pw       # root-owned retired files present; sudo accepts only r00t-pw
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_has "root steps: sudo password verified"
+  out_has "=== done:"
+  # the probe first, then each root step: always -S (stdin) and -k, never a plain sudo
+  log_has "sudo -S -p  -k true"
+  log_has "sudo -S -p  -k env DESKFLOW_INSTALL_APP=/Applications/Deskflow.app"
+  log_has "bash $FAKE_ROOT/scripts/install-login-bridge-macos.sh"
+  log_has "sudo -S -p  -k chmod 600 $DESKFLOW_LOGIN_BRIDGE_LOG"
+  log_has "sudo -S -p  -k sed -i  /key down id=/d $DESKFLOW_LOGIN_BRIDGE_LOG"
+  [ "$(grep -c '^sudo ' "$SHIM_LOG")" -eq "$(grep -c '^sudo -S -p  -k ' "$SHIM_LOG")" ]
+  sudo_stdin_all "r00t-pw"
+  argv_lacks_secret "r00t-pw"
+  argv_lacks_secret "s3cret-pw"
+  log_lacks "LEAK"
+  # the ctl's root parts ran through --sudo-stdin, fed the same password on stdin
+  log_has "deskflow-ctl prio --sudo-stdin"
+  log_has "deskflow-ctl retire --sudo-stdin"
+  [ "$(cat "$SHIM_STATE/ctl-stdin.prio")" = "r00t-pw" ]
+  [ "$(cat "$SHIM_STATE/ctl-stdin.retire")" = "r00t-pw" ]
+  # on disk: the plist is installed, the log is 600 with the keystroke line gone and the rest kept
+  [ "$(cat "$DESKFLOW_LOGIN_BRIDGE_PLIST")" = "$BRIDGE_PLIST" ]
+  [ "$(stat -f %Lp "$DESKFLOW_LOGIN_BRIDGE_LOG")" = 600 ]
+  [ "$(grep -c 'key down id=' "$DESKFLOW_LOGIN_BRIDGE_LOG")" -eq 0 ]
+  [ "$(grep -c '' "$DESKFLOW_LOGIN_BRIDGE_LOG")" -eq 3 ]
+  out_has "bridge log: mode 644 -> 600"
+  out_has "1 'key down id=' line(s) removed"
+  # the only thing left for a human is a log-out, stated as a note, never a failure
+  out_has "bridge plist installed: $DESKFLOW_LOGIN_BRIDGE_PLIST; takes effect at next login window"
+  out_has "note: LoginWindow bridge plist installed"
+  out_lacks "HUMAN STEP REQUIRED"
+  out_lacks "bridge plist stale — run root step"
+  out_lacks "root steps still pending"
+}
+
+@test "with a password, a BTM Login Item as the only leftover is listed as a System Settings step and the run exits 0" {
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_SUDO_PASSWORD=r00t-pw"
+  export SHIM_CTL_RETIRE_RC=2 SHIM_CTL_ASSERT_RC=1
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [ -e "$SHIM_STATE/root-files-cleared" ]
+  out_has "HUMAN STEP REQUIRED"
+  out_has "System Settings only"
+  out_has '- login-items audit FAIL: enabled BTM app record'
+  out_has 'remove "Deskflow"'
+  out_lacks "BLOCKERS"
+  out_lacks "retired file present"
+  out_has "only the System Settings step above remains"
+  out_has "=== done:"
+}
+
+@test "without a password a BTM Login Item as the only leftover still exits 0; the root steps are printed as pending" {
+  write_env "ABCDEF0123456789"
+  echo "<plist>old</plist>" >"$DESKFLOW_LOGIN_BRIDGE_PLIST"
+  export SHIM_CTL_ASSERT_RC=1
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_has "root steps: no DESKFLOW_SUDO_PASSWORD"
+  out_has "System Settings only"
+  out_lacks "BLOCKERS"
+  out_has "root steps still pending"
+  out_has "sudo env DESKFLOW_INSTALL_APP=/Applications/Deskflow.app bash $FAKE_ROOT/scripts/install-login-bridge-macos.sh"
+  out_has "=== done:"
+  log_lacks "sudo"
+  log_lacks "--sudo-stdin"
+  [ "$(cat "$DESKFLOW_LOGIN_BRIDGE_PLIST")" = "<plist>old</plist>" ]
+}
+
+@test "a rejected sudo password is reported once, root steps fall back to print, the seat still builds/installs, a retired root file is then a blocker" {
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_SUDO_PASSWORD=wrong-pw"
+  echo "<plist>old</plist>" >"$DESKFLOW_LOGIN_BRIDGE_PLIST"
+  export SHIM_SUDO_EXPECT_PW=r00t-pw SHIM_CTL_RETIRE_RC=2 SHIM_CTL_ASSERT_RC=1
+  run bash "$SCRIPT"
+  [ "$status" -ne 0 ]
+  out_has "sudo password rejected for $(hostname -s); check FLEET_SEAT_PASSWORD_$(seat_id)"
+  [ "$(count_in_output "sudo password rejected")" -eq 1 ]
+  # exactly one sudo call (the probe); nothing else escalated; the seat still built and installed
+  [ "$(grep -c '^sudo ' "$SHIM_LOG")" -eq 1 ]
+  log_has "cmake --build build"
+  log_has "install-macos.sh"
+  log_has "MOUSER_RESTART=1"
+  log_lacks "--sudo-stdin"
+  out_has "bridge plist stale — run root step"
+  out_has "BLOCKERS"
+  out_has "- retired file present: /usr/local/bin/deskflow-prio-apply.sh"
+  out_has 'sudo rm -f "/usr/local/bin/deskflow-prio-apply.sh"'
+  out_lacks "=== done:"
+  [ "$(cat "$DESKFLOW_LOGIN_BRIDGE_PLIST")" = "<plist>old</plist>" ]
+  argv_lacks_secret "wrong-pw"
+}
+
+@test "a root step that fails under a verified sudo password fails the run loudly" {
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_SUDO_PASSWORD=r00t-pw"
+  export SHIM_CTL_SUDO_RC=1
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  out_has "deskflow-ctl prio --sudo-stdin failed"
+  out_lacks "=== done:"
+}
+
+@test "an install that leaves the bridge plist different from the render is a failure, never a silent success" {
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_SUDO_PASSWORD=r00t-pw"
+  echo "<plist>old</plist>" >"$DESKFLOW_LOGIN_BRIDGE_PLIST"
+  printf '#!/usr/bin/env bash\necho "install-login-bridge-macos.sh $*" >> "$SHIM_LOG"\nif [[ "$*" == *--dry-run* ]]; then cat <<'"'"'PL'"'"'\n%s\nPL\nfi\nexit 0\n' "$BRIDGE_PLIST" >"$FAKE_ROOT/scripts/install-login-bridge-macos.sh"
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  out_has "bridge plist still differs from the render after install-login-bridge-macos.sh ran as root"
+}
+
+@test "a cmake cache mismatch reconfigures automatically in place; a configure that fails over the stale cache is retried from scratch" {
+  write_env "ABCDEF0123456789"
+  mkdir -p "$FAKE_ROOT/build/CMakeFiles"
+  : >"$FAKE_ROOT/build/CMakeFiles/stale.marker"
+  printf 'APPLE_CODESIGN_DEV:STRING=OLDID0000000000\nFLEET_STRICT_SIGNING:BOOL=ON\n' >"$FAKE_ROOT/build/CMakeCache.txt"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_has "cmake cache mismatch → reconfiguring: APPLE_CODESIGN_DEV cache mismatch"
+  [ "$(grep -c '^cmake -S' "$SHIM_LOG")" -eq 1 ]
+  [ -e "$FAKE_ROOT/build/CMakeFiles/stale.marker" ]     # in place: object files survive
+  grep -q '^APPLE_CODESIGN_DEV:STRING=ABCDEF0123456789$' "$FAKE_ROOT/build/CMakeCache.txt"
+
+  : >"$SHIM_LOG"
+  printf 'APPLE_CODESIGN_DEV:STRING=ABCDEF0123456789\n' >"$FAKE_ROOT/build/CMakeCache.txt"   # older cache: no strict flag at all
+  SHIM_CMAKE_FAIL_ONCE=1 run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_has "cmake cache mismatch → reconfiguring: FLEET_STRICT_SIGNING cache is '<unset>', need ON"
+  out_has "discarding build/CMakeCache.txt + build/CMakeFiles and reconfiguring from scratch"
+  [ "$(grep -c '^cmake -S' "$SHIM_LOG")" -eq 2 ]
+  [ ! -e "$FAKE_ROOT/build/CMakeFiles/stale.marker" ]
+  grep -q '^FLEET_STRICT_SIGNING:BOOL=ON$' "$FAKE_ROOT/build/CMakeCache.txt"
+  log_has "cmake --build build"
+  out_has "=== done:"
+}
+
+@test "no child (cmake, python3, installers, deskflow-ctl, sudo, security) inherits either password or any FLEET_SEAT_PASSWORD_* line" {
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_KEYCHAIN_PASSWORD=s3cret-pw" "DESKFLOW_SUDO_PASSWORD=r00t-pw" \
+    "FLEET_SEAT_PASSWORD_hackintosh=other-seat-pw" "FLEET_SEAT_PASSWORD_$(seat_id)=self-pw"
+  export SHIM_CTL_RETIRE_RC=2
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  log_lacks "LEAK"
+  log_has "cmake --build build"
+  log_has "python3 scripts/build_and_install.py"
+  log_has "sudo -S -p  -k true"
+  log_has "deskflow-ctl prio --sudo-stdin"
+  # explicit .env keys win over the seat's own FLEET_SEAT_PASSWORD line
+  [ "$(cat "$SHIM_STATE/keychain-pw")" = "s3cret-pw" ]
+  sudo_stdin_all "r00t-pw"
+  argv_lacks_secret "self-pw"
+  argv_lacks_secret "other-seat-pw"
+}
+
+@test "a password transported in the environment (the controller's route) works without one in .env, and the seat's own .env value wins over it" {
+  write_env "ABCDEF0123456789"                 # mode 644 and no password inside: must not be refused
+  DESKFLOW_KEYCHAIN_PASSWORD=ctl-pw DESKFLOW_SUDO_PASSWORD=ctl-pw run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SHIM_STATE/keychain-pw")" = "ctl-pw" ]
+  sudo_stdin_all "ctl-pw"
+  out_has "codesign verified from this session"
+  out_has "root steps: sudo password verified"
+  log_lacks "LEAK"
+
+  reset_shim_state
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_KEYCHAIN_PASSWORD=seat-pw"
+  DESKFLOW_KEYCHAIN_PASSWORD=ctl-pw DESKFLOW_SUDO_PASSWORD=ctl-pw run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SHIM_STATE/keychain-pw")" = "seat-pw" ]   # .env beats the transported value
+  sudo_stdin_all "ctl-pw"                              # nothing in .env for sudo: the transported one
+}
+
+@test "a FLEET_SEAT_PASSWORD_<this seat> line in the seat's own .env serves both uses; each password defaults to the other" {
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "FLEET_SEAT_PASSWORD_$(seat_id)=self-pw"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SHIM_STATE/keychain-pw")" = "self-pw" ]
+  sudo_stdin_all "self-pw"
+  log_lacks "LEAK"
+
+  reset_shim_state
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_SUDO_PASSWORD=r00t-pw"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SHIM_STATE/keychain-pw")" = "r00t-pw" ]   # keychain defaults to the sudo password
+  sudo_stdin_all "r00t-pw"
+
+  reset_shim_state
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_KEYCHAIN_PASSWORD=s3cret-pw"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  sudo_stdin_all "s3cret-pw"                           # sudo defaults to the keychain password
+}
+
+@test "bash -x never echoes a password: xtrace is off around every expansion" {
+  write_env_lines "DESKFLOW_CODESIGN_ID=ABCDEF0123456789" "DESKFLOW_KEYCHAIN_PASSWORD=s3cret-pw" "DESKFLOW_SUDO_PASSWORD=r00t-pw"
+  export SHIM_CTL_RETIRE_RC=2
+  run bash -x "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_has "+ main"                                     # the trace really was on
+  out_lacks "s3cret-pw"
+  out_lacks "r00t-pw"
+  argv_lacks_secret "s3cret-pw"
+  argv_lacks_secret "r00t-pw"
+  sudo_stdin_all "r00t-pw"
+}
+
+@test "without a password a world-readable bridge log is reported with its two root steps and left alone; a 600 log is not inspected" {
+  write_env "ABCDEF0123456789"
+  write_bridge_log 644
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_has "bridge log: mode 644 (want 600), 1 keystroke line(s) — run root steps: sudo chmod 600 $DESKFLOW_LOGIN_BRIDGE_LOG; sudo sed -i '' '/key down id=/d' $DESKFLOW_LOGIN_BRIDGE_LOG"
+  out_has "root steps still pending"
+  [ "$(stat -f %Lp "$DESKFLOW_LOGIN_BRIDGE_LOG")" = 644 ]
+  [ "$(grep -c 'key down id=' "$DESKFLOW_LOGIN_BRIDGE_LOG")" -eq 1 ]
+  log_lacks "sudo"
+
+  : >"$SHIM_LOG"
+  chmod 600 "$DESKFLOW_LOGIN_BRIDGE_LOG"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_lacks "bridge log:"
+  out_lacks "root steps still pending"
+}
+
+@test ".env must be mode 600 as soon as ANY *PASSWORD* value is set (not only the keychain one); empty template keys need nothing" {
+  printf 'DESKFLOW_CODESIGN_ID=ABCDEF0123456789\nDESKFLOW_SUDO_PASSWORD=r00t-pw\n' >"$FAKE_ROOT/.env"
+  chmod 644 "$FAKE_ROOT/.env"
+  run bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  out_has ".env holds DESKFLOW_SUDO_PASSWORD but is mode 644"
+  out_has "chmod 600"
+  log_lacks "sudo"
+  log_lacks "cmake"
+  log_lacks "security"
+
+  printf 'DESKFLOW_CODESIGN_ID=ABCDEF0123456789\nDESKFLOW_KEYCHAIN_PASSWORD=\nDESKFLOW_SUDO_PASSWORD=""\n' >"$FAKE_ROOT/.env"
+  chmod 644 "$FAKE_ROOT/.env"
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_has "root steps: no DESKFLOW_SUDO_PASSWORD"
+  log_lacks "security"
+  log_lacks "sudo"
 }
