@@ -46,6 +46,10 @@ case "$verb" in
     if [[ -f "$SHIM_STATE/args/$label" ]]; then
       echo "	arguments = {"; sed 's/^/		/' "$SHIM_STATE/args/$label"; echo "	}"
     fi
+    # env/<label> (K=V lines) is the `environment = {` block launchd prints for the LOADED definition
+    if [[ -f "$SHIM_STATE/env/$label" ]]; then
+      echo "	environment = {"; sed -e 's/=/ => /' -e 's/^/		/' "$SHIM_STATE/env/$label"; echo "	}"
+    fi
     [[ -f "$SHIM_STATE/exit/$label" ]] && echo "	last exit code = $(cat "$SHIM_STATE/exit/$label")"
     echo "}"
     ;;
@@ -199,14 +203,19 @@ DOMAIN="gui/$(id -u)"
   log_lacks "launchctl bootout"
 }
 
-@test "stop leaves Mouser and a foreign deskflow-core alone (bundle scope only)" {
+@test "stop terminates every deskflow-core/Deskflow of this user from ANY path (each one blocks start); Mouser is never touched" {
+  # A dev build or a Deskflow.app.bak core makes `start` refuse (a duplicate)
+  # and the remedy that refusal names is `stop`, so `stop` must clear it.
   add_proc 900 "/Applications/Mouser.app/Contents/MacOS/Mouser"
   add_proc 901 "/opt/other/deskflow-core"
   run bash "$SCRIPT" stop
   [ "$status" -eq 0 ]
-  log_lacks "kill "
+  log_has "kill -TERM 901"
+  log_lacks "kill -TERM 900"
+  [[ "$output" == *"escalating: SIGTERM to 901 (/opt/other/deskflow-core)"* ]]
+  [[ "$output" == *"stopped (escalated)"* ]]
   grep -q "^900" "$SHIM_STATE/ps.txt"
-  grep -q "^901" "$SHIM_STATE/ps.txt"
+  ! grep -q "^901" "$SHIM_STATE/ps.txt"
 }
 
 @test "stop ignores root's LoginWindow bridge and deskflow-prio in the bundle (uid + basename scope)" {
@@ -215,7 +224,6 @@ DOMAIN="gui/$(id -u)"
   load_agent $CORE 100; add_proc 100 "$APP/Contents/MacOS/deskflow-core"
   add_proc 910 "$APP/Contents/MacOS/deskflow-vhid-bridge" 0
   add_proc 911 "$APP/Contents/MacOS/deskflow-prio" 0
-  add_proc 912 "$APP/Contents/MacOS/deskflow-core" 0
   run bash "$SCRIPT" stop
   [ "$status" -eq 0 ]
   [[ "$output" == *"stopped"* ]]
@@ -223,19 +231,24 @@ DOMAIN="gui/$(id -u)"
   ! grep -q "^100" "$SHIM_STATE/ps.txt"
   grep -q "^910" "$SHIM_STATE/ps.txt"
   grep -q "^911" "$SHIM_STATE/ps.txt"
-  grep -q "^912" "$SHIM_STATE/ps.txt"
 }
 
-@test "stop never signals another uid's core even when escalating" {
+@test "stop never signals another uid's deskflow-core: it prints the exact sudo kill line and exits 1, never 'stopped'" {
+  # No root deskflow-core exists by design (the login-window agent is the
+  # vhid-bridge): one is somebody's sudo. `start` refuses beside it, so a
+  # "stopped" here would be a lie; the remedy printed is the one that works.
   load_agent $CORE 100; add_proc 100 "$APP/Contents/MacOS/deskflow-core"
   mkdir -p "$SHIM_STATE/stubborn"; touch "$SHIM_STATE/stubborn/100"
   add_proc 913 "$APP/Contents/MacOS/deskflow-core" 0
   run bash "$SCRIPT" stop
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 1 ]
   log_has "kill -TERM 100"
   log_lacks "kill -TERM 913"
   log_lacks "kill -KILL 913"
   grep -q "^913" "$SHIM_STATE/ps.txt"
+  [[ "$output" == *"NOT stopped"* ]]
+  [[ "$output" == *"sudo kill 913   # deskflow-core pid 913 uid 0: $APP/Contents/MacOS/deskflow-core"* ]]
+  [[ "$output" != *"== deskflow-ctl: stopped"* ]]
 }
 
 # --- start --------------------------------------------------------------------
@@ -992,14 +1005,14 @@ EOF
   # com.fleet.selftest rebuilds from the checkout under ~/Desktop: launchd could never run it
   run bash "$SCRIPT" render-plist com.fleet.selftest
   [ "$status" -eq 1 ]
-  [[ "$output" == *"rendered com.fleet.selftest.plist points launchd into ~/Desktop, ~/Documents or ~/Downloads"* ]]
+  [[ "$output" == *"rendered com.fleet.selftest.plist points launchd into ~/Desktop, ~/Documents, ~/Downloads, iCloud Drive (~/Library/Mobile Documents) or /Volumes"* ]]
   # nothing was installed or loaded by render-plist
   [ ! -e "$DESKFLOW_CTL_AGENT_DIR/com.fleet.soak.plist" ]
   log_lacks "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/com.fleet"
   # and the safe dir itself may never sit under a TCC-protected folder
   DESKFLOW_CTL_SAFE_DIR="$HOME/Desktop/bin" run bash "$SCRIPT" safe-copy
   [ "$status" -eq 1 ]
-  [[ "$output" == *"is under ~/Desktop, ~/Documents or ~/Downloads; launchd could never execute it"* ]]
+  [[ "$output" == *"is under ~/Desktop, ~/Documents, ~/Downloads, iCloud Drive (~/Library/Mobile Documents) or /Volumes; launchd could never execute it"* ]]
 }
 
 @test "converge refuses to kick or bootstrap the core when one already runs that launchd does not own (GUI-spawned / orphan)" {
@@ -1123,7 +1136,7 @@ EOF
   sed -i '' "s#<string>$SAFE/deskflow-ctl</string>#<string>$HOME/Desktop/deskflow/scripts/deskflow-ctl</string>#" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
   run bash "$SCRIPT" assert-single
   [ "$status" -eq 1 ]
-  [[ "$output" == *"(TCC): $HOME/Desktop/deskflow/scripts/deskflow-ctl is under ~/Desktop, ~/Documents or ~/Downloads"* ]]
+  [[ "$output" == *"(TCC): $HOME/Desktop/deskflow/scripts/deskflow-ctl is under ~/Desktop, ~/Documents, ~/Downloads, iCloud Drive"* ]]
   [[ "$output" == *"fleet launchd plist points into a TCC-protected folder"*"$CONVERGE.plist:"*":$HOME/Desktop/deskflow/scripts/deskflow-ctl"* ]]
   : >"$SHIM_LOG"
   run bash "$SCRIPT" converge --apply
@@ -1185,4 +1198,306 @@ EOF
   cmp -s "$fake/scripts/deskflow-ctl" "$SAFE/deskflow-ctl"
   run bash "$SCRIPT" status
   [[ "$output" == *"(checkout); safe copy: $SAFE/deskflow-ctl"* ]]
+}
+
+# --- K10 review regressions (adversarial review, 2026-09-25) -----------------
+#
+# Each of these was a proven defect; the assertions state the behaviour the
+# review demanded. env/<label> (K=V lines) is the `environment = {` block a
+# loaded label prints, beside args/<label> (its `arguments = {` block).
+
+set_args() { mkdir -p "$SHIM_STATE/args"; printf '%s\n' "$2" >"$SHIM_STATE/args/$1"; }
+set_env() { mkdir -p "$SHIM_STATE/env"; printf '%s\n' "$2" >"$SHIM_STATE/env/$1"; }
+# Whole-line matches: the GUI label is a prefix of the -core and -converge
+# labels, so a substring check on "...$GUI" also matches their lines.
+log_has_line() { grep -qxF -- "$1" "$SHIM_LOG" || { echo "missing line from shim log: $1" >&2; return 1; }; }
+log_lacks_line() { ! grep -qxF -- "$1" "$SHIM_LOG" || { echo "unexpected line in shim log: $1" >&2; return 1; }; }
+make_fake_checkout() {
+  # A throwaway checkout beside the sandbox; fake_real is its physical path
+  # (what the ctl records: $TMP sits behind the /var -> /private/var symlink).
+  fake="$TMP/checkout"
+  mkdir -p "$fake/scripts" "$fake/tools/launchd"
+  cp "$SCRIPT" "$fake/scripts/deskflow-ctl"; cp "$REPO"/tools/launchd/*.plist "$fake/tools/launchd/"
+  cp "$REPO/tools/fleet-soak" "$fake/tools/fleet-soak"
+  fake_real="$(cd "$fake" && pwd -P)"
+}
+
+@test "K10-review: every verb runs from the launchd-safe copy with the checkout gone and never names it" {
+  make_fake_checkout
+  add_prio_binary
+  healthy_seat; load_agent $CONVERGE
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  run bash "$fake/scripts/deskflow-ctl" start
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SAFE/checkout")" = "$fake_real" ]     # the copy remembers where it came from
+  rm -rf "$fake"
+  all="$TMP/all-output.txt"; : >"$all"
+  for verb in "status" "assert-single" "converge" "converge --apply --quiet" "prio" "retire" "login-items audit" "login-items print-steps" "render-plist com.fleet.soak" "render-plist $CORE" "safe-copy" "help" "restart" "stop"; do
+    # shellcheck disable=SC2086
+    run bash "$SAFE/deskflow-ctl" $verb
+    echo "--- $verb (rc=$status) ---" >>"$all"; echo "$output" >>"$all"
+    [ "$status" -eq 0 ] || { echo "verb '$verb' rc=$status: $output" >&2; false; }
+  done
+  run bash "$SAFE/deskflow-ctl" start
+  echo "--- start (rc=$status) ---" >>"$all"; echo "$output" >>"$all"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"safe-copy: no checkout known"* ]]
+  ! grep -qF "$TMP/checkout" "$all"      # a vanished checkout is never named ...
+  ! grep -qF "$fake_real" "$all"         # ... under either spelling
+  ! grep -q "missing template" "$all"
+  grep -q "assert-single: OK" "$all"
+  grep -q "<string>$SAFE/fleet-soak</string>" "$all"
+}
+
+@test "K10-review: a DESKFLOW_ROOT that is not a checkout is a warning for start (fallback: the recorded checkout, else none) and an error for safe-copy" {
+  make_fake_checkout
+  healthy_seat; load_agent $CONVERGE
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  bash "$fake/scripts/deskflow-ctl" start >/dev/null
+  # the copy refreshes itself from the recorded checkout, no DESKFLOW_ROOT needed
+  echo "# newer" >>"$fake/scripts/deskflow-ctl"
+  run bash "$SAFE/deskflow-ctl" safe-copy
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"safe-copy: installed $SAFE/deskflow-ctl"* ]]
+  cmp -s "$fake/scripts/deskflow-ctl" "$SAFE/deskflow-ctl"
+  run bash "$SAFE/deskflow-ctl" status
+  [[ "$output" == *"checkout: $fake_real (recorded by the last safe-copy)"* ]]
+  # a stale DESKFLOW_ROOT: start warns, names the variable, falls back and starts
+  bash "$SCRIPT" stop >/dev/null 2>&1 || true
+  DESKFLOW_ROOT="$TMP/nowhere" run bash "$SAFE/deskflow-ctl" start
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"warning: safe-copy: DESKFLOW_ROOT=$TMP/nowhere is not a deskflow checkout"* ]]
+  [[ "$output" == *"safe-copy: $SAFE up to date"* ]]
+  # ... and is an error for the safe-copy verb itself
+  DESKFLOW_ROOT="$TMP/nowhere" run bash "$SAFE/deskflow-ctl" safe-copy
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"DESKFLOW_ROOT=$TMP/nowhere is not a deskflow checkout"* ]]
+  # the checkout gone AND a stale DESKFLOW_ROOT naming it (K10ADV-2): a warning, and the seat still starts
+  rm -rf "$fake"
+  bash "$SCRIPT" stop >/dev/null 2>&1 || true
+  DESKFLOW_ROOT="$fake" run bash "$SAFE/deskflow-ctl" start
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"safe-copy: no checkout known"* ]]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+}
+
+@test "K10-review: a deskflow-core from a NON-canonical path blocks start with a remedy that works: stop terminates it, start then owns the seat" {
+  add_proc 555 "$TMP/Applications/Deskflow.app.bak/Contents/MacOS/deskflow-core"
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"bootstrap $CORE refused: deskflow-core pid 555 already running outside launchd; deskflow-ctl stop"* ]]
+  log_lacks "launchctl bootstrap"
+  run bash "$SCRIPT" stop
+  [ "$status" -eq 0 ]
+  log_has "kill -TERM 555"
+  [[ "$output" == *"escalating: SIGTERM to 555 ($TMP/Applications/Deskflow.app.bak/Contents/MacOS/deskflow-core)"* ]]
+  ! grep -q "^555" "$SHIM_STATE/ps.txt"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 0 ]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+}
+
+@test "K10-review: a deskflow-core of another uid blocks start/restart with the exact sudo line; stop never signals it and exits 1" {
+  add_proc 556 "$APP/Contents/MacOS/deskflow-core" 0
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"bootstrap $CORE refused: deskflow-core pid 556 already running outside launchd; not this user's to signal (deskflow-ctl stop cannot clear it); run as admin: sudo kill 556  # $APP/Contents/MacOS/deskflow-core (uid 0); then deskflow-ctl start"* ]]
+  [[ "$output" != *"deskflow-ctl stop (bootout"* ]]     # never a remedy that cannot work
+  run bash "$SCRIPT" stop
+  [ "$status" -eq 1 ]
+  log_lacks "kill "
+  [[ "$output" == *"NOT stopped"* ]]
+  [[ "$output" == *"sudo kill 556   # deskflow-core pid 556 uid 0: $APP/Contents/MacOS/deskflow-core"* ]]
+  [[ "$output" != *"== deskflow-ctl: stopped"* ]]
+  grep -q "^556" "$SHIM_STATE/ps.txt"
+  load_agent $CORE
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" restart
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"kickstart -k $CORE refused: deskflow-core pid 556"*"sudo kill 556"* ]]
+  log_lacks "launchctl kickstart"
+  # both kinds at once: each pid gets the remedy that clears it
+  add_proc 557 "$APP/Contents/MacOS/deskflow-core"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"pid 556 557 already running outside launchd; deskflow-ctl stop (bootout, then TERM/KILL of every deskflow-core/Deskflow this user runs, any path) first, then start; not this user's to signal"*"sudo kill 556"* ]]
+}
+
+@test "K10-review: the TCC refusal is canonical and case-insensitive (APFS): ~/desktop, ~/Library/../Desktop, a symlink into ~/Desktop, iCloud Drive, /Volumes, and a <string> under ~/documents" {
+  for dir in "$HOME/desktop/bin" "$HOME/Library/../Desktop/bin" "$HOME/Library/Mobile Documents/com~apple~CloudDocs/bin" "/Volumes/Stick/bin"; do
+    DESKFLOW_CTL_SAFE_DIR="$dir" run bash "$SCRIPT" safe-copy
+    [ "$status" -eq 1 ] || { echo "$dir was accepted: $output" >&2; false; }
+    [[ "$output" == *"launchd could never execute it"* ]]
+  done
+  mkdir -p "$HOME/Desktop"; ln -s "$HOME/Desktop" "$HOME/link-to-desktop"
+  DESKFLOW_CTL_SAFE_DIR="$HOME/link-to-desktop/bin" run bash "$SCRIPT" safe-copy
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"launchd could never execute it"* ]]
+  # a render is refused the same way whatever the spelling
+  DESKFLOW_CTL_SOAK_DIR="$HOME/documents/soak" run bash "$SCRIPT" render-plist com.fleet.soak
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"points launchd into"* ]]
+  # the default and a merely similar folder are fine
+  run bash "$SCRIPT" safe-copy
+  [ "$status" -eq 0 ]
+  DESKFLOW_CTL_SAFE_DIR="$HOME/Desktopish/bin" run bash "$SCRIPT" safe-copy
+  [ "$status" -eq 0 ]
+}
+
+@test "K10-review: start replaces a LOADED definition that differs from the render (converge --apply re-rendered the file, launchd still ran the checkout path) and restarts nothing else" {
+  healthy
+  old="$HOME/Desktop/deskflow/scripts/deskflow-ctl"
+  sed -i '' "s#<string>$SAFE/deskflow-ctl</string>#<string>$old</string>#" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
+  set_args $CONVERGE "$(printf '/bin/bash\n%s\nconverge\n--apply\n--quiet' "$old")"
+  mkdir -p "$SHIM_STATE/exit"; echo 126 >"$SHIM_STATE/exit/$CONVERGE"
+  # runbook 1b: converge --apply by hand from the checkout: gated, and the FILE is re-rendered
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"(launchd last exit code 126)"* ]]
+  [[ "$output" == *"render $CONVERGE (takes effect at next deskflow-ctl start/restart)"* ]]
+  grep -q "<string>$SAFE/deskflow-ctl</string>" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
+  # the next tick: the file is current, launchd still runs the old definition -- named, not hidden
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"rebootstrap $CONVERGE (launchd runs an older definition than $DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist; takes effect at next deskflow-ctl start/restart)"* ]]
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['needs_rebootstrap'] is True and d['actions']==[]" "$STATE/health.json"
+  log_lacks "launchctl bootout"
+  # runbook 1d: `start` is the repair: bootout + bootstrap of THAT label only; the current core and GUI are just kickstarted
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$CONVERGE: launchd's loaded definition (argv/environment) differs from the rendered plist; bootout then bootstrap"* ]]
+  log_has "launchctl bootout $DOMAIN/$CONVERGE"
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
+  log_lacks "launchctl bootout $DOMAIN/$CORE"
+  log_lacks_line "launchctl bootout $DOMAIN/$GUI"
+  log_has "launchctl kickstart $DOMAIN/$CORE"
+  log_has_line "launchctl kickstart $DOMAIN/$GUI"
+  # the shim keeps args/exit until a bootout, as launchd keeps the loaded definition
+  rm -f "$SHIM_STATE/args/$CONVERGE" "$SHIM_STATE/exit/$CONVERGE"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"nothing to do"* ]]
+}
+
+@test "K10-review: a loaded GUI whose launchd environment lacks DESKFLOW_LAUNCHD=1 is re-bootstrapped by start and restart although the file matches (env drift)" {
+  healthy
+  set_args $GUI "$APP/Contents/MacOS/Deskflow"
+  set_env $GUI "$(printf 'OSLogRateLimit=64\nXPC_SERVICE_NAME=%s' "$GUI")"   # the Sep 16 macbookpro GUI: no DESKFLOW_LAUNCHD
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$GUI: launchd's loaded definition (argv/environment) differs from the rendered plist; bootout then bootstrap"* ]]
+  log_has_line "launchctl bootout $DOMAIN/$GUI"
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+  log_lacks "launchctl bootout $DOMAIN/$CORE"
+  # the same definition, complete: current, only kickstarted
+  set_env $GUI "$(printf 'OSLogRateLimit=64\nXPC_SERVICE_NAME=%s\nDESKFLOW_LAUNCHD=1' "$GUI")"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 0 ]
+  log_lacks_line "launchctl bootout $DOMAIN/$GUI"
+  log_has_line "launchctl kickstart $DOMAIN/$GUI"
+  # restart: -k would only restart the OLD definition, so drift goes through bootout + bootstrap there too
+  set_env $GUI "$(printf 'OSLogRateLimit=64\nXPC_SERVICE_NAME=%s' "$GUI")"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" restart
+  [ "$status" -eq 0 ]
+  log_has_line "launchctl kickstart -k $DOMAIN/$CORE"
+  log_lacks_line "launchctl kickstart -k $DOMAIN/$GUI"
+  log_has_line "launchctl bootout $DOMAIN/$GUI"
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+}
+
+@test "K10-review: EPERM evidence is shape-specific and windowed: an old refusal never gates, a tick's own 'Permission denied' is not TCC on its program, /bin/sh's refusal is" {
+  healthy
+  rm -f "$SHIM_STATE/loaded/$GUI"; del_proc 301
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  log="$HOME/Library/Logs/Deskflow/converge.log"
+  printf '/bin/bash: %s: Operation not permitted\n' "$HOME/Desktop/deskflow/scripts/deskflow-ctl" >"$log"
+  touch -t "$(date -v-11M +%Y%m%d%H%M.%S)" "$log"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+  # a tick that died on its own redirection ran, so its program is fine
+  rm -f "$SHIM_STATE/loaded/$GUI"; del_proc 301
+  printf '%s: line 810: %s/.tmp: Permission denied\n' "$SAFE/deskflow-ctl" "$HOME/Library/Application Support/Deskflow" >"$log"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"cannot execute its program"* ]]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+  # the refusal shape from /bin/sh is evidence too
+  rm -f "$SHIM_STATE/loaded/$GUI"; del_proc 301
+  printf '/bin/sh: %s: Permission denied\n' "$HOME/Documents/x/deskflow-ctl" >"$log"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot execute its program (TCC): $HOME/Documents/x/deskflow-ctl"* ]]
+  log_lacks "launchctl bootstrap"
+}
+
+@test "K10-review: a stubborn old core: start leaves the label booted out; converge refuses the core AND holds the GUI; stop KILLs it; start then owns the seat" {
+  load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
+  load_agent $CONVERGE
+  autostart $CORE 300 "$APP/Contents/MacOS/deskflow-core"
+  autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
+  mkdir -p "$DESKFLOW_CTL_AGENT_DIR"
+  echo "<plist>stale</plist>" >"$DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  mkdir -p "$SHIM_STATE/stubborn"; touch "$SHIM_STATE/stubborn/300"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 1 ]
+  [ ! -f "$SHIM_STATE/loaded/$CORE" ]          # booted out, never bootstrapped beside the stubborn pid
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" converge --apply --quiet
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"refused bootstrap $CORE: deskflow-core pid 300 already running outside launchd"* ]]
+  log_lacks "launchctl bootstrap"
+  # the GUI plist render is a free repair (as for any unloaded agent); no start action at all
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert 'bootstrap $GUI held while $CORE is refused (deskflow-ctl stop, then start)' in d['plan'] and not [a for a in d['actions'] if not a.startswith('render')] and d['errors'][0].startswith('refused bootstrap $CORE')" "$STATE/health.json"
+  run bash "$SCRIPT" stop
+  [ "$status" -eq 0 ]
+  log_has "kill -KILL 300"
+  : >"$SHIM_LOG"
+  run bash "$SCRIPT" start
+  [ "$status" -eq 0 ]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$GUI.plist"
+}
+
+@test "K10-review: assert-single polices fleet-label plists only: a third party's plist under ~/Documents is ignored, a sibling product's fleet-label plist (any spelling) is not" {
+  healthy
+  mkdir -p "$DESKFLOW_CTL_AGENT_DIR"
+  printf '<plist><dict><key>ProgramArguments</key><array><string>%s/Documents/backup.sh</string></array></dict></plist>\n' "$HOME" >"$DESKFLOW_CTL_AGENT_DIR/com.example.backup.plist"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 0 ]
+  printf '<plist><dict><key>ProgramArguments</key><array><string>%s/desktop/Mouser/tools/x</string></array></dict></plist>\n' "$HOME" >"$DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.mouser.plist"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"io.github.hughesyadaddy.mouser.plist:"*"$HOME/desktop/Mouser/tools/x"* ]]
+}
+
+@test "K10-review: a template change in a NEWER checkout is a pending start, never applied from the old safe copy, and the copy's own tick never reports the drift" {
+  make_fake_checkout
+  healthy_seat; load_agent $CONVERGE
+  bash "$fake/scripts/deskflow-ctl" start >/dev/null
+  echo "# newer checkout" >>"$fake/scripts/deskflow-ctl"
+  run bash "$SAFE/deskflow-ctl" converge --apply --quiet
+  [ "$status" -eq 0 ]
+  ! grep -q "differs" "$STATE/health.json"
+  sed -i '' 's#<integer>60</integer>#<integer>30</integer>#' "$fake/tools/launchd/$CONVERGE.plist"
+  run bash "$fake/scripts/deskflow-ctl" converge --apply
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"differs from this checkout"* ]]
+  [[ "$output" != *"render $CONVERGE"* ]]
+  grep -q "<integer>60</integer>" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
 }
