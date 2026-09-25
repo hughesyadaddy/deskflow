@@ -255,7 +255,7 @@ void MSWindowsScreen::sanitizeStaleModifiers() const
   }
   const std::vector<WORD> released = m_desks->sanitizeStaleModifiers(
       m_keyState != nullptr ? m_keyState->injectedModifierBits(false) : 0, /*entered=*/false,
-      m_keyState != nullptr ? m_keyState->lastInjectedKeyDownMs() : 0
+      m_keyState != nullptr ? m_keyState->lastInjectedSuperChordMs() : 0
   );
   if (m_keyState != nullptr) {
     // D1: whatever the sweep released is no longer held by us; a ledger
@@ -346,7 +346,7 @@ void MSWindowsScreen::leave()
     // D1: the raw releases close their ledger entries too, or a phantom
     // entry survives the visit and vouches for a stuck Win on the next one.
     m_keyState->forgetInjectedModifiers(
-        m_desks->sanitizeStaleModifiers(0, /*entered=*/false, m_keyState->lastInjectedKeyDownMs())
+        m_desks->sanitizeStaleModifiers(0, /*entered=*/false, m_keyState->lastInjectedSuperChordMs())
     );
     // ...and the ledger's own view. Ledger ONLY (K4 audit MED-2): the full
     // sanitize sweep always lists LSHIFT/RSHIFT as candidates and releases
@@ -1572,11 +1572,13 @@ void MSWindowsScreen::auditStaleModifiers()
   // Entered: every ledger entry vouches, however old (a macOS server never
   // repeats modifiers); the grace window applies only at boundaries.
   // D3: entered=true makes the desk side require two consecutive sightings
-  // and a quiet keyboard before releasing, so a Win that PowerToys/AHK is
-  // holding around our own keys is not fought every second. D1: whatever
-  // was released leaves the ledger.
+  // before releasing; the Win rows additionally wait for 2 s after our last
+  // Win+key, so a Win that PowerToys/AHK is holding around our own chord is
+  // not fought every second. Ctrl/Alt rows are NOT held back by typing:
+  // a stuck Ctrl must go while the user types. D1: whatever was released
+  // leaves the ledger.
   m_keyState->forgetInjectedModifiers(m_desks->sanitizeStaleModifiers(
-      m_keyState->injectedModifierBits(m_isOnScreen), /*entered=*/m_isOnScreen, m_keyState->lastInjectedKeyDownMs()
+      m_keyState->injectedModifierBits(m_isOnScreen), /*entered=*/m_isOnScreen, m_keyState->lastInjectedSuperChordMs()
   ));
 }
 

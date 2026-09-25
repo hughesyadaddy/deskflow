@@ -157,7 +157,7 @@ public:
   {
     uint32_t heldByUsBits = 0;  //!< ledger bits: rows this client holds, never released
     bool entered = false;       //!< true: the 1 s audit (graced, D3); false: boundary sweep (immediate)
-    uint64_t lastKeyDownMs = 0; //!< MSWindowsKeyState::lastInjectedKeyDownMs()
+    uint64_t lastSuperChordMs = 0; //!< MSWindowsKeyState::lastInjectedSuperChordMs() (Win rows only)
     std::vector<WORD> released; //!< OUT: VKs whose UP was injected
   };
 
@@ -167,10 +167,12 @@ public:
   Returns the VKs actually released so the caller can close its ledger for
   them (D1). \p entered false = boundary (enable/enter/leave): every
   non-ledgered held row is released at once. \p entered true = the periodic
-  audit: a row is released only after two consecutive sightings and with no
-  key-down injected within deskflow::platform::kAuditQuietMs (D3).
+  audit: a row is released only after two consecutive sightings; the
+  LWIN/RWIN rows additionally wait until no Win+key was injected within
+  deskflow::platform::kAuditQuietMs (D3). Alt/Ctrl rows get no quiet
+  window, so a stuck one is released even while the user keeps typing.
   */
-  std::vector<WORD> sanitizeStaleModifiers(uint32_t heldByUsBits, bool entered, uint64_t lastKeyDownMs) const;
+  std::vector<WORD> sanitizeStaleModifiers(uint32_t heldByUsBits, bool entered, uint64_t lastSuperChordMs) const;
 
   //! Release each VK in \p vks that the input desktop still reports held.
   /*!

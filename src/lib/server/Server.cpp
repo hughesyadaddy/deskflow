@@ -2297,7 +2297,13 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
   }
   // D5: a key pressed during a withheld Super hold must not carry Super --
   // the client would tap Win around it and a target-side hook remaps that.
-  mask = maskWithoutWithheldSuper(mask, superWithheld(), remapped);
+  if (const KeyModifierMask stripped = maskWithoutWithheldSuper(mask, superWithheld(), remapped); stripped != mask) {
+    LOG_DEBUG(
+        "withheld super stripped from key down id=%d mask=0x%04x -> 0x%04x for \"%s\"", id, mask, stripped,
+        getName(m_active).c_str()
+    );
+    mask = stripped;
+  }
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
@@ -2389,7 +2395,14 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
     }
   } else {
     const bool remapped = applyChordRemapForActiveScreen(id, mask);
-    mask = maskWithoutWithheldSuper(mask, superWasWithheld, remapped);
+    if (const KeyModifierMask stripped = maskWithoutWithheldSuper(mask, superWasWithheld, remapped);
+        stripped != mask) {
+      LOG_DEBUG(
+          "withheld super stripped from key up id=%d mask=0x%04x -> 0x%04x for \"%s\"", id, mask, stripped,
+          getName(m_active).c_str()
+      );
+      mask = stripped;
+    }
   }
 
   // relay
@@ -2437,7 +2450,15 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
     mask = effectiveChordRemapMask(mask);
   } else {
     const bool remapped = applyChordRemapForActiveScreen(id, mask);
-    mask = maskWithoutWithheldSuper(mask, superWithheld(), remapped); // D5, as onKeyDown
+    // D5, as onKeyDown
+    if (const KeyModifierMask stripped = maskWithoutWithheldSuper(mask, superWithheld(), remapped);
+        stripped != mask) {
+      LOG_DEBUG(
+          "withheld super stripped from key repeat id=%d mask=0x%04x -> 0x%04x for \"%s\"", id, mask, stripped,
+          getName(m_active).c_str()
+      );
+      mask = stripped;
+    }
   }
 
   // relay

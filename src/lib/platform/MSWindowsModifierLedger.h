@@ -37,13 +37,20 @@ inline constexpr size_t kAuditModifierRows = 6;
 //! seen by the audit; 0 = not currently seen. Owned by the desk thread.
 using AuditFirstSeen = std::array<uint64_t, kAuditModifierRows>;
 
-//! Quiet window for the entered audit: a non-ledgered Win/Alt/Ctrl is not
-//! released while a key-down was injected on this screen within this
-//! many ms -- another injector (PowerToys Keyboard Manager, AutoHotkey)
-//! re-processing our keys legitimately holds Win around them, and fighting
-//! it every second is exactly the "constantly sticking" / Start-menu
-//! flapping seen live 2026-09-25.
+//! Quiet window for the entered audit, WIN ROWS ONLY: a non-ledgered
+//! LWIN/RWIN is not released while a key-down was injected on this screen
+//! under a ledgered Super within this many ms -- another injector
+//! (PowerToys Keyboard Manager, AutoHotkey) re-processing our Win+key
+//! legitimately holds Win around it, and fighting it every second is
+//! exactly the "constantly sticking" / Start-menu flapping seen live
+//! 2026-09-25. Alt/Ctrl rows get no quiet window (see
+//! staleModifiersToRelease): a stuck non-ledgered LCONTROL must be released
+//! WHILE the user types, or every letter becomes Ctrl+letter for as long
+//! as they keep typing.
 inline constexpr uint64_t kAuditQuietMs = 2000;
+
+//! Audit rows that the quiet window applies to: LWIN (0) and RWIN (1).
+inline constexpr uint32_t kAuditQuietRows = (1u << 0) | (1u << 1);
 
 //! D1: the ledger forgets EVERY VK whose release was attempted, whether or
 //! not the OS still reported it down.
@@ -69,19 +76,28 @@ inline void forgetReleased(InjectedModifierMap &ledger, const std::vector<uint16
                 released it (it vouches; never released here).
 \p firstSeen    per-row first-seen stamp, updated in place.
 \p nowMs        current tick.
-\p lastKeyDownMs tick of the last key-down injected on this screen (0 =
-                never).
+\p lastSuperChordMs tick of the last NON-modifier key-down injected on this
+                screen while the ledger held LWIN/RWIN, i.e. the last
+                Win+key we sent (0 = never). NOT the last key-down of any
+                kind: see below.
 \p entered      true while the server is driving this screen.
 
 At a boundary (\p entered false) the protocol guarantees the server holds
 nothing here, so every non-ledgered OS-down row is released at once (the
-pre-existing contract of enable/enter/leave). While entered the release
-needs BOTH: the row has been non-ledgered-down on two consecutive ticks
-(this one and an earlier one), AND no key-down was injected within
-kAuditQuietMs. A row that is up, or ledgered, resets its first-seen stamp.
+pre-existing contract of enable/enter/leave). While entered EVERY row needs
+two consecutive non-ledgered-down sightings (this tick and an earlier one).
+The LWIN/RWIN rows additionally wait until no Win+key was injected within
+kAuditQuietMs: a target-side hook (PowerToys KBM, AHK) re-processing our
+Win+key holds Win around it, and that is the only injector-held Win we
+must not fight. The quiet window is deliberately NOT applied to the Alt/Ctrl
+rows and NOT keyed to plain key-downs: a stuck non-ledgered LCONTROL/LMENU
+would otherwise never be released while the user keeps typing (each letter
+becoming Ctrl+letter), and a plain letter after a chord says nothing about
+who is holding Win. A row that is up, or ledgered, resets its first-seen
+stamp.
 */
 inline uint32_t staleModifiersToRelease(
-    uint32_t osDownMask, uint32_t ledgerBits, AuditFirstSeen &firstSeen, uint64_t nowMs, uint64_t lastKeyDownMs,
+    uint32_t osDownMask, uint32_t ledgerBits, AuditFirstSeen &firstSeen, uint64_t nowMs, uint64_t lastSuperChordMs,
     bool entered
 )
 {
@@ -102,8 +118,8 @@ inline uint32_t staleModifiersToRelease(
       firstSeen[i] = nowMs; // first sighting: give it a tick
       continue;
     }
-    if (lastKeyDownMs != 0 && nowMs - lastKeyDownMs < kAuditQuietMs) {
-      continue; // typing in progress: another injector may hold it
+    if ((bit & kAuditQuietRows) != 0 && lastSuperChordMs != 0 && nowMs - lastSuperChordMs < kAuditQuietMs) {
+      continue; // Win row, Win+key just sent: a hook may still hold Win around it
     }
     release |= bit;
     firstSeen[i] = 0; // a re-press earns a fresh two-tick grace

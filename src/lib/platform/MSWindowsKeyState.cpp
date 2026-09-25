@@ -1179,6 +1179,12 @@ void MSWindowsKeyState::noteInjectedModifier(WORD vk, bool held)
   }
 }
 
+bool MSWindowsKeyState::ledgerHoldsSuper() const
+{
+  const std::lock_guard<std::mutex> lock(m_injectedModifiersMutex);
+  return m_injectedModifiers.count(VK_LWIN) != 0 || m_injectedModifiers.count(VK_RWIN) != 0;
+}
+
 void MSWindowsKeyState::forgetInjectedModifiers(const std::vector<WORD> &released)
 {
   const std::lock_guard<std::mutex> lock(m_injectedModifiersMutex);
@@ -1437,8 +1443,14 @@ void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
     const bool injected = m_desks->fakeKeyEvent(vk, scanCode, flags, keystroke.m_data.m_button.m_repeat);
     const bool keyup = (flags & KEYEVENTF_KEYUP) != 0;
     if (!keyup && injected) {
-      // D3: the audit's quiet window -- any key-down we inject here counts.
-      m_lastInjectedKeyDownMs.store(GetTickCount64(), std::memory_order_relaxed);
+      const ULONGLONG now = GetTickCount64();
+      m_lastInjectedKeyDownMs.store(now, std::memory_order_relaxed);
+      // D3: the audit's Win-row quiet window is keyed to Win+key ONLY -- a
+      // non-modifier down injected while WE hold LWIN/RWIN. Plain typing
+      // must not postpone the release of a stuck Ctrl/Alt/Win (review D3).
+      if (modifierVkIndex(vk) < 0 && ledgerHoldsSuper()) {
+        m_lastInjectedSuperChordMs.store(now, std::memory_order_relaxed);
+      }
     }
     // Record what WE are holding, from what actually reached the injector.
     // This must never be derived from GetKeyboardState: a physically stuck

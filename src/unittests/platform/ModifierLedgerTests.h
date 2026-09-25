@@ -22,7 +22,8 @@ private Q_SLOTS:
 
   // D3: audit grace while entered
   void audit_unledgeredDown_needsTwoTicks();
-  void audit_unledgeredDown_notReleasedWhileTyping();
+  void audit_unledgeredCtrl_releasedOnTick2_regardlessOfTyping();
+  void audit_unledgeredWin_skippedOnlyAfterSuperChord();
   void audit_ledgeredDown_neverReleased();
   void audit_boundary_releasesImmediately();
   void audit_upBetweenTicks_resetsGrace();

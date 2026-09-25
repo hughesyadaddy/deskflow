@@ -26,6 +26,7 @@ constexpr uint16_t kVkLControl = 0xA2;
 // Audit table rows (contract with deskSanitizeStaleModifiers' kModifiers[]).
 constexpr uint32_t kRowLWin = 1u << 0;
 constexpr uint32_t kRowRWin = 1u << 1;
+constexpr uint32_t kRowLMenu = 1u << 2;
 constexpr uint32_t kRowLControl = 1u << 4;
 
 constexpr uint64_t kTick = 1000; // the audit period
@@ -74,24 +75,61 @@ void ModifierLedgerTests::audit_unledgeredDown_needsTwoTicks()
   // its second consecutive sighting: another injector (PowerToys KBM, an
   // AutoHotkey Win hook) holding it around one of our keys is gone by then.
   AuditFirstSeen seen{};
-  const uint64_t quiet = 0; // never typed
+  const uint64_t quiet = 0; // no Win+key ever sent
   QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, 10 * kTick, quiet, true), 0u);
   QCOMPARE(seen[0], 10 * kTick);
   QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, 11 * kTick, quiet, true), kRowLWin);
 }
 
-void ModifierLedgerTests::audit_unledgeredDown_notReleasedWhileTyping()
+void ModifierLedgerTests::audit_unledgeredCtrl_releasedOnTick2_regardlessOfTyping()
 {
-  // Two sightings but a key-down injected within the quiet window: the hook
-  // is legitimately re-processing our keys -- do not fight it every second.
+  // Review D3: a stuck non-ledgered LCONTROL turns every letter into
+  // Ctrl+letter, so it must be released on its second sighting even though
+  // a Win+key (the only thing the quiet window is about) went out 100 ms
+  // ago and the user is typing continuously. Same for the Alt rows.
+  AuditFirstSeen seen{};
+  const uint64_t now = 20 * kTick;
+  QCOMPARE(staleModifiersToRelease(kRowLControl, 0, seen, now, now - 100, true), 0u);
+  QCOMPARE(seen[4], now);
+  QCOMPARE(staleModifiersToRelease(kRowLControl, 0, seen, now + kTick, now + kTick - 100, true), kRowLControl);
+  QCOMPARE(seen[4], 0u);
+  // ...and again after the reset, still under a fresh Super chord.
+  QCOMPARE(staleModifiersToRelease(kRowLControl, 0, seen, now + 2 * kTick, now + 2 * kTick - 100, true), 0u);
+  QCOMPARE(staleModifiersToRelease(kRowLControl, 0, seen, now + 3 * kTick, now + 3 * kTick - 100, true), kRowLControl);
+  // The Alt rows share the Ctrl rule.
+  AuditFirstSeen seenAlt{};
+  QCOMPARE(staleModifiersToRelease(kRowLMenu, 0, seenAlt, now, now - 100, true), 0u);
+  QCOMPARE(staleModifiersToRelease(kRowLMenu, 0, seenAlt, now + kTick, now + kTick - 100, true), kRowLMenu);
+}
+
+void ModifierLedgerTests::audit_unledgeredWin_skippedOnlyAfterSuperChord()
+{
+  // Win row, two sightings, but a Super-bearing key-down (Win+key we sent
+  // while LWIN was ledgered) went out within the quiet window: a target
+  // hook is legitimately re-processing that chord -- do not fight it.
   AuditFirstSeen seen{};
   const uint64_t now = 20 * kTick;
   QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, now, now - 100, true), 0u);
   QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, now + kTick, now + kTick - 100, true), 0u);
   QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, now + 2 * kTick, now + 2 * kTick - 100, true), 0u);
-  // ...the keyboard goes quiet: released on the next tick after the window.
-  const uint64_t lastKey = now + 2 * kTick - 100;
-  QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, lastKey + kAuditQuietMs, lastKey, true), kRowLWin);
+  QCOMPARE(seen[0], now); // still counting from the first sighting
+  // ...no further Super chord: released on the first tick past the window.
+  const uint64_t lastChord = now + 2 * kTick - 100;
+  QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, lastChord + kAuditQuietMs, lastChord, true), kRowLWin);
+  QCOMPARE(seen[0], 0u);
+
+  // The same Win row with only PLAIN typing (the caller reports no Super
+  // chord at all, 0): released on tick 2 like any other row -- plain letters
+  // say nothing about who is holding Win.
+  AuditFirstSeen seenPlain{};
+  QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seenPlain, now, 0, true), 0u);
+  QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seenPlain, now + kTick, 0, true), kRowLWin);
+
+  // A Super chord older than the window does not postpone RWIN either.
+  AuditFirstSeen seenOld{};
+  const uint64_t oldChord = now - kAuditQuietMs;
+  QCOMPARE(staleModifiersToRelease(kRowRWin, 0, seenOld, now, oldChord, true), 0u);
+  QCOMPARE(staleModifiersToRelease(kRowRWin, 0, seenOld, now + kTick, oldChord, true), kRowRWin);
 }
 
 void ModifierLedgerTests::audit_ledgeredDown_neverReleased()

@@ -280,7 +280,7 @@ void MSWindowsDesks::getCursorPos(int32_t &x, int32_t &y) const
 }
 
 std::vector<WORD>
-MSWindowsDesks::sanitizeStaleModifiers(uint32_t heldByUsBits, bool entered, uint64_t lastKeyDownMs) const
+MSWindowsDesks::sanitizeStaleModifiers(uint32_t heldByUsBits, bool entered, uint64_t lastSuperChordMs) const
 {
   // Synchronous: the desk queue is FIFO, and waiting for the ack guarantees
   // the stale releases have landed before the caller (enable/enter) returns
@@ -289,7 +289,7 @@ MSWindowsDesks::sanitizeStaleModifiers(uint32_t heldByUsBits, bool entered, uint
   StaleModifierAudit audit;
   audit.heldByUsBits = heldByUsBits;
   audit.entered = entered;
-  audit.lastKeyDownMs = lastKeyDownMs;
+  audit.lastSuperChordMs = lastSuperChordMs;
   sendMessage(DESKFLOW_MSG_SANITIZE_MODS, reinterpret_cast<WPARAM>(&audit), 0);
   return audit.released;
 }
@@ -504,7 +504,7 @@ void deskSanitizeStaleModifiers(MSWindowsDesks::StaleModifierAudit *audit, const
     }
   }
   const uint32_t releaseBits = deskflow::platform::staleModifiersToRelease(
-      osDownMask, heldByUsBits, s_firstSeen, GetTickCount64(), audit->lastKeyDownMs, audit->entered
+      osDownMask, heldByUsBits, s_firstSeen, GetTickCount64(), audit->lastSuperChordMs, audit->entered
   );
   if (releaseBits == 0) {
     return;

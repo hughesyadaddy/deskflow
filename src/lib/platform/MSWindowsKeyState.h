@@ -105,10 +105,20 @@ public:
   void forgetInjectedModifiers(const std::vector<WORD> &released);
 
   //! Tick (ms) of the last key DOWN this client injected on this screen,
-  //! 0 if none yet. Feeds the audit's quiet window (D3). Thread-safe.
+  //! 0 if none yet. Diagnostics only. Thread-safe.
   uint64_t lastInjectedKeyDownMs() const
   {
     return m_lastInjectedKeyDownMs.load(std::memory_order_relaxed);
+  }
+
+  //! Tick (ms) of the last NON-modifier key DOWN injected while the ledger
+  //! held LWIN/RWIN -- the last Win+key we sent -- 0 if none yet. Feeds the
+  //! audit's Win-row quiet window (D3): only a Win+key can make a target
+  //! hook legitimately hold Win, so plain typing must not postpone the
+  //! release of a stuck modifier. Thread-safe.
+  uint64_t lastInjectedSuperChordMs() const
+  {
+    return m_lastInjectedSuperChordMs.load(std::memory_order_relaxed);
   }
 
   MSWindowsKeyState(
@@ -259,7 +269,10 @@ private:
   void noteInjectedModifier(WORD vk, bool held);
   InjectedModifierMap m_injectedModifiers;              // guarded by m_injectedModifiersMutex (D2)
   mutable std::mutex m_injectedModifiersMutex;
-  std::atomic<uint64_t> m_lastInjectedKeyDownMs{0}; // D3 quiet window
+  std::atomic<uint64_t> m_lastInjectedKeyDownMs{0};    // diagnostics
+  std::atomic<uint64_t> m_lastInjectedSuperChordMs{0}; // D3 quiet window (Win rows only)
+  //! True when the ledger holds LWIN or RWIN. Takes the ledger mutex.
+  bool ledgerHoldsSuper() const;
 
   using GroupList = std::vector<HKL>;
 
