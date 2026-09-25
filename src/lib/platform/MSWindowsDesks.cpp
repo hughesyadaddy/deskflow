@@ -9,6 +9,7 @@
 #include "platform/MSWindowsDesks.h"
 
 #include "platform/InjectionCoalesce.h"
+#include "platform/MSWindowsModifierLedger.h"
 
 #include "arch/Arch.h"
 #include "base/IEventQueue.h"
@@ -278,12 +279,19 @@ void MSWindowsDesks::getCursorPos(int32_t &x, int32_t &y) const
   y = pos.y;
 }
 
-void MSWindowsDesks::sanitizeStaleModifiers(uint32_t heldByUsBits) const
+std::vector<WORD>
+MSWindowsDesks::sanitizeStaleModifiers(uint32_t heldByUsBits, bool entered, uint64_t lastKeyDownMs) const
 {
   // Synchronous: the desk queue is FIFO, and waiting for the ack guarantees
   // the stale releases have landed before the caller (enable/enter) returns
-  // and the server starts sending real input.
-  sendMessage(DESKFLOW_MSG_SANITIZE_MODS, static_cast<WPARAM>(heldByUsBits), 0);
+  // and the server starts sending real input. The request lives on this
+  // stack for exactly that reason.
+  StaleModifierAudit audit;
+  audit.heldByUsBits = heldByUsBits;
+  audit.entered = entered;
+  audit.lastKeyDownMs = lastKeyDownMs;
+  sendMessage(DESKFLOW_MSG_SANITIZE_MODS, reinterpret_cast<WPARAM>(&audit), 0);
+  return audit.released;
 }
 
 void MSWindowsDesks::releaseHeldKeys(std::vector<WORD> &vks) const
@@ -450,8 +458,14 @@ namespace {
 // desktop actually receiving input. Running this on the main screen thread
 // silently no-ops on LogonUI / secure-desktop / post-desk-switch -- the log
 // would claim a release that never landed.
-void deskSanitizeStaleModifiers(uint32_t heldByUsBits)
+// The decision (which rows to release, two-tick grace, quiet window) is
+// deskflow::platform::staleModifiersToRelease -- pure and unit-tested on
+// every platform; this function only probes, injects and logs. The
+// first-seen state is desk-thread-private: every pass is a synchronous
+// message from the main thread, so no two passes ever overlap.
+void deskSanitizeStaleModifiers(MSWindowsDesks::StaleModifierAudit *audit, const std::wstring &deskName)
 {
+  const uint32_t heldByUsBits = audit->heldByUsBits;
   // SHIFT IS DELIBERATELY ABSENT. GetAsyncKeyState cannot tell an injected
   // modifier from one the user is physically holding, and this runs on core
   // (re)start -- including the per-desktop relaunch when LogonUI appears,
@@ -477,13 +491,29 @@ void deskSanitizeStaleModifiers(uint32_t heldByUsBits)
   // a deliberate tap, so if any Win/Alt is about to be released, first inject
   // a no-op key (unassigned VK 0xE8) to break the tap sequence -- the same
   // trick remappers use.
-  bool maskMenu = false;
-  for (size_t i = 0; i < sizeof(kModifiers) / sizeof(kModifiers[0]); ++i) {
-    const auto &[vk, extended] = kModifiers[i];
-    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0 || (heldByUsBits & (1u << i)) != 0) {
-      continue;
+  static_assert(
+      sizeof(kModifiers) / sizeof(kModifiers[0]) == deskflow::platform::kAuditModifierRows,
+      "audit table rows must match the pure decision helper"
+  );
+  static deskflow::platform::AuditFirstSeen s_firstSeen{}; // desk-thread private (see above)
+
+  uint32_t osDownMask = 0;
+  for (size_t i = 0; i < deskflow::platform::kAuditModifierRows; ++i) {
+    if ((GetAsyncKeyState(static_cast<int>(kModifiers[i].vk)) & 0x8000) != 0) {
+      osDownMask |= (1u << i);
     }
-    if (vk == VK_LWIN || vk == VK_RWIN || vk == VK_LMENU || vk == VK_RMENU) {
+  }
+  const uint32_t releaseBits = deskflow::platform::staleModifiersToRelease(
+      osDownMask, heldByUsBits, s_firstSeen, GetTickCount64(), audit->lastKeyDownMs, audit->entered
+  );
+  if (releaseBits == 0) {
+    return;
+  }
+
+  bool maskMenu = false;
+  for (size_t i = 0; i < deskflow::platform::kAuditModifierRows; ++i) {
+    const UINT vk = kModifiers[i].vk;
+    if ((releaseBits & (1u << i)) != 0 && (vk == VK_LWIN || vk == VK_RWIN || vk == VK_LMENU || vk == VK_RMENU)) {
       maskMenu = true;
       break;
     }
@@ -498,20 +528,32 @@ void deskSanitizeStaleModifiers(uint32_t heldByUsBits)
     SendInput(2, dummy, sizeof(INPUT));
   }
 
-  for (size_t i = 0; i < sizeof(kModifiers) / sizeof(kModifiers[0]); ++i) {
-    const auto &[vk, extended] = kModifiers[i];
-    if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) == 0) {
+  // Desk names are ASCII ("Default", "Winlogon", "Screen-saver").
+  std::string desk;
+  for (const wchar_t c : deskName) {
+    desk.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+  }
+
+  for (size_t i = 0; i < deskflow::platform::kAuditModifierRows; ++i) {
+    if ((releaseBits & (1u << i)) == 0) {
       continue;
     }
-    if ((heldByUsBits & (1u << i)) != 0) {
-      continue; // we injected this one and have not released it yet
-    }
+    const auto &[vk, extended] = kModifiers[i];
     INPUT input{};
     input.type = INPUT_KEYBOARD;
     input.ki.wVk = static_cast<WORD>(vk);
     input.ki.dwFlags = KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
     if (SendInput(1, &input, sizeof(input)) == 1) {
-      LOG_WARN("released stuck modifier vk=0x%02x (injected bits 0x%02x)", vk, heldByUsBits);
+      audit->released.push_back(static_cast<WORD>(vk));
+      LOG_WARN(
+          "released stuck modifier vk=0x%02x (injected bits 0x%02x, %s)", vk, heldByUsBits,
+          audit->entered ? "audit" : "boundary"
+      );
+      // D6: an UP that did not take (wrong desktop) reads os_after=down here
+      // with no further Deskflow traffic; a re-press by another hook reads
+      // os_after=up now and down again on the next tick.
+      const bool stillDown = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+      LOG_INFO("[keys] audit release vk=0x%02x os_after=%s desk=%s", vk, stillDown ? "down" : "up", desk.c_str());
     } else {
       LOG_WARN("failed to release stuck modifier vk=0x%02x: %d", vk, GetLastError());
     }
@@ -1017,7 +1059,7 @@ void MSWindowsDesks::deskThread(const void *vdesk)
       break;
 
     case DESKFLOW_MSG_SANITIZE_MODS:
-      deskSanitizeStaleModifiers(static_cast<uint32_t>(msg.wParam));
+      deskSanitizeStaleModifiers(reinterpret_cast<StaleModifierAudit *>(msg.wParam), desk->m_name);
       break;
 
     case DESKFLOW_MSG_RELEASE_KEYS:

@@ -16,6 +16,8 @@
 #include "platform/MSWindowsDesks.h"
 #include "platform/MSWindowsHandle.h"
 
+#include <algorithm>
+
 // extended mouse buttons
 #if !defined(VK_XBUTTON1)
 #define VK_XBUTTON1 0x05
@@ -1167,6 +1169,7 @@ void MSWindowsKeyState::noteInjectedModifier(WORD vk, bool held)
   if (modifierVkIndex(vk) < 0) {
     return;
   }
+  const std::lock_guard<std::mutex> lock(m_injectedModifiersMutex);
   if (held) {
     // Down AND repeat land here: a repeat refreshes the stamp so a chord the
     // server keeps holding stays inside the audit's grace window.
@@ -1174,6 +1177,12 @@ void MSWindowsKeyState::noteInjectedModifier(WORD vk, bool held)
   } else {
     m_injectedModifiers.erase(vk);
   }
+}
+
+void MSWindowsKeyState::forgetInjectedModifiers(const std::vector<WORD> &released)
+{
+  const std::lock_guard<std::mutex> lock(m_injectedModifiersMutex);
+  deskflow::platform::forgetReleased(m_injectedModifiers, released);
 }
 
 int MSWindowsKeyState::modifierVkIndex(WORD vk)
@@ -1208,6 +1217,7 @@ uint32_t MSWindowsKeyState::injectedModifierBits(const InjectedModifierMap &ledg
 
 uint32_t MSWindowsKeyState::injectedModifierBits(bool entered) const
 {
+  const std::lock_guard<std::mutex> lock(m_injectedModifiersMutex);
   return injectedModifierBits(m_injectedModifiers, GetTickCount64(), entered);
 }
 
@@ -1270,11 +1280,28 @@ void MSWindowsKeyState::sanitizeInjectedKeys()
   // input desktop -- exactly the case that strands keys. The desk thread
   // probes each candidate, injects the UP, and trims the list to what it
   // actually released.
-  std::vector<WORD> vks = injectedKeyCandidates(m_injectedModifiers);
-  m_desks->releaseHeldKeys(vks);
+  std::vector<WORD> vks;
+  {
+    const std::lock_guard<std::mutex> lock(m_injectedModifiersMutex);
+    vks = injectedKeyCandidates(m_injectedModifiers);
+  }
+  const std::vector<WORD> attempted = vks;
+  m_desks->releaseHeldKeys(vks); // no lock held: round-trips to the desk thread
+  std::vector<WORD> wasInjected;
+  {
+    // D1: forget every VK we ATTEMPTED, not only those still down -- an entry
+    // whose key is already up defends nothing and would vouch forever.
+    const std::lock_guard<std::mutex> lock(m_injectedModifiersMutex);
+    for (const WORD vk : vks) {
+      if (m_injectedModifiers.count(vk) != 0) {
+        wasInjected.push_back(vk);
+      }
+    }
+    deskflow::platform::forgetReleased(m_injectedModifiers, attempted);
+  }
   for (const WORD vk : vks) {
-    const bool wasInjected = m_injectedModifiers.erase(vk) != 0;
-    LOG_INFO("released stale %s key vk=0x%02x", wasInjected ? "injected" : "held", vk);
+    const bool injected = std::find(wasInjected.begin(), wasInjected.end(), vk) != wasInjected.end();
+    LOG_INFO("released stale %s key vk=0x%02x", injected ? "injected" : "held", vk);
   }
 }
 
@@ -1286,14 +1313,27 @@ void MSWindowsKeyState::releaseInjectedKeys(KeyModifierMask keep)
   // ongoing chord) stay down. The desk thread still probes each VK
   // (GetAsyncKeyState on the input desktop) and trims the list to what it
   // actually released.
-  std::vector<WORD> vks = ledgerKeysToRelease(m_injectedModifiers, keep);
+  std::vector<WORD> vks;
+  {
+    const std::lock_guard<std::mutex> lock(m_injectedModifiersMutex);
+    vks = ledgerKeysToRelease(m_injectedModifiers, keep);
+  }
   if (vks.empty()) {
     return;
   }
-  m_desks->releaseHeldKeys(vks);
+  const std::vector<WORD> attempted = vks;
+  m_desks->releaseHeldKeys(vks); // no lock held: may run inline on the desk thread
+  // D1: forget every VK attempted, not only those the desk thread found
+  // down. Previously an entry whose key was already up survived here and,
+  // while entered, vouched forever -- the audit then IGNORED a physically
+  // stuck Win (live 2026-09-25: "injected bits 0x03" with nothing held by us).
+  forgetInjectedModifiers(attempted);
   for (const WORD vk : vks) {
-    m_injectedModifiers.erase(vk);
     LOG_INFO("released injected key vk=0x%02x", vk);
+  }
+  if (vks.size() != attempted.size()) {
+    LOG_DEBUG("[keys] ledger closed %zu entr%s whose key was already up", attempted.size() - vks.size(),
+              attempted.size() - vks.size() == 1 ? "y" : "ies");
   }
 }
 
@@ -1395,12 +1435,23 @@ void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
     // vk,sc,flags,keystroke.m_data.m_button.m_repeat
 
     const bool injected = m_desks->fakeKeyEvent(vk, scanCode, flags, keystroke.m_data.m_button.m_repeat);
+    const bool keyup = (flags & KEYEVENTF_KEYUP) != 0;
+    if (!keyup && injected) {
+      // D3: the audit's quiet window -- any key-down we inject here counts.
+      m_lastInjectedKeyDownMs.store(GetTickCount64(), std::memory_order_relaxed);
+    }
     // Record what WE are holding, from what actually reached the injector.
     // This must never be derived from GetKeyboardState: a physically stuck
     // modifier would be read back as "intended", and the audit that exists
     // to release it would skip it forever. A drop simply means the key is
     // not held, so the state stays truthful either way.
-    noteInjectedModifier(vk, injected && (flags & KEYEVENTF_KEYUP) == 0);
+    // D4: an UP that was DROPPED still closes the ledger (the OS may hold
+    // the key, and only a non-vouching ledger lets the audit release it)
+    // -- but say so, since the key is now stuck until the audit's next tick.
+    if (keyup && !injected && modifierVkIndex(vk) >= 0) {
+      LOG_WARN("[keys] injected UP dropped for modifier vk=0x%02x; ledger closed, audit is the backstop", vk);
+    }
+    noteInjectedModifier(vk, keyup ? false : injected);
 
     // synthesize event
     // m_desks->fakeKeyEvent(button, vk,

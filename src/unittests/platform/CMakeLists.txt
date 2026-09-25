@@ -10,6 +10,17 @@ create_test(
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
 )
 
+# Platform-neutral: MSWindowsModifierLedger.h is a pure header (no Win32
+# deps) -- the injected-modifier ledger hygiene and the stale-modifier audit
+# grace are decided there and tested here on every platform.
+create_test(
+  NAME ModifierLedgerTests
+  DEPENDS platform
+  LIBS base arch
+  SOURCE ModifierLedgerTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
+)
+
 if (WIN32)
   create_test(
     NAME MSWindowsClipboardTests
