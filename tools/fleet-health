@@ -751,9 +751,19 @@ def identifier_is_filename_derived(path: str, identifier: str) -> bool:
     if not identifier:
         return False
     stem = re.sub(r"\.(dylib|so|bundle)$", "", Path(path).name)
-    if not stem.startswith(identifier):
-        return False
-    return bool(_VERSION_TAIL.match(stem[len(identifier):]))
+    # ld64 / Homebrew ad-hoc identifiers keep a 40-hex content hash after the
+    # name (libpcre2-16-55554944…); our re-sign preserves it. Strip it before
+    # comparing -- a content hash is not a TCC-relevant identifier for a
+    # bundled third-party dylib (the sign/no-adhoc checks already enforce the
+    # team + hardened runtime on it).
+    ident = re.sub(r"-[0-9a-f]{40}$", "", identifier)
+    if stem.startswith(ident) and _VERSION_TAIL.match(stem[len(ident):]):
+        return True
+    # The identifier may carry MORE version components than the file name
+    # (libjpeg.8.dylib -> libjpeg.8.3.2).
+    if ident.startswith(stem) and _VERSION_TAIL.match(ident[len(stem):]):
+        return True
+    return False
 
 
 def is_first_party(path: str) -> bool:

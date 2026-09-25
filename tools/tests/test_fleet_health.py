@@ -1259,3 +1259,30 @@ def test_macho_scan_cmd_parses_under_bin_sh():
     cmd = fh.macho_scan_cmd(["/Applications/Deskflow.app", "/Applications/Mouser.app"])
     r = subprocess.run(["/bin/sh", "-n", "-c", cmd], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+def test_identifier_filename_derived_accepts_ld_hash_and_version_variants():
+    """Bundled Homebrew/Qt dylibs re-signed by our identity keep ld64's
+    <name>-<sha1> identifier or a deeper version (libjpeg.8.3.2); these are
+    not first-party and must not fail the identifiers check (seen live
+    2026-09-25 on 22 PlugIns/Frameworks dylibs, all team-signed + hardened)."""
+    ok = [
+        ("libpcre2-16.0.dylib", "libpcre2-16-55554944b1707004b58b3354b18007ab5e016dbf"),
+        ("libgraphite2.3.dylib", "libgraphite2-55554944869b6ae6f82b3fe7904dd1ae97255561"),
+        ("libpng16.16.dylib", "libpng16-55554944ab22ce59433a32e195bea0ce698b2ba3"),
+        ("libdbus-1.3.dylib", "libdbus-1-55554944fb8085dc9746335c90d0429dfe91dd60"),
+        ("libjpeg.8.dylib", "libjpeg.8.3.2"),
+        ("libb2.1.dylib", "libb2-55554944c443136029603e50b6993691771ade27"),
+        ("libqtvirtualkeyboardplugin.dylib", "libqtvirtualkeyboardplugin-5555494444567dbebee139c0bead99f3c1657e0f"),
+        ("libqsvgicon.dylib", "libqsvgicon-555549441c98f8358be63a26b44298d06099913d"),
+    ]
+    for name, ident in ok:
+        assert fh.identifier_is_filename_derived("/Applications/Deskflow.app/Contents/PlugIns/x/" + name, ident), (name, ident)
+    bad = [
+        ("libfoo.dylib", "com.evil.thing"),
+        ("libfoo.dylib", "libfoobar-55554944c443136029603e50b6993691771ade27"),
+        ("libfoo.dylib", "libfo"),
+        ("libfoo.dylib", ""),
+    ]
+    for name, ident in bad:
+        assert not fh.identifier_is_filename_derived("/Applications/Deskflow.app/Contents/PlugIns/x/" + name, ident), (name, ident)
