@@ -62,8 +62,18 @@ never the checkout (see 1d): it re-renders stale plists, `launchctl enable`s
 and bootstraps unloaded agents, kickstarts loaded-but-dead ones, and never
 kills anything. It refuses to bootstrap/kickstart a core or GUI while a
 process launchd does not own is already running (`refused ... already running
-outside launchd`, exit 1: that is the duplicate-core path, fix = `stop` then
-`start`). It stays quiet while any of these hold:
+outside launchd`, exit 1: that is the duplicate-core path) and holds the GUI
+while the core is refused. The refusal names the remedy that works, per pid:
+this user's -> `deskflow-ctl stop` then `start` (`stop` TERM/KILLs every
+`deskflow-core`/`Deskflow` of this user from *any* path, a dev build or
+`Deskflow.app.bak` included, logging each pid with its path); another uid's
+-> the exact `sudo kill <pid>  # <path>` line, which `stop` never signals and
+exits 1 on instead of claiming "stopped". A plist re-rendered while its label
+is loaded is only a pending change (`render ... (takes effect at next
+deskflow-ctl start/restart)`, then `rebootstrap ...` and `needs_rebootstrap:
+true` in `health.json` until `start`/`restart` replaces launchd's loaded
+definition; the tick never boots a loaded label out). It stays quiet while any
+of these hold:
 
 - `~/Library/Application Support/Deskflow/quit-intent` is newer than the last
   boot (written by tray Quit and `deskflow-ctl stop`; removed by
@@ -116,29 +126,46 @@ Fix (in `deskflow-ctl start` from this branch): the tick runs the launchd-safe
 copy `~/Library/Deskflow/bin/deskflow-ctl` (+ `launchd/` templates +
 `fleet-soak`), refreshed by `deskflow-ctl start` / `safe-copy`
 (diff-and-replace, 755/644) and by `install-macos.sh`; the converge, soak and
-prio renders never contain a checkout path (`render-plist` refuses one), and
-`start` appends a marker to `converge.log` so the old EPERM block stops
-counting as evidence. On the seat:
+prio renders never contain a checkout path (`render-plist` refuses one; the
+refusal list is canonical and case-insensitive -- `~/desktop`,
+`~/Library/../Desktop`, a symlink into `~/Desktop`, iCloud Drive and
+`/Volumes` count), and `start` appends a marker to `converge.log` so the old
+EPERM block stops counting as evidence. `start` compares what launchd LOADED
+for each label (`launchctl print` argv + environment) with the fresh render:
+only a label whose loaded definition differs is booted out and bootstrapped
+again (here the converge label, still holding the checkout path); a current
+core/GUI is only kickstarted. A `converge --apply` by hand (1b) re-renders the
+FILE but cannot replace the loaded definition, so on its own it changes
+nothing -- `start` (or `restart`) is the repair. On the seat:
 
 ```bash
-ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl start'   # refreshes ~/Library/Deskflow/bin, re-renders + re-bootstraps the tick
-ssh <mac> 'launchctl print gui/$(id -u)/io.github.hughesyadaddy.deskflow-converge | grep -E "Deskflow/bin|state|last exit"'   # program under ~/Library/Deskflow/bin, never exit 126
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl start'   # refreshes ~/Library/Deskflow/bin, re-renders, boots out + bootstraps the converge label (loaded definition differed), kickstarts core + GUI
+ssh <mac> 'launchctl print gui/$(id -u)/io.github.hughesyadaddy.deskflow-converge | grep -E "Deskflow/bin|state|last exit"'   # arguments now name ~/Library/Deskflow/bin/deskflow-ctl; last exit code 0 after the next tick
 ssh <mac> 'tail -3 ~/Library/Logs/Deskflow/converge.log; ls -l ~/Library/Application\ Support/Deskflow/health.json'   # health.json rewritten every minute
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl assert-single'   # OK: no "cannot execute its program", no "rebootstrap" pending
 tools/fleet-health --check converge --host <mac>
 ```
 
-Why the agent had to stay unloaded until this landed: a converge that *could*
-run decided from launchd's view only -- "label not loaded" or "loaded, no pid"
--- and bootstrapped / kickstarted launchd's core next to a core that was
-already running (the GUI's own child on the old build, an orphan, a copy still
-exiting after a `bootout`), leaving two `deskflow-core`. `converge`, `start`
-and `restart` now consult the process table first and refuse with
-`refused kickstart io.github.hughesyadaddy.deskflow-core: deskflow-core pid N
-already running outside launchd` (exit 1, no `launchctl` call, no budget
-spent); the fix is `deskflow-ctl stop` (bootout, then by-pid escalation) and
-`start`. `start` also waits for the old pid to exit after a `bootout` before
-bootstrapping the fresh render. Never re-enable a converge agent whose
-program is under `~/Desktop`, `~/Documents` or `~/Downloads`.
+What the 2026-09-25 review established about duplicate cores: on macbookpro
+the tick had exited 126 since install -- it never ran, so it never spawned
+anything; the converge design's own gap was latent (a tick that *could* run
+decided from launchd's view only, "label not loaded" or "loaded, no pid", and
+would have bootstrapped / kickstarted launchd's core next to a core that was
+already running: the GUI's own child on the old build, an orphan, a copy still
+exiting after a `bootout`). The path that does start a core without looking
+at the process table is the GUI's own `kickstartExternalCore`
+(`src/lib/gui/core/CoreProcess.cpp`, `launchctl kickstart -k`; follow-up in
+the plan). `converge`, `start` and `restart` now consult the process table
+first and refuse with `refused kickstart io.github.hughesyadaddy.deskflow-core:
+deskflow-core pid N already running outside launchd; deskflow-ctl stop (...)
+first, then start` (exit 1, no `launchctl` call, no budget spent); `stop`
+clears every `deskflow-core`/`Deskflow` of this user from any path (TERM,
+then KILL, each pid logged with its path) and names another uid's with the
+exact `sudo kill <pid>` line (exit 1, never "stopped"). `start` also waits
+for the old pid to exit after a `bootout` (launchd SIGKILLs at its 5 s exit
+timeout) before bootstrapping the fresh render. Never re-enable a converge
+agent whose program is under `~/Desktop`, `~/Documents`, `~/Downloads`,
+iCloud Drive or `/Volumes`.
 
 ## 2. Redeploy one seat from the branch
 
