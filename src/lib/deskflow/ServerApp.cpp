@@ -256,7 +256,14 @@ void ServerApp::closeServer(Server *server)
     getEvents()->addEvent(Event(EventTypes::Quit));
   });
 
-  getEvents()->loop();
+  // A handler that throws inside this nested loop must not skip the
+  // teardown below and in stopServer() (closeClientListener releases the
+  // port): that is the leaked-listener path of the 2026-09-25 outage.
+  try {
+    getEvents()->loop();
+  } catch (std::exception &e) {
+    LOG_WARN("error while waiting for clients to disconnect: %s", e.what());
+  }
 
   getEvents()->removeHandler(EventTypes::Timer, timer);
   getEvents()->deleteTimer(timer);

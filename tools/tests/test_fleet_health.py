@@ -1362,7 +1362,10 @@ def test_parse_crashloop_three_hits_in_a_minute_is_not_a_loop():
                                  for i in range(3)) + "\n"
     status, detail = fh.parse_crashloop_log(out, now=now)
     assert status == "PASS" and "3x 'cannot bind address'" in detail and "fds=76" in detail
-    # Four spread over more than a minute: the epoch loop backing off, not looping.
+    # Four spread over 75 s (launchd ThrottleInterval restarts, or the epoch
+    # backoff once it has reached 16-30 s): not a hot loop. The designed
+    # 1-2-4-8-16 s backoff itself puts 5 failures inside ~31 s and DOES trip
+    # the check -- a persistent bind fault is exactly what it must report.
     out = "fds=76\n" + "\n".join(crash_line("cannot bind address", t0 + timedelta(seconds=25 * i))
                                  for i in range(4)) + "\n"
     assert fh.parse_crashloop_log(out, now=now)[0] == "PASS"

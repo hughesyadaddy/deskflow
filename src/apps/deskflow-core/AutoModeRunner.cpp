@@ -114,8 +114,15 @@ void AutoModeRunner::run(QThread &coreThread)
 void AutoModeRunner::requestQuit()
 {
   // Set before the coordinator fires the interrupt callback so a quit is
-  // never rate-limited like a role flip.
-  m_quitRequested = true;
+  // never rate-limited like a role flip. Flipped UNDER the gate mutex: the
+  // backoff wait evaluates its predicate under that mutex, and a flag set
+  // between its check and its sleep is otherwise missed until the wait
+  // times out (review 2026-09-25: 48/4000 quits slept the full backoff
+  // without the lock, 0/4000 with it).
+  {
+    std::scoped_lock lock{m_gateMutex};
+    m_quitRequested = true;
+  }
   if (m_coordinator) {
     m_coordinator->requestQuit();
   }

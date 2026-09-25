@@ -18,6 +18,8 @@
 #include "net/TCPSocket.h"
 #include "net/TSocketMultiplexerMethodJob.h"
 
+#include <atomic>
+
 //
 // TCPListenSocket
 //
@@ -106,11 +108,21 @@ std::unique_ptr<IDataSocket> TCPListenSocket::accept()
     return std::make_unique<TCPSocket>(m_events, m_socketMultiplexer, raw);
   } catch (std::exception &e) {
     // The connection was accepted but could not be set up: typically a
-    // SocketCreateException because the peer already reset it (a wedge
-    // probe closes with SO_LINGER 0, so TCP_NODELAY fails with ECONNRESET).
-    // This used to be rethrown -- sliced to a bare std::exception -- out of
-    // the server's event loop, which ended the epoch and leaked its listener.
-    LOG_WARN("rejected incoming connection: %s", e.what());
+    // SocketCreateException because the peer already reset it (the wedge
+    // probe closes with SO_LINGER 0; on macOS accept() still succeeds and
+    // setsockopt(TCP_NODELAY) on the reset fd fails with EINVAL). This used
+    // to be rethrown -- sliced to a bare std::exception -- out of the
+    // server's event loop, which ended the epoch and leaked its listener.
+    // Our own probe does this every 30 s on a server seat, so only the
+    // first rejection and every 120th (about hourly) are WARN; the rest are
+    // DEBUG so the level still means something for a real rejection.
+    static std::atomic<unsigned long long> s_rejected{0};
+    const unsigned long long n = ++s_rejected;
+    if (n == 1 || n % 120 == 0) {
+      LOG_WARN("rejected incoming connection (%llu so far): %s", n, e.what());
+    } else {
+      LOG_DEBUG("rejected incoming connection (%llu so far): %s", n, e.what());
+    }
     return nullptr;
   }
 }
