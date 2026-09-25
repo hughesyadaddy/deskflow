@@ -305,8 +305,20 @@ function Deploy-Mouser {
       $venvPy = Join-Path $MouserRoot '.venv\Scripts\python.exe'
       if (-not (Test-Path (Join-Path $MouserRoot '.venv'))) {
         Invoke-Native -Label 'Mouser venv create' -FilePath $py -ArgumentList @('-m', 'venv', (Join-Path $MouserRoot '.venv'))
+        # requirements.txt alone pins PySide6>=6.6, so an unpinned install can
+        # resolve above the exact version build_and_install.py's provenance
+        # gate requires; requirements.lock is the source of truth for that
+        # pin (a macOS `pip freeze`, so it also carries darwin-only packages
+        # like pyobjc-core that fail to build on Windows -- install it for
+        # this ONE package by exact version, never `-r requirements.lock`
+        # wholesale on Windows).
+        $lockLine = Select-String -Path (Join-Path $MouserRoot 'requirements.lock') -Pattern '^PySide6==' |
+          Select-Object -First 1 -ExpandProperty Line
+        if (-not $lockLine) { throw 'PySide6 pin not found in requirements.lock' }
+        Invoke-Native -Label 'Mouser pip install (pinned)' -FilePath $venvPy `
+          -ArgumentList @('-m', 'pip', 'install', '--quiet', $lockLine, 'pyinstaller')
         Invoke-Native -Label 'Mouser pip install' -FilePath $venvPy `
-          -ArgumentList @('-m', 'pip', 'install', '--quiet', '-r', 'requirements.txt', 'pyinstaller')
+          -ArgumentList @('-m', 'pip', 'install', '--quiet', '-r', 'requirements.txt')
       }
       Invoke-Native -Label 'Mouser build_and_install.py' -FilePath $venvPy `
         -ArgumentList @((Join-Path $MouserRoot 'scripts\build_and_install.py'))
