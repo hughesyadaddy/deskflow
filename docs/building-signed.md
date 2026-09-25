@@ -142,41 +142,88 @@ Two rules for `scripts/fleet.env`:
   on macOS, `$env:COMPUTERNAME` on Windows, lowercased) — never from the file.
   The `FLEET_SSH_<LOCAL_ID>` entry on each seat **must be `local`**; the other
   hosts get their SSH target. So the file differs by exactly one line per seat.
-- **No keychain passwords in `scripts/fleet.env`.** `FLEET_KEYCHAIN_PASSWORD_*`
+- **No passwords in `scripts/fleet.env`.** `FLEET_KEYCHAIN_PASSWORD_*`
   is gone from the shared file and `tools/fleet-doctor` fails if any
-  `KEYCHAIN_PASSWORD` key exists in `scripts/fleet.env*`. The per-seat
-  `.env` (mode 600, never shared) may hold `DESKFLOW_KEYCHAIN_PASSWORD`; see
-  "Signing over SSH" below.
+  `*PASSWORD*` key exists in `scripts/fleet.env*`. Passwords live only in the
+  git-ignored `.env` (mode 600, never tracked -- fleet-doctor checks both);
+  see "Signing over SSH" below.
 
-### Signing over SSH — the two credential routes (macOS)
+### Signing over SSH — the unattended flow (macOS)
 
 `codesign` needs the private key's ACL to allow it *and* the login keychain to
-be unlocked. An SSH session gets neither by default, so
-`scripts/fleet-deploy-macos.sh` picks one of two routes, in this order:
+be unlocked, and the seat's root steps (LoginWindow bridge plist, the
+`deskflow-prio` LaunchDaemon, root-owned retired files, the bridge log) need
+`sudo`. An SSH session gets none of that by default. Since 2026-09-25 one
+password per Mac, kept in **one file on the controller**, covers all of it.
 
-1. **`.env` password route (preferred, unattended).** If the seat's
-   `~/Desktop/deskflow/.env` contains `DESKFLOW_KEYCHAIN_PASSWORD=<login
-   password>` — the file **must** be mode `600` or the deploy refuses —
-   `prepare_keychain_for_ssh` runs `security unlock-keychain` and
-   `security set-key-partition-list -S apple-tool:,apple:,codesign:` on the
-   login keychain, proves it with a `codesign` probe on a temp copy of
-   `/bin/ls`, then **unsets the variable** so no child process (cmake,
-   Python, Mouser's installer) ever sees it. Every later `codesign` runs
-   directly in the SSH session. Mouser is built by
-   `scripts/build_and_install.py` in the same session.
-2. **GUI-session route (fallback).** Without the password, every step that
-   touches the keychain is relayed by `tools/fleet-gui-exec.py` into the
-   logged-in console session (Terminal + System Events Automation must be
-   granted once, and the console user must be logged in — a locked screen is
-   fine, a logged-out seat is not). Mouser goes through
-   `scripts/build_macos_gui_session.py`. Slower and interactive-dependent;
-   kept for seats without a `.env` password.
+**One-time setup, on the seat you run the deploy from** (any seat; the file
+is the repo's git-ignored `.env`, mode 600, never tracked):
 
-Windows needs neither: `DESKFLOW_SIGN_THUMBPRINT` names a cert already in the
-user's store and `signtool` runs in the SSH session (High-Integrity admin).
+```sh
+printf 'FLEET_SEAT_PASSWORD_hackintosh=…\n' >> ~/Desktop/deskflow/.env && chmod 600 ~/Desktop/deskflow/.env
+printf 'FLEET_SEAT_PASSWORD_macbookpro=…\n' >> ~/Desktop/deskflow/.env   # one line per Mac, ids as in FLEET_HOSTS (lowercase)
+```
 
-Which route ran is visible in the deploy log: `keychain: unlocked for SSH
-(probe ok)` vs `gui-exec: routing <step> through the console session`.
+Windows needs nothing: `DESKFLOW_SIGN_THUMBPRINT` names a cert already in the
+user's store, `signtool` and the service manager run in the High-Integrity
+SSH session, and the controller transports nothing to `tiny11`
+(`tools/fleet-doctor` fails on a password in a Windows `.env`).
+
+What happens on `scripts/fleet-deploy.sh`:
+
+1. **Controller.** `.env` is read by a plain `KEY=VALUE` parser (nothing is
+   sourced or exported). It refuses to run if any `*PASSWORD*` value is set
+   and the file is not mode 600, and refuses to *start* a deploy of a Mac
+   that has no `FLEET_SEAT_PASSWORD_<id>` line -- such a run would stall on
+   a prompt -- naming the key to add (`--allow-prompts` overrides for a seat
+   that carries its own `.env` password). A remote Mac gets the value on the
+   **SSH session's stdin only**: the remote command starts with
+   `IFS= read -rs FLEET_SEAT_PASSWORD` and passes it to
+   `scripts/fleet-deploy-macos.sh` as `DESKFLOW_KEYCHAIN_PASSWORD` and
+   `DESKFLOW_SUDO_PASSWORD` on that one invocation (git never sees it). The
+   local seat gets the same two exports in-process. It is never an ssh
+   argument, never in `fleet.env`, never in a log line, and `bash -x` cannot
+   echo it (xtrace is off around every expansion). `--pull-only` transports
+   nothing.
+2. **Seat.** `scripts/fleet-deploy-macos.sh` resolves each password as: the
+   seat's own `.env` key (`DESKFLOW_KEYCHAIN_PASSWORD` / `DESKFLOW_SUDO_PASSWORD`,
+   non-empty, wins) → the transported value → the seat's own
+   `FLEET_SEAT_PASSWORD_<this seat>` line; each defaults to the other. Both
+   are captured into plain shell variables and **unset before any child
+   runs**, so cmake, python3, codesign and the installers never inherit
+   them. Then `prepare_keychain_for_ssh` runs `security unlock-keychain` +
+   `security set-key-partition-list -S apple-tool:,apple:,codesign:` and
+   proves it with a `codesign` probe (Mouser's `scripts/build_and_install.py`
+   signs in the same session), and `init_root_mode` verifies the sudo
+   password once (`sudo -S -p '' -k true`). A cmake cache that disagrees
+   with the identity / strict-signing requirements is reconfigured
+   automatically (`cmake cache mismatch → reconfiguring`; from scratch if the
+   in-place configure fails).
+3. **Root steps, run on the seat through `sudo -S` with the password on
+   sudo's stdin (never argv):** install a stale LoginWindow bridge plist
+   (`install-login-bridge-macos.sh`), `deskflow-ctl prio --sudo-stdin` (the
+   `deskflow-prio` LaunchDaemon + `/private/var/db/deskflow`),
+   `deskflow-ctl retire --sudo-stdin` (root-owned leftovers such as
+   `/usr/local/bin/deskflow-prio-apply.sh` and
+   `/Library/LaunchAgents/com.symless.synergy-agent.plist`), and `chmod 600` +
+   `sed -i '' '/key down id=/d'` on `/var/log/deskflow-vhid-bridge.log`. A
+   rejected password is reported **once** (`sudo password rejected for
+   <seat>; check FLEET_SEAT_PASSWORD_<id>`) and every root step falls back
+   to being printed; the deploy still builds and installs.
+4. **What is left for a human -- exactly two things, neither fails the run:**
+   removing a BTM Login Item (System Settings → General → Login Items &
+   Extensions; listed under *System Settings only*), and a log-out or reboot
+   after a new bridge plist was installed (*takes effect at next login
+   window*). Real blockers (a second core, a process outside the bundle, a
+   root-owned file nobody could remove, an audit that could not run) still
+   exit non-zero under *BLOCKERS*.
+
+Without any password the old behaviour remains: signing is relayed by
+`tools/fleet-gui-exec.py` into the logged-in console session (Terminal +
+System Events Automation granted, console user logged in; Mouser through
+`scripts/build_macos_gui_session.py`) and the root steps are printed at the
+end as *root steps still pending*. The controller only runs that mode with
+`--allow-prompts`.
 
 ### How a macOS build actually runs: GUI-session routing
 
@@ -214,7 +261,9 @@ tools/fleet-health --json [--check sign|no-adhoc|identifiers|tcc|authenticode|se
   `APPLE_CODESIGN_DEV=-` or `FLEET_STRICT_SIGNING:BOOL=OFF` in any deployed
   `CMakeCache.txt`, console user != target user, a missing or locked Windows
   interactive session, a missing cert, a Python version that is not the seat's
-  pinned one, or any `KEYCHAIN_PASSWORD` key in `fleet.env*`. `--check noise`
+  pinned one, any `*PASSWORD*` key in `fleet.env*`, a `.env` holding a
+  password at a mode other than 600 or tracked by git, or a password in a
+  Windows `.env`. `--check noise`
   (hackintosh) also fails if `com.cursor.worker.*` is loaded, vitest workers
   exist, or Spotlight is indexing the app bundle; `--fix` boots the Cursor
   workers out.
@@ -242,8 +291,10 @@ tools/fleet-health --json [--check sign|no-adhoc|identifiers|tcc|authenticode|se
    `scripts/fleet.env` on hackintosh, delete `scripts/fleet.env.bak-20260814`,
    and remove every `FLEET_KEYCHAIN_PASSWORD_*` line. Agents only check
    `! grep -rq KEYCHAIN_PASSWORD scripts/fleet.env*`.
-2. Approve the Terminal Automation prompt on hackintosh the first time
-   `tools/fleet-gui-exec.py` runs.
+2. Put `FLEET_SEAT_PASSWORD_hackintosh` and `FLEET_SEAT_PASSWORD_macbookpro`
+   into the controller's `.env` (`chmod 600`; see "Signing over SSH"). Only
+   then is the Terminal Automation prompt for `tools/fleet-gui-exec.py`
+   irrelevant; without the lines approve it once on hackintosh.
 3. Quit Cursor on hackintosh before harness runs (or run
    `tools/fleet-doctor --host hackintosh --check noise --fix`).
 4. Put `DESKFLOW_CODESIGN_ID` (hash from `security find-identity -v -p

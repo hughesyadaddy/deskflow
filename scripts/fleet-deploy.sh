@@ -28,6 +28,11 @@
 #   --app X           deskflow | mouser (same as --deskflow-only / --mouser-only)
 #   --reconfigure     force cmake configure on Macs
 #   --pull-only       git sync only, no build
+#   --allow-prompts   deploy a macOS seat that has no FLEET_SEAT_PASSWORD_<id>
+#                     line anyway (its own .env password or the GUI-session
+#                     route must then carry it); by default such a run is
+#                     refused up front instead of stalling on a prompt
+#                     (FLEET_ALLOW_PROMPTS=1 does the same)
 #
 # The local seat is the FLEET_HOSTS entry matching `hostname -s`
 # (case-insensitive) or FLEET_LOCAL_ID; FLEET_SSH_<id>=local is ignored.
@@ -65,6 +70,7 @@ PULL_ONLY=0
 OPT_DEPLOY_DESKFLOW=""
 OPT_DEPLOY_MOUSER=""
 OPT_RECONFIGURE=""
+OPT_ALLOW_PROMPTS=""
 
 die() { echo "fleet-deploy: error: $*" >&2; exit 1; }
 warn() { echo "fleet-deploy: warning: $*" >&2; }
@@ -92,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --mouser-only) set_app mouser; shift ;;
     --reconfigure) OPT_RECONFIGURE=1; shift ;;
     --pull-only) PULL_ONLY=1; shift ;;
+    --allow-prompts) OPT_ALLOW_PROMPTS=1; shift ;;
     -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -116,6 +123,7 @@ FLEET_HOSTS="${FLEET_HOSTS:-hackintosh macbookpro tiny11}"
 DEPLOY_DESKFLOW="${OPT_DEPLOY_DESKFLOW:-${FLEET_DEPLOY_DESKFLOW:-1}}"
 DEPLOY_MOUSER="${OPT_DEPLOY_MOUSER:-${FLEET_DEPLOY_MOUSER:-1}}"
 RECONFIGURE="${OPT_RECONFIGURE:-${FLEET_RECONFIGURE:-0}}"
+ALLOW_PROMPTS="${OPT_ALLOW_PROMPTS:-${FLEET_ALLOW_PROMPTS:-0}}"
 
 # ---------------------------------------------------------------------------
 # Seat credentials: ROOT/.env (git-ignored; the same file the local seat's
@@ -128,6 +136,7 @@ RECONFIGURE="${OPT_RECONFIGURE:-${FLEET_RECONFIGURE:-0}}"
 # ---------------------------------------------------------------------------
 DOTENV="${ROOT}/.env"
 SEAT_PW=""
+SEAT_PW_SET=0   # tested instead of -n "$SEAT_PW": that test would put the value in a `bash -x` trace
 XTRACE_ON=0
 xtrace_off() { if [[ $- == *x* ]]; then XTRACE_ON=1; else XTRACE_ON=0; fi; { set +x; } 2>/dev/null; }
 xtrace_restore() { if (( XTRACE_ON )); then set -x; fi; }
@@ -160,7 +169,7 @@ check_dotenv_mode
 # unquoted value ends at a ` #` comment, as under `source`.
 load_seat_password() { # id
   local want="FLEET_SEAT_PASSWORD_$(lower "$1")" line key val
-  SEAT_PW=""
+  clear_seat_password
   [[ -f "$DOTENV" ]] || return 0
   xtrace_off
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -179,8 +188,10 @@ load_seat_password() { # id
     fi
     SEAT_PW="$val"
   done < "$DOTENV"
+  if [[ -n "$SEAT_PW" ]]; then SEAT_PW_SET=1; else SEAT_PW_SET=0; fi
   xtrace_restore
 }
+clear_seat_password() { SEAT_PW=""; SEAT_PW_SET=0; }
 
 # ---------------------------------------------------------------------------
 # Local identity: hostname (or FLEET_LOCAL_ID) must match a FLEET_HOSTS entry.
@@ -301,6 +312,32 @@ if [[ "$DRY_RUN" == 1 ]]; then
   fi
   exit 0
 fi
+
+# ---------------------------------------------------------------------------
+# Preflight: never start a deploy that would stall on a prompt. A macOS seat
+# without a FLEET_SEAT_PASSWORD_<id> line would sign through the GUI-session
+# route and leave its root steps to a human; the local seat is covered by a
+# DESKFLOW_KEYCHAIN_PASSWORD / DESKFLOW_SUDO_PASSWORD value in the same .env.
+# Refused up front with the exact key to add; --allow-prompts overrides.
+# ---------------------------------------------------------------------------
+preflight_prompts() {
+  [[ "$PULL_ONLY" == 0 && "$ALLOW_PROMPTS" != 1 ]] || return 0
+  local i id keys=""
+  [[ -f "$DOTENV" ]] && keys=" $(dotenv_password_keys "$DOTENV" | tr '\n' ' ')"
+  for i in "${!P_ID[@]}"; do
+    selected "$i" || continue
+    [[ "${P_OS[$i]}" == "macos" ]] || continue
+    id="${P_ID[$i]}"
+    load_seat_password "$id"
+    if (( SEAT_PW_SET )); then clear_seat_password; continue; fi
+    if [[ "${P_TARGET[$i]}" == "local" ]] && [[ "$keys" == *" DESKFLOW_KEYCHAIN_PASSWORD "* || "$keys" == *" DESKFLOW_SUDO_PASSWORD "* ]]; then
+      continue
+    fi
+    die "no FLEET_SEAT_PASSWORD_$(lower "$id") in $DOTENV -- deploying $id would prompt (keychain/sudo); add it: printf 'FLEET_SEAT_PASSWORD_$(lower "$id")=…\\n' >> $DOTENV && chmod 600 $DOTENV (or --allow-prompts to use the seat's own .env / GUI-session route)"
+  done
+  clear_seat_password
+}
+preflight_prompts
 
 # ---------------------------------------------------------------------------
 # Per-repo lock: flock(1) when present, otherwise an atomic mkdir on
@@ -445,7 +482,7 @@ sh_password_env() {
 # not turn ssh's own exit code into 141 under pipefail.
 run_ssh() {
   local rc=0
-  if [[ -n "$SEAT_PW" ]]; then
+  if (( SEAT_PW_SET )); then
     xtrace_off
     { printf '%s\n' "$SEAT_PW" || true; } 2>/dev/null | ssh -o BatchMode=yes "$1" "$2" || rc=$? # fleet:allow printf SIGPIPE when ssh exits first; ssh's status is what counts
     xtrace_restore
@@ -490,7 +527,7 @@ deploy_host() { # index dref mref
   local dpath="${P_DESKFLOW[$i]}" mpath="${P_MOUSER[$i]}" rc=0 cmd log
   HOST_RC=0; HOST_RESULT="ok"; HOST_SETTINGS="-"
   # Only a macOS deploy (not a pull, never Windows) is handed a password.
-  SEAT_PW=""
+  clear_seat_password
   log="$(mktemp "${TMPDIR:-/tmp}/fleet-deploy-${id}.XXXXXX")"
 
   if [[ "$target" == "local" ]]; then
@@ -504,7 +541,7 @@ deploy_host() { # index dref mref
       cmd="$(sh_exports "$dpath" "$mpath" "$dref" "$mref"); $(sh_git_sync "$dpath" "$dref")$(sh_mouser_sync "$mpath" "$mref") && bash '${ROOT}/scripts/fleet-deploy-macos.sh'"
       load_seat_password "$id"
     fi
-    if [[ -n "$SEAT_PW" ]]; then
+    if (( SEAT_PW_SET )); then
       # In-process exports for the local seat script; gone again right after.
       xtrace_off
       export DESKFLOW_KEYCHAIN_PASSWORD="$SEAT_PW" DESKFLOW_SUDO_PASSWORD="$SEAT_PW"
@@ -513,7 +550,7 @@ deploy_host() { # index dref mref
     fi
     run_logged "$log" bash -euo pipefail -c "$cmd" || rc=$?
     unset DESKFLOW_KEYCHAIN_PASSWORD DESKFLOW_SUDO_PASSWORD
-    SEAT_PW=""
+    clear_seat_password
     if [[ "$rc" != 0 ]]; then HOST_RC="$rc"; HOST_RESULT="fail($rc)"; fi
     HOST_SETTINGS="$(settings_from_log "$log")"; rm -f "$log"
     return 0
@@ -544,7 +581,7 @@ deploy_host() { # index dref mref
     else
       load_seat_password "$id"
       local seat_run="bash scripts/fleet-deploy-macos.sh"
-      if [[ -n "$SEAT_PW" ]]; then
+      if (( SEAT_PW_SET )); then
         prelude="$(sh_password_read)${prelude}"
         seat_run="$(sh_password_env)${seat_run}"
         echo "    seat password: FLEET_SEAT_PASSWORD_$(lower "$id") from $DOTENV (on the SSH session's stdin; unattended signing + root steps)"
@@ -554,7 +591,7 @@ deploy_host() { # index dref mref
   fi
 
   run_logged "$log" run_ssh "$target" "$cmd" || rc=$?
-  SEAT_PW=""
+  clear_seat_password
   if [[ "$rc" == 255 ]]; then HOST_RC=255; HOST_RESULT="unreachable(ssh 255)"
   elif [[ "$rc" != 0 ]]; then HOST_RC="$rc"; HOST_RESULT="fail($rc)"; fi
   HOST_SETTINGS="$(settings_from_log "$log")"; rm -f "$log"

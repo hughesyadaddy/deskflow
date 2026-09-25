@@ -95,13 +95,20 @@ Prerequisites on the target seat (once):
 - `Mouser/.env.local`: `MOUSER_SIGN_IDENTITY=<same sha1>` (macOS).
 - Both branches pushed: deskflow `origin/fleet/memory-program`,
   Mouser `fork/fleet/memory-program`.
-- macOS over SSH, one of (see `docs/building-signed.md` → "Signing over SSH"):
-  - **preferred:** `deskflow/.env` also holds `DESKFLOW_KEYCHAIN_PASSWORD=<login
-    password>` and the file is `chmod 600` — signing then runs unattended in
-    the SSH session and nothing is routed through the GUI; or
-  - **fallback:** the console user is logged in and Terminal + System Events
-    Automation are granted, so `tools/fleet-gui-exec.py` can relay the
-    keychain steps into the console session.
+- macOS over SSH (see `docs/building-signed.md` → "Signing over SSH"):
+  - **unattended (the normal way):** the `.env` of the seat you deploy FROM
+    holds one `FLEET_SEAT_PASSWORD_<id>=<login password>` line per Mac, mode
+    600 -- one-time setup:
+    `printf 'FLEET_SEAT_PASSWORD_hackintosh=…\n' >> ~/Desktop/deskflow/.env && chmod 600 ~/Desktop/deskflow/.env`.
+    The controller sends it on the SSH session's stdin; the seat signs in the
+    SSH session and runs its root steps through `sudo -S`. Nothing is
+    prompted, nothing is routed through the GUI. A seat's own
+    `deskflow/.env` `DESKFLOW_KEYCHAIN_PASSWORD` / `DESKFLOW_SUDO_PASSWORD`
+    (mode 600) still work and win over the transported value.
+  - **fallback (`--allow-prompts`):** the console user is logged in and
+    Terminal + System Events Automation are granted, so
+    `tools/fleet-gui-exec.py` can relay the keychain steps into the console
+    session; the root steps are then printed for you.
 
 ### Windows (`tiny11`)
 
@@ -120,8 +127,19 @@ uninstalled. Last line must be `== DEPLOY OK`.
 
 ### macOS (`hackintosh` or this Mac)
 
+From any seat that has the `FLEET_SEAT_PASSWORD_<id>` line (unattended):
+
 ```bash
-ssh hackintosh 'cd ~/Desktop/deskflow && git fetch origin && git checkout fleet/memory-program && git pull --ff-only origin fleet/memory-program && FLEET_SKIP_GIT_PULL=1 bash scripts/fleet-deploy-macos.sh'
+scripts/fleet-deploy.sh --host hackintosh          # or --host macbookpro
+```
+
+By hand on the seat itself (its own `.env` must then hold
+`DESKFLOW_SUDO_PASSWORD` / `DESKFLOW_KEYCHAIN_PASSWORD`, or a
+`FLEET_SEAT_PASSWORD_<its own id>` line, mode 600 -- otherwise the root steps
+are printed):
+
+```bash
+ssh hackintosh 'cd ~/Desktop/deskflow && git fetch origin fleet/memory-program && git checkout fleet/memory-program && git pull --ff-only origin fleet/memory-program && FLEET_SKIP_GIT_PULL=1 bash scripts/fleet-deploy-macos.sh'
 ```
 
 `fleet-deploy-macos.sh` builds strict-signed, then `install-macos.sh`
@@ -135,18 +153,32 @@ run `deskflow-ctl start` by hand — converge will not restart a stopped seat
 on its own. Mouser follows via its own installer. After the identifier fix, expect **one** Accessibility/Input
 Monitoring re-grant per Mac for `deskflow-core` and the login bridge.
 
-The deploy ends with two lines that may need a human with root:
+With a password the deploy runs its root steps itself (through `sudo -S`,
+password on stdin) and logs them:
 
 ```text
-== deskflow-ctl: prio: system/io.github.hughesyadaddy.deskflow-prio needs root; run once as admin: ==
-== [<seat>] bridge plist stale — run root step: sudo env DESKFLOW_INSTALL_APP=/Applications/Deskflow.app bash ~/Desktop/deskflow/scripts/install-login-bridge-macos.sh ==
+== [<seat>] root steps: sudo password verified (DESKFLOW_SUDO_PASSWORD); running them here ==
+== [<seat>] bridge plist installed: /Library/LaunchAgents/org.deskflow.vhid-bridge.plist; takes effect at next login window ==
+== [<seat>] bridge log: mode 644 -> 600 ==            # and any 'key down id=' lines scrubbed
+== [<seat>] prio LaunchDaemon (deskflow-ctl prio --sudo-stdin) ==
+== [<seat>] retired files (deskflow-ctl retire --sudo-stdin) ==
 ```
 
-Root steps (over ssh, once per seat; nothing in the deploy escalates):
+Exactly two things can remain for you, and neither fails the run:
+a BTM Login Item (listed under *System Settings only*, see the next section)
+and a log-out/reboot for a freshly installed bridge plist (*takes effect at
+next login window*). Anything else under *BLOCKERS* (a second core, a
+process outside the bundle, a root-owned file that could not be removed)
+exits non-zero. A wrong password is reported once
+(`sudo password rejected for <seat>; check FLEET_SEAT_PASSWORD_<id>`) and
+the root steps are printed instead.
+
+Without a password the steps are printed as *root steps still pending*; run
+them over ssh once per seat (or, better, add the `.env` line):
 
 ```bash
 # prio LaunchDaemon + /private/var/db/deskflow (1777, machine-scope lock dir) — copy the printed sudo lines, or:
-ssh <mac> 'sudo ~/Desktop/deskflow/scripts/deskflow-ctl prio'
+ssh <mac> 'printf "%s\n" "$PW" | ~/Desktop/deskflow/scripts/deskflow-ctl prio --sudo-stdin'   # or: sudo ~/Desktop/deskflow/scripts/deskflow-ctl prio
 # LoginWindow bridge plist (hosts from Deskflow.conf peers: ip/lan fields only), log 0600, legacy launchers retired
 ssh <mac> 'sudo env DESKFLOW_INSTALL_APP=/Applications/Deskflow.app bash ~/Desktop/deskflow/scripts/install-login-bridge-macos.sh'
 # preview without installing
@@ -185,12 +217,25 @@ Then `deskflow-ctl start` (or wait for converge) and re-check the count.
 
 ### From any seat, whole fleet (once every seat has `scripts/fleet.env`)
 
+One-time, on the seat you deploy from -- one line per Mac, none for tiny11:
+
+```bash
+printf 'FLEET_SEAT_PASSWORD_hackintosh=…\n' >> ~/Desktop/deskflow/.env && chmod 600 ~/Desktop/deskflow/.env
+printf 'FLEET_SEAT_PASSWORD_macbookpro=…\n' >> ~/Desktop/deskflow/.env
+tools/fleet-doctor --check env                   # .env mode 600 + untracked, no password in fleet.env*
+```
+
+Then:
+
 ```bash
 scripts/fleet-deploy.sh --dry-run --json -      # plan: 3 hosts, server last
-scripts/fleet-deploy.sh                          # deploy
+scripts/fleet-deploy.sh                          # deploy; refuses up front if a Mac has no FLEET_SEAT_PASSWORD line
 scripts/fleet-deploy.sh --self-test --json out.json && jq .ok out.json
 tools/fleet-health --check all --host all
 ```
+
+Left for you afterwards: at most the BTM Login Item removal (System Settings)
+and a log-out on a seat whose bridge plist was reinstalled.
 
 ### What the deploy gates on (2026-09-22 build)
 
@@ -204,10 +249,11 @@ when `version` increased and the old keys are a subset) with
 `config.json.pre-deploy-<ts>` kept ×5 → the Mouser log must show
 `CGEventTap created (native tap:` within 60 s and never `enabled on its own run
 loop` (Python-tap fallback = the leaking path; deploy fails) → **last**:
-`deskflow-ctl retire` + `deskflow-ctl assert-single`; a failure here prints a
-`#### HUMAN STEP REQUIRED on <seat>` block (Login Items to remove, root-owned
-leftovers, bridge reinstall) and exits non-zero **after** everything is
-installed. The controller's report has `apple|adhoc|hard|settings` columns
+`deskflow-ctl prio --sudo-stdin` + `deskflow-ctl retire --sudo-stdin` (with a
+password) + `deskflow-ctl assert-single`; what still fails prints a
+`#### HUMAN STEP REQUIRED on <seat>` block **after** everything is installed:
+*System Settings only* (a BTM Login Item; exit 0) versus *BLOCKERS* (exit
+non-zero). The controller's report has `apple|adhoc|hard|settings` columns
 and `ALL_OK=0` on any ad-hoc, non-hardened, or settings mismatch.
 
 ## 3. Verify after deploy
@@ -266,7 +312,8 @@ the seat deploy above.
 | Mouser lock | `~/Library/Application Support/Mouser/mouser.lock`; Windows mutex `Local\MouserSingleInstance` |
 | launchd agents | `~/Library/LaunchAgents/io.github.hughesyadaddy.{deskflow,deskflow-core,deskflow-converge,mouser}.plist`, `/Library/LaunchAgents/org.deskflow.vhid-bridge.plist`, `/Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist` |
 | converge state | `~/Library/Application Support/Deskflow/{health.json,quit-intent,converge-actions}`, `~/Library/Deskflow/deploy.lock` (install in progress), `~/Library/Logs/Deskflow/converge.log` |
-| Bridge plist generator | `scripts/install-login-bridge-macos.sh` (`--dry-run` prints the plist; run under `sudo` over ssh; the GUI calls the same script) |
+| Bridge plist generator | `scripts/install-login-bridge-macos.sh` (`--dry-run` prints the plist; the deploy runs it through `sudo -S` with `DESKFLOW_SUDO_PASSWORD`; the GUI calls the same script) |
+| Seat passwords | controller `~/Desktop/deskflow/.env` (`FLEET_SEAT_PASSWORD_<id>`, mode 600, gitignored); per seat `.env` `DESKFLOW_KEYCHAIN_PASSWORD` / `DESKFLOW_SUDO_PASSWORD`; never `scripts/fleet.env`; tiny11 none |
 | Windows service | `Deskflow` (`deskflow-daemon.exe`, LocalSystem); GUI + Mouser via HKCU Run |
 | Mouser⇄Deskflow bridge | Mouser listens `127.0.0.1:19795`; token `~/Library/Application Support/Mouser/bridge.token` / `%APPDATA%\Mouser\bridge.token` |
 | Logs | macOS `~/Library/Deskflow/deskflow-core.log`, `~/Library/Logs/Deskflow/`, `/var/log/deskflow-vhid-bridge.log` (root, 0600); Windows `C:\ProgramData\Deskflow\deskflow-daemon.log` (dir created by `deskflow-ctl.ps1 start`); Mouser `~/Library/Logs/Mouser/` |

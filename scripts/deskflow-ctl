@@ -851,12 +851,17 @@ btm_dump() {
   if (( rc != 0 )) || ! grep -q 'Records for UID' <<<"$out"; then
     if grep -qiE 'root|privilege|permission|not permitted|must be run|operation not' <<<"$out" || (( rc != 0 )); then
       if have_sudo_pw; then
-        local sout src=0
-        sout="$(sudo_stdin sfltool dumpbtm 2>&1)" || src=$?
-        if (( src == 0 )) && grep -q 'Records for UID' <<<"$sout"; then
-          echo "$sout"
+        # Not in a $( ): a rejection must set SUDO_REJECTED in THIS shell and
+        # its one-time message must reach stderr, not a captured string.
+        local stmp src=0
+        stmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+        sudo_stdin sfltool dumpbtm >"$stmp" 2>/dev/null || src=$?
+        if (( src == 0 )) && grep -q 'Records for UID' "$stmp"; then
+          cat "$stmp"
+          rm -f "$stmp"
           return 0
         fi
+        rm -f "$stmp"
       fi
       echo "$out"
       return 3
