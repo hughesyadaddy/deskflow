@@ -34,6 +34,7 @@
 #include <Carbon/Carbon.h>
 #endif
 
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <sstream>
@@ -820,25 +821,75 @@ void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
 
-    for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
+    for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
       server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
       QCOMPARE(restartCalls, 0);
     }
-    QCOMPARE(remote.keys().size(), static_cast<size_t>(deskflow::coordination::EscTapRescue::kTaps - 1));
+    QCOMPARE(remote.keys().size(), static_cast<size_t>(deskflow::coordination::RescueBurst::kRestartTaps - 1));
     for (const auto &key : remote.keys()) {
       QCOMPARE(key.kind, RecordedKeyEvent::Kind::Down);
       QCOMPARE(key.id, kKeyEscape);
     }
     remote.clearKeys();
+    // The fifth Esc is swallowed and nothing fires yet: the burst is
+    // decided once it has ended (the settle timer), not at the 5th press.
     server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+    QCOMPARE(restartCalls, 0);
+    QVERIFY(remote.keys().empty());
+    QVERIFY(server.m_escBurstTimer != nullptr);
+
+    server.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
     QCOMPARE(restartCalls, 1);
-    // The fifth Esc is swallowed; the only traffic is the ledger releasing
-    // the Esc still held there (the rescue is a boundary like any other).
+    QVERIFY(server.m_escBurstTimer == nullptr);
+    // The only traffic is the ledger releasing the Esc still held there
+    // (the rescue is a boundary like any other).
+    QVERIFY(!remote.keys().empty());
     for (const auto &key : remote.keys()) {
       QCOMPARE(key.kind, RecordedKeyEvent::Kind::Up);
       QCOMPARE(key.id, kKeyEscape);
     }
     QCOMPARE(server.m_active, &remote);
+
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::tenEsc_requestsStopAllNotRestart()
+{
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    int restartCalls = 0;
+    int stopCalls = 0;
+    server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+    server.m_localStopAllHook = [&stopCalls] { ++stopCalls; };
+
+    // Exactly ten: no restart on the way, taps 5..10 stay off the wire.
+    for (int i = 0; i < deskflow::coordination::RescueBurst::kStopAllTaps; ++i) {
+      server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+      QCOMPARE(restartCalls, 0);
+      QCOMPARE(stopCalls, 0);
+    }
+    QCOMPARE(remote.keys().size(), static_cast<size_t>(deskflow::coordination::RescueBurst::kRestartTaps - 1));
+    remote.clearKeys();
+
+    server.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
+    QCOMPARE(stopCalls, 1);
+    QCOMPARE(restartCalls, 0);
+    // Held keys are released before the seat goes down.
+    for (const auto &key : remote.keys()) {
+      QCOMPARE(key.kind, RecordedKeyEvent::Kind::Up);
+      QCOMPARE(key.id, kKeyEscape);
+    }
 
     server.m_clients.erase("remote");
   }
@@ -969,6 +1020,9 @@ void ServerTests::chordRemapHoldThrough_fiveEscCancelsSession()
     }
     remote.clearKeys();
     server.onKeyDown(kKeyEscape, 0, 0, "en", nullptr);
+    QCOMPARE(restartCalls, 0); // decided when the burst ends, not at the 5th press
+    QVERIFY(server.m_chordRemapSession.active);
+    server.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
 
     QCOMPARE(restartCalls, 1);
     QVERIFY(!server.m_chordRemapSession.active);

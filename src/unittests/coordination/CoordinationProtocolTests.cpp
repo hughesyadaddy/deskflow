@@ -54,6 +54,32 @@ void CoordinationProtocolTests::rescueRoundTrip()
   QCOMPARE(message.token, std::string("tok"));
 }
 
+void CoordinationProtocolTests::stopAllRoundTrip()
+{
+  const auto line = protocol::encodeStopAll("tok");
+  const auto object = QJsonDocument::fromJson(QByteArray::fromStdString(line)).object();
+  QCOMPARE(object.value(QStringLiteral("t")).toString(), QStringLiteral("stopall"));
+
+  const auto message = protocol::decode(line);
+  QCOMPARE(message.type, Message::Type::StopAll);
+  QCOMPARE(message.token, std::string("tok"));
+  // Not a rescue: an old peer must not mistake it for a restart either.
+  QVERIFY(message.type != Message::Type::Rescue);
+}
+
+void CoordinationProtocolTests::unknownKindDecodesInvalidForForwardCompat()
+{
+  // A peer that predates a message kind (an older build receiving
+  // `stopall`) sees Invalid, which the transport drops without touching
+  // the connection -- the same path every unknown "t" takes.
+  QCOMPARE(protocol::decode(R"({"t":"stopall-v9","token":"tok"})").type, Message::Type::Invalid);
+  QCOMPARE(protocol::decode(R"({"t":"","token":"tok"})").type, Message::Type::Invalid);
+  QCOMPARE(protocol::decode(R"({"token":"tok"})").type, Message::Type::Invalid);
+  // ...while the known kinds still decode with their token.
+  QCOMPARE(protocol::decode(R"({"t":"stopall","token":"tok"})").type, Message::Type::StopAll);
+  QCOMPARE(protocol::decode(R"({"t":"rescue","token":"tok"})").type, Message::Type::Rescue);
+}
+
 void CoordinationProtocolTests::statusRoundTrip()
 {
   const auto message = protocol::decode(protocol::encodeStatus("tok"));

@@ -321,6 +321,62 @@ void Server::requestLocalCoreRestart()
   deskflow::coordination::requestFleetRescue();
 }
 
+void Server::requestLocalStopAll()
+{
+  if (m_localStopAllHook) {
+    m_localStopAllHook();
+    return;
+  }
+  // Fleet-wide (falls back to this seat alone when no mesh is running).
+  deskflow::coordination::requestFleetStopAll();
+}
+
+void Server::armEscBurstTimer()
+{
+  using deskflow::coordination::RescueBurst;
+  clearEscBurstTimer();
+  m_escBurstTimer = m_events->newOneShotTimer(static_cast<double>(RescueBurst::kSettleMs) / 1000.0, nullptr);
+  m_events->addHandler(EventTypes::Timer, m_escBurstTimer, [this](const auto &) { settleEscBurst(); });
+}
+
+void Server::clearEscBurstTimer()
+{
+  if (m_escBurstTimer == nullptr) {
+    return;
+  }
+  m_events->removeHandler(EventTypes::Timer, m_escBurstTimer);
+  m_events->deleteTimer(m_escBurstTimer);
+  m_escBurstTimer = nullptr;
+}
+
+void Server::settleEscBurst(deskflow::coordination::EscTapRescue::Clock::time_point now)
+{
+  clearEscBurstTimer();
+  const auto action = m_escTapRescue.settle(now);
+  if (action == deskflow::coordination::RescueAction::None) {
+    return;
+  }
+  fireEscRescue(action);
+}
+
+void Server::fireEscRescue(deskflow::coordination::RescueAction action)
+{
+  using deskflow::coordination::RescueAction;
+  // The rescue tears this core down: release what we hold on the active
+  // screen first, or the restart strands it there (the one structural
+  // boundary that used to skip the ledger).
+  cancelChordRemapSession();
+  releaseKeysHeldOnActive();
+  releaseKeysHeldOnBroadcast(nullptr);
+  if (action == RescueAction::StopAll) {
+    LOG_INFO("keyboard rescue: 10x Esc burst ended -- requesting a fleet stop-all");
+    requestLocalStopAll();
+    return;
+  }
+  LOG_INFO("keyboard rescue: 5x Esc burst ended -- requesting a fleet restart");
+  requestLocalCoreRestart();
+}
+
 //
 // Server
 //
@@ -455,6 +511,7 @@ Server::~Server()
   m_events->removeHandler(PrimaryScreenFakeInputEnd, m_inputFilter);
   m_events->removeHandler(Timer, this);
   stopSwitch();
+  clearEscBurstTimer();
 
   // Best-effort: release any chord-held mods while the client link is still
   // alive, so a role flip / epoch teardown doesn't strand a synthetic
@@ -2234,15 +2291,26 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
   );
   assert(m_active != nullptr);
 
-  // Keyboard rescue: five plain Esc downs within 2s soft-restarts local core.
-  if (m_escTapRescue.noteEscDown(id, mask)) {
-    // The rescue tears this core down: release what we hold on the active
-    // screen first, or the restart strands it there (the one structural
-    // boundary that used to skip the ledger).
-    cancelChordRemapSession();
-    releaseKeysHeldOnActive();
-    releaseKeysHeldOnBroadcast(nullptr);
-    requestLocalCoreRestart();
+  // Keyboard rescue: a burst of plain Esc downs, decided once it has ended
+  // (5..9 = restart every seat's core, 10+ = stop everything everywhere).
+  // Nothing fires on a press; the settle timer calls settleEscBurst().
+  // (In auto mode the coordinator's off-loop monitor counts the same taps;
+  // the coordinator dedupes the two requests. This on-loop counter keeps
+  // the ledger release and the swallowing, and is the only counter in
+  // plain --server mode.)
+  const auto closed = m_escTapRescue.noteKeyDown(id, mask);
+  if (m_escTapRescue.pending()) {
+    // Also when this press closed a stale burst: it opened the next one.
+    armEscBurstTimer();
+  }
+  if (closed != deskflow::coordination::RescueAction::None) {
+    // A stale burst the timer missed: its decision is still owed.
+    fireEscRescue(closed);
+    return;
+  }
+  if (m_escTapRescue.pending() && m_escTapRescue.swallowing()) {
+    // From the 5th tap on this is a rescue in progress: the Esc that
+    // completes it and every later one in the burst stay off the wire.
     return;
   }
 

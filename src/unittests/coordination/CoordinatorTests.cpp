@@ -14,6 +14,7 @@
 #include "base/Log.h"
 #include "base/Event.h"
 #include "base/EventTypes.h"
+#include "common/ExitCodes.h"
 #include "coordination/CoordinationMesh.h"
 #include "coordination/CoordinationProtocol.h"
 #include "coordination/Coordinator.h"
@@ -75,12 +76,23 @@ private Q_SLOTS:
   void relayStop_forwardedHoldsAreReleasedOnTheKeyLane();
   void rescue_discardsQueuedKeysAndResyncsLedger();
   void rescue_duplicateDeliveryRestartsOnce();
+  void stopAll_messageStopsLocallyOnce();
+  void stopAll_tenEscBurstBroadcastsAndStopsLocallyOnce();
+  void fleetCommands_unknownSourceIsDropped();
+  void fleetCommands_knownPeerSourceIsAccepted();
+  void offLoop_tenEscWithBlockedEventLoop_stopsAll();
+  void offLoop_fiveEscWithBlockedEventLoop_exitsAfterAckTimeout();
+  void offLoop_fiveEscWithLiveEventLoop_noExit();
   void claim_duplicateDeliveryEvaluatedOnce();
   void heartbeat_doesNotBlockOnUnreachablePeers();
   void keyForward_returnsWithinGraceWhenPeerUnreachable();
   void keyForward_followsRunningRoleNotElection();
   void relayReconciler_followsRunningRoleNotElection();
   void mesh_handlerThreadsAreBounded();
+
+private:
+  //! Nested (friend access): a seat whose event loop is never serviced.
+  struct BlockedLoopSeat;
 };
 
 namespace {
@@ -167,6 +179,14 @@ template <typename Condition> bool waitFor(Condition condition, int timeoutMs)
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   return true;
+}
+
+//! Decode \p line as if it arrived from \p source (the transport stamps it).
+Message decodeFrom(const std::string &line, const std::string &source)
+{
+  Message message = protocol::decode(line);
+  message.sourceAddress = source;
+  return message;
 }
 
 double elapsedMs(const std::chrono::steady_clock::time_point &since)
@@ -988,20 +1008,269 @@ void CoordinatorTests::rescue_discardsQueuedKeysAndResyncsLedger()
   }
   coordinator.setRunningRole(Role::Client);
 
-  // Four Esc taps ride the lane (no lane thread: each is withdrawn after
-  // its grace and reported local).
-  for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
+  coordinator.m_exitProcessHook = [](int) {};
+
+  // The taps are COUNTED by the local input monitor (off the event loop);
+  // the relay only consults the count. Four Esc taps ride the lane (no
+  // lane thread: each is withdrawn after its grace and reported local).
+  for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
+    coordinator.onLocalKeyDown(kKeyEscape, 0);
     QCOMPARE(
         coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Local
     );
   }
   // S6: the fifth is Swallowed -- consumed, NOT reported as forwarded, so
-  // the hook records it Local and its Up never chases a hold on the peer;
-  // and every forwarded hold is re-labelled Local for the restart.
+  // the hook records it Local and its Up never chases a hold on the peer.
+  coordinator.onLocalKeyDown(kKeyEscape, 0);
   QCOMPARE(
       coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Swallowed
   );
+  // Nothing fires on the press: the burst is decided once it has ended,
+  // and only then is every forwarded hold re-labelled Local for the restart.
+  QCOMPARE(relayPtr->resyncs.load(), 0);
+  coordinator.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
   QCOMPARE(relayPtr->resyncs.load(), 1);
+}
+
+void CoordinatorTests::stopAll_messageStopsLocallyOnce()
+{
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "test-token";
+  config.peers = deskflow::coordination::parsePeerList(std::string("hackintosh=") + kBlackholeA);
+
+  Coordinator coordinator(config);
+  int restarts = 0;
+  int stops = 0;
+  coordinator.m_localCoreRestartHook = [&restarts] { ++restarts; };
+  coordinator.m_localStopAllHook = [&stops] { ++stops; };
+  const auto reply = [](const std::string &) {};
+  const std::string line = protocol::encodeStopAll("test-token");
+
+  // Duplicate deliveries (ip + lan lanes) and a later repeat: one stop,
+  // never a loop, never a restart.
+  coordinator.onMessage(decodeFrom(line, kBlackholeA), reply);
+  coordinator.onMessage(decodeFrom(line, kBlackholeA), reply);
+  QCOMPARE(stops, 1);
+  QCOMPARE(restarts, 0);
+  coordinator.m_lastRescueAt = -1.0e9;
+  coordinator.onMessage(decodeFrom(line, kBlackholeA), reply);
+  QCOMPARE(stops, 1);
+  // A stopping seat also ignores a burst of its own.
+  coordinator.requestFleetStopAll();
+  QCOMPARE(stops, 1);
+}
+
+void CoordinatorTests::stopAll_tenEscBurstBroadcastsAndStopsLocallyOnce()
+{
+  using deskflow::coordination::EscTapRescue;
+  using deskflow::coordination::RescueBurst;
+  using deskflow::coordination::Role;
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "test-token";
+  config.peers = deskflow::coordination::parsePeerList(std::string("hackintosh=") + kBlackholeA);
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  int restarts = 0;
+  int stops = 0;
+  coordinator.m_localCoreRestartHook = [&restarts] { ++restarts; };
+  coordinator.m_localStopAllHook = [&stops] { ++stops; };
+  auto relay = std::make_unique<FakeKeyboardRelay>();
+  auto *relayPtr = relay.get();
+  coordinator.m_keyboardRelay = std::move(relay);
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_election.becameClient(kBlackholeA);
+    coordinator.m_fleetState.cursorHost = "hackintosh";
+  }
+  coordinator.setRunningRole(Role::Client);
+
+  coordinator.m_exitProcessHook = [](int) {};
+
+  // Taps 1-4 ride the lane; from the 5th on the burst is a rescue in
+  // progress and every Esc is swallowed -- but NOTHING fires on the way
+  // to ten (no restart at five). The monitor counts, the relay consults.
+  for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
+    coordinator.onLocalKeyDown(kKeyEscape, 0);
+    const auto expected = i < RescueBurst::kRestartTaps - 1 ? KeyForwardResult::Local : KeyForwardResult::Swallowed;
+    QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), expected);
+    QCOMPARE(restarts, 0);
+    QCOMPARE(stops, 0);
+  }
+  QCOMPARE(relayPtr->resyncs.load(), 0);
+
+  coordinator.settleEscBurst(EscTapRescue::Clock::now() + std::chrono::seconds(1));
+  QCOMPARE(stops, 1);
+  QCOMPARE(restarts, 0);
+  QCOMPARE(relayPtr->resyncs.load(), 1); // same boundary as the rescue
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_stopAllTriggered);
+  }
+
+  // Already stopping: a second burst changes nothing.
+  for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
+    coordinator.onLocalKeyDown(kKeyEscape, 0);
+  }
+  coordinator.settleEscBurst(EscTapRescue::Clock::now() + std::chrono::seconds(2));
+  QCOMPARE(stops, 1);
+  QCOMPARE(restarts, 0);
+}
+
+void CoordinatorTests::fleetCommands_unknownSourceIsDropped()
+{
+  // Without a token the mesh accepts any line from anyone (INADDR_ANY);
+  // rescue/stopall are therefore gated on the source address belonging to
+  // a configured peer. Anything else is dropped -- one line from a random
+  // LAN host must never restart or stop the fleet.
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "";
+  config.peers = deskflow::coordination::parsePeerList(std::string("hackintosh=") + kBlackholeA);
+
+  Coordinator coordinator(config);
+  int restarts = 0;
+  int stops = 0;
+  coordinator.m_localCoreRestartHook = [&restarts] { ++restarts; };
+  coordinator.m_localStopAllHook = [&stops] { ++stops; };
+  const auto reply = [](const std::string &) {};
+
+  for (const char *source : {"192.0.2.99", "", "not-an-address", "::1"}) {
+    coordinator.onMessage(decodeFrom(protocol::encodeStopAll(""), source), reply);
+    coordinator.onMessage(decodeFrom(protocol::encodeRescue(""), source), reply);
+  }
+  QCOMPARE(stops, 0);
+  QCOMPARE(restarts, 0);
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(!coordinator.m_stopAllTriggered);
+  }
+}
+
+void CoordinatorTests::fleetCommands_knownPeerSourceIsAccepted()
+{
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "";
+  // Both the stable and the LAN entry of a peer count, including the
+  // IPv4-mapped form a dual-stack listener would report.
+  config.peers = deskflow::coordination::parsePeerList(std::string("hackintosh=") + kBlackholeA + "|" + kBlackholeB);
+
+  Coordinator coordinator(config);
+  int restarts = 0;
+  int stops = 0;
+  coordinator.m_localCoreRestartHook = [&restarts] { ++restarts; };
+  coordinator.m_localStopAllHook = [&stops] { ++stops; };
+  const auto reply = [](const std::string &) {};
+
+  coordinator.onMessage(decodeFrom(protocol::encodeRescue(""), kBlackholeB), reply);
+  QCOMPARE(restarts, 1);
+  coordinator.m_lastRescueAt = -1.0e9;
+  coordinator.onMessage(decodeFrom(protocol::encodeRescue(""), std::string("::ffff:") + kBlackholeA), reply);
+  QCOMPARE(restarts, 2);
+  coordinator.onMessage(decodeFrom(protocol::encodeStopAll(""), kBlackholeA), reply);
+  QCOMPARE(stops, 1);
+}
+
+//! A server seat whose core event loop is never serviced (the wedge the
+//! gesture exists for): the counter and both executors must not need it.
+struct CoordinatorTests::BlockedLoopSeat
+{
+  EventQueue events; //!< set on the coordinator, never looped
+  Coordinator coordinator;
+  int restarts = 0;
+  int stops = 0;
+  std::atomic<int> exits{0};
+  std::atomic<int> exitCode{-1};
+  FakeKeyboardRelay *relay = nullptr;
+
+  static CoordinatorConfig config()
+  {
+    CoordinatorConfig config;
+    config.selfName = "hackintosh";
+    config.meshPort = 0;
+    config.token = "test-token";
+    config.peers = deskflow::coordination::parsePeerList(std::string("tiny11=") + kBlackholeA);
+    return config;
+  }
+
+  BlockedLoopSeat() : coordinator(config())
+  {
+    coordinator.setEventQueue(&events);
+    coordinator.m_localCoreRestartHook = [this] { ++restarts; };
+    coordinator.m_localStopAllHook = [this] { ++stops; };
+    coordinator.m_exitProcessHook = [this](int code) {
+      exitCode = code;
+      ++exits;
+    };
+    coordinator.m_rescueAckTimeout = std::chrono::milliseconds(50);
+    auto fake = std::make_unique<FakeKeyboardRelay>();
+    relay = fake.get();
+    coordinator.m_keyboardRelay = std::move(fake);
+    coordinator.setRunningRole(deskflow::coordination::Role::Server);
+  }
+
+  void tap(int times)
+  {
+    for (int i = 0; i < times; ++i) {
+      coordinator.onLocalKeyDown(kKeyEscape, 0);
+    }
+  }
+
+  void settle()
+  {
+    coordinator.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
+  }
+};
+
+void CoordinatorTests::offLoop_tenEscWithBlockedEventLoop_stopsAll()
+{
+  BlockedLoopSeat seat;
+  seat.tap(deskflow::coordination::RescueBurst::kStopAllTaps);
+  QCOMPARE(seat.stops, 0);
+  seat.settle();
+  // Reached StopAll from ten observed taps with the loop never serviced.
+  QCOMPARE(seat.stops, 1);
+  QCOMPARE(seat.restarts, 0);
+  QCOMPARE(seat.relay->resyncs.load(), 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  QCOMPARE(seat.exits.load(), 0); // stop-all never arms the ack watchdog
+}
+
+void CoordinatorTests::offLoop_fiveEscWithBlockedEventLoop_exitsAfterAckTimeout()
+{
+  BlockedLoopSeat seat;
+  seat.tap(deskflow::coordination::RescueBurst::kRestartTaps);
+  seat.settle();
+  // The restart request went out (peers + local IPC) without the loop...
+  QCOMPARE(seat.restarts, 1);
+  QVERIFY(seat.coordinator.m_rescueWatchdog.armed());
+  // ...and since the loop never dispatches the probe, the process is
+  // hard-exited non-zero so the supervisor relaunches the core.
+  QVERIFY(waitFor([&seat] { return seat.exits.load() == 1; }, 2000));
+  QCOMPARE(seat.exitCode.load(), s_exitFailed);
+}
+
+void CoordinatorTests::offLoop_fiveEscWithLiveEventLoop_noExit()
+{
+  BlockedLoopSeat seat;
+  seat.tap(deskflow::coordination::RescueBurst::kRestartTaps);
+  seat.settle();
+  QCOMPARE(seat.restarts, 1);
+  QVERIFY(seat.coordinator.m_rescueWatchdog.armed());
+  // A live loop dispatches the probe: the watchdog stands down.
+  seat.events.addEvent(Event(EventTypes::Quit));
+  seat.events.loop();
+  QVERIFY(waitFor([&seat] { return !seat.coordinator.m_rescueWatchdog.armed(); }, 2000));
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  QCOMPARE(seat.exits.load(), 0);
 }
 
 void CoordinatorTests::rescue_duplicateDeliveryRestartsOnce()
@@ -1020,12 +1289,12 @@ void CoordinatorTests::rescue_duplicateDeliveryRestartsOnce()
   const auto reply = [](const std::string &) {};
   const std::string line = protocol::encodeRescue("test-token");
 
-  coordinator.onMessage(protocol::decode(line), reply);
-  coordinator.onMessage(protocol::decode(line), reply);
+  coordinator.onMessage(decodeFrom(line, kBlackholeA), reply);
+  coordinator.onMessage(decodeFrom(line, kBlackholeA), reply);
   QCOMPARE(restarts, 1);
 
   coordinator.m_lastRescueAt = -1.0e9; // window elapsed
-  coordinator.onMessage(protocol::decode(line), reply);
+  coordinator.onMessage(decodeFrom(line, kBlackholeA), reply);
   QCOMPARE(restarts, 2);
 }
 

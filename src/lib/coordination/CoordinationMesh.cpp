@@ -235,7 +235,7 @@ void CoordinationMesh::stop()
   }
   m_handlers.clear();
   std::scoped_lock lock{m_clientsMutex};
-  for (const int fd : m_pendingFds) {
+  for (const auto &[fd, source] : m_pendingFds) {
     m_clientFds.erase(fd);
     platformCloseSocket(fd);
   }
@@ -338,6 +338,13 @@ void CoordinationMesh::serveLoop()
       platformCloseSocket(clientFd);
       break;
     }
+    // The numeric source address travels with the connection: the
+    // receiver gates fleet-wide commands on it (PeerAddressAllowlist).
+    char sourceBuffer[INET_ADDRSTRLEN] = {};
+    std::string source;
+    if (inet_ntop(AF_INET, &peer.sin_addr, sourceBuffer, sizeof(sourceBuffer)) != nullptr) {
+      source = sourceBuffer;
+    }
     {
       std::scoped_lock lock{m_clientsMutex};
       if (m_activeClients.load() + static_cast<int>(m_pendingFds.size()) >= kMaxConcurrentClients) {
@@ -347,7 +354,7 @@ void CoordinationMesh::serveLoop()
         continue;
       }
       m_clientFds.insert(clientFd);
-      m_pendingFds.push_back(clientFd);
+      m_pendingFds.emplace_back(clientFd, std::move(source));
     }
     m_pendingReady.notify_one();
   }
@@ -357,17 +364,19 @@ void CoordinationMesh::handlerLoop()
 {
   while (true) {
     int clientFd = -1;
+    std::string source;
     {
       std::unique_lock lock{m_clientsMutex};
       m_pendingReady.wait(lock, [this] { return !m_running || !m_pendingFds.empty(); });
       if (!m_running) {
         return; // stop() closes whatever is still pending
       }
-      clientFd = m_pendingFds.front();
+      clientFd = m_pendingFds.front().first;
+      source = std::move(m_pendingFds.front().second);
       m_pendingFds.pop_front();
       ++m_activeClients;
     }
-    handleClient(clientFd);
+    handleClient(clientFd, source);
     {
       std::scoped_lock lock{m_clientsMutex};
       m_clientFds.erase(clientFd);
@@ -377,7 +386,7 @@ void CoordinationMesh::handlerLoop()
   }
 }
 
-void CoordinationMesh::handleClient(int clientFd)
+void CoordinationMesh::handleClient(int clientFd, const std::string &source)
 {
   setReceiveTimeout(clientFd, kClientReadTimeoutMs);
 
@@ -391,10 +400,11 @@ void CoordinationMesh::handleClient(int clientFd)
       if (line.empty()) {
         continue;
       }
-      const Message message = protocol::decode(line);
+      Message message = protocol::decode(line);
       if (message.type == Message::Type::Invalid) {
         continue;
       }
+      message.sourceAddress = source;
       if (!tokenOk(message)) {
         LOG_DEBUG("coordination: dropping message with bad token");
         continue;

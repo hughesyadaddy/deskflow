@@ -54,7 +54,11 @@ void IpcServerLocalRestartTests::emptyClients_stopsWithoutQueuingRestart()
 
   server.requestLocalCoreRestart();
 
-  QCOMPARE(stopSpy.count(), 1);
+  // A rescue that cannot restart must do nothing rather than destroy the
+  // thing it was meant to rescue: with no GUI client (and, on Windows, no
+  // daemon to relaunch us) the core is NOT stopped and nothing is queued
+  // for a later client to replay.
+  QCOMPARE(stopSpy.count(), 0);
   QCOMPARE(server.m_pendingMessages.size(), 0);
   QVERIFY(!server.m_pendingMessages.contains(QStringLiteral("restartCore")));
 }

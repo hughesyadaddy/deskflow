@@ -398,6 +398,17 @@ private:
   //! Queue the active session's held out-mods for delivery on reconnect.
   void rememberUndeliveredChordModClear();
   void requestLocalCoreRestart();
+  //! 10x Esc: stop every Deskflow instance and service on every seat.
+  void requestLocalStopAll();
+  //! Settle poll for the Esc burst (one-shot timer on m_events; tests
+  //! inject the clock): decides and fires the burst's action.
+  void settleEscBurst(
+      deskflow::coordination::EscTapRescue::Clock::time_point now = deskflow::coordination::EscTapRescue::Clock::now()
+  );
+  //! Release everything held on the active screen, then restart / stop.
+  void fireEscRescue(deskflow::coordination::RescueAction action);
+  void armEscBurstTimer();
+  void clearEscBurstTimer();
   void onMouseDown(ButtonID);
   void onMouseUp(ButtonID);
   bool onMouseMovePrimary(int32_t x, int32_t y);
@@ -693,6 +704,10 @@ private:
   std::map<std::string, KeyModifierMask, deskflow::string::CaselessCmp> m_pendingChordModClears;
 
   deskflow::coordination::EscTapRescue m_escTapRescue;
+  //! Fires settleEscBurst() once the burst has been silent for kSettleMs.
+  EventQueueTimer *m_escBurstTimer = nullptr;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
   std::function<void()> m_localCoreRestartHook;
+  //! When set (unit tests), used instead of the fleet stop-all.
+  std::function<void()> m_localStopAllHook;
 };

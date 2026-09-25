@@ -166,6 +166,74 @@ for the old pid to exit after a `bootout` (launchd SIGKILLs at its 5 s exit
 timeout) before bootstrapping the fresh render. Never re-enable a converge
 agent whose program is under `~/Desktop`, `~/Documents`, `~/Downloads`,
 iCloud Drive or `/Volumes`.
+### 1e. Keyboard rescue from any keyboard: 5×Esc restarts, 10×Esc stops everything
+
+Tap plain **Esc** (no Shift/Ctrl/Alt/Cmd; Caps/Num state is ignored) in a
+burst, each tap within 700 ms of the previous. The burst is decided **only
+once it has ended** (700 ms without another Esc; the same 700 ms is the join
+gap) -- nothing fires on the 5th press, so heading for 10 never restarts you
+on the way:
+
+| Taps in the burst | Effect on **every seat** (mesh broadcast; the seat that saw the taps included) |
+|---|---|
+| 1–4 | nothing |
+| **5–9** | `fleet keyboard rescue`: every seat restarts its local core (today's behaviour; GUI `restartCore` / Windows daemon relaunch / launchd) |
+| **10+** | **stop-all**: every seat logs `WARNING: [rescue] 10x Esc: stopping ALL Deskflow instances and services on <seat>` and then stops every Deskflow instance and service it owns (Mouser untouched) |
+
+From the 5th tap on, the Escs stay off the wire (a rescue in progress is not
+typed into the remote app). A non-Esc key abandons the burst.
+
+The taps are counted **off the core event loop** in every role (macOS:
+the coordinator's listen-only event tap; Windows: its Raw Input sink) --
+a seat whose event loop is wedged is exactly the case this exists for. On a
+10×Esc the stop-all executor never touches that loop; on a 5×Esc the
+restart request goes out at once and the core hard-exits non-zero
+(`[rescue] ... exiting with 1`) if its loop has not acknowledged within 3 s,
+so launchd KeepAlive / the Windows service relaunch it. Plain
+`deskflow-core --server` (no coordinator) keeps only the on-loop counter.
+
+Trust: without a `[coordination] token`, `rescue`/`stopall` are accepted
+only from an address a configured peer resolves to (its LAN name and
+Tailscale FQDN entries, IPv4+IPv6, re-resolved every 5 min or after a
+miss); anything else is dropped with one `coordination: dropping fleet
+stop-all from <addr>` WARN. A shared token is stronger and, when set, is
+still required.
+
+What stop-all does per seat:
+
+- **macOS**: writes `~/Library/Application Support/Deskflow/quit-intent`
+  (the same sentinel `deskflow-ctl stop` writes, so converge/KeepAlive leave
+  everything down), then runs the launchd-safe `~/Library/Deskflow/bin/deskflow-ctl stop`
+  when present, else in-process: `launchctl bootout gui/$UID/` converge →
+  GUI → SIGTERM/SIGKILL any stray bundle `Deskflow`/`deskflow-core` (this
+  user, by executable path) → core (itself) last. The login-window bridge
+  (`loginwindow/org.deskflow.vhid-bridge`, root) keeps running -- it is out
+  of reach without root, and it is what still gives you a cursor there.
+- **Windows** (`tiny11`): the core sends the `Deskflow` service `stopAll`;
+  the daemon terminates every `deskflow-core.exe` and `deskflow.exe` under
+  the install root in **every session** (the SYSTEM login-screen core too),
+  then stops itself cleanly. It reports `SERVICE_STOPPED` with
+  `dwWin32ExitCode = NO_ERROR`, and the SCM recovery actions
+  `deskflow-ctl.ps1 start` configures (`sc failure … restart/1000/5000/30000`
+  + `failureflag 1`) fire only on a crash or a non-zero exit code -- so the
+  service stays stopped. If the core cannot reach the daemon it kills the
+  GUI under the install root and exits itself.
+- **Mouser** is a separate app and is never touched. (A future
+  `[coordination] rescueStopsMouser=false` may opt it in; not implemented.)
+- A seat that is already stopping ignores repeats; a peer that predates the
+  `stopall` mesh message ignores it (no mesh version bump).
+
+Bring it back:
+
+```bash
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl start'          # clears quit-intent, bootstraps core → GUI → converge
+ssh tiny11 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\alexh\Desktop\deskflow\scripts\deskflow-ctl.ps1 start'
+```
+
+Log lines to grep: `keyboard rescue: 5x Esc burst ended` /
+`10x Esc burst ended` on the seat that saw the taps,
+`coordination: fleet keyboard rescue received` / `fleet stop-all received`
+on the others, `[rescue]` for every stop-all step.
 
 ## 2. Redeploy one seat from the branch
 

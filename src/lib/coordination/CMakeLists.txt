@@ -21,9 +21,13 @@ add_library(coordination STATIC
   LocalInputMonitor.h
   Peer.cpp
   Peer.h
+  PeerAddressAllowlist.cpp
+  PeerAddressAllowlist.h
   PreConnectHosts.cpp
   PreConnectHosts.h
   RelayKeyEvent.h
+  RescueStopAll.cpp
+  RescueStopAll.h
   WakeOnLan.cpp
   WakeOnLan.h
   WedgeDetector.cpp
@@ -34,6 +38,7 @@ if(APPLE)
   target_sources(coordination PRIVATE
     OSXLocalInputMonitor.mm
     OSXKeyboardRelayMonitor.mm
+    OSXRescueStopAll.mm
     KeyboardRelayMap.mm
   )
   # AppKit is needed for NSEvent (media-key decode); it re-exports Foundation.

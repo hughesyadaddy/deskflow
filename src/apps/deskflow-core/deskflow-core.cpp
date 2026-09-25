@@ -29,6 +29,7 @@
 #include "common/Settings.h"
 #include "common/SingleInstanceLock.h"
 #include "coordination/KeyboardRescue.h"
+#include "coordination/RescueStopAll.h"
 #include "deskflow/App.h"
 #include "deskflow/ClientApp.h"
 #include "deskflow/ServerApp.h"
@@ -117,6 +118,24 @@ void logHealthLine(
 void showHelp(const CoreArgParser &parser)
 {
   QTextStream(stdout) << parser.helpText();
+}
+
+//! 10x Esc stop-all executor for this seat (runs on a detached thread; the
+//! WARNING line was already logged by requestLocalStopAll).
+void localStopAllExecutor(const std::string &seat)
+{
+#if defined(Q_OS_WIN)
+  // The daemon stops every core/GUI under the install root and then the
+  // service itself; without a daemon the core stops the GUI and leaves.
+  LOG_INFO("[rescue] stop-all on %s: handing over to the daemon", seat.c_str());
+  ipcRequestLocalStopAll();
+#elif defined(Q_OS_MAC)
+  // quit-intent, converge, GUI, strays, then this core (launchd bootout).
+  deskflow::coordination::runMacStopAll(seat);
+#else
+  LOG_INFO("[rescue] stop-all on %s: no service manager integration here; exiting this core", seat.c_str());
+  deskflow::coordination::requestLocalCoreQuit();
+#endif
 }
 
 App *createApp(const CoreArgParser &parser, EventQueue &events, const QString &processName)
@@ -251,6 +270,10 @@ int main(int argc, char **argv)
 
     const auto ipcServer = new deskflow::core::ipc::CoreIpcServer(&app); // NOSONAR - Qt managed
     deskflow::coordination::setLocalCoreRestartHandler(&ipcRequestLocalCoreRestart);
+    // 10x Esc: the executor's final step is this graceful quit; the handler
+    // is cleared below before `runner` goes away.
+    deskflow::coordination::setLocalCoreQuitHandler([&runner] { runner.requestQuit(); });
+    deskflow::coordination::setLocalStopAllHandler(&localStopAllExecutor);
     QObject::connect(ipcServer, &deskflow::core::ipc::IpcServer::stopProcessRequested, &app, [&runner] {
       runner.requestQuit();
     });
@@ -272,6 +295,7 @@ int main(int argc, char **argv)
 
     int exitCode = QApplication::exec();
     coreThread.wait();
+    deskflow::coordination::setLocalCoreQuitHandler({});
 
     if (exitCode == s_exitSuccess) {
       exitCode = runner.exitCode();
@@ -288,6 +312,8 @@ int main(int argc, char **argv)
 
   const auto ipcServer = new deskflow::core::ipc::CoreIpcServer(&app); // NOSONAR - Qt managed
   deskflow::coordination::setLocalCoreRestartHandler(&ipcRequestLocalCoreRestart);
+  deskflow::coordination::setLocalCoreQuitHandler([app = coreApp.get()] { app->quit(); });
+  deskflow::coordination::setLocalStopAllHandler(&localStopAllExecutor);
   QObject::connect(
       ipcServer, &deskflow::core::ipc::IpcServer::stopProcessRequested, coreApp.get(), &App::quit, Qt::DirectConnection
   );
@@ -299,6 +325,7 @@ int main(int argc, char **argv)
 
   int exitCode = QApplication::exec();
   coreThread.wait();
+  deskflow::coordination::setLocalCoreQuitHandler({});
 
   if (exitCode == s_exitSuccess) {
     exitCode = coreApp->getExitCode();

@@ -9,11 +9,73 @@
 #include "base/Log.h"
 #include "common/Constants.h"
 #include "common/VersionInfo.h"
+#include "coordination/KeyboardRescue.h"
 
 #include <QLocalServer>
 #include <QLocalSocket>
 
+#include <chrono>
+
+#if defined(Q_OS_WIN)
+#include <QCoreApplication>
+#include <QDir>
+#include <QTimer>
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#include <tlhelp32.h>
+
+#include <iterator>
+#endif
+
 namespace deskflow::core::ipc {
+
+#if defined(Q_OS_WIN)
+namespace {
+
+//! Terminate every process named \p exeName whose image lives under
+//! \p rootDir, in every session (never self). Returns how many were hit.
+int terminateProcessesUnderRoot(const wchar_t *exeName, const QString &rootDir)
+{
+  int terminated = 0;
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    LOG_WARN("[rescue] could not snapshot processes: %lu", GetLastError());
+    return 0;
+  }
+  const QString root = QDir::cleanPath(rootDir).toLower() + QLatin1Char('/');
+  const DWORD self = GetCurrentProcessId();
+  PROCESSENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
+    if (entry.th32ProcessID == self || _wcsicmp(entry.szExeFile, exeName) != 0) {
+      continue;
+    }
+    HANDLE process =
+        OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, entry.th32ProcessID);
+    if (process == nullptr) {
+      continue;
+    }
+    wchar_t image[MAX_PATH * 2] = {};
+    DWORD size = static_cast<DWORD>(std::size(image));
+    if (QueryFullProcessImageNameW(process, 0, image, &size)) {
+      const QString path = QDir::fromNativeSeparators(QString::fromWCharArray(image, static_cast<int>(size))).toLower();
+      if (path.startsWith(root)) {
+        LOG_INFO("[rescue] terminating %ls pid %lu", entry.szExeFile, entry.th32ProcessID);
+        if (TerminateProcess(process, 0)) {
+          WaitForSingleObject(process, 2000);
+          ++terminated;
+        }
+      }
+    }
+    CloseHandle(process);
+  }
+  CloseHandle(snapshot);
+  return terminated;
+}
+
+} // namespace
+#endif
 
 IpcServer::IpcServer(QObject *parent, const QString &serverName, const QString &typeName)
     : QObject(parent),
@@ -237,6 +299,54 @@ void IpcServer::requestLocalCoreRestart()
       "keyboard rescue: 5x Esc — no GUI IPC client to restart the core; "
       "ignoring (stopping it here would leave this machine dead)"
   );
+#endif
+}
+
+void IpcServer::requestLocalStopAll()
+{
+#if defined(Q_OS_WIN)
+  // The daemon owns every core and the service: it terminates each
+  // deskflow-core.exe / deskflow.exe under the install root in every session
+  // and then stops itself cleanly (SERVICE_STOPPED with NO_ERROR, so the
+  // SCM recovery actions `restart/1000/...` + failureflag 1 do NOT relaunch
+  // it -- those fire only on a crash or a non-zero exit code).
+  QLocalSocket daemon;
+  daemon.connectToServer(QString::fromLatin1(kDaemonIpcName));
+  if (daemon.waitForConnected(500)) {
+    LOG_INFO("[rescue] asking the daemon to stop every Deskflow process and the service");
+    daemon.write("stopAll\n");
+    daemon.flush();
+    daemon.waitForBytesWritten(500);
+    daemon.disconnectFromServer();
+    // The daemon terminates us. If it has not within the grace period
+    // (broken service), still take the GUI down and leave ourselves.
+    QTimer::singleShot(5000, this, [this] {
+      LOG_WARN("[rescue] still alive 5 s after asking the daemon; stopping the GUI and this core directly");
+      terminateProcessesUnderRoot(L"deskflow.exe", QCoreApplication::applicationDirPath());
+      requestStopProcess();
+      // The quit goes through the core event loop; a wedged loop must not
+      // keep this seat alive.
+      deskflow::coordination::armProcessExitFallback(
+          std::chrono::milliseconds(3000), 0, "stop-all: the event loop did not finish the quit in time"
+      );
+    });
+    return;
+  }
+  LOG_WARN(
+      "[rescue] daemon unreachable (%s); stopping the GUI and this core directly",
+      daemon.errorString().toUtf8().constData()
+  );
+  // GUI first: in Desktop process mode it would otherwise relaunch the core.
+  terminateProcessesUnderRoot(L"deskflow.exe", QCoreApplication::applicationDirPath());
+  requestStopProcess();
+  deskflow::coordination::armProcessExitFallback(
+      std::chrono::milliseconds(3000), 0, "stop-all: the event loop did not finish the quit in time"
+  );
+#else
+  // macOS runs the launchd sequence in coordination/OSXRescueStopAll.mm;
+  // nothing here owns a service on other platforms.
+  LOG_WARN("[rescue] stop-all via IPC is Windows-only; stopping this core");
+  requestStopProcess();
 #endif
 }
 

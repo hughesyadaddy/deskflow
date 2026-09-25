@@ -632,12 +632,17 @@ void ServerKeyLedgerTests::escRescue_releasesLedger()
 
     // a key is stuck down on the target; the user mashes Esc
     server.onKeyDown(kKeyA, 0, kButtonA, "en", nullptr);
-    for (int i = 0; i < deskflow::coordination::EscTapRescue::kTaps - 1; ++i) {
+    for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
       server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
       server.onKeyUp(kKeyEscape, 0, 1, nullptr);
     }
     remote.keys.clear();
     server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+    // Nothing fires on the press; the ledger is released when the burst
+    // has ended (settle timer) and the restart is requested.
+    QCOMPARE(restarts, 0);
+    QVERIFY(!server.m_keysHeldOnActive.empty());
+    server.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
 
     QCOMPARE(restarts, 1);
     QVERIFY(server.m_keysHeldOnActive.empty());

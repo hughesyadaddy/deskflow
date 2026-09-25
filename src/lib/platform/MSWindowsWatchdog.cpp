@@ -30,6 +30,7 @@
 #include <QStringDecoder>
 
 #include <algorithm>
+#include <iterator>
 
 //
 // Free functions
@@ -502,6 +503,81 @@ void MSWindowsWatchdog::requestRestart()
   LOG_INFO("keyboard rescue: relaunching core via watchdog");
   m_processState = ProcessState::StartPending;
   m_nextStartTime.reset();
+}
+
+void MSWindowsWatchdog::requestStopAll(const std::wstring &installRoot)
+{
+  {
+    LOG_VERBOSE("locking process state mutex for watchdog stop-all request");
+    std::scoped_lock lock{m_processStateMutex};
+    LOG_INFO("[rescue] stop-all: clearing the watchdog command so no core is relaunched");
+    m_command.clear();
+    m_nextStartTime.reset();
+    m_processState = ProcessState::StopPending;
+  }
+  terminateProcessesUnderRoot(installRoot);
+}
+
+void MSWindowsWatchdog::terminateProcessesUnderRoot(const std::wstring &installRoot)
+{
+  // Prefix match on the full image path, case-insensitive, with a trailing
+  // separator so "C:\Deskflow" never matches "C:\DeskflowOther\...".
+  std::wstring root = installRoot;
+  if (!root.empty() && root.back() != L'\\' && root.back() != L'/') {
+    root.push_back(L'\\');
+  }
+  for (auto &ch : root) {
+    if (ch == L'/') {
+      ch = L'\\';
+    }
+  }
+
+  MSWindowsHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+  if (snapshot.get() == INVALID_HANDLE_VALUE) {
+    LOG_ERR("[rescue] could not get process snapshot: %s", windowsErrorToString(GetLastError()).c_str());
+    return;
+  }
+
+  PROCESSENTRY32 entry;
+  entry.dwSize = sizeof(PROCESSENTRY32);
+  const DWORD self = GetCurrentProcessId();
+  for (BOOL more = Process32First(snapshot.get(), &entry); more; more = Process32Next(snapshot.get(), &entry)) {
+    if (entry.th32ProcessID == 0 || entry.th32ProcessID == self) {
+      continue;
+    }
+    const bool isCore = _wcsicmp(entry.szExeFile, L"deskflow-core.exe") == 0 ||
+                        _wcsicmp(entry.szExeFile, L"deskflow-client.exe") == 0 ||
+                        _wcsicmp(entry.szExeFile, L"deskflow-server.exe") == 0;
+    const bool isGui = _wcsicmp(entry.szExeFile, L"deskflow.exe") == 0;
+    if (!isCore && !isGui) {
+      continue;
+    }
+    const DWORD desiredAccess = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+    MSWindowsHandle process(OpenProcess(desiredAccess, FALSE, entry.th32ProcessID));
+    if (process.get() == nullptr) {
+      LOG_WARN(
+          "[rescue] could not open pid %lu for termination: %s", entry.th32ProcessID,
+          windowsErrorToString(GetLastError()).c_str()
+      );
+      continue;
+    }
+    wchar_t image[MAX_PATH * 2] = {};
+    DWORD size = static_cast<DWORD>(std::size(image));
+    if (!QueryFullProcessImageNameW(process.get(), 0, image, &size)) {
+      continue;
+    }
+    if (size < root.size() || _wcsnicmp(image, root.c_str(), root.size()) != 0) {
+      LOG_DEBUG("[rescue] leaving pid %lu alone: %ls is outside the install root", entry.th32ProcessID, image);
+      continue;
+    }
+    LOG_INFO("[rescue] stopping %ls pid %lu (%ls)", entry.szExeFile, entry.th32ProcessID, image);
+    if (isCore) {
+      // Close event first (ledger releases, graceful exit), terminate after.
+      deskflow::platform::MSWindowsProcess::shutdown(process.get(), entry.th32ProcessID, 3);
+    } else if (TerminateProcess(process.get(), 0)) {
+      WaitForSingleObject(process.get(), 2000);
+    }
+  }
 }
 
 void MSWindowsWatchdog::outputLoop(const void *)

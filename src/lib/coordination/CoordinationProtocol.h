@@ -38,6 +38,10 @@ struct Message
     Hello,
     Fleet,
     Rescue,
+    //! Fleet-wide stop (10x Esc): every peer stops every Deskflow instance
+    //! and service on its seat. Mesh v2 extension, no version bump: a peer
+    //! that predates it decodes the line as Invalid and drops it silently.
+    StopAll,
     //! Boundary resync (peer → cursor host): the sender lost track of which
     //! of its forwarded keys the receiver still holds (lane failure, relay
     //! stop); the receiver releases every key it holds on the sender's
@@ -73,6 +77,10 @@ struct Message
   int meshVersion = 0;
   // fleet fragment (decoded from `fleet` messages)
   FleetFragment fleet;
+  //! Numeric address the line arrived from (set by the transport, never
+  //! decoded from the wire). Fleet-wide commands (`rescue`, `stopall`) are
+  //! accepted only from an address a configured peer resolves to.
+  std::string sourceAddress;
 };
 
 namespace protocol {
@@ -87,6 +95,9 @@ std::string encodePromote(const std::string &token);
 
 //! Fleet-wide keyboard rescue: every peer restarts its local core.
 std::string encodeRescue(const std::string &token);
+//! Fleet-wide stop-all (10x Esc): every peer stops every Deskflow instance
+//! and service on its seat (`{"t":"stopall"}`; unknown to older peers).
+std::string encodeStopAll(const std::string &token);
 std::string encodeStatus(const std::string &token);
 
 //! Nominal transit budget for a relayed Down/Repeat (ms). The sender's

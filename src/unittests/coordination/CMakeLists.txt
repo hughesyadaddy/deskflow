@@ -60,6 +60,22 @@ create_test(
 )
 
 create_test(
+  NAME RescueStopAllTests
+  DEPENDS coordination
+  LIBS base arch
+  SOURCE RescueStopAllTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+)
+
+create_test(
+  NAME PeerAddressAllowlistTests
+  DEPENDS coordination
+  LIBS base arch
+  SOURCE PeerAddressAllowlistTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+)
+
+create_test(
   NAME KeyboardRelayHookPolicyTests
   DEPENDS coordination
   SOURCE KeyboardRelayHookPolicyTests.cpp

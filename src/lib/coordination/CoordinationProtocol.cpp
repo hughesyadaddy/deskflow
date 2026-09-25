@@ -186,6 +186,8 @@ Message decode(const std::string &line)
     message.type = Message::Type::Promote;
   } else if (type == QStringLiteral("rescue")) {
     message.type = Message::Type::Rescue;
+  } else if (type == QStringLiteral("stopall")) {
+    message.type = Message::Type::StopAll;
   } else if (type == QStringLiteral("status")) {
     message.type = Message::Type::Status;
   } else if (type == QStringLiteral("cursor")) {
@@ -257,6 +259,14 @@ std::string encodeRescue(const std::string &token)
 {
   QJsonObject object;
   object[QStringLiteral("t")] = QStringLiteral("rescue");
+  putToken(object, token);
+  return serialize(object);
+}
+
+std::string encodeStopAll(const std::string &token)
+{
+  QJsonObject object;
+  object[QStringLiteral("t")] = QStringLiteral("stopall");
   putToken(object, token);
   return serialize(object);
 }

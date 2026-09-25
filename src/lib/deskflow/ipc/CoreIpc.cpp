@@ -37,3 +37,13 @@ void ipcRequestLocalCoreRestart()
       &server, [] { deskflow::core::ipc::CoreIpcServer::instance().requestLocalCoreRestart(); }, Qt::QueuedConnection
   );
 }
+
+void ipcRequestLocalStopAll()
+{
+  auto &server = deskflow::core::ipc::CoreIpcServer::instance();
+  // QLocalSocket must be used on the IPC owning thread (the stop-all
+  // executor calls this from its own detached thread).
+  QMetaObject::invokeMethod(
+      &server, [] { deskflow::core::ipc::CoreIpcServer::instance().requestLocalStopAll(); }, Qt::QueuedConnection
+  );
+}
