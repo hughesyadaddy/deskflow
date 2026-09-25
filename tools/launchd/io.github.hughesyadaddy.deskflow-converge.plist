@@ -8,8 +8,18 @@
   fresh deploy lock exists.
 
   Rendered into ~/Library/LaunchAgents by `scripts/deskflow-ctl start`
-  (__CTL__ -> this checkout's scripts/deskflow-ctl, __APP__ -> the bundle,
-  __HOME__ -> $HOME). `scripts/deskflow-ctl stop` boots it out.
+  (__CTL__ -> the launchd-safe copy ~/Library/Deskflow/bin/deskflow-ctl,
+  __APP__ -> the bundle, __HOME__ -> $HOME). `scripts/deskflow-ctl stop`
+  boots it out.
+
+  __CTL__ is NEVER a checkout path. macOS TCC guards ~/Desktop, ~/Documents
+  and ~/Downloads per consenting app and a launchd job has none, so bash got
+  EPERM opening ~/Desktop/deskflow/scripts/deskflow-ctl: no prompt, the log
+  says "Operation not permitted", launchd records exit 126, and the tick was
+  dead from deploy until 2026-09-25. `deskflow-ctl start` refreshes the safe
+  copy (script + these templates + fleet-soak) before rendering; the tick
+  never reads a checkout. `deskflow-ctl assert-single`/`converge` and
+  `tools/fleet-health --check converge` report that state.
 -->
 <plist version="1.0">
 <dict>

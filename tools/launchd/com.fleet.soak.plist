@@ -6,14 +6,25 @@
   NOT INSTALLED ANYWHERE as of 2026-09-18: the sampler was built during the
   memory program but never bootstrapped on any seat, so nothing watched for a
   dead Mouser (pid null) or the 27 h 100%-CPU spin. Install on every macOS
-  seat (user agent, Aqua session so osascript notifications reach the desktop):
+  seat (user agent, Aqua session so osascript notifications reach the desktop).
+  It runs from the launchd-safe copy (__CTL_DIR__ = ~/Library/Deskflow/bin,
+  refreshed by `deskflow-ctl start`/`safe-copy`) and writes under __SOAK_DIR__
+  (~/Library/Deskflow/soak), never a checkout: a launchd job gets TCC EPERM
+  (no prompt, exit 126) on anything under ~/Desktop, ~/Documents or
+  ~/Downloads, so the old recipe pointing at ~/Desktop/deskflow could never
+  have run.
 
     cd ~/Desktop/deskflow
-    sed -e "s#__REPO__#$PWD#g" -e "s#__HOME__#$HOME#g" tools/launchd/com.fleet.soak.plist \
-      > ~/Library/LaunchAgents/com.fleet.soak.plist
+    scripts/deskflow-ctl start                     # or: scripts/deskflow-ctl safe-copy
+    scripts/deskflow-ctl render-plist com.fleet.soak > ~/Library/LaunchAgents/com.fleet.soak.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet.soak.plist
     launchctl kickstart gui/$(id -u)/com.fleet.soak        # first sample now
-    tail -1 harness/soak/latest/$(hostname -s | tr A-Z a-z)-mouser.jsonl
+    tail -1 ~/Library/Deskflow/soak/latest/$(hostname -s | tr A-Z a-z)-mouser.jsonl
+
+  --heap-classes looks for $FLEET_MOUSER_ROOT/tools/mouser-heap-classes
+  (default ~/Desktop/Mouser): unreadable from launchd for the same reason, so
+  `classes` stays null unless FLEET_MOUSER_ROOT (EnvironmentVariables) names
+  a Mouser clone outside those folders.
 
   Windows (tiny11): tools/fleet-soak-task.ps1 header has the schtasks line.
 
@@ -31,8 +42,8 @@
 
     launchctl bootout gui/$(id -u)/com.fleet.soak
 
-  Output goes to __REPO__/harness/soak/<date>/<seat>-<proc>.jsonl with
-  harness/soak/latest pointing at the current day directory (the <date>
+  Output goes to __SOAK_DIR__/<date>/<seat>-<proc>.jsonl with
+  __SOAK_DIR__/latest pointing at the current day directory (the <date>
   directory is created once by `fleet-soak sample --start-soak`; --soak keeps
   appending to latest so a multi-day soak stays in one file per process).
   The label for deskflow-core is a plain name (it is a child of the GUI app,
@@ -52,14 +63,14 @@
   <array>
     <string>/usr/bin/env</string>
     <string>python3</string>
-    <string>__REPO__/tools/fleet-soak</string>
+    <string>__CTL_DIR__/fleet-soak</string>
     <string>sample</string>
     <string>--once</string>
     <string>--interval</string>
     <string>60</string>
     <string>--heap-classes</string>
     <string>--soak</string>
-    <string>__REPO__/harness/soak</string>
+    <string>__SOAK_DIR__</string>
     <string>--label</string>
     <string>io.github.hughesyadaddy.mouser</string>
     <string>--exe</string>

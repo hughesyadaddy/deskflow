@@ -3,7 +3,7 @@
 
 Usage:
   tools/fleet-health [--host all|local|<id>]
-                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|instances|bridge|loginbridge|all]
+                     [--check sign|no-adhoc|identifiers|tcc|authenticode|session|mesh|instances|bridge|loginbridge|keys|converge|all]
                      [--json] [--env PATH] [--watch N]
 
 Reads scripts/fleet.env (same format as fleet-doctor / fleet-deploy.sh):
@@ -73,6 +73,23 @@ Checks:
                              login password containing a non-ASCII character
                              (accents, other scripts), a dead key or a keypad
                              operator cannot be typed through it.
+  converge                   the self-heal tick (macOS): gui/$UID/io.github.
+                             hughesyadaddy.deskflow-converge is loaded and
+                             its program is one launchd can execute. FAIL on
+                             "Operation not permitted" as the LAST line of
+                             ~/Library/Logs/Deskflow/converge.log written in
+                             the last 10 min, on a launchd last exit code of
+                             126, or on a program under ~/Desktop,
+                             ~/Documents or ~/Downloads (macOS TCC: a launchd
+                             job has no consenting app, so it gets EPERM there
+                             with no prompt -- the tick must run the
+                             launchd-safe copy ~/Library/Deskflow/bin/
+                             deskflow-ctl, never a checkout); on health.json
+                             missing or older than 10 min (the tick is not
+                             completing); and on ANY installed launchd plist
+                             (~/Library/LaunchAgents, /Library/LaunchAgents,
+                             /Library/LaunchDaemons) with a <string> under
+                             those folders.
 
 Environment overrides:
   DESKFLOW_EXPECT_AUTHORITY  expected `Authority=` prefix (default "Apple Development")
@@ -110,8 +127,8 @@ DEFAULT_ENV_FILE = REPO_ROOT / "scripts" / "fleet.env"
 IDENTIFIERS_FILE = TOOLS_DIR / "fleet-health.identifiers"
 
 ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh", "instances", "bridge",
-              "loginbridge", "keys")
-MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc", "loginbridge", "keys"}
+              "loginbridge", "keys", "converge")
+MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc", "loginbridge", "keys", "converge"}
 WIN_ONLY = {"authenticode"}
 
 MAC_APPS = ("/Applications/Deskflow.app", "/Applications/Mouser.app")
@@ -147,6 +164,23 @@ LOGIN_BRIDGE_CONNECT_FAILED_MARK = "vhid connect_failed"
 LOGIN_BRIDGE_READY_MAX_S = 30
 LOGIN_BRIDGE_SINCE_START_MAX_LINES = 400
 LOGIN_BRIDGE_CALIBRATE_FLAG = "--calibrate"
+# Self-heal tick (scripts/deskflow-ctl converge, every 60 s). It must run the
+# launchd-safe copy: macOS TCC gives a launchd job EPERM (no prompt, exit 126)
+# on anything under ~/Desktop, ~/Documents or ~/Downloads, which is where every
+# checkout lives -- macbookpro's tick was dead that way from deploy to 2026-09-25.
+CONVERGE_LABEL = "io.github.hughesyadaddy.deskflow-converge"
+CONVERGE_LOG = "~/Library/Logs/Deskflow/converge.log"
+CONVERGE_HEALTH_JSON = "~/Library/Application Support/Deskflow/health.json"
+CONVERGE_SAFE_CTL = "~/Library/Deskflow/bin/deskflow-ctl"
+CONVERGE_EPERM_WINDOW_S = 600
+CONVERGE_HEALTH_MAX_AGE_S = 600
+CONVERGE_LOG_TAIL_LINES = 5
+LAUNCHD_PLIST_DIRS = ("~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons")
+# A plist <string> value under a TCC-protected user folder (any account, ~ or $HOME spelling).
+TCC_PROTECTED_STRING_RE = r"<string>[^<]*(/Desktop|/Documents|/Downloads)(/|<)"
+_TCC_PROTECTED_PATH_RE = re.compile(r"/(Desktop|Documents|Downloads)(/|$)")
+# What launchd's shell prints when TCC refuses the script: "/bin/bash: <path>: Operation not permitted".
+_CONVERGE_EPERM_RE = re.compile(r"^(?P<shell>[^:]+): (?P<path>.+): (Operation not permitted|Permission denied)\s*$")
 WIN_DESKFLOW_ROOT = "C:/Users/alexh/Desktop/deskflow"
 # The core's own rotated log on macOS: Deskflow.conf `[log] toFile=true
 # file=...` (FileLogOutputter, generations file.1 .. file.3). launchd's
@@ -479,6 +513,94 @@ def login_bridge_log_since_start_cmd(log: str = LOGIN_BRIDGE_LOG,
            f"{{if (n<{int(max_lines)} || /{LOGIN_BRIDGE_CONNECT_FAILED_MARK}/) buf=buf $0 \"\\n\"; n++}} "
            "END{printf \"%s\", buf}")
     return f"sudo -n awk '{awk}' {shlex.quote(log)}"
+
+
+def _home_path(path: str) -> str:
+    """A remote path for a shell command: `~/x` -> "$HOME"/'x' (expands on the remote), else quoted."""
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+def converge_agent_cmd(label: str = CONVERGE_LABEL) -> str:
+    """launchd's LOADED definition of the tick: state, argv, runs, last exit code (rc != 0: not loaded)."""
+    return f'launchctl print "gui/$(id -u)/{label}"'
+
+
+def converge_log_cmd(log: str = CONVERGE_LOG, lines: int = CONVERGE_LOG_TAIL_LINES) -> str:
+    """"mtime=<epoch> now=<epoch>" then the last lines of converge.log (rc 1 when absent)."""
+    f = _home_path(log)
+    return f'f={f}; test -f "$f" && echo "mtime=$(stat -f %m "$f") now=$(date +%s)" && tail -n {int(lines)} "$f"'
+
+
+def converge_health_cmd(path: str = CONVERGE_HEALTH_JSON) -> str:
+    """"mtime=<epoch> now=<epoch>" of health.json, which every completed tick rewrites (rc 1 when absent)."""
+    f = _home_path(path)
+    return f'f={f}; test -f "$f" && echo "mtime=$(stat -f %m "$f") now=$(date +%s)"'
+
+
+def launchd_plists_tcc_cmd(dirs: Sequence[str] = LAUNCHD_PLIST_DIRS) -> str:
+    """grep -H -n of every <string> in any installed launchd plist that points under ~/Desktop,
+    ~/Documents or ~/Downloads (a launchd job gets EPERM there), then "scanned=<plist count>"."""
+    globs = " ".join(_home_path(d) + "/*.plist" for d in dirs)
+    return (f"grep -H -n -E {shlex.quote(TCC_PROTECTED_STRING_RE)} {globs} 2>/dev/null; "
+            f"echo \"scanned=$(ls {globs} 2>/dev/null | wc -l | tr -d ' ')\"")
+
+
+def parse_launchctl_print(text: str) -> Dict[str, object]:
+    """state, pid, runs, last_exit and argv from `launchctl print <service>`."""
+    info: Dict[str, object] = {"state": "", "pid": None, "runs": None, "last_exit": None, "argv": []}
+    in_args = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if in_args:
+            if s == "}":
+                in_args = False
+            elif s:
+                info["argv"].append(s)  # type: ignore[union-attr]
+            continue
+        if s == "arguments = {":
+            in_args = True
+        elif s.startswith("state = "):
+            info["state"] = s[len("state = "):]
+        elif s.startswith("pid = ") and s[len("pid = "):].isdigit():
+            info["pid"] = int(s[len("pid = "):])
+        elif s.startswith("runs = ") and s[len("runs = "):].isdigit():
+            info["runs"] = int(s[len("runs = "):])
+        elif s.startswith("last exit code = "):
+            info["last_exit"] = s[len("last exit code = "):]
+    return info
+
+
+def program_from_argv(argv: Sequence[str]) -> str:
+    """The script a job runs: argv[1] behind an interpreter (bash/sh/zsh/env), else argv[0]."""
+    if not argv:
+        return ""
+    if len(argv) > 1 and argv[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh", "env"):
+        return argv[1]
+    return argv[0]
+
+
+def parse_mtime_now(text: str) -> Tuple[Optional[int], List[str]]:
+    """("mtime=M now=N" first line, rest) -> (age in seconds or None, the remaining lines)."""
+    lines = text.splitlines()
+    if not lines:
+        return None, []
+    m = re.match(r"mtime=(\d+) now=(\d+)$", lines[0].strip())
+    if not m:
+        return None, lines
+    return int(m.group(2)) - int(m.group(1)), lines[1:]
+
+
+def converge_eperm_path(line: str) -> Optional[str]:
+    """The path in a "<shell>: <path>: Operation not permitted" line (TCC seen from launchd), else None."""
+    m = _CONVERGE_EPERM_RE.match(line.strip())
+    return m.group("path") if m else None
+
+
+def tcc_protected(path: str) -> bool:
+    """True for a path under ~/Desktop, ~/Documents or ~/Downloads (any account, ~/$HOME spelling)."""
+    return bool(_TCC_PROTECTED_PATH_RE.search(path))
 
 
 _BRIDGE_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})")
@@ -1004,6 +1126,69 @@ class FleetHealth:
             self._add(host, "loginbridge", PASS,
                       f"plist lints, program ok, --calibrate, log 600 with 0 keystrokes, {agent}, {ready}")
 
+    def check_converge_mac(self, host: Host) -> None:
+        """The self-heal tick can run and does: loaded, its program executable from launchd (no TCC
+        EPERM), health.json fresh, and no installed launchd plist pointing into a TCC-protected folder."""
+        problems: List[str] = []
+        notes: List[str] = []
+        evidence: List[str] = []
+        prog = ""
+        tcc_path = ""
+        rc, out, err = self.runner(host, converge_agent_cmd())
+        if rc != 0:
+            problems.append(f"gui/$UID/{CONVERGE_LABEL} not loaded (launchctl rc={rc}): the self-heal tick is dead; "
+                            "deskflow-ctl start")
+        else:
+            info = parse_launchctl_print(out)
+            prog = program_from_argv(info["argv"])  # type: ignore[arg-type]
+            if info["last_exit"] == "126":
+                tcc_path = prog
+                evidence.append("launchd last exit code 126")
+            if prog and tcc_protected(prog):
+                tcc_path = tcc_path or prog
+                evidence.append("program is under ~/Desktop, ~/Documents or ~/Downloads")
+            runs = info["runs"]
+            notes.append(f"agent loaded ({info['state'] or '?'}, runs={runs if runs is not None else '?'}), "
+                         f"program {prog or '?'}")
+        rc, out, err = self.runner(host, converge_log_cmd())
+        if rc == 0:
+            age, tail = parse_mtime_now(out)
+            last = tail[-1] if tail else ""
+            path = converge_eperm_path(last)
+            if path and age is not None and age <= CONVERGE_EPERM_WINDOW_S:
+                tcc_path = tcc_path or path
+                evidence.append(f"converge.log ends with '{last.strip()[:120]}' ({age}s ago)")
+        if evidence:
+            problems.append(f"converge agent cannot execute its program (TCC): {tcc_path or '?'} "
+                            f"[{'; '.join(evidence)}] -- deskflow-ctl start renders the agent onto {CONVERGE_SAFE_CTL}")
+        rc, out, err = self.runner(host, converge_health_cmd())
+        if rc != 0:
+            problems.append(f"{CONVERGE_HEALTH_JSON} missing: the tick has never completed on this seat")
+        else:
+            age, _ = parse_mtime_now(out)
+            if age is None:
+                problems.append(f"{CONVERGE_HEALTH_JSON}: unreadable mtime ({out.strip()[:80] or 'no output'})")
+            elif age > CONVERGE_HEALTH_MAX_AGE_S:
+                problems.append(f"{CONVERGE_HEALTH_JSON} is {age // 60} min old (want <= "
+                                f"{CONVERGE_HEALTH_MAX_AGE_S // 60} min: the tick is not completing)")
+            else:
+                notes.append(f"health.json {age}s old")
+        rc, out, err = self.runner(host, launchd_plists_tcc_cmd())
+        scanned = "?"
+        for ln in out.splitlines():
+            if not ln.strip():
+                continue
+            if ln.startswith("scanned="):
+                scanned = ln[len("scanned="):].strip()
+                continue
+            problems.append(f"launchd plist points into a TCC-protected folder (EPERM for launchd, no prompt): "
+                            f"{ln.strip()}")
+        notes.append(f"{scanned} installed plists free of ~/Desktop|~/Documents|~/Downloads")
+        if problems:
+            self._add(host, "converge", FAIL, "; ".join(problems))
+        else:
+            self._add(host, "converge", PASS, ", ".join(notes))
+
     def check_keys_mac(self, host: Host) -> None:
         rc, out, err = self.runner(host, keys_log_cmd())
         if rc == 4:
@@ -1090,6 +1275,8 @@ class FleetHealth:
                     self.check_login_bridge_mac(host)
                 elif c == "keys":
                     self.check_keys_mac(host)
+                elif c == "converge":
+                    self.check_converge_mac(host)
                 elif c == "mesh":
                     if not peers:
                         self._add(host, "mesh", SKIP, "no peers")
