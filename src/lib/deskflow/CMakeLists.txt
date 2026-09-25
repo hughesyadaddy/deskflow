@@ -55,6 +55,8 @@ add_library(${lib_name} STATIC ${PLATFORM_CODE}
   ISecondaryScreen.h
   KeyTypes.cpp
   KeyTypes.h
+  KeyLogToken.cpp
+  KeyLogToken.h
   KeyMap.cpp
   KeyMap.h
   KeyState.cpp

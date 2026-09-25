@@ -129,6 +129,10 @@ public:
     // Comma-separated message prefixes (e.g. "coordination") logged at DEBUG
     // while `level` stays INFO; see Log::setDebugCategories.
     inline static const auto Categories = QStringLiteral("log/categories");
+    // Typed content in the core log. Default false: key lines print
+    // `id=<redacted>` for every non-modifier key. true AND level=VERBOSE
+    // prints the KeyID/char/button in cleartext (deskflow/KeyLogToken.h).
+    inline static const auto Keystrokes = QStringLiteral("log/keystrokes");
     inline static const auto ToFile = QStringLiteral("log/toFile");
     inline static const auto GuiDebug = QStringLiteral("log/guiDebug");
   };
@@ -331,6 +335,7 @@ private:
     , Settings::Log::File
     , Settings::Log::Level
     , Settings::Log::Categories
+    , Settings::Log::Keystrokes
     , Settings::Log::ToFile
     , Settings::Log::GuiDebug
     , Settings::Gui::Autohide
@@ -377,7 +382,8 @@ private:
 
   // When checking the default values this list contains the ones that default to false.
   inline static const QStringList m_defaultFalseValues = {
-      Settings::Gui::Autohide
+      Settings::Log::Keystrokes
+    , Settings::Gui::Autohide
     , Settings::Gui::AutoStartCore
     , Settings::Gui::ShownFirstConnectedMessage
     , Settings::Gui::ShownServerFirstStartMessage

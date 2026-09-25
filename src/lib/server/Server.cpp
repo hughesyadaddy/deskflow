@@ -179,14 +179,13 @@ void Server::sendReleases(BaseClientProxy *client, HeldKeys &keys, const char *w
   // boundary we are in the middle of: log and keep clearing.
   for (const auto &[button, id] : keys) {
     LOG_DEBUG(
-        "releasing key %s (button 0x%04x) held on \"%s\": %s", IKeyState::describeKey(id).c_str(), button,
-        getName(client).c_str(), why
+        "releasing key %s held on \"%s\": %s", deskflow::keyLogToken(id, button).c_str(), getName(client).c_str(), why
     );
     try {
       client->keyUp(id, 0, button);
     } catch (const std::exception &e) { // NOSONAR
       LOG_WARN(
-          "could not release key %s on \"%s\": %s", IKeyState::describeKey(id).c_str(), getName(client).c_str(),
+          "could not release key %s on \"%s\": %s", deskflow::keyLogToken(id).c_str(), getName(client).c_str(),
           e.what()
       );
     }
@@ -2228,10 +2227,7 @@ bool Server::screenHasChordRemaps(const std::string &screen) const
 
 void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang, const char *screens)
 {
-  LOG_DEBUG(
-      "onKeyDown id=%s mask=0x%04x button=0x%04x lang=%s", IKeyState::describeKey(id).c_str(), mask, button,
-      lang.c_str()
-  );
+  LOG_DEBUG("onKeyDown %s mask=0x%04x lang=%s", deskflow::keyLogToken(id, button).c_str(), mask, lang.c_str());
   assert(m_active != nullptr);
 
   // Keyboard rescue: five plain Esc downs within 2s soft-restarts local core.
@@ -2285,10 +2281,14 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
         id = entry.outKey;
         mask = effectiveChordRemapMask(mask);
         LOG_DEBUG(
-            "chord remap hold-through start -> id=%d mask=0x%04x for \"%s\"", id, mask, getName(m_active).c_str()
+            "chord remap hold-through start -> %s mask=0x%04x for \"%s\"", deskflow::keyLogToken(id).c_str(), mask,
+            getName(m_active).c_str()
         );
       } else if (applyChordRemap(id, mask, m_config->getChordRemaps(), getName(m_active))) {
-        LOG_DEBUG("chord remap -> id=%d mask=0x%04x for \"%s\"", id, mask, getName(m_active).c_str());
+        LOG_DEBUG(
+            "chord remap -> %s mask=0x%04x for \"%s\"", deskflow::keyLogToken(id).c_str(), mask,
+            getName(m_active).c_str()
+        );
       }
     }
   }

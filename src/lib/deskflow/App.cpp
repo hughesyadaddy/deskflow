@@ -14,6 +14,7 @@
 #include "common/ExitCodes.h"
 #include "common/Settings.h"
 #include "deskflow/DeskflowException.h"
+#include "deskflow/KeyLogToken.h"
 #include "mt/ThreadException.h"
 
 #if defined(Q_OS_WIN)
@@ -166,6 +167,7 @@ void App::initApp()
     m_bye(s_exitArgs);
   }
   CLOG->setDebugCategories(Settings::value(Settings::Log::Categories).toString().split(QLatin1Char(',')));
+  deskflow::setKeystrokeLoggingEnabled(Settings::value(Settings::Log::Keystrokes).toBool());
   loggingFilterWarning();
 
   // setup file logging after parsing args

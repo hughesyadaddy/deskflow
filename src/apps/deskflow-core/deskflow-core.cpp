@@ -31,6 +31,7 @@
 #include "coordination/KeyboardRescue.h"
 #include "deskflow/App.h"
 #include "deskflow/ClientApp.h"
+#include "deskflow/KeyLogToken.h"
 #include "deskflow/ServerApp.h"
 #include "deskflow/MouserLink.h"
 #include "deskflow/ipc/CoreIpc.h"
@@ -241,6 +242,7 @@ int main(int argc, char **argv)
     // no longer captures stdout on macOS).
     CLOG->setFilter(Settings::logLevelText());
     CLOG->setDebugCategories(Settings::value(Settings::Log::Categories).toString().split(QLatin1Char(',')));
+    deskflow::setKeystrokeLoggingEnabled(Settings::value(Settings::Log::Keystrokes).toBool());
     App::attachFileLogOnce();
     // Read once here: Settings is a shared QSettings that the core thread
     // writes to, so the main-thread health timer must not touch it.
