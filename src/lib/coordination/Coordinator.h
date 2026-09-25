@@ -14,6 +14,7 @@
 #include "coordination/KeyboardRescue.h"
 #include "coordination/LocalInputMonitor.h"
 #include "coordination/Peer.h"
+#include "coordination/WedgeDetector.h"
 #include "deskflow/KeyTypes.h"
 
 #include <atomic>
@@ -46,6 +47,9 @@ struct CoordinatorConfig
   std::string selfName;
   int meshPort = 24851;
   int deskflowPort = 24800;
+  //! `core/interface`: what the server binds (empty = IPv4 any). The wedge
+  //! probe targets the loopback of the same family/address.
+  std::string deskflowInterface;
   std::string token;
   PeerList peers;
   ElectionTuning tuning;
@@ -126,6 +130,10 @@ public:
   */
   void setRunningRole(Role role);
   Role runningRole() const;
+
+  //! Server epoch: its client listener is bound and accepting (true) or
+  //! gone (false). Gates the wedge probe; see WedgeDetector.
+  void notifyServerListening(bool listening);
 
   //! Server epoch: update cursor host/screen in fleet state.
   //! \p screenName is the active screen name (deskflow screen names identify cursor host).
@@ -255,7 +263,7 @@ private:
   bool m_workerStop = false;
   bool m_broadcastPending = false;
   double m_startedAt = 0.0;
-  int m_wedgeStrikes = 0;
+  WedgeDetector m_wedge; //!< guarded by m_mutex
   bool m_loggedKeyForward = false;
   bool m_loggedKeyForwardReceive = false;
   //! Lane the last key was forwarded on (guarded by m_mutex; lanes live as

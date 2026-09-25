@@ -419,6 +419,12 @@ void Coordinator::handleFleetMessage(const Message &message)
   postFleetStateEvents(events, merge);
 }
 
+void Coordinator::notifyServerListening(bool listening)
+{
+  std::scoped_lock lock{m_mutex};
+  m_wedge.setListening(listening);
+}
+
 void Coordinator::updateCursorHost(const std::string &screenName)
 {
   if (screenName.empty()) {
@@ -1045,7 +1051,6 @@ void Coordinator::decide(Role role, const std::string &serverAddress, bool resta
     }
     m_decision = RoleDecision{role, serverAddress, false, restart};
     m_hasDecision = true;
-    m_wedgeStrikes = 0;
     interrupt = m_interrupt;
   }
   m_decisionReady.notify_all();
@@ -1126,39 +1131,50 @@ void Coordinator::workerLoop()
           sendLineToPeers(line);
         }
       }
-      // HOTFIX #2 2026-09-25 (pending fix/k8-epoch-rebind): the probe's own
-      // local connect-and-close is accepted by our server, the accepted-socket
-      // construction throws, TCPListenSocket::accept() rethrows it BY VALUE
-      // (sliced to "std::exception") and that ends the healthy server epoch
-      // ~30 s after every start -- the first cause of today's outage. The
-      // verdict was already made log-only by the first hotfix; the connection
-      // itself is the harm, so the probe is disabled until accept() is made
-      // resilient and the epoch teardown deterministic.
-      constexpr bool kWedgeProbeEnabled = false;
-      if (kWedgeProbeEnabled && tick % kWedgeProbeEveryTicks == 0) {
-        // Alive-but-not-accepting detection: the server process can wedge
-        // while its accept loop is stuck; restart the epoch if the
-        // transport port stops answering locally.
-        if (m_mesh->probeDeskflowPort(m_config.deskflowPort, kWedgeProbeTimeoutMs)) {
-          m_wedgeStrikes = 0;
-        } else if (++m_wedgeStrikes >= kWedgeStrikesToRestart) {
-          // HOTFIX 2026-09-25 (pending fix/k8-epoch-rebind): the in-process
-          // epoch restart this branch used to trigger (`decide(Role::Server,
-          // {}, true)`) never closed the previous epoch's listener or its
-          // event-queue pipes, so every retry failed with EADDRINUSE at 500 ms,
-          // leaked two fds per attempt, exhausted the fd table (~2600 fds in
-          // 10 min), and then could not even open deskflow-server.conf --
-          // while the process never exited, so launchd never restarted it and
-          // the fleet lost its server. The probe also fired on demonstrably
-          // healthy epochs (clients had just connected). Until the epoch
-          // teardown is made deterministic, only record the suspicion; a
-          // genuinely dead server is caught by fleet-health / deskflow-ctl.
-          LOG_WARN(
-              "coordination: server transport wedge suspected (local probe failed %d times); "
-              "in-process epoch restart is disabled pending fix/k8-epoch-rebind",
-              m_wedgeStrikes
-          );
-          m_wedgeStrikes = 0;
+      if (tick % kWedgeProbeEveryTicks == 0) {
+        // Alive-but-not-accepting detection: connect to the port the
+        // running server epoch bound. Only while that epoch reports its
+        // listener up (never during a display wait / config retry), only
+        // counting strikes once the listener has answered in this epoch,
+        // and restarting at most once per cool-down (WedgeDetector).
+        bool probeNow = false;
+        {
+          std::scoped_lock lock{m_mutex};
+          probeNow = m_wedge.shouldProbe();
+        }
+        if (probeNow) {
+          const std::string host = probeHostForListenInterface(m_config.deskflowInterface);
+          const bool ok = m_mesh->probeDeskflowPort(host, m_config.deskflowPort, kWedgeProbeTimeoutMs);
+          bool restart = false;
+          bool armed = false;
+          int strikes = 0;
+          {
+            std::scoped_lock lock{m_mutex};
+            armed = m_wedge.armed();
+            restart = m_wedge.recordProbe(ok, now);
+            strikes = m_wedge.strikes();
+          }
+          if (restart) {
+            LOG_WARN(
+                "coordination: server transport wedged (%s:%d stopped answering after it had accepted); "
+                "restarting server epoch",
+                host.c_str(), m_config.deskflowPort
+            );
+            // restart=true: same role and address as the running epoch, and
+            // the epoch loop would otherwise keep it (no rebuild).
+            decide(Role::Server, {}, true);
+          } else if (!ok && !armed) {
+            LOG_WARN(
+                "coordination: local probe of the server port %s:%d failed before it ever answered; "
+                "not counted as a wedge (listener still starting, or bound elsewhere)",
+                host.c_str(), m_config.deskflowPort
+            );
+          } else if (!ok) {
+            LOG_WARN(
+                "coordination: local probe of the server port %s:%d failed (strike %d)", host.c_str(),
+                m_config.deskflowPort, strikes
+            );
+          }
         }
       }
     } else if (role == Role::Init && now - m_startedAt <= kDiscoveryWindowS) {

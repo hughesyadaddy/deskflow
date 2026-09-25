@@ -98,3 +98,10 @@ create_test(
   LIBS base arch mt
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
 )
+
+create_test(
+  NAME WedgeDetectorTests
+  DEPENDS coordination
+  SOURCE WedgeDetectorTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+)

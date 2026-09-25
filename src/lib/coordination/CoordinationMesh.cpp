@@ -268,9 +268,9 @@ bool CoordinationMesh::probe(const std::string &host, int timeoutMs)
   return true;
 }
 
-bool CoordinationMesh::probeDeskflowPort(int port, int timeoutMs)
+bool CoordinationMesh::probeDeskflowPort(const std::string &host, int port, int timeoutMs)
 {
-  const int fd = connectWithTimeout("127.0.0.1", port, timeoutMs);
+  const int fd = connectWithTimeout(host, port, timeoutMs);
   if (fd < 0) {
     return false;
   }

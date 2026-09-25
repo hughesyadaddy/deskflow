@@ -52,6 +52,7 @@ CoordinatorConfig configFromSettings()
   config.selfName = Settings::value(Settings::Core::ComputerName).toString().toStdString();
   config.meshPort = Settings::value(Settings::Coordination::Port).toInt();
   config.deskflowPort = Settings::value(Settings::Core::Port).toInt();
+  config.deskflowInterface = Settings::value(Settings::Core::Interface).toString().toStdString();
   config.token = Settings::value(Settings::Coordination::Token).toString().toStdString();
   // QSettings turns comma-separated INI values into a QStringList; accept
   // both that and a plain string by normalizing through a list join.
@@ -118,6 +119,8 @@ void AutoModeRunner::requestQuit()
   if (m_coordinator) {
     m_coordinator->requestQuit();
   }
+  // Wake a loop sleeping out a failure backoff.
+  m_gateCv.notify_all();
 }
 
 void AutoModeRunner::epochLoop()
@@ -165,13 +168,34 @@ void AutoModeRunner::epochLoop()
       break;
     }
 
+    const auto epochStartedAt = std::chrono::steady_clock::now();
     const int result = runEpoch(decision.role, decision.serverAddress);
+    const auto ranFor =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - epochStartedAt);
+    const auto verdict = m_failurePolicy.epochEnded(result, ranFor);
     if (result != s_exitSuccess) {
-      LOG_WARN("coordination: %s epoch ended with code %d", roleName(decision.role), result);
-      // Pause briefly so a persistent failure cannot hot-loop. Plain
-      // std sleep: Arch::sleep() requires an Arch-registered thread and
-      // this is a QThread (it crashes in testCancelThread otherwise).
-      std::this_thread::sleep_for(kFailureBackoff);
+      LOG_WARN(
+          "coordination: %s epoch ended with code %d after %lld ms (%d consecutive failure(s))",
+          roleName(decision.role), result, static_cast<long long>(ranFor.count()), verdict.consecutiveFailures
+      );
+      if (verdict.giveUp && !m_quitRequested) {
+        // Never loop in-process forever: hand the port, the display and a
+        // clean fd table to a fresh process. launchd (KeepAlive with
+        // SuccessfulExit=false, ThrottleInterval) restarts the core.
+        LOG_CRIT(
+            "coordination: %d consecutive %s epoch failures (last code %d); exiting with code %d so the "
+            "supervisor restarts the core",
+            verdict.consecutiveFailures, roleName(decision.role), result, s_exitFailed
+        );
+        m_exitCode = s_exitFailed;
+        break;
+      }
+      // Back off so a persistent failure cannot hot-loop (1 s doubling to
+      // 30 s). A quit request cuts the wait short. Plain std wait, not
+      // Arch::sleep(): this is a QThread, not an Arch-registered thread.
+      LOG_INFO("coordination: next epoch in %lld ms", static_cast<long long>(verdict.backoff.count()));
+      std::unique_lock lock{m_gateMutex};
+      m_gateCv.wait_for(lock, verdict.backoff, [this] { return m_quitRequested.load(); });
     }
     bool decisionWaiting = false;
     {
@@ -351,6 +375,7 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
     });
     serverApp->setFleetSnapshotCallback([this] { return m_coordinator->fleetSnapshot(); });
     serverApp->setWakePeerCallback([this](const std::string &name) { m_coordinator->wakePeer(name); });
+    serverApp->setListeningCallback([this](bool listening) { m_coordinator->notifyServerListening(listening); });
     app = std::move(serverApp);
   } else {
     auto clientApp = std::make_unique<ClientApp>(&m_events, m_processName);
@@ -400,8 +425,9 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
   } catch (ExitAppException &e) {
     result = e.getCode();
   } catch (DisplayInvalidException &die) {
+    // The platform screen already waited up to 30 s for a display; the
+    // failure backoff in epochLoop() paces the retry from here.
     LOG_CRIT("a display invalid exception error occurred: %s\n", die.what());
-    std::this_thread::sleep_for(std::chrono::seconds(10));
   } catch (std::runtime_error &re) {
     LOG_CRIT("a runtime error occurred: %s\n", re.what());
   } catch (std::exception &e) {
@@ -428,6 +454,8 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
   }
 
   m_coordinator->updateKeyboardRelayForRole(Role::Init);
+  // Whatever the app managed to report, no listener survives the epoch.
+  m_coordinator->notifyServerListening(false);
   deskflow::MouserLink::shared().setRole(deskflow::MouserLink::Role::None);
 
   m_exitCode = result;

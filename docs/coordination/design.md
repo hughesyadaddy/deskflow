@@ -81,7 +81,9 @@ A 3 s `EventQueueTimer` on the coordinator:
 - client link health from real connection events
   (`ClientConnected` / `ClientConnectionFailed` / `ClientDisconnected`)
   with the 10 s grace, then targeted relaunch, then rediscovery
-- server wedge probe (`127.0.0.1:<port>` connect + RST, 2 strikes ≈ 60 s)
+- server wedge probe (loopback of the bound family + RST, 2 strikes ≈ 60 s;
+  only while the epoch reports its listener up, strikes only after it has
+  answered once, one restart per 60 s — `WedgeDetector`)
 - startup discovery window (30 s of 1 s `status` polls while `init`)
 
 ## Settings

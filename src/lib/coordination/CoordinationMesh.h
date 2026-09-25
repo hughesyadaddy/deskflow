@@ -74,7 +74,13 @@ public:
   bool probe(const std::string &host, int timeoutMs);
 
   //! Connect-probe the local deskflow transport port (server wedge check).
-  bool probeDeskflowPort(int port, int timeoutMs);
+  /*!
+  \p host is the loopback of the family the listener bound (see
+  probeHostForListenInterface). The connection is reset, not closed: the
+  server's accept path tolerates that (TCPListenSocket::accept) and no
+  ClientProxyUnknown is left holding the fd for its 30 s timeout.
+  */
+  bool probeDeskflowPort(const std::string &host, int port, int timeoutMs);
 
   //! Send one line and read one reply line (status query); empty on failure.
   std::string query(const std::string &host, const std::string &line);

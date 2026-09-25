@@ -26,6 +26,8 @@ add_library(coordination STATIC
   RelayKeyEvent.h
   WakeOnLan.cpp
   WakeOnLan.h
+  WedgeDetector.cpp
+  WedgeDetector.h
 )
 
 if(APPLE)

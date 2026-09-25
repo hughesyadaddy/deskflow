@@ -117,10 +117,23 @@ start client transport towards X, persist state.
 - Client down < 10 s: grace. Beyond that: relaunch towards the same host;
   after >= 2 direct retries, re-run discovery (`status` to peers) and
   repoint if the server is reachable at an alternate address.
-- **Server wedge probe**: every ~30 s, connect to `127.0.0.1:24800` with a
-  1 s timeout and reset the connection (RST) so the server's unknown-client
-  proxy is torn down at once; two consecutive failures (~60 s) => the
-  server is alive but not accepting => restart server transport.
+- **Server wedge probe**: every ~30 s, connect to the loopback of the family
+  the server bound (`127.0.0.1:24800`, or `::1` for a v6 `core/interface`)
+  with a 1 s timeout and reset the connection (RST) so the server's
+  unknown-client proxy is torn down at once (the accept path tolerates a
+  reset peer: it logs "rejected incoming connection" and re-arms). Gated by
+  `WedgeDetector`: no probe until the running server epoch reports its
+  listener bound (never during a display wait or config retry), strikes
+  count only after the listener answered once in this epoch, and two
+  consecutive failures (~60 s) => alive-but-not-accepting => restart the
+  server epoch, at most once per 60 s. A listener that never answers is
+  logged, not restarted (the epoch loop's bind failure backoff owns that).
+- **Epoch failure backoff**: an epoch that ends in failure is retried after
+  1 s, doubling to 30 s; five consecutive failures (a healthy run of >= 60 s
+  or a clean flip resets the streak) end the process with a non-zero exit so
+  launchd (`KeepAlive`, `ThrottleInterval` 10 s) replaces it with a clean one.
+  Every epoch tears down its listener, multiplexer thread (and its poll
+  pipe), screen and power thread on every exit path first.
 - **Startup discovery**: for 30 s while `init`, query peers' `status`
   every 1 s; converge to an active server immediately when found.
 

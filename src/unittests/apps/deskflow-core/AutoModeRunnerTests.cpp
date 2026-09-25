@@ -249,13 +249,41 @@ void AutoModeRunnerTests::quietEpochResetsDwell()
   QCOMPARE(h.gate.currentDwell(), 5000ms);
 }
 
-void AutoModeRunnerTests::failureBackoffUnchanged()
+void AutoModeRunnerTests::failureBackoffEscalatesAndGivesUp()
 {
-  // The hot-loop guard for failed epochs is a fixed 500 ms sleep and is
-  // not subject to the dwell gate: a failed app is restarted by the
-  // loop, which sees no running epoch and therefore no rate limit.
-  QCOMPARE(AutoModeRunner::kFailureBackoff, 500ms);
+  // A failed epoch is restarted by the loop (no running epoch, so the
+  // dwell gate does not apply) but never hot-looped: consecutive failures
+  // back off 1 s -> 2 -> 4 -> 8 -> 16 (capped at 30 s) and the fifth one
+  // gives up so launchd replaces the process. 2026-09-25: the old fixed
+  // 500 ms retry rebuilt a server epoch against its own leaked listener
+  // 3400 times in 30 min and never let the supervisor in.
+  QCOMPARE(AutoModeRunner::kFailureBackoff, 1000ms);
+  QCOMPARE(AutoModeRunner::kMaxFailureBackoff, 30000ms);
+  QCOMPARE(AutoModeRunner::kMaxConsecutiveFailures, 5);
 
+  EpochFailurePolicy policy{EpochFailurePolicy::Config{
+      AutoModeRunner::kFailureBackoff, AutoModeRunner::kMaxFailureBackoff, AutoModeRunner::kMaxConsecutiveFailures
+  }};
+  const std::vector<std::chrono::milliseconds> expected{1000ms, 2000ms, 4000ms, 8000ms, 16000ms};
+  for (int i = 0; i < 5; ++i) {
+    const auto verdict = policy.epochEnded(1, 40ms);
+    QCOMPARE(verdict.consecutiveFailures, i + 1);
+    QCOMPARE(verdict.backoff, expected[static_cast<size_t>(i)]);
+    QCOMPARE(verdict.giveUp, i + 1 >= 5);
+  }
+
+  // The cap: with a higher give-up threshold the backoff stays at 30 s.
+  EpochFailurePolicy patient{EpochFailurePolicy::Config{1000ms, 30000ms, 100}};
+  std::chrono::milliseconds last{0};
+  for (int i = 0; i < 10; ++i) {
+    last = patient.epochEnded(4, 0ms).backoff;
+  }
+  QCOMPARE(last, 30000ms);
+  QCOMPARE(patient.consecutiveFailures(), 10);
+
+  // The flip gate itself is untouched by failures: a failed app is
+  // re-armed with the same role by the loop, which sees no running epoch
+  // and therefore no rate limit.
   Harness h;
   h.startEpoch({Role::Client, "a"});
   h.advance(100ms);
@@ -270,6 +298,32 @@ void AutoModeRunnerTests::failureBackoffUnchanged()
   h.gate.epochEnded(h.now);
   QCOMPARE(h.gate.requestFlip(h.now), Action::Ignored);
   QVERIFY(!h.gate.deferredDeadline().has_value());
+}
+
+void AutoModeRunnerTests::failurePolicyResetsOnCleanExitAndLongRun()
+{
+  EpochFailurePolicy policy{EpochFailurePolicy::Config{1000ms, 30000ms, 5, 60000ms}};
+  policy.epochEnded(1, 10ms);
+  policy.epochEnded(1, 10ms);
+  QCOMPARE(policy.consecutiveFailures(), 2);
+
+  // A clean end (role flip, quit) wipes the streak and sleeps nothing.
+  const auto clean = policy.epochEnded(0, 10ms);
+  QCOMPARE(clean.backoff, 0ms);
+  QVERIFY(!clean.giveUp);
+  QCOMPARE(policy.consecutiveFailures(), 0);
+
+  // A crash after a long healthy run is a fresh streak of one, never the
+  // fifth strike of failures that happened hours ago.
+  policy.epochEnded(1, 10ms);
+  policy.epochEnded(1, 10ms);
+  policy.epochEnded(1, 10ms);
+  policy.epochEnded(1, 10ms);
+  QCOMPARE(policy.consecutiveFailures(), 4);
+  const auto afterLongRun = policy.epochEnded(1, 2h);
+  QCOMPARE(afterLongRun.consecutiveFailures, 1);
+  QCOMPARE(afterLongRun.backoff, 1000ms);
+  QVERIFY(!afterLongRun.giveUp);
 }
 
 void AutoModeRunnerTests::deferredIsDisarmedWhenEpochEnds()

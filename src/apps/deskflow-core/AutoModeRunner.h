@@ -151,6 +151,73 @@ private:
   int m_coalesced = 0;
 };
 
+//! Backoff and give-up policy for epochs that end in failure (pure logic).
+/*!
+An epoch that fails at once (bind failure: the port is held by another
+process or -- before the teardown fixes -- by a leaked listener in this
+very process; no display; unreadable config) used to be rebuilt every
+500 ms forever. That never converges and, worse, never lets launchd
+replace the process. Now consecutive failures back off exponentially
+(1 s doubling to 30 s) and after \c maxConsecutiveFailures the loop gives
+up: the process exits non-zero and launchd's KeepAlive starts a clean one
+(fleet ownership model; ThrottleInterval in the plist bounds that too).
+
+A clean exit (role flip, quit) resets the streak, and so does an epoch
+that ran for at least \c healthyRunTime before failing: one crash after
+hours of service is a fresh streak of one, not the fifth strike.
+*/
+class EpochFailurePolicy
+{
+public:
+  struct Config
+  {
+    std::chrono::milliseconds firstBackoff{1000};
+    std::chrono::milliseconds maxBackoff{30000};
+    int maxConsecutiveFailures = 5;
+    std::chrono::milliseconds healthyRunTime{60000};
+  };
+
+  struct Verdict
+  {
+    std::chrono::milliseconds backoff{0}; //!< sleep before the next epoch
+    bool giveUp = false;                  //!< exit the process instead
+    int consecutiveFailures = 0;
+  };
+
+  EpochFailurePolicy() = default;
+  explicit EpochFailurePolicy(Config config) : m_config(config)
+  {
+  }
+
+  //! An epoch ended with \p exitCode after running for \p ranFor.
+  Verdict epochEnded(int exitCode, std::chrono::milliseconds ranFor)
+  {
+    Verdict verdict;
+    if (exitCode == 0) {
+      m_failures = 0;
+      return verdict;
+    }
+    m_failures = ranFor >= m_config.healthyRunTime ? 1 : m_failures + 1;
+    verdict.consecutiveFailures = m_failures;
+    verdict.giveUp = m_failures >= m_config.maxConsecutiveFailures;
+    std::chrono::milliseconds backoff = m_config.firstBackoff;
+    for (int i = 1; i < m_failures && backoff < m_config.maxBackoff; ++i) {
+      backoff *= 2;
+    }
+    verdict.backoff = std::min(backoff, m_config.maxBackoff);
+    return verdict;
+  }
+
+  int consecutiveFailures() const
+  {
+    return m_failures;
+  }
+
+private:
+  Config m_config;
+  int m_failures = 0;
+};
+
 //! Runs deskflow-core in "auto" mode: the coordination epoch loop.
 /*!
 Owns a Coordinator for the process lifetime and repeatedly constructs,
@@ -195,8 +262,12 @@ public:
     return m_epochCount.load();
   }
 
-  //! Backoff after an epoch ends with a failure code (hot-loop guard).
-  static constexpr std::chrono::milliseconds kFailureBackoff{500};
+  //! First backoff after an epoch ends with a failure code; doubles per
+  //! consecutive failure up to kMaxFailureBackoff, then the loop gives up
+  //! after kMaxConsecutiveFailures (see EpochFailurePolicy).
+  static constexpr std::chrono::milliseconds kFailureBackoff{1000};
+  static constexpr std::chrono::milliseconds kMaxFailureBackoff{30000};
+  static constexpr int kMaxConsecutiveFailures = 5;
 
   //! Hysteresis ceiling as a multiple of the base dwell (5 s -> 15 s).
   static constexpr int kMaxDwellMultiplier = 3;
@@ -248,6 +319,9 @@ private:
   std::atomic<bool> m_quitRequested{false};
   std::atomic<const deskflow::coordination::Coordinator *> m_healthCoordinator{nullptr};
   std::atomic<int> m_epochCount{0};
+  EpochFailurePolicy m_failurePolicy{
+      EpochFailurePolicy::Config{kFailureBackoff, kMaxFailureBackoff, kMaxConsecutiveFailures}
+  };
 
   // Everything below is guarded by m_gateMutex.
   std::mutex m_gateMutex;

@@ -18,7 +18,8 @@ private Q_SLOTS:
   void flipAfterDwellInterruptsImmediately();
   void hysteresisDoublesDwellUnderChurn();
   void quietEpochResetsDwell();
-  void failureBackoffUnchanged();
+  void failureBackoffEscalatesAndGivesUp();
+  void failurePolicyResetsOnCleanExitAndLongRun();
   void deferredIsDisarmedWhenEpochEnds();
   void restartDecisionForRunningRoleRebuilds();
   void decisionInBuildGapInterruptsImmediately();
