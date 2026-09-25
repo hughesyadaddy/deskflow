@@ -1133,11 +1133,23 @@ void Coordinator::workerLoop()
         if (m_mesh->probeDeskflowPort(m_config.deskflowPort, kWedgeProbeTimeoutMs)) {
           m_wedgeStrikes = 0;
         } else if (++m_wedgeStrikes >= kWedgeStrikesToRestart) {
-          LOG_WARN("coordination: server transport wedged; restarting server epoch");
+          // HOTFIX 2026-09-25 (pending fix/k8-epoch-rebind): the in-process
+          // epoch restart this branch used to trigger (`decide(Role::Server,
+          // {}, true)`) never closed the previous epoch's listener or its
+          // event-queue pipes, so every retry failed with EADDRINUSE at 500 ms,
+          // leaked two fds per attempt, exhausted the fd table (~2600 fds in
+          // 10 min), and then could not even open deskflow-server.conf --
+          // while the process never exited, so launchd never restarted it and
+          // the fleet lost its server. The probe also fired on demonstrably
+          // healthy epochs (clients had just connected). Until the epoch
+          // teardown is made deterministic, only record the suspicion; a
+          // genuinely dead server is caught by fleet-health / deskflow-ctl.
+          LOG_WARN(
+              "coordination: server transport wedge suspected (local probe failed %d times); "
+              "in-process epoch restart is disabled pending fix/k8-epoch-rebind",
+              m_wedgeStrikes
+          );
           m_wedgeStrikes = 0;
-          // restart=true: same role and address as the running epoch, and
-          // the epoch loop would otherwise keep it (no rebuild).
-          decide(Role::Server, {}, true);
         }
       }
     } else if (role == Role::Init && now - m_startedAt <= kDiscoveryWindowS) {
