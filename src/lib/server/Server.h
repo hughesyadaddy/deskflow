@@ -618,6 +618,14 @@ private:
   };
   DeferredSuper m_deferredSuper;
 
+  //! D5: the physical Super is held but its down was never forwarded
+  //! (undecided, or consumed by a chord), so no outgoing mask may carry
+  //! KeyModifierSuper unless a chord remap put it there.
+  bool superWithheld() const
+  {
+    return m_deferredSuper.active && !m_deferredSuper.emitted;
+  }
+
   //! True when \p screen has at least one chord-remap entry (caseless).
   bool screenHasChordRemaps(const std::string &screen) const;
 

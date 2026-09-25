@@ -2272,11 +2272,14 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
     }
   }
 
+  bool remapped = false;
   if (isActiveChordRemapSession()) {
     mask = effectiveChordRemapMask(mask);
+    remapped = true;
   } else {
     ChordRemapEntry entry;
     if (findChordRemap(id, mask, m_config->getChordRemaps(), getName(m_active), &entry)) {
+      remapped = true;
       if (needsHoldThrough(entry)) {
         m_chordRemapSession.active = true;
         m_chordRemapSession.entry = entry;
@@ -2292,6 +2295,9 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
       }
     }
   }
+  // D5: a key pressed during a withheld Super hold must not carry Super --
+  // the client would tap Win around it and a target-side hook remaps that.
+  mask = maskWithoutWithheldSuper(mask, superWithheld(), remapped);
 
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
@@ -2329,9 +2335,19 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
   // Resolve a deferred Super on its release: chord hold (nothing to send),
   // consumed momentary chord (nothing), emitted combo (send the up), or a
   // deliberate lone tap (send down+up now; Start menu is intended).
+  // D5: an UP for a Super whose DOWN was never forwarded (a hold-through
+  // chord session consumed it) must not be relayed once the session below
+  // has been ended -- the client logged "key up Super_L" with no matching
+  // down, and a target-side hook can read that as a Win tap.
+  bool withheldSuperUp = false;
+  // D5: strip Super from an ordinary key's UP during a withheld hold (the
+  // matching DOWN went out without it). Decided before the block below
+  // clears m_deferredSuper on the Super key's own release.
+  const bool superWasWithheld = superWithheld();
   if (m_deferredSuper.active && (id == kKeySuper_L || id == kKeySuper_R) && IKeyState::KeyInfo::isDefault(screens)) {
     const DeferredSuper deferred = m_deferredSuper;
     m_deferredSuper = {};
+    withheldSuperUp = !deferred.emitted;
     // A live chord session ALWAYS falls through to the normal path below,
     // which is the only code that ends the session and clears its held-out
     // modifiers. Returning early here (as this block first did) stranded
@@ -2366,8 +2382,14 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
     } else {
       mask = effectiveChordRemapMask(mask);
     }
+    if (withheldSuperUp) {
+      forgetKeySentToActive(button); // no-op unless a down was noted
+      LOG_DEBUG("withheld super up not relayed (down never sent) for \"%s\"", getName(m_active).c_str());
+      return;
+    }
   } else {
-    applyChordRemapForActiveScreen(id, mask);
+    const bool remapped = applyChordRemapForActiveScreen(id, mask);
+    mask = maskWithoutWithheldSuper(mask, superWasWithheld, remapped);
   }
 
   // relay
@@ -2414,7 +2436,8 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
   if (isActiveChordRemapSession()) {
     mask = effectiveChordRemapMask(mask);
   } else {
-    applyChordRemapForActiveScreen(id, mask);
+    const bool remapped = applyChordRemapForActiveScreen(id, mask);
+    mask = maskWithoutWithheldSuper(mask, superWithheld(), remapped); // D5, as onKeyDown
   }
 
   // relay
