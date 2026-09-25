@@ -246,7 +246,17 @@ function Register-DeskflowService {
 }
 
 function Suspend-DeskflowServiceRecovery {
-  sc.exe failure $ServiceName reset= 0 actions= "" | Out-Null
+  # An empty `actions=` value (the documented way to clear failure actions)
+  # is rejected as ERROR_INVALID_PARAMETER (1639) by sc.exe on some Windows
+  # builds (reproduced on tiny11, every invocation form: native, cmd /c,
+  # Start-Process, argument array) even though `sc /?` accepts it in
+  # principle. A single restart action with the maximum delay (2^31-1 ms =
+  # ~24.8 days) is syntactically a normal non-empty `actions=` value, so it
+  # is accepted everywhere, and in practice never fires during a deploy —
+  # functionally equivalent to "no recovery actions" for our purposes.
+  # ctl start (Register-DeskflowService -> Set-DeskflowServiceRecovery)
+  # always restores the real restart/1s/5s/30s policy afterwards.
+  sc.exe failure $ServiceName reset= 0 actions= restart/2147483647 | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "sc.exe failure (suspend) failed ($LASTEXITCODE)" }
 }
 
