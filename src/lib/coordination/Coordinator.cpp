@@ -1126,7 +1126,16 @@ void Coordinator::workerLoop()
           sendLineToPeers(line);
         }
       }
-      if (tick % kWedgeProbeEveryTicks == 0) {
+      // HOTFIX #2 2026-09-25 (pending fix/k8-epoch-rebind): the probe's own
+      // local connect-and-close is accepted by our server, the accepted-socket
+      // construction throws, TCPListenSocket::accept() rethrows it BY VALUE
+      // (sliced to "std::exception") and that ends the healthy server epoch
+      // ~30 s after every start -- the first cause of today's outage. The
+      // verdict was already made log-only by the first hotfix; the connection
+      // itself is the harm, so the probe is disabled until accept() is made
+      // resilient and the epoch teardown deterministic.
+      constexpr bool kWedgeProbeEnabled = false;
+      if (kWedgeProbeEnabled && tick % kWedgeProbeEveryTicks == 0) {
         // Alive-but-not-accepting detection: the server process can wedge
         // while its accept loop is stuck; restart the epoch if the
         // transport port stops answering locally.
