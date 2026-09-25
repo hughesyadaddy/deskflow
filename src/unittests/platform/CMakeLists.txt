@@ -13,6 +13,15 @@ create_test(
 # Platform-neutral: MSWindowsModifierLedger.h is a pure header (no Win32
 # deps) -- the injected-modifier ledger hygiene and the stale-modifier audit
 # grace are decided there and tested here on every platform.
+# Pure display-wait schedule from DisplayWaitPolicy.h (no CoreGraphics).
+create_test(
+  NAME DisplayWaitPolicyTests
+  DEPENDS platform
+  LIBS base arch
+  SOURCE DisplayWaitPolicyTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
+)
+
 create_test(
   NAME ModifierLedgerTests
   DEPENDS platform

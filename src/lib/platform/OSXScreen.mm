@@ -26,6 +26,7 @@
 #include "mt/Lock.h"
 #include "mt/Mutex.h"
 #include "mt/Thread.h"
+#include "platform/DisplayWaitPolicy.h"
 #include "platform/OSXClipboard.h"
 #include "platform/OSXEventQueueBuffer.h"
 #include "platform/OSXInjectedEvent.h"
@@ -251,8 +252,21 @@ OSXScreen::OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync)
       m_events(events),
       m_impl(nullptr)
 {
-  m_displayID = CGMainDisplayID();
-  if (!updateScreenShape(m_displayID, 0)) {
+  // A display reconfiguration in flight (hot-plug, lid, wake) reports no
+  // active display for a moment; wait for one (bounded) instead of failing
+  // the epoch outright. The epoch only starts once a shape exists.
+  const bool haveDisplay = deskflow::platform::waitForValidDisplay(
+      deskflow::platform::DisplayWaitPolicy{},
+      [this] {
+        m_displayID = CGMainDisplayID();
+        return updateScreenShape(m_displayID, 0);
+      },
+      [](std::chrono::milliseconds interval) { std::this_thread::sleep_for(interval); },
+      [](std::chrono::milliseconds elapsed) {
+        LOG_WARN("waiting for a valid display (%lld ms so far)", static_cast<long long>(elapsed.count()));
+      }
+  );
+  if (!haveDisplay) {
     throw DisplayInvalidException("failed to initialize screen shape");
   }
 
@@ -362,6 +376,12 @@ OSXScreen::~OSXScreen()
     // power (e.g. in a VM) and exited early without ever entering its run loop;
     // in that case its CFRunLoop is already gone and stopping it would crash.
     LOG_DEBUG("stopping watchSystemPowerThread");
+    // Order matters: flag first so a thread between waitForReady() and
+    // CFRunLoopRun() skips the loop; cancel unparks a thread still waiting
+    // for an event loop that never started (epoch failed before its loop);
+    // stop ends a loop that is already running.
+    m_pmStopRequested = true;
+    m_pmWatchThread->cancel();
     if (m_pmRunloop) {
       CFRunLoopStop(m_pmRunloop);
     }
@@ -1811,25 +1831,41 @@ void OSXScreen::watchSystemPowerThread(const void *)
   LOG_DEBUG("started watchSystemPowerThread");
 
   LOG_DEBUG("waiting for event loop");
-  m_events->waitForReady();
-
-  {
-    Lock lockCarbon(m_carbonLoopMutex);
-    if (*m_carbonLoopReady == false) {
-
-      // we signalling carbon loop ready before starting
-      // unless we know how to do it within the loop
-      LOG_DEBUG("signalling carbon loop ready");
-
-      *m_carbonLoopReady = true;
-      m_carbonLoopReady->signal();
-    }
+  bool runLoop = true;
+  try {
+    m_events->waitForReady();
+  } catch (ThreadCancelException &) {
+    // The screen is being destroyed while its epoch never started an
+    // event loop (bind failure, display wait): nothing to run, clean up.
+    LOG_DEBUG("power thread cancelled before the event loop started");
+    runLoop = false;
+  } catch (std::exception &e) {
+    LOG_WARN("power thread will not run: %s", e.what());
+    runLoop = false;
+  }
+  if (m_pmStopRequested) {
+    runLoop = false;
   }
 
-  // start the run loop
-  LOG_DEBUG("starting carbon loop");
-  CFRunLoopRun();
-  LOG_DEBUG("carbon loop has stopped");
+  if (runLoop) {
+    {
+      Lock lockCarbon(m_carbonLoopMutex);
+      if (*m_carbonLoopReady == false) {
+
+        // we signalling carbon loop ready before starting
+        // unless we know how to do it within the loop
+        LOG_DEBUG("signalling carbon loop ready");
+
+        *m_carbonLoopReady = true;
+        m_carbonLoopReady->signal();
+      }
+    }
+
+    // start the run loop
+    LOG_DEBUG("starting carbon loop");
+    CFRunLoopRun();
+    LOG_DEBUG("carbon loop has stopped");
+  }
 
   // cleanup
   if (notificationPortRef) {

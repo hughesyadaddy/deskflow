@@ -18,6 +18,7 @@
 #include <mach/mach_interface.h>
 #include <mach/mach_port.h>
 
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <memory>
@@ -379,6 +380,10 @@ private:
   Thread *m_pmWatchThread;
   CondVar<bool> *m_pmThreadReady;
   CFRunLoopRef m_pmRunloop;
+  //! Set by the destructor before it stops the power run loop, so a thread
+  //! that has not entered CFRunLoopRun yet skips it instead of running a
+  //! loop nobody will stop.
+  std::atomic<bool> m_pmStopRequested{false};
   io_connect_t m_pmRootPort;
 
   // hot key stuff
