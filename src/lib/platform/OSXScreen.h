@@ -71,6 +71,49 @@ public:
     return true;
   }
 
+  //! K6: outcome of one mid-session secure-input poll tick.
+  /*!
+  Pure decision so the cadence/gating logic is unit testable without a real
+  OSXScreen instance (no CGEventTap/CFRunLoop machinery involved).
+  */
+  enum class SecureInputTransition
+  {
+    None,     //!< no edge this tick (steady state, or not entered)
+    TurnedOn, //!< false -> true: a password field just grabbed input
+    TurnedOff //!< true -> false: the password field released input
+  };
+
+  //! Decide what a mid-session secure-input poll tick should do.
+  /*!
+  \p onScreen is the platform's \c m_isOnScreen (K6: this watcher only runs
+  while entered -- the boundary sweep in \c Screen::enable() / its delayed
+  timer already owns the not-entered case, so this always reports \c None
+  then to avoid double-firing). \p wasSecureInputOn is the last observed
+  state (mirrors \c m_secureInputLogged); \p isSecureInputOnNow is this
+  tick's fresh read of \c IsSecureEventInputEnabled().
+  */
+  static SecureInputTransition
+  secureInputWatchTick(bool onScreen, bool wasSecureInputOn, bool isSecureInputOnNow)
+  {
+    if (!onScreen) {
+      return SecureInputTransition::None;
+    }
+    if (isSecureInputOnNow == wasSecureInputOn) {
+      return SecureInputTransition::None;
+    }
+    return isSecureInputOnNow ? SecureInputTransition::TurnedOn : SecureInputTransition::TurnedOff;
+  }
+
+  //! Poll cadence (seconds) for the mid-session secure-input watcher.
+  /*!
+  K6: closes the gap left by the boundary-only sweep (Screen::enable() /
+  Screen::kEnableSweepDelayS) -- a SecurityAgent/admin-auth dialog can pop
+  up at any point while already entered and typing. Cheap: a single
+  IsSecureEventInputEnabled() call per tick, never faster than ~1 Hz so it
+  is not a CPU/battery cost.
+  */
+  static constexpr double kSecureInputPollSec = 1.0;
+
   OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync = false);
 
   virtual ~OSXScreen();
@@ -195,6 +238,11 @@ private:
   void armClipboardTimer();
   double clipboardPollInterval() const;
 
+  // K6: mid-session secure-input watcher (see SecureInputTransition / kSecureInputPollSec).
+  void secureInputPollTick();
+  void armSecureInputTimer();
+  void cancelSecureInputTimer();
+
   // global hotkey operating mode
   static bool isGlobalHotKeyOperatingModeAvailable();
   static void setGlobalHotKeysEnabled(bool enabled);
@@ -310,6 +358,11 @@ private:
 
   // low-rate watchdog: quits if accessibility trust is revoked at runtime
   EventQueueTimer *m_axTimer;
+
+  // K6: mid-session secure-input watcher. Armed in enable(), cancelled in
+  // disable(); the tick itself only acts while m_isOnScreen (see
+  // secureInputWatchTick()).
+  EventQueueTimer *m_secureInputTimer = nullptr;
 
   // window object that gets user input events when the server
   // has focus.

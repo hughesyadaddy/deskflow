@@ -1050,4 +1050,41 @@ void OSXKeyStateTests::lagRaceDoesNotReassertReleasedShift()
   QVERIFY((os.posted.back().flags & kCGEventFlagMaskShift) != 0);
 }
 
+void OSXKeyStateTests::midSessionDialogDismissReleasesOnlyLedgeredModifier()
+{
+  // K6: OSXScreen::secureInputPollTick() calls exactly this -- releaseInjectedKeys()
+  // -- on a true->false secure-input edge detected mid-session (a
+  // SecurityAgent/admin-auth dialog was just dismissed while already
+  // entered). Same K5 pattern/assertions as
+  // releaseInjectedKeysReleasesLedgeredCmd() / releaseInjectedKeysLeaves
+  // PhysicallyHeldModifierAlone(): a modifier WE posted while the dialog was
+  // up gets released; a modifier the user is PHYSICALLY holding (Shift,
+  // stamped fresh) must never be touched by this path, whatever the
+  // freshness clock says -- the user may be mid-gesture at this keyboard.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  // Our own Cmd got posted (ledgered) before the dialog opened; the user's
+  // physical Shift has been down the whole time.
+  keyState.fakeKey(stroke(kVK_Command, true));
+  QVERIFY(keyState.injectedModifiers().contains(kVK_Command));
+  os.posted.clear();
+  os.osFlags = kCGEventFlagMaskCommand | kCGEventFlagMaskShift;
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK, os.now - 30.0);
+
+  // secure input just went true -> false: the mid-session watcher's release path
+  keyState.releaseInjectedKeys();
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Command));
+  QVERIFY(!os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskCommand) == 0); // ours: released
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0);   // user's: untouched
+  QVERIFY(keyState.injectedModifiers().empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift));
+}
+
 QTEST_MAIN(OSXKeyStateTests)

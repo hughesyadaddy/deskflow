@@ -47,6 +47,8 @@ private Q_SLOTS:
   void ledgerReleaseKeepsShiftHeldOnRightHandKey();
   void modifierPostFlagsDeriveFromLiveOsNotShadow();
   void lagRaceDoesNotReassertReleasedShift();
+  // K6: mid-session secure-input transitions (OSXScreen::secureInputPollTick())
+  void midSessionDialogDismissReleasesOnlyLedgeredModifier();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);
