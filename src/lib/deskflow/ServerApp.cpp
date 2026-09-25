@@ -129,6 +129,25 @@ ServerApp::ServerApp(IEventQueue *events, const QString &processName) : App(even
   // do nothing
 }
 
+ServerApp::~ServerApp()
+{
+  // mainLoop() normally tears everything down; if it did not (an exception
+  // escaped the event loop, or startNode() threw before the loop ran) do it
+  // here so the epoch cannot leak its listen socket (the next epoch would
+  // fail with EADDRINUSE against our own fd) or its screen and worker
+  // thread. Destructors must not throw: log and carry on.
+  if (m_serverState != ServerState::Uninitialized) {
+    LOG_WARN("server epoch ended without cleanup; releasing listener and screen now");
+    try {
+      cleanupServer();
+    } catch (std::exception &e) {
+      LOG_ERR("server cleanup failed: %s", e.what());
+    } catch (...) {
+      LOG_ERR("server cleanup failed");
+    }
+  }
+}
+
 void ServerApp::parseArgs()
 {
   if (const auto address = Settings::value(Settings::Core::Interface).toString(); !address.isEmpty()) {
@@ -268,6 +287,9 @@ void ServerApp::stopServer()
 {
   using enum ServerState;
   if (m_serverState == Started) {
+    if (m_listeningCallback) {
+      m_listeningCallback(false);
+    }
     closeServer(m_server);
     closeClientListener(m_listener);
     m_server = nullptr;
@@ -444,6 +466,10 @@ bool ServerApp::startServer()
     LOG_DEBUG("started server, waiting for clients");
     ipcSendConnectionState(deskflow::core::ConnectionState::Listening);
     m_serverState = Started;
+    m_startFailureCode = s_exitFailed;
+    if (m_listeningCallback) {
+      m_listeningCallback(true);
+    }
     if (m_cursorBroadcastCallback && !m_name.empty()) {
       m_cursorBroadcastCallback(m_name);
     }
@@ -453,9 +479,11 @@ bool ServerApp::startServer()
     return true;
   } catch (SocketAddressInUseException &e) {
     LOG_CRIT("cannot listen for clients: %s", e.what());
+    m_startFailureCode = s_exitAddressInUse;
     closeClientListener(listener);
   } catch (BaseException &e) {
     LOG_CRIT("failed to start server: %s", e.what());
+    m_startFailureCode = s_exitFailed;
     closeClientListener(listener);
     return false;
   }
@@ -619,9 +647,6 @@ int ServerApp::mainLoop()
     return s_exitFailed;
   }
 
-  // start server, etc
-  appUtil().startNode();
-
   // handle hangup signal by reloading the server's configuration
   ARCH->setSignalHandler(Arch::ThreadSignal::Hangup, &reloadSignalHandler, nullptr);
   getEvents()->addHandler(EventTypes::ServerAppReloadConfig, getEvents()->getSystemTarget(), [this](const auto &) {
@@ -642,21 +667,42 @@ int ServerApp::mainLoop()
 
   registerKeyForwardHandler();
 
-  // run event loop.  if startServer() failed we're supposed to retry
-  // later.  the timer installed by startServer() will take care of
-  // that.
-  int exitCode = getEvents()->loop();
+  // Whatever way the loop ends -- a Quit, an ExitAppException from
+  // startNode() (bind failure), or an exception escaping a handler -- the
+  // server, listener, screen and power thread must be torn down before the
+  // caller builds the next epoch. Skipping this once left the listen
+  // socket open in-process and every later server epoch failed with
+  // EADDRINUSE against our own fd (2026-09-25 fleet outage).
+  int exitCode = s_exitFailed;
+  try {
+    // start server, etc
+    appUtil().startNode();
+
+    // run event loop.  if startServer() failed we're supposed to retry
+    // later.  the timer installed by startServer() will take care of
+    // that.
+    exitCode = getEvents()->loop();
+  } catch (...) {
+    LOG_DEBUG("stopping server after error");
+    shutdownServerNode();
+    throw;
+  }
 
   // close down
   LOG_DEBUG("stopping server");
+  shutdownServerNode();
+  LOG_INFO("stopped server");
+
+  return exitCode;
+}
+
+void ServerApp::shutdownServerNode()
+{
   unregisterKeyForwardHandler();
   unregisterFleetTopologyHandlers();
   getEvents()->removeHandler(EventTypes::ServerAppForceReconnect, getEvents()->getSystemTarget());
   getEvents()->removeHandler(EventTypes::ServerAppReloadConfig, getEvents()->getSystemTarget());
   cleanupServer();
-  LOG_INFO("stopped server");
-
-  return exitCode;
 }
 
 void ServerApp::resetServer()
@@ -699,7 +745,7 @@ void ServerApp::startNode()
   // we shouldn't retry.
   LOG_VERBOSE("starting server");
   if (!startServer()) {
-    bye(s_exitFailed);
+    bye(m_startFailureCode);
   }
 }
 

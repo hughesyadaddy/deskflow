@@ -14,3 +14,4 @@ static const int s_exitTerminated = 2; //!< App was kill by a signal
 static const int s_exitArgs = 3;       //!< App was unable to run due to bad arguments being passed
 static const int s_exitConfig = 4;     //!< App was unable to read the configuration
 static const int s_exitDuplicate = 5;  //!< An instance of the app (or core app) is already running
+static const int s_exitAddressInUse = 6; //!< The server could not bind its listen address (EADDRINUSE)

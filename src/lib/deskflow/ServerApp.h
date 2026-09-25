@@ -12,6 +12,7 @@
 #include "arch/IArchMultithread.h"
 #include "coordination/CoordinationEvents.h"
 #include "coordination/FleetState.h"
+#include "common/ExitCodes.h"
 #include "deskflow/App.h"
 #include "net/NetworkAddress.h"
 #include "server/Config.h"
@@ -49,7 +50,10 @@ class ServerApp : public App
 
 public:
   explicit ServerApp(IEventQueue *events, const QString &processName = QString());
-  ~ServerApp() override = default;
+  //! Tears down whatever startServer()/initServer() built if mainLoop()
+  //! did not get to (an exception out of the event loop); the listener,
+  //! server, screen and primary client are raw owned pointers.
+  ~ServerApp() override;
 
   //
   // IApp overrides
@@ -80,6 +84,8 @@ public:
   void closePrimaryClient(PrimaryClient *primaryClient);
   void closeServerScreen(deskflow::Screen *screen);
   void cleanupServer();
+  //! mainLoop() teardown: handlers off, then cleanupServer().
+  void shutdownServerNode();
   bool initServer();
   void retryHandler();
   deskflow::Screen *openServerScreen();
@@ -116,6 +122,18 @@ public:
   void setWakePeerCallback(std::function<void(const std::string &name)> callback)
   {
     m_wakePeerCallback = std::move(callback);
+  }
+
+  //! Called with true once the client listener is bound and accepting,
+  //! and with false when it is torn down (stop, suspend, teardown).
+  /*!
+  The coordinator's wedge detector keys off this: it must never probe a
+  server epoch that has not bound its port yet (display wait, config
+  retry) and only counts strikes after the listener existed.
+  */
+  void setListeningCallback(std::function<void(bool listening)> callback)
+  {
+    m_listeningCallback = std::move(callback);
   }
 
   //
@@ -156,6 +174,12 @@ private:
       m_fleetTopologyPublishCallback;
   std::function<deskflow::coordination::FleetState()> m_fleetSnapshotCallback;
   std::function<void(const std::string &name)> m_wakePeerCallback;
+  std::function<void(bool listening)> m_listeningCallback;
+  //! Exit code startNode() reports when startServer() fails: s_exitFailed,
+  //! or s_exitAddressInUse when the listen address was already taken so
+  //! the epoch loop can back off and eventually hand the port to a fresh
+  //! process instead of retrying at 500 ms forever.
+  int m_startFailureCode = s_exitFailed;
   bool m_fleetTopologyHandlersRegistered = false;
   bool m_keyForwardHandlerRegistered = false;
 };

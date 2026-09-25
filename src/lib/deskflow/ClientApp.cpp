@@ -546,13 +546,23 @@ int ClientApp::mainLoop()
   // on unix because threads evaporate across a fork().
   setSocketMultiplexer(std::make_unique<SocketMultiplexer>());
 
-  // start client, etc
-  appUtil().startNode();
+  // The client, its screen and worker threads must be torn down on every
+  // exit path (an exception out of a handler included): in auto mode the
+  // next epoch reuses this process and its event queue.
+  int exitCode = s_exitFailed;
+  try {
+    // start client, etc
+    appUtil().startNode();
 
-  // run event loop.  if startClient() failed we're supposed to retry
-  // later.  the timer installed by startClient() will take care of
-  // that.
-  int exitCode = getEvents()->loop();
+    // run event loop.  if startClient() failed we're supposed to retry
+    // later.  the timer installed by startClient() will take care of
+    // that.
+    exitCode = getEvents()->loop();
+  } catch (...) {
+    LOG_DEBUG("stopping client after error");
+    stopClient();
+    throw;
+  }
 
   // close down
   LOG_DEBUG("stopping client");
