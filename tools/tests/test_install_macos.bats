@@ -236,6 +236,11 @@ log_lacks() {
   grep -q '^codesign -dvvv .*/deskflow-install\..*/Deskflow.app/Contents/MacOS/deskflow-core$' "$SHIM_LOG"
   log_has "launchctl bootstrap gui/$(id -u) $DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow-core.plist"
   log_has "launchctl bootstrap gui/$(id -u) $DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow.plist"
+  # the converge tick runs the launchd-safe copy this install refreshed, never the checkout (TCC)
+  [[ "$output" == *"Launchd-safe copy (deskflow-ctl safe-copy)"* ]]
+  [ -x "$HOME/Library/Deskflow/bin/deskflow-ctl" ]
+  grep -q "<string>$HOME/Library/Deskflow/bin/deskflow-ctl</string>" "$DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow-converge.plist"
+  ! grep -q -F "$(cd "$BATS_TEST_DIRNAME/../.." && pwd)" "$DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.deskflow-converge.plist"
   # verify happens BEFORE stop (ps inventory), start after the swap
   verify_line="$(grep -n '^codesign --verify' "$SHIM_LOG" | cut -d: -f1)"
   stop_line="$(grep -n '^ps ' "$SHIM_LOG" | head -1 | cut -d: -f1)"

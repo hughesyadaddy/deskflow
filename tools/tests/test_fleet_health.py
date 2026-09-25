@@ -154,6 +154,10 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.login_bridge_log_since_start_cmd()): (0, LOGIN_BRIDGE_LOG_OK, ""),
         (hid, fh.keys_log_cmd()): (0, "level=INFO\n", ""),
         (hid, fh.crashloop_log_cmd()): (0, "fds=76\n", ""),
+        (hid, fh.converge_agent_cmd()): (0, converge_print(), ""),
+        (hid, fh.converge_log_cmd()): (0, CONVERGE_LOG_OK, ""),
+        (hid, fh.converge_health_cmd()): (0, CONVERGE_HEALTH_OK, ""),
+        (hid, fh.launchd_plists_tcc_cmd()): (0, PLISTS_CLEAN, ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, fh.DEFAULT_MESH_PORT))] = (0, "", "")
@@ -1428,3 +1432,164 @@ def test_crashloop_check_maps_runner_exit_codes_like_keys():
     checker = fh.FleetHealth(hosts, {}, runner=runner_for(0, out="fds=76\n"))
     checker.run(["crashloop"], explicit=True)
     assert [r.status for r in checker.results] == ["PASS"]
+# ------------------------------------------------------------- converge
+# The self-heal tick must run the launchd-safe copy: macOS TCC gives a launchd
+# job EPERM (no prompt, exit 126) on anything under ~/Desktop, ~/Documents or
+# ~/Downloads. macbookpro 2026-09-25: 48 x "Operation not permitted", exit 126.
+
+SAFE_CTL = "/Users/alexhughes/Library/Deskflow/bin/deskflow-ctl"
+DESKTOP_CTL = "/Users/alexhughes/Desktop/deskflow/scripts/deskflow-ctl"
+
+
+def converge_print(prog=SAFE_CTL, last_exit="0", state="not running", runs=16):
+    return ("gui/501/io.github.hughesyadaddy.deskflow-converge = {\n\tactive count = 0\n"
+            "\tpath = /Users/alexhughes/Library/LaunchAgents/io.github.hughesyadaddy.deskflow-converge.plist\n"
+            f"\ttype = LaunchAgent\n\tstate = {state}\n\n\tprogram = /bin/bash\n\targuments = {{\n\t\t/bin/bash\n"
+            f"\t\t{prog}\n\t\tconverge\n\t\t--apply\n\t\t--quiet\n\t}}\n\n"
+            "\tstdout path = /Users/alexhughes/Library/Logs/Deskflow/converge.log\n"
+            f"\tdomain = gui/501 [100023]\n\truns = {runs}\n\tlast exit code = {last_exit}\n}}\n")
+
+
+CONVERGE_LOG_OK = "mtime=1000 now=1060\n== deskflow-ctl: converge: nothing to do ==\n"
+CONVERGE_LOG_TCC = "mtime=1000 now=1060\n" + f"/bin/bash: {DESKTOP_CTL}: Operation not permitted\n" * 3
+CONVERGE_HEALTH_OK = "mtime=1000 now=1060\n"
+PLISTS_CLEAN = "scanned=7\n"
+PLISTS_HIT = ("/Users/alexhughes/Library/LaunchAgents/io.github.hughesyadaddy.deskflow-converge.plist:21:"
+              f"    <string>{DESKTOP_CTL}</string>\nscanned=7\n")
+
+
+def converge_table(hid="macbookpro", **over):
+    t = mac_ok_table(hid)
+    for cmd, val in over.items():
+        t[(hid, getattr(fh, cmd)())] = val
+    return t
+
+
+def test_converge_registered_mac_only_with_repo_free_commands():
+    assert "converge" in fh.ALL_CHECKS and "converge" in fh.MAC_ONLY
+    assert fh.converge_agent_cmd() == 'launchctl print "gui/$(id -u)/io.github.hughesyadaddy.deskflow-converge"'
+    assert fh.converge_log_cmd() == ('f="$HOME"/Library/Logs/Deskflow/converge.log; test -f "$f" && '
+                                     'echo "mtime=$(stat -f %m "$f") now=$(date +%s)" && tail -n 5 "$f"')
+    assert fh.converge_health_cmd() == ("f=\"$HOME\"/'Library/Application Support/Deskflow/health.json'; "
+                                        'test -f "$f" && echo "mtime=$(stat -f %m "$f") now=$(date +%s)"')
+    cmd = fh.launchd_plists_tcc_cmd()
+    assert cmd.startswith("grep -H -n -i -E '<string>[^<]*(/Desktop|/Documents|/Downloads|/Library/Mobile Documents|/Volumes)(/|<)' "
+                          '"$HOME"/Library/LaunchAgents/io.github.hughesyadaddy.*.plist '
+                          '"$HOME"/Library/LaunchAgents/org.deskflow.*.plist "$HOME"/Library/LaunchAgents/com.fleet.*.plist '
+                          '/Library/LaunchAgents/io.github.hughesyadaddy.*.plist')
+    assert "/Library/LaunchDaemons/com.fleet.*.plist" in cmd
+    assert "/*.plist" not in cmd   # fleet labels only: a third party's plist is never scanned
+    assert cmd.endswith("| wc -l | tr -d ' ')\"")
+    assert "sudo" not in cmd
+    # the check never runs anything from a checkout (that is the bug it hunts)
+    for name in ("converge_agent_cmd", "converge_log_cmd", "converge_health_cmd", "launchd_plists_tcc_cmd"):
+        assert "Desktop" not in getattr(fh, name)().replace("/Desktop|", "")
+
+
+def test_parse_launchctl_print_and_program():
+    info = fh.parse_launchctl_print(converge_print(DESKTOP_CTL, last_exit="126", runs=2))
+    assert info["state"] == "not running" and info["pid"] is None and info["runs"] == 2 and info["last_exit"] == "126"
+    assert info["argv"] == ["/bin/bash", DESKTOP_CTL, "converge", "--apply", "--quiet"]
+    assert fh.program_from_argv(info["argv"]) == DESKTOP_CTL
+    assert fh.program_from_argv(["/Applications/Deskflow.app/Contents/MacOS/deskflow-core", "auto"]).endswith("deskflow-core")
+    assert fh.program_from_argv([]) == ""
+    assert fh.parse_mtime_now("mtime=1000 now=1600\nx\ny\n") == (600, ["x", "y"])
+    assert fh.parse_mtime_now("") == (None, [])
+    assert fh.parse_mtime_now("garbage\n") == (None, ["garbage"])
+    assert fh.converge_eperm_path(f"/bin/bash: {DESKTOP_CTL}: Operation not permitted") == DESKTOP_CTL
+    assert fh.converge_eperm_path("/bin/bash: /x/y: Permission denied") == "/x/y"
+    assert fh.converge_eperm_path("/bin/sh: /x/y: Permission denied") == "/x/y"
+    assert fh.converge_eperm_path("== deskflow-ctl: converge: nothing to do ==") is None
+    # shape-specific: a tick that ran and died on its own redirection is not TCC on its program
+    assert fh.converge_eperm_path(f"{SAFE_CTL}: line 810: /Users/alexhughes/Library/Application Support/Deskflow/.tmp: "
+                                  "Permission denied") is None
+    assert fh.converge_eperm_path("/bin/bash: line 810: /x/.tmp: Permission denied") is None
+    assert fh.tcc_protected(DESKTOP_CTL) and fh.tcc_protected("/Users/x/Documents/a") and fh.tcc_protected("/Users/x/Downloads")
+    # APFS is case-insensitive; iCloud Drive and removable volumes are guarded too
+    assert fh.tcc_protected("/Users/x/desktop/bin") and fh.tcc_protected("/Users/x/Library/Mobile Documents/com~apple~CloudDocs/a")
+    assert fh.tcc_protected("/Volumes/Stick/a")
+    assert not fh.tcc_protected(SAFE_CTL) and not fh.tcc_protected("/Applications/Deskflow.app/Contents/MacOS/Deskflow")
+    assert not fh.tcc_protected("/Users/x/Desktopish/a")
+
+
+def test_converge_pass_on_safe_copy_fresh_health_clean_plists():
+    results, runner = run_checks([mac()], converge_table(), ["converge"])
+    assert [r.check for r in results] == ["converge"]
+    assert results[0].status == "PASS", results[0].detail
+    assert f"program {SAFE_CTL}" in results[0].detail and "health.json 60s old" in results[0].detail
+    assert "7 installed fleet plists free of" in results[0].detail
+    for name in ("converge_agent_cmd", "converge_log_cmd", "converge_health_cmd", "launchd_plists_tcc_cmd"):
+        assert ("macbookpro", getattr(fh, name)()) in runner.calls
+
+
+def test_converge_fails_on_tcc_eperm_in_log_synthetic_fixture():
+    # the 2026-09-25 macbookpro state: converge.log is nothing but EPERM lines, written a minute ago
+    t = converge_table(converge_agent_cmd=(0, converge_print(DESKTOP_CTL, last_exit="126", runs=16), ""),
+                       converge_log_cmd=(0, CONVERGE_LOG_TCC, ""),
+                       converge_health_cmd=(1, "", ""),
+                       launchd_plists_tcc_cmd=(0, PLISTS_HIT, ""))
+    results, _ = run_checks([mac()], t, ["converge"])
+    r = results[0]
+    assert r.status == "FAIL"
+    assert f"converge agent cannot execute its program (TCC): {DESKTOP_CTL}" in r.detail
+    assert "launchd last exit code 126" in r.detail and "program is under ~/Desktop" in r.detail
+    assert "Operation not permitted' (60s ago)" in r.detail
+    assert "health.json missing: the tick has never completed" in r.detail
+    assert "launchd plist points into a TCC-protected folder" in r.detail and "deskflow-converge.plist:21:" in r.detail
+    assert "deskflow-ctl start" in r.detail and SAFE_CTL.replace("/Users/alexhughes", "~") in r.detail
+
+
+def test_converge_log_evidence_alone_fails_and_expires_after_ten_minutes():
+    t = converge_table(converge_log_cmd=(0, CONVERGE_LOG_TCC, ""))
+    results, _ = run_checks([mac()], t, ["converge"])
+    assert results[0].status == "FAIL"
+    assert f"converge agent cannot execute its program (TCC): {DESKTOP_CTL} [converge.log ends with" in results[0].detail
+    old = CONVERGE_LOG_TCC.replace("now=1060", "now=1601")
+    results, _ = run_checks([mac()], converge_table(converge_log_cmd=(0, old, "")), ["converge"])
+    assert results[0].status == "PASS", results[0].detail
+    # a later tick line after the EPERM block means the agent ran again: no evidence
+    later = CONVERGE_LOG_TCC + "== deskflow-ctl: start: io.github.hughesyadaddy.deskflow-converge bootstrapped ==\n"
+    results, _ = run_checks([mac()], converge_table(converge_log_cmd=(0, later, "")), ["converge"])
+    assert results[0].status == "PASS", results[0].detail
+
+
+def test_converge_polices_fleet_plists_only_and_ignores_third_party_plists():
+    # The scan itself globs only the fleet's labels in each launchd dir (the class of report noise
+    # 986d456f5 removed from `identifiers`: a third party's plist is never this tool's business).
+    cmd = fh.launchd_plists_tcc_cmd()
+    for d in ('"$HOME"/Library/LaunchAgents', "/Library/LaunchAgents", "/Library/LaunchDaemons"):
+        for g in ("io.github.hughesyadaddy.*.plist", "org.deskflow.*.plist", "com.fleet.*.plist"):
+            assert f"{d}/{g}" in cmd
+    assert "/*.plist" not in cmd
+    # A hit on a fleet plist is a finding; a hit on a foreign plist (should a scan ever return one) is not.
+    hit = ("/Users/alexhughes/Library/LaunchAgents/com.fleet.soak.plist:55:    <string>/Users/alexhughes/Desktop/deskflow/tools/fleet-soak</string>\n"
+           "/Library/LaunchDaemons/com.example.backup.plist:9:    <string>/Users/alexhughes/Documents/backup.sh</string>\nscanned=9\n")
+    results, _ = run_checks([mac()], converge_table(launchd_plists_tcc_cmd=(0, hit, "")), ["converge"])
+    assert results[0].status == "FAIL"
+    assert results[0].detail.count("launchd plist points into a TCC-protected folder") == 1
+    assert "com.fleet.soak.plist:55:" in results[0].detail and "com.example.backup" not in results[0].detail
+    only_foreign = "/Library/LaunchDaemons/com.example.backup.plist:9:    <string>/Users/alexhughes/Documents/backup.sh</string>\nscanned=9\n"
+    results, _ = run_checks([mac()], converge_table(launchd_plists_tcc_cmd=(0, only_foreign, "")), ["converge"])
+    assert results[0].status == "PASS", results[0].detail
+    assert "converge agent cannot execute" not in results[0].detail
+
+
+def test_converge_fails_when_agent_not_loaded_or_health_stale():
+    results, _ = run_checks([mac()], converge_table(converge_agent_cmd=(113, "", "Could not find service")), ["converge"])
+    assert results[0].status == "FAIL" and "not loaded (launchctl rc=113): the self-heal tick is dead" in results[0].detail
+    results, _ = run_checks([mac()], converge_table(converge_health_cmd=(0, "mtime=1000 now=2500\n", "")), ["converge"])
+    assert results[0].status == "FAIL" and "health.json is 25 min old (want <= 10 min" in results[0].detail
+    results, _ = run_checks([mac()], converge_table(converge_health_cmd=(0, "mtime=1000 now=1600\n", "")), ["converge"])
+    assert results[0].status == "PASS", results[0].detail
+
+
+def test_converge_is_included_in_all_and_skipped_on_windows(tmp_path):
+    env_file = tmp_path / "fleet.env"
+    env_file.write_text('FLEET_HOSTS="macbookpro"\nFLEET_SSH_macbookpro=macbookpro\n')
+    runner = FakeRunner(converge_table())
+    rc = fh.main(["--json", "--env", str(env_file)], runner=runner)
+    assert ("macbookpro", fh.converge_agent_cmd()) in runner.calls
+    assert rc == 0
+    results, runner = run_checks([win()], {}, ["converge"], explicit=True)
+    assert [(r.check, r.status) for r in results] == [("converge", "SKIP")] and results[0].ok
+    assert runner.calls == []

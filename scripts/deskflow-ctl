@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 # deskflow-ctl — the ONE way to stop/start/restart Deskflow on macOS.
 #
-#   scripts/deskflow-ctl stop           launchctl bootout both agents, wait, escalate
-#   scripts/deskflow-ctl start          render + launchctl bootstrap (core, then GUI)
-#   scripts/deskflow-ctl restart        launchctl kickstart -k (bootstrap if unloaded)
+#   scripts/deskflow-ctl stop           launchctl bootout the three agents, wait, then
+#                                       TERM/KILL every deskflow-core/Deskflow this
+#                                       user still runs, from ANY path (each one makes
+#                                       `start` refuse). Another uid's is never
+#                                       signalled: the exact `sudo kill` line is
+#                                       printed and stop exits 1, never "stopped".
+#   scripts/deskflow-ctl start          render + launchctl bootstrap (core, then GUI,
+#                                       then converge). A loaded label whose LOADED
+#                                       definition (launchctl print argv/env) differs
+#                                       from the render is booted out and bootstrapped
+#                                       again; a current one is only kickstarted.
+#   scripts/deskflow-ctl restart        launchctl kickstart -k (bootstrap if unloaded;
+#                                       bootout+bootstrap if the loaded definition is stale)
 #   scripts/deskflow-ctl status         inventory: launchd state + every Deskflow process
 #   scripts/deskflow-ctl assert-single  exit 0 only when exactly one core (owned by
 #                                       launchd) and exactly one GUI run from the
@@ -41,7 +51,23 @@
 #                                       rolling hour, then report-only. Writes
 #                                       ~/Library/Application Support/Deskflow/health.json.
 #                                       Exit 1 when --apply leaves assert-single failing
-#                                       or the login-items audit fails.
+#                                       or the login-items audit fails. Report-only
+#                                       (exit 1) while its own agent cannot run its
+#                                       program (TCC EPERM / exit 126 evidence).
+#   scripts/deskflow-ctl safe-copy      install/refresh the launchd-safe copy under
+#                                       ~/Library/Deskflow/bin (this script, the
+#                                       tools/launchd templates, tools/fleet-soak;
+#                                       diff-and-replace, 755/644). The converge and
+#                                       soak agents run from there: macOS TCC gives
+#                                       a launchd job EPERM (no prompt, exit 126) on
+#                                       anything under ~/Desktop, ~/Documents or
+#                                       ~/Downloads, i.e. on every checkout. Also run
+#                                       by `start`.
+#   scripts/deskflow-ctl render-plist <label>
+#                                       print a rendered tools/launchd/<label>.plist
+#                                       (com.fleet.soak, ...) to stdout; installs and
+#                                       loads nothing. Refuses a render that points
+#                                       launchd into a TCC-protected folder.
 #
 # launchd is the only owner of deskflow-core and the GUI:
 #   gui/$UID/io.github.hughesyadaddy.deskflow-core     deskflow-core auto (KeepAlive on crash)
@@ -58,10 +84,54 @@
 #      DESKFLOW_CTL_DAEMON_DIR (default /Library/LaunchDaemons),
 #      DESKFLOW_CTL_DAEMON_STAGE_DIR (default ~/Library/Deskflow/launchd),
 #      DESKFLOW_CTL_RETIRED_PRIO_APPLY / DESKFLOW_CTL_RETIRED_SYNERGY_AGENT
-#      (retired root-owned paths; overridable for tests only).
+#      (retired root-owned paths; overridable for tests only),
+#      DESKFLOW_CTL_SAFE_DIR (default ~/Library/Deskflow/bin; must not be under
+#      ~/Desktop, ~/Documents, ~/Downloads, iCloud Drive or /Volumes -- checked
+#      canonical (symlinks, ..) and case-insensitive, APFS is),
+#      DESKFLOW_ROOT (the checkout; only read by the launchd-safe copy, only
+#      for `safe-copy`/`start`; validated: a value that is not a checkout is a
+#      warning for `start` (then the checkout recorded by the last safe-copy,
+#      else none) and an error for `safe-copy`; never rendered into a plist
+#      and never needed by `converge`),
+#      DESKFLOW_CTL_SOAK_DIR (default ~/Library/Deskflow/soak; com.fleet.soak output).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Two homes. The checkout (scripts/deskflow-ctl: humans, deploys) and the
+# launchd-safe copy under ~/Library/Deskflow/bin that the converge and soak
+# agents run. macOS TCC guards ~/Desktop, ~/Documents and ~/Downloads per
+# consenting app; a launchd job has none, so it gets EPERM there with no
+# prompt -- from deploy until 2026-09-25 the converge tick on macbookpro died
+# with "/bin/bash: ~/Desktop/deskflow/scripts/deskflow-ctl: Operation not
+# permitted" (exit 126) every 60 s. `start`/`safe-copy` refresh the safe copy
+# (diff-and-replace); a tick never reads the checkout.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+CTL_SELF="$SELF_DIR/${BASH_SOURCE[0]##*/}"
+SAFE_DIR="${DESKFLOW_CTL_SAFE_DIR:-$HOME/Library/Deskflow/bin}"
+SAFE_DIR="${SAFE_DIR%/}"
+SAFE_CTL="$SAFE_DIR/deskflow-ctl"
+SAFE_TEMPLATE_DIR="$SAFE_DIR/launchd"
+IS_SAFE_COPY=0
+if [[ -d "$SAFE_DIR" && "$SELF_DIR" == "$(cd "$SAFE_DIR" && pwd -P)" ]]; then IS_SAFE_COPY=1; fi
+# Where the last `safe-copy` came from, recorded by it: the copy's own way
+# back to a checkout when DESKFLOW_ROOT is unset. A vanished one is simply
+# "no checkout known" -- never named, never fatal.
+SAFE_CHECKOUT_FILE="$SAFE_DIR/checkout"
+is_checkout() { [[ -n "$1" && -f "$1/scripts/deskflow-ctl" && -d "$1/tools/launchd" ]]; }
+ROOT_WARNING=""
+if (( IS_SAFE_COPY )); then
+  ROOT="${DESKFLOW_ROOT:-}"
+  ROOT="${ROOT/#\~/$HOME}"
+  if [[ -n "$ROOT" ]] && ! is_checkout "$ROOT"; then
+    ROOT_WARNING="DESKFLOW_ROOT=$ROOT is not a deskflow checkout (no scripts/deskflow-ctl + tools/launchd there); ignored"
+    ROOT=""
+  fi
+  if [[ -z "$ROOT" && -f "$SAFE_CHECKOUT_FILE" ]]; then
+    ROOT="$(head -n 1 "$SAFE_CHECKOUT_FILE" 2>/dev/null || true)" # fleet:allow unreadable record = no checkout known
+    is_checkout "$ROOT" || ROOT=""
+  fi
+else
+  ROOT="$(cd "$SELF_DIR/.." && pwd)"
+fi
 APP="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
 APP="${APP%/}"
 CORE_LABEL="io.github.hughesyadaddy.deskflow-core"
@@ -81,14 +151,39 @@ HEALTH_JSON="$STATE_DIR/health.json"
 ACTION_LOG="$STATE_DIR/converge-actions"
 DEPLOY_LOCK="$HOME/Library/Deskflow/deploy.lock"
 MACHINE_LOCK_DIR="/private/var/db/deskflow"
-TEMPLATE_DIR="$ROOT/tools/launchd"
+# Templates are rendered from the launchd-safe copy once it exists, so a
+# checkout-run converge and the tick agree on what "stale" means; before the
+# first `start` (or with no checkout at all) the checkout's are used.
+TEMPLATE_DIR="$SAFE_TEMPLATE_DIR"
+[[ -d "$TEMPLATE_DIR" ]] || TEMPLATE_DIR="${ROOT:+$ROOT/tools/launchd}"
+CONVERGE_LOG="$LOG_DIR/converge.log"
+CONVERGE_EPERM_WINDOW=600
+# What launchd's shell prints when TCC refuses the script it was handed:
+# "/bin/bash: <path>: Operation not permitted" (exit 126). Shape-specific on
+# purpose: a tick's own "<script>: line N: <file>: Permission denied" (its
+# redirection, not its program) is not this. Group 3 is the refused path.
+CONVERGE_EPERM_RE='^(/[^:]*/)?(bash|sh|zsh|dash|env): (/[^:]+): (Operation not permitted|Permission denied)[[:space:]]*$'
+SOAK_DIR="${DESKFLOW_CTL_SOAK_DIR:-$HOME/Library/Deskflow/soak}"
+# Folders macOS TCC guards per consenting app: a launchd job has none, so it
+# gets EPERM there with no prompt (exit 126). Paths are compared canonical
+# (symlinks and .. resolved) and case-insensitively, since APFS is.
+# shellcheck disable=SC2088  # display text, the ~ is deliberate
+TCC_FOLDERS="~/Desktop, ~/Documents, ~/Downloads, iCloud Drive (~/Library/Mobile Documents) or /Volumes"
+tcc_roots() { printf '%s\n' "$HOME/Desktop" "$HOME/Documents" "$HOME/Downloads" "$HOME/Library/Mobile Documents" "/Volumes"; }
+# A plist <string> value under such a folder (any account, ~, $HOME; grep -i).
+TCC_STRING_RE='<string>[^<]*(/Desktop|/Documents|/Downloads|/Library/Mobile Documents|/Volumes)(/|<)'
+# launchd's `exit timeout` for these labels (`launchctl print` shows it):
+# bootout sends SIGTERM and launchd SIGKILLs this many seconds later.
+# STOP_TIMEOUT, the wait after a bootout before by-pid escalation, covers it.
+LAUNCHD_EXIT_TIMEOUT=5
 STOP_TIMEOUT="${DESKFLOW_CTL_STOP_TIMEOUT:-10}"
 START_TIMEOUT="${DESKFLOW_CTL_START_TIMEOUT:-15}"
 ESCALATE_TIMEOUT="${DESKFLOW_CTL_ESCALATE_TIMEOUT:-5}"
 CONVERGE_BUDGET=3
 CONVERGE_BUDGET_WINDOW=3600
 DEPLOY_LOCK_MAX_AGE=1800
-DOMAIN="gui/$(id -u)"
+ME_UID="$(id -u)"
+DOMAIN="gui/$ME_UID"
 # Retired launchers/logs from earlier fleet designs. The keepalive log is this
 # user's (retire removes it); the other two are root-owned (retire prints the
 # sudo lines). All three fail assert-single while present.
@@ -111,6 +206,7 @@ enable -n kill 2>/dev/null || true # fleet:allow builtin may already be disabled
 
 usage() { sed -n '2,/^set -euo pipefail/p' "${BASH_SOURCE[0]}" | sed '$d'; }
 die() { echo "deskflow-ctl: $*" >&2; exit 1; }
+warn() { echo "deskflow-ctl: warning: $*" >&2; }
 log() { echo "== deskflow-ctl: $* =="; }
 
 # ---------------------------------------------------------------- inventory
@@ -129,17 +225,44 @@ inventory() {
 
 canonical_path() { [[ "$1" == "$APP/Contents/MacOS/"* ]]; }
 
-# The processes `stop` owns: this user's deskflow-core and Deskflow GUI from
-# the canonical bundle. Filtered by uid and basename on purpose: the root
-# LoginWindow vhid-bridge and the root deskflow-prio LaunchDaemon also run
-# from the bundle, and waiting on / signalling them makes `stop` hang forever
-# (or EPERM) at the login window.
-pids_under_bundle() {
-  inventory | awk -F'\t' -v app="$APP/Contents/MacOS/" -v uid="$(id -u)" '
-    index($3, app) == 1 && $2 == uid {
-      n = split($3, parts, "/"); base = parts[n]
-      if (base == "deskflow-core" || base == "Deskflow") print $1
-    }'
+# What `stop` owns and `start` refuses to duplicate: every deskflow-core and
+# Deskflow GUI THIS user runs, from ANY path (a dev build, a Deskflow.app.bak,
+# a GUI-spawned or orphaned core). Exactly those two basenames: the root
+# LoginWindow vhid-bridge and the root deskflow-prio LaunchDaemon run from
+# the same bundle and are never matched (waiting on / signalling them made
+# `stop` hang forever, or EPERM, at the login window). No root deskflow-core
+# exists by design -- the login-window agent is deskflow-vhid-bridge -- so
+# one is somebody's `sudo`, named with the exact sudo line, never signalled.
+# Output lines: "<pid>\t<uid>\t<path>".
+user_program() { case "${1##*/}" in deskflow-core|Deskflow) return 0 ;; esac; return 1; }
+
+owned_lines() {
+  local pid uid path
+  while IFS=$'\t' read -r pid uid path; do
+    if [[ "$uid" == "$ME_UID" ]] && user_program "$path"; then printf '%s\t%s\t%s\n' "$pid" "$uid" "$path"; fi
+  done < <(inventory)
+  return 0
+}
+
+owned_pids() { owned_lines | cut -f1; }
+
+foreign_lines() {
+  # The same programs run by ANOTHER uid: not ours to signal.
+  local pid uid path
+  while IFS=$'\t' read -r pid uid path; do
+    if [[ "$uid" != "$ME_UID" ]] && user_program "$path"; then printf '%s\t%s\t%s\n' "$pid" "$uid" "$path"; fi
+  done < <(inventory)
+  return 0
+}
+
+pids_of() {
+  # "<pid>\t<uid>\t<path>" lines in $1 -> their pids, space-separated, no newline.
+  awk -F'\t' 'NF { out = out (out == "" ? "" : " ") $1 } END { printf "%s", out }' <<<"$1"
+}
+
+pids_with_paths() {
+  # "<pid>\t<uid>\t<path>" lines in $1 -> "pid (path) pid (path) " for a log line.
+  awk -F'\t' 'NF { printf "%s (%s) ", $1, $3 }' <<<"$1"
 }
 
 count_role() {
@@ -179,11 +302,17 @@ domain_services() {
 }
 
 render_agent_to() {
-  # $1 = label, $2 = output file. Renders tools/launchd/<label>.plist with the
-  # bundle, home and ctl path substituted.
-  local src="$TEMPLATE_DIR/$1.plist"
-  [[ -f "$src" ]] || die "missing template $src"
-  sed -e "s#__APP__#$APP#g" -e "s#__HOME__#$HOME#g" -e "s#__CTL__#$ROOT/scripts/deskflow-ctl#g" "$src" >"$2"
+  # $1 = label, $2 = output file. Renders <templates>/<label>.plist with the
+  # bundle, home, launchd-safe ctl/dir and soak dir substituted. __CTL__ is
+  # ALWAYS the safe copy, never this checkout. Refuses a result that points
+  # launchd into a TCC-protected folder (it would die with EPERM, no prompt).
+  local src="${TEMPLATE_DIR:+$TEMPLATE_DIR/$1.plist}" hit
+  [[ -n "$src" && -f "$src" ]] || die "missing template ${src:-$1.plist}: no launchd-safe copy at $SAFE_TEMPLATE_DIR and no checkout (run scripts/deskflow-ctl start from the checkout)"
+  sed -e "s#__APP__#$APP#g" -e "s#__HOME__#$HOME#g" -e "s#__CTL__#$SAFE_CTL#g" \
+      -e "s#__CTL_DIR__#$SAFE_DIR#g" -e "s#__SOAK_DIR__#$SOAK_DIR#g" "$src" >"$2"
+  if hit="$(grep -m1 -iE "$TCC_STRING_RE" "$2")"; then
+    die "rendered $1.plist points launchd into $TCC_FOLDERS (EPERM, no prompt): $(echo "$hit" | sed 's/^[[:space:]]*//')"
+  fi
 }
 
 agent_plist_stale() {
@@ -284,30 +413,118 @@ EOF
   return 0
 }
 
-agent_plist_differs() {
-  # $1 = label. True when $AGENT_DIR/<label>.plist exists AND differs from a
-  # fresh render (a missing file is "not yet rendered", not "stale").
-  [[ -f "$AGENT_DIR/$1.plist" ]] && agent_plist_stale "$1"
+# ------------------------------------------- loaded definition vs render
+plist_program_args() {
+  # $1 = plist file. Its ProgramArguments, one per line, XML entities decoded.
+  awk '
+    /<key>ProgramArguments<\/key>/ { p = 1; next }
+    p && /<\/array>/ { exit }
+    p && /<string>/ {
+      s = $0; sub(/^[[:space:]]*<string>/, "", s); sub(/<\/string>[[:space:]]*$/, "", s)
+      gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&quot;/, "\"", s); gsub(/&amp;/, "\\&", s)
+      print s
+    }' "$1"
+}
+
+plist_env() {
+  # $1 = plist file. Its EnvironmentVariables as "KEY=VALUE" lines.
+  awk '
+    /<key>EnvironmentVariables<\/key>/ { p = 1; next }
+    p && /<\/dict>/ { exit }
+    p && /<key>/ { k = $0; sub(/^[[:space:]]*<key>/, "", k); sub(/<\/key>[[:space:]]*$/, "", k); next }
+    p && /<string>/ {
+      v = $0; sub(/^[[:space:]]*<string>/, "", v); sub(/<\/string>[[:space:]]*$/, "", v)
+      gsub(/&lt;/, "<", v); gsub(/&gt;/, ">", v); gsub(/&quot;/, "\"", v); gsub(/&amp;/, "\\&", v)
+      print k "=" v
+    }' "$1"
+}
+
+launchctl_block() {
+  # $1 = label, $2 = "arguments" | "environment". The entries of that block
+  # in `launchctl print gui/$UID/<label>` (what launchd LOADED), one per
+  # line, leading whitespace stripped ("K => V" for the environment); nothing
+  # when the label is not loaded or launchd prints no such block.
+  launchctl print "$DOMAIN/$1" 2>/dev/null | awk -v b="$2" '
+    $0 ~ ("^[[:space:]]*" b " = \\{") { p = 1; next }
+    p && /^[[:space:]]*\}/ { exit }
+    p { sub(/^[[:space:]]+/, ""); print }' || true # fleet:allow not loaded / no such block = nothing to compare
+}
+
+loaded_definition_differs() {
+  # $1 = label, $2 = a rendered plist. True when what launchd LOADED for the
+  # label (its argv, and every EnvironmentVariables entry of the file) is not
+  # what the file says. The installed file alone cannot tell: `converge
+  # --apply` re-renders it while the label stays loaded with the OLD
+  # definition (macbookpro 2026-09-25: file = safe copy, launchd = checkout
+  # path, exit 126 forever), and only a bootout + bootstrap replaces it.
+  # Unknown (launchd prints no arguments block) compares equal.
+  local largs lenv kv
+  largs="$(launchctl_block "$1" arguments)"
+  [[ -n "$largs" ]] || return 1
+  [[ "$largs" == "$(plist_program_args "$2")" ]] || return 0
+  lenv="$(launchctl_block "$1" environment | sed 's/ => /=/')"
+  [[ -n "$lenv" ]] || return 1
+  while IFS= read -r kv; do
+    [[ -n "$kv" ]] || continue
+    grep -qxF -- "$kv" <<<"$lenv" || return 0
+  done < <(plist_env "$2")
+  return 1
+}
+
+agent_needs_rebootstrap() {
+  # $1 = label. Prints why launchd's loaded definition must be replaced
+  # (bootout + bootstrap) and returns 0; returns 1 with no output when the
+  # label is not loaded or launchd already runs what a fresh render says. A
+  # missing installed file is "not yet rendered", not stale: a loaded label
+  # without one is kickstarted, as before.
+  local label="$1" plist="$AGENT_DIR/$1.plist" tmp why=""
+  agent_loaded "$label" || return 1
+  tmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+  render_agent_to "$label" "$tmp"
+  if [[ -f "$plist" ]] && ! cmp -s "$tmp" "$plist"; then
+    why="installed plist was stale while loaded"
+  elif loaded_definition_differs "$label" "$tmp"; then
+    why="launchd's loaded definition (argv/environment) differs from the rendered plist"
+  fi
+  rm -f "$tmp"
+  [[ -n "$why" ]] || return 1
+  printf '%s' "$why"
 }
 
 bootstrap_agent() {
-  local label="$1" plist="$AGENT_DIR/$1.plist" reload=0
+  local label="$1" plist="$AGENT_DIR/$1.plist" why="" old_pid=""
+  # Never start launchd's copy beside a process it does not own (a
+  # GUI-spawned core, an orphan, a Login Item GUI): that is a duplicate.
+  refuse_if_stray "$label" bootstrap
   # launchd keeps the definition it loaded: a re-rendered file only takes
-  # effect at the next bootstrap. A loaded label whose installed plist is
-  # stale (macbookpro's GUI agent without DESKFLOW_LAUNCHD=1) must be booted
-  # out and bootstrapped again, or the old definition runs forever.
-  if agent_loaded "$label" && agent_plist_differs "$label"; then reload=1; fi
+  # effect at the next bootstrap. Decide from what launchd LOADED against a
+  # fresh render, never from the file alone: after `converge --apply`
+  # re-rendered the file the two match while launchd still runs the old
+  # definition, and a plain kickstart would run it again (macbookpro's
+  # converge label: checkout path, exit 126, forever). Only a label whose
+  # loaded definition differs is booted out; a current one is never restarted
+  # from here.
+  why="$(agent_needs_rebootstrap "$label")" || why=""
   render_agent "$label"
   # A label disabled by an earlier `launchctl disable` (or the Login Items
   # pane) makes bootstrap fail silently at login; enable is idempotent.
   launchctl enable "$DOMAIN/$label"
-  if (( reload )); then
-    log "$label: installed plist was stale while loaded; bootout then bootstrap"
+  if [[ -n "$why" ]]; then
+    old_pid="$(agent_pid "$label")"
+    log "$label: $why; bootout then bootstrap"
     launchctl bootout "$DOMAIN/$label" || die "launchctl bootout $DOMAIN/$label failed"
+    # bootout returns before the process is gone: launchd sends SIGTERM and
+    # SIGKILLs at its exit timeout (LAUNCHD_EXIT_TIMEOUT, 5 s for these
+    # labels). Bootstrapping straight away ran two copies for up to that
+    # long and the new one could lose the instance lock and crash-loop, so
+    # wait STOP_TIMEOUT (which covers it) for the old pid.
+    if [[ -n "$old_pid" ]] && ! wait_pid_gone "$old_pid" "$STOP_TIMEOUT"; then
+      die "$label: pid $old_pid still running ${STOP_TIMEOUT}s after bootout; not bootstrapping a second $(label_exe "$label" || true) (launchd SIGKILLs at its ${LAUNCHD_EXIT_TIMEOUT}s exit timeout; deskflow-ctl stop escalates by pid)"
+    fi
     launchctl bootstrap "$DOMAIN" "$plist"
   elif agent_loaded "$label"; then
-    # Already loaded (e.g. previous start with KeepAlive false and a clean
-    # exit): kickstart runs it if it is not running.
+    # Already loaded and current (e.g. previous start with KeepAlive false
+    # and a clean exit): kickstart runs it if it is not running.
     launchctl kickstart "$DOMAIN/$label"
   else
     launchctl bootstrap "$DOMAIN" "$plist"
@@ -321,23 +538,324 @@ bootout_agent() {
 }
 
 kickstart_agent() {
+  # `restart`: kickstart -k a loaded, current label. A loaded label whose
+  # definition must change goes through bootstrap_agent (bootout then
+  # bootstrap): -k would only restart the OLD definition.
   local label="$1"
-  if agent_loaded "$label"; then
+  if agent_loaded "$label" && ! agent_needs_rebootstrap "$label" >/dev/null; then
+    refuse_if_stray "$label" "kickstart -k"
     launchctl kickstart -k "$DOMAIN/$label"
   else
     bootstrap_agent "$label"
   fi
 }
 
-# ------------------------------------------------------------------- verbs
-wait_gone() {
-  # Wait up to $1 seconds for no process to run from the bundle.
-  local deadline=$(( $(date +%s) + $1 ))
-  while [[ -n "$(pids_under_bundle)" ]]; do
+# ------------------------------------------------------ launchd-safe copy
+canon_path() {
+  # Canonical form of $1 for the TCC checks: absolute, "." / ".." / "//"
+  # folded, symlinks in the longest existing prefix resolved (a path that
+  # does not exist yet keeps its tail as given). Pure bash 3.2 + `cd -P`: no
+  # python3 (the tick's PATH is /usr/bin:/bin and /usr/bin/python3 may be the
+  # Xcode CLT stub).
+  local p="$1" out="" seg rest dir tail=""
+  [[ "$p" == /* ]] || p="$PWD/$p"
+  rest="$p"
+  while [[ -n "$rest" ]]; do
+    seg="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    case "$seg" in
+      ''|.) ;;
+      ..) out="${out%/*}" ;;
+      *) out="$out/$seg" ;;
+    esac
+  done
+  p="${out:-/}"
+  dir="$p"
+  while [[ ! -d "$dir" && "$dir" != "/" ]]; do
+    tail="/${dir##*/}$tail"
+    dir="${dir%/*}"
+    dir="${dir:-/}"
+  done
+  dir="$(cd -P "$dir" 2>/dev/null && pwd -P)" || dir="${p%"$tail"}" # fleet:allow unreadable prefix = keep the folded path
+  [[ "$dir" == "/" ]] && dir=""
+  out="$dir$tail"
+  printf '%s' "${out:-/}"
+}
+
+tcc_protected_path() {
+  # True for a path under a folder macOS TCC guards per consenting app (a
+  # launchd job has none: EPERM there, no prompt, exit 126). Canonical and
+  # case-insensitive: APFS is, so ~/desktop/bin and ~/Library/../Desktop/bin
+  # are ~/Desktop/bin.
+  local p d lp ld
+  p="$(canon_path "$1")"
+  lp="$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')"
+  while IFS= read -r d; do
+    ld="$(canon_path "$d" | tr '[:upper:]' '[:lower:]')"
+    [[ "$lp" == "$ld" || "$lp" == "$ld/"* ]] && return 0
+  done < <(tcc_roots)
+  return 1
+}
+
+install_file_if_changed() {
+  # $1 = mode, $2 = src, $3 = dst. Returns 0 when dst was (re)written, 1 when
+  # it already matched. Atomic replace: a bash still running the old copy
+  # keeps its inode.
+  local mode="$1" src="$2" dst="$3" tmp
+  if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+    chmod "$mode" "$dst"
+    return 1
+  fi
+  tmp="$(mktemp "$(dirname "$dst")/.${dst##*/}.XXXXXX")"
+  cp "$src" "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dst"
+  return 0
+}
+
+cmd_safe_copy() {
+  # $1 = "strict" for the safe-copy verb (an invalid DESKFLOW_ROOT is an
+  # error naming the variable); `start` passes nothing (a warning, then the
+  # checkout recorded by the last safe-copy, else none: the seat must still
+  # start). Refresh $SAFE_DIR from the checkout: deskflow-ctl (755), every
+  # tools/launchd/*.plist (644; ones that left the checkout are removed) and
+  # tools/fleet-soak (755). Diff-and-replace: an up-to-date copy is untouched.
+  local strict="${1:-}" src_ctl f n=0 tmp
+  if [[ -n "$ROOT_WARNING" ]]; then
+    if [[ "$strict" == strict ]]; then
+      die "safe-copy: $ROOT_WARNING; point DESKFLOW_ROOT at the checkout, or run scripts/deskflow-ctl safe-copy from it"
+    fi
+    warn "safe-copy: $ROOT_WARNING"
+  fi
+  if [[ -z "$ROOT" ]]; then
+    log "safe-copy: no checkout known (run scripts/deskflow-ctl from the checkout, or set DESKFLOW_ROOT); $SAFE_DIR left as is"
+    return 0
+  fi
+  src_ctl="$ROOT/scripts/deskflow-ctl"
+  [[ -f "$src_ctl" ]] || die "safe-copy: $src_ctl not found (DESKFLOW_ROOT=$ROOT is not a deskflow checkout)"
+  if tcc_protected_path "$SAFE_DIR"; then
+    die "safe-copy: $SAFE_DIR is under $TCC_FOLDERS; launchd could never execute it (DESKFLOW_CTL_SAFE_DIR)"
+  fi
+  mkdir -p "$SAFE_TEMPLATE_DIR"
+  # Remember the checkout for the copy's own `safe-copy`/`start`.
+  tmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+  printf '%s\n' "$ROOT" >"$tmp"
+  install_file_if_changed 644 "$tmp" "$SAFE_CHECKOUT_FILE" || true # fleet:allow unchanged record
+  rm -f "$tmp"
+  if install_file_if_changed 755 "$src_ctl" "$SAFE_CTL"; then log "safe-copy: installed $SAFE_CTL"; n=$((n + 1)); fi
+  for f in "$ROOT"/tools/launchd/*.plist; do
+    [[ -f "$f" ]] || continue
+    if install_file_if_changed 644 "$f" "$SAFE_TEMPLATE_DIR/${f##*/}"; then log "safe-copy: installed $SAFE_TEMPLATE_DIR/${f##*/}"; n=$((n + 1)); fi
+  done
+  for f in "$SAFE_TEMPLATE_DIR"/*.plist; do
+    [[ -f "$f" && ! -f "$ROOT/tools/launchd/${f##*/}" ]] || continue
+    rm -f "$f"
+    log "safe-copy: removed $f (no longer in the checkout)"
+    n=$((n + 1))
+  done
+  if [[ -f "$ROOT/tools/fleet-soak" ]]; then
+    if install_file_if_changed 755 "$ROOT/tools/fleet-soak" "$SAFE_DIR/fleet-soak"; then log "safe-copy: installed $SAFE_DIR/fleet-soak"; n=$((n + 1)); fi
+  fi
+  TEMPLATE_DIR="$SAFE_TEMPLATE_DIR"
+  (( n )) || log "safe-copy: $SAFE_DIR up to date"
+  return 0
+}
+
+safe_copy_differs() {
+  # From a checkout only: true when the safe copy is missing or behind it.
+  local f
+  [[ -n "$ROOT" && -f "$ROOT/scripts/deskflow-ctl" ]] || return 1
+  { [[ -f "$SAFE_CTL" ]] && cmp -s "$ROOT/scripts/deskflow-ctl" "$SAFE_CTL"; } || return 0
+  for f in "$ROOT"/tools/launchd/*.plist; do
+    [[ -f "$f" ]] || continue
+    { [[ -f "$SAFE_TEMPLATE_DIR/${f##*/}" ]] && cmp -s "$f" "$SAFE_TEMPLATE_DIR/${f##*/}"; } || return 0
+  done
+  return 1
+}
+
+cmd_render_plist() {
+  # Print a rendered tools/launchd/<label>.plist to stdout. Installs and
+  # loads nothing; each template's header carries its bootstrap recipe.
+  local label="${1:-}" tmp
+  [[ -n "$label" ]] || die "render-plist: usage: render-plist <label> (a tools/launchd/<label>.plist template)"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+  render_agent_to "$label" "$tmp"
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+# -------------------------------------------------------- duplicate guard
+label_exe() {
+  # Executable basename launchd runs for a label; empty for the converge tick.
+  case "$1" in
+    "$CORE_LABEL") echo "deskflow-core" ;;
+    "$GUI_LABEL") echo "Deskflow" ;;
+    *) echo "" ;;
+  esac
+}
+
+stray_lines() {
+  # $1 = label. "<pid>\t<uid>\t<path>" for every process (any uid, any path)
+  # whose basename is this label's executable and which launchd does not
+  # report as the label's pid. Empty = nothing runs that a bootstrap/kickstart
+  # would duplicate. The process table has the last word, never launchd's pid
+  # line: a GUI-spawned core (ppid = GUI), an orphan, a Login Item GUI or a
+  # copy still exiting all leave launchd with no pid for the label.
+  local label="$1" base launchd_pid pid uid path
+  base="$(label_exe "$label")"
+  [[ -n "$base" ]] || return 0
+  launchd_pid="$(agent_pid "$label")"
+  while IFS=$'\t' read -r pid uid path; do
+    [[ "${path##*/}" == "$base" ]] || continue
+    [[ -n "$launchd_pid" && "$pid" == "$launchd_pid" ]] && continue
+    printf '%s\t%s\t%s\n' "$pid" "$uid" "$path"
+  done < <(inventory)
+  return 0
+}
+
+stray_remedy() {
+  # $1 = stray lines. What clears them, and only what can: this user's ->
+  # `deskflow-ctl stop` (it TERM/KILLs every deskflow-core/Deskflow this user
+  # runs, any path); another uid's -> the exact sudo line, since nothing here
+  # may signal it and `stop` would only be pretending.
+  local pid uid path mine=0 foreign="" out=""
+  while IFS=$'\t' read -r pid uid path; do
+    [[ -n "$pid" ]] || continue
+    if [[ "$uid" == "$ME_UID" ]]; then
+      mine=1
+    else
+      foreign+="${foreign:+; }sudo kill $pid  # $path (uid $uid)"
+    fi
+  done <<<"$1"
+  if (( mine )); then
+    out="deskflow-ctl stop (bootout, then TERM/KILL of every deskflow-core/Deskflow this user runs, any path) first, then start"
+  fi
+  if [[ -n "$foreign" ]]; then
+    out+="${out:+; }not this user's to signal (deskflow-ctl stop cannot clear it); run as admin: $foreign; then deskflow-ctl start"
+  fi
+  printf '%s' "$out"
+}
+
+refuse_if_stray() {
+  # $1 = label, $2 = the launchctl verb about to run. Dies when a process
+  # launchd does not own already runs: starting launchd's copy beside it is
+  # exactly the duplicate-core path. The remedy named is one that works.
+  local strays
+  strays="$(stray_lines "$1")"
+  [[ -z "$strays" ]] || die "$2 $1 refused: $(label_exe "$1") pid $(pids_of "$strays") already running outside launchd; $(stray_remedy "$strays")"
+}
+
+wait_pid_gone() {
+  # Wait up to $2 seconds for pid $1 to leave the inventory.
+  local deadline=$(( $(date +%s) + $2 ))
+  while inventory | awk -F'\t' -v p="$1" '$1 == p { f = 1 } END { exit !f }'; do
     (( $(date +%s) >= deadline )) && return 1
     sleep 0.5
   done
   return 0
+}
+
+# --------------------------------------------------- converge self-check
+program_of_args() {
+  # $1 = argv, one per line. The script a job runs: argv[1] behind an
+  # interpreter (bash/sh/zsh/dash/env), else argv[0]; nothing for no argv.
+  awk 'NR == 1 { a0 = $0 } NR == 2 { a1 = $0 }
+       END { if (NR == 0 || a0 == "") exit; if (NR > 1 && a0 ~ /(^|\/)(bash|sh|zsh|dash|env)$/) print a1; else print a0 }' <<<"$1"
+}
+
+converge_program() {
+  # The script the converge agent runs: launchd's LOADED definition when the
+  # label is loaded (a re-rendered file only takes effect at the next
+  # bootstrap), else the installed plist; nothing when neither exists.
+  local prog="" plist="$AGENT_DIR/$CONVERGE_LABEL.plist"
+  if agent_loaded "$CONVERGE_LABEL"; then
+    prog="$(program_of_args "$(launchctl_block "$CONVERGE_LABEL" arguments)")"
+  fi
+  if [[ -z "$prog" && -f "$plist" ]]; then
+    prog="$(program_of_args "$(plist_program_args "$plist")")"
+  fi
+  printf '%s' "$prog"
+}
+
+converge_log_eperm_path() {
+  # Prints the path launchd's shell was refused at when converge.log was
+  # written within CONVERGE_EPERM_WINDOW and its LAST line is exactly that
+  # refusal (CONVERGE_EPERM_RE: "/bin/bash: <path>: Operation not permitted",
+  # TCC EPERM, exit 126). Only the last line counts: any later tick output
+  # means the agent ran again (`start` appends a marker for the same reason),
+  # and only that shape counts: a tick that died on its own redirection
+  # ("<script>: line N: <file>: Permission denied") ran, so its program is
+  # fine.
+  local last
+  [[ -f "$CONVERGE_LOG" ]] || return 1
+  (( $(date +%s) - $(file_mtime "$CONVERGE_LOG") <= CONVERGE_EPERM_WINDOW )) || return 1
+  last="$(tail -n 1 "$CONVERGE_LOG")"
+  grep -qE "$CONVERGE_EPERM_RE" <<<"$last" || return 1
+  sed -E "s#$CONVERGE_EPERM_RE#\\3#" <<<"$last"
+}
+
+converge_last_exit_126() {
+  agent_loaded "$CONVERGE_LABEL" || return 1
+  launchctl print "$DOMAIN/$CONVERGE_LABEL" 2>/dev/null | grep -q 'last exit code = 126'
+}
+
+converge_program_problem() {
+  # One line when the converge agent cannot run its program, else nothing.
+  # Evidence first (the log, launchd's exit code), then the static facts.
+  local prog eperm
+  prog="$(converge_program)"
+  [[ -n "$prog" ]] || return 0
+  if eperm="$(converge_log_eperm_path)"; then
+    echo "converge agent cannot execute its program (TCC): ${eperm:-$prog}"
+  elif converge_last_exit_126; then
+    echo "converge agent cannot execute its program (TCC): $prog (launchd last exit code 126)"
+  elif tcc_protected_path "$prog"; then
+    echo "converge agent cannot execute its program (TCC): $prog is under $TCC_FOLDERS (launchd gets EPERM there, no prompt)"
+  elif [[ ! -f "$prog" || ! -r "$prog" ]]; then
+    echo "converge agent cannot execute its program (missing or unreadable): $prog"
+  fi
+  return 0
+}
+
+installed_plists_tcc_hits() {
+  # "<plist>:<line>:<value>" for every <string> in a FLEET plist of
+  # $AGENT_DIR (our labels only; a third party's plist is not this tool's
+  # business) that points into a TCC-protected folder ($TCC_FOLDERS).
+  local f
+  for f in "$AGENT_DIR"/io.github.hughesyadaddy.*.plist "$AGENT_DIR"/org.deskflow.*.plist "$AGENT_DIR"/com.fleet.*.plist; do
+    [[ -f "$f" ]] || continue
+    grep -n -iE "$TCC_STRING_RE" "$f" 2>/dev/null | sed -e 's/[[:space:]]*<string>//' -e 's#</string>.*$##' | awk -v f="$f" '{ print f ":" $0 }' || true # fleet:allow no hit = grep exit 1
+  done
+}
+
+# ------------------------------------------------------------------- verbs
+wait_gone() {
+  # Wait up to $1 seconds for none of this user's deskflow-core/Deskflow to run.
+  local deadline=$(( $(date +%s) + $1 ))
+  while [[ -n "$(owned_pids)" ]]; do
+    (( $(date +%s) >= deadline )) && return 1
+    sleep 0.5
+  done
+  return 0
+}
+
+stop_foreign_report() {
+  # Another uid's deskflow-core/Deskflow (root: somebody's sudo, never a
+  # fleet design -- the login-window agent is deskflow-vhid-bridge) is not
+  # ours to signal. `start` will refuse beside it, so `stop` names the exact
+  # sudo line and exits 1 rather than say "stopped".
+  local lines pid uid path
+  lines="$(foreign_lines)"
+  [[ -n "$lines" ]] || return 0
+  {
+    echo "== deskflow-ctl: stop: NOT stopped: a deskflow-core/Deskflow of another user is running and deskflow-ctl cannot signal it; run as admin: =="
+    while IFS=$'\t' read -r pid uid path; do
+      [[ -n "$pid" ]] || continue
+      echo "  sudo kill $pid   # ${path##*/} pid $pid uid $uid: $path"
+    done <<<"$lines"
+    echo "  then: deskflow-ctl start"
+  } >&2
+  return 1
 }
 
 write_quit_intent() {
@@ -348,40 +866,45 @@ write_quit_intent() {
 clear_quit_intent() { rm -f "$QUIT_INTENT"; }
 
 cmd_stop() {
-  log "stop (launchctl bootout $DOMAIN/{$CONVERGE_LABEL,$GUI_LABEL,$CORE_LABEL})"
+  log "stop (launchctl bootout $DOMAIN/{$CONVERGE_LABEL,$GUI_LABEL,$CORE_LABEL}, then every deskflow-core/Deskflow of this user, any path)"
   # The sentinel goes first: a converge tick racing this stop must not
   # bootstrap the agents straight back.
   write_quit_intent
   bootout_agent "$CONVERGE_LABEL"
   bootout_agent "$GUI_LABEL"
   bootout_agent "$CORE_LABEL"
-  if wait_gone "$STOP_TIMEOUT"; then
-    log "stopped"
-    return 0
-  fi
-  # Escalate by PID only — never `pkill -f`, which also matches Mouser and
-  # anything with "deskflow" in its argv.
-  local sig
-  for sig in TERM KILL; do
-    local pids
-    pids="$(pids_under_bundle)"
-    [[ -n "$pids" ]] || break
-    log "escalating: SIG$sig to $(echo "$pids" | tr '\n' ' ')"
-    for pid in $pids; do
-      kill "-$sig" "$pid" 2>/dev/null || true # fleet:allow pid may have exited already
+  local how="stopped"
+  if ! wait_gone "$STOP_TIMEOUT"; then
+    # Escalate by PID only — never `pkill -f`, which also matches Mouser and
+    # anything with "deskflow" in its argv. Every deskflow-core/Deskflow this
+    # user runs, from any path: each one makes `start` refuse, so `stop` must
+    # clear all of them for the remedy the refusal names to be true.
+    local sig lines pid
+    for sig in TERM KILL; do
+      lines="$(owned_lines)"
+      [[ -n "$lines" ]] || break
+      log "escalating: SIG$sig to $(pids_with_paths "$lines")"
+      for pid in $(pids_of "$lines"); do
+        kill "-$sig" "$pid" 2>/dev/null || true # fleet:allow pid may have exited already
+      done
+      wait_gone "$ESCALATE_TIMEOUT" && break
     done
-    wait_gone "$ESCALATE_TIMEOUT" && break
-  done
-  if [[ -n "$(pids_under_bundle)" ]]; then
-    die "processes still running from $APP after SIGKILL: $(pids_under_bundle | tr '\n' ' ')"
+    if [[ -n "$(owned_pids)" ]]; then
+      die "processes still running after SIGKILL: $(pids_with_paths "$(owned_lines)")"
+    fi
+    how="stopped (escalated)"
   fi
-  log "stopped (escalated)"
+  # "stopped" only when nothing is left that `start` would refuse beside.
+  stop_foreign_report || return 1
+  log "$how"
 }
 
 cmd_start() {
   [[ -d "$APP" ]] || die "bundle missing: $APP"
   [[ -x "$APP/Contents/MacOS/deskflow-core" ]] || die "missing $APP/Contents/MacOS/deskflow-core"
   log "start ($DOMAIN/$CORE_LABEL then $DOMAIN/$GUI_LABEL, then $DOMAIN/$CONVERGE_LABEL)"
+  # The converge tick runs the launchd-safe copy, never this checkout.
+  cmd_safe_copy
   clear_quit_intent
   bootstrap_agent "$CORE_LABEL"
   local deadline=$(( $(date +%s) + START_TIMEOUT ))
@@ -391,6 +914,10 @@ cmd_start() {
   done
   bootstrap_agent "$GUI_LABEL"
   bootstrap_agent "$CONVERGE_LABEL"
+  # Ends any "Operation not permitted" block in the tick's log so the TCC
+  # self-check (which reads only the last line) stops reporting it.
+  mkdir -p "$LOG_DIR"
+  echo "== deskflow-ctl: start: $CONVERGE_LABEL bootstrapped; program $SAFE_CTL ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ==" >>"$CONVERGE_LOG"
   log "started: core pid $(agent_pid "$CORE_LABEL")"
   cmd_prio
 }
@@ -459,6 +986,7 @@ CONVERGE_DONE=()
 CONVERGE_ERRORS=()
 CONVERGE_GATE=""
 CONVERGE_NEEDS_REBOOTSTRAP=0
+CONVERGE_CORE_REFUSED=0
 
 converge_agent() {
   # $1 = label, $2 = apply (0/1), $3 = starts allowed (0/1), $4 = kickstart
@@ -480,6 +1008,14 @@ converge_agent() {
       render_agent "$label" >/dev/null
       (( loaded )) || CONVERGE_DONE+=("$render")
     fi
+  elif (( loaded )) && [[ -f "$AGENT_DIR/$label.plist" ]] && loaded_definition_differs "$label" "$AGENT_DIR/$label.plist"; then
+    # The file is current but launchd still runs an older definition (an
+    # earlier tick re-rendered it while loaded): invisible to a file diff,
+    # so it is named here and in health.json; the tick never boots a loaded
+    # label out (it must not restart the living nor hot-swap its own
+    # program), deskflow-ctl start/restart does.
+    CONVERGE_PLAN+=("rebootstrap $label (launchd runs an older definition than $AGENT_DIR/$label.plist; takes effect at next deskflow-ctl start/restart)")
+    CONVERGE_NEEDS_REBOOTSTRAP=1
   fi
   local want=""
   if (( ! loaded )); then
@@ -488,6 +1024,31 @@ converge_agent() {
     want="kickstart $label"
   fi
   [[ -n "$want" ]] || return 0
+  # launchd's view alone decided this until 2026-09-25: a core the GUI
+  # spawned (ppid = GUI), an orphan, or a copy still exiting leaves launchd
+  # with no pid for the label, and the bootstrap/kickstart below would start
+  # a SECOND one (a latent path here: on macbookpro the tick itself never
+  # ran, exit 126, and the GUI's own `launchctl kickstart -k` is the other
+  # unguarded one). The process table has the last word: never start beside
+  # a live one; report it (exit 1 under --apply) and leave it to assert-single.
+  local strays
+  strays="$(stray_lines "$label")"
+  if [[ -n "$strays" ]]; then
+    local pids
+    pids="$(pids_of "$strays")"
+    CONVERGE_PLAN+=("$want REFUSED: $(label_exe "$label") pid $pids already running outside launchd")
+    if [[ "$label" == "$CORE_LABEL" ]]; then CONVERGE_CORE_REFUSED=1; fi
+    if (( apply && starts_ok )); then
+      CONVERGE_ERRORS+=("refused $want: $(label_exe "$label") pid $pids already running outside launchd; a second one is never started here ($(stray_remedy "$strays"))")
+    fi
+    return 0
+  fi
+  # No GUI while the core is refused: `start` brings the core up first for
+  # the same reason (an old-build GUI spawns its own core beside the stray).
+  if [[ "$label" == "$GUI_LABEL" ]] && (( CONVERGE_CORE_REFUSED )); then
+    CONVERGE_PLAN+=("$want held while $CORE_LABEL is refused (deskflow-ctl stop, then start)")
+    return 0
+  fi
   CONVERGE_PLAN+=("$want")
   (( apply && starts_ok )) || return 0
   if (( $(budget_used) >= CONVERGE_BUDGET )); then
@@ -559,15 +1120,33 @@ cmd_converge() {
   done
   [[ -d "$APP" ]] || die "bundle missing: $APP"
 
-  local starts_ok=1 intended=0 used mode="plan"
+  local starts_ok=1 intended=0 used mode="plan" program_problem=""
   (( apply )) && mode="apply"
   used="$(budget_used)"
+  # First converge from a checkout on a seat that never ran `start`: install
+  # the safe copy now (nothing runs from there yet), or the converge plist
+  # rendered below would name a program that does not exist. A copy that
+  # exists but differs is a pending `start` (plan item below): the tick's
+  # program is never swapped under it from here.
+  if (( ! IS_SAFE_COPY )) && [[ -n "$ROOT" && ! -f "$SAFE_CTL" ]]; then
+    if (( apply )); then
+      if (( quiet )); then cmd_safe_copy >/dev/null; else cmd_safe_copy; fi
+    else
+      CONVERGE_PLAN+=("install launchd-safe copy $SAFE_DIR (missing; converge --apply or deskflow-ctl start)")
+    fi
+  fi
+  program_problem="$(converge_program_problem)"
   if deploy_lock_active; then
     CONVERGE_GATE="deploy lock $DEPLOY_LOCK is younger than $((DEPLOY_LOCK_MAX_AGE / 60)) min"
     intended=1
   elif quit_intent_active; then
     CONVERGE_GATE="quit-intent set after last boot ($QUIT_INTENT)"
     intended=1
+  elif [[ -n "$program_problem" ]]; then
+    # The tick itself cannot run (TCC EPERM on a checkout path, exit 126, a
+    # missing file): report-only. The repair is a human `deskflow-ctl start`
+    # (re-render onto the safe copy + re-bootstrap); assert-single names it.
+    CONVERGE_GATE="$program_problem; report-only until deskflow-ctl start re-renders $CONVERGE_LABEL"
   elif (( used >= CONVERGE_BUDGET )); then
     CONVERGE_GATE="action budget exhausted ($used/$CONVERGE_BUDGET in the last $((CONVERGE_BUDGET_WINDOW / 60)) min); report-only"
   fi
@@ -601,6 +1180,12 @@ cmd_converge() {
       fi
       ;;
   esac
+
+  # A checkout ahead of the safe copy is a pending `start`, never something
+  # the tick does on its own (it must not hot-swap its own program).
+  if (( ! IS_SAFE_COPY )) && safe_copy_differs; then
+    CONVERGE_PLAN+=("launchd-safe copy $SAFE_DIR differs from this checkout (deskflow-ctl start refreshes it)")
+  fi
 
   local assert_out assert_rc=0
   assert_out="$(cmd_assert_single 2>&1)" || assert_rc=$?
@@ -775,7 +1360,7 @@ login_items_audit() {
     dump="$(btm_dump)" || rc=$?
     if (( rc == 3 )); then
       echo "deskflow-ctl login-items: SKIP: sfltool dumpbtm needs privileges here ($(echo "$dump" | head -1))"
-      echo "  run as admin: sudo sfltool dumpbtm | $ROOT/scripts/deskflow-ctl login-items audit --stdin"
+      echo "  run as admin: sudo sfltool dumpbtm | $CTL_SELF login-items audit --stdin"
       return 3
     elif (( rc != 0 )); then
       echo "deskflow-ctl login-items: FAIL: sfltool dumpbtm produced no records ($(echo "$dump" | head -1))"
@@ -870,6 +1455,19 @@ EOF
 cmd_status() {
   local label pid
   echo "bundle: $APP"
+  if (( IS_SAFE_COPY )); then
+    local checkout="unknown, DESKFLOW_ROOT unset"
+    if [[ -n "$ROOT" && -n "${DESKFLOW_ROOT:-}" && -z "$ROOT_WARNING" ]]; then
+      checkout="$ROOT (DESKFLOW_ROOT)"
+    elif [[ -n "$ROOT" ]]; then
+      checkout="$ROOT (recorded by the last safe-copy)"
+    elif [[ -n "$ROOT_WARNING" ]]; then
+      checkout="unknown ($ROOT_WARNING)"
+    fi
+    echo "ctl: $CTL_SELF (launchd-safe copy; checkout: $checkout)"
+  else
+    echo "ctl: $CTL_SELF (checkout); safe copy: $SAFE_CTL$([[ -f "$SAFE_CTL" ]] || echo ' (missing: deskflow-ctl start)')"
+  fi
   for label in "$CORE_LABEL" "$GUI_LABEL"; do
     if agent_loaded "$label"; then
       pid="$(agent_pid "$label")"
@@ -940,6 +1538,15 @@ cmd_assert_single() {
   for f in "$RETIRED_KEEPALIVE_LOG" "$RETIRED_KEEPALIVE_LOG_OLD" "$RETIRED_PRIO_APPLY" "$RETIRED_SYNERGY_AGENT"; do
     [[ -e "$f" || -L "$f" ]] && problems+=("retired file present: $f (deskflow-ctl retire)")
   done
+  # The self-heal tick must be able to run at all (TCC: a launchd job gets
+  # EPERM, no prompt, on anything under ~/Desktop, ~/Documents, ~/Downloads).
+  local prog_problem hit
+  prog_problem="$(converge_program_problem)"
+  [[ -z "$prog_problem" ]] || problems+=("$prog_problem")
+  while IFS= read -r hit; do
+    [[ -n "$hit" ]] || continue
+    problems+=("fleet launchd plist points into a TCC-protected folder (launchd gets EPERM there, no prompt; deskflow-ctl start): $hit")
+  done < <(installed_plists_tcc_hits)
   if ((${#problems[@]})); then
     printf 'deskflow-ctl assert-single: FAIL\n' >&2
     printf '  %s\n' "${problems[@]}" >&2
@@ -958,6 +1565,8 @@ case "${1:-}" in
   converge) cmd_converge "${@:2}" ;;
   login-items) cmd_login_items "${@:2}" ;;
   retire) cmd_retire ;;
+  safe-copy) cmd_safe_copy strict ;;
+  render-plist) cmd_render_plist "${@:2}" ;;
   -h|--help|help) usage ;;
   *) usage >&2; die "unknown verb '${1:-}'" ;;
 esac

@@ -114,6 +114,12 @@ quit_deskflow() {
 }
 
 start_deskflow() {
+  # The converge/soak agents run the launchd-safe copy under
+  # ~/Library/Deskflow/bin: macOS TCC gives a launchd job EPERM (no prompt,
+  # exit 126) on anything under ~/Desktop, so this checkout can never be
+  # their program. Refresh it even when the seat is left stopped.
+  echo "== Launchd-safe copy (deskflow-ctl safe-copy) =="
+  DESKFLOW_INSTALL_APP="$INSTALL_APP" "$CTL" safe-copy
   if [[ "$RESTART" -ne 1 ]]; then
     # `deskflow-ctl start` also handles the prio LaunchDaemon; with
     # --no-restart still surface it so the operator sees the root step.

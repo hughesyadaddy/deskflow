@@ -57,9 +57,23 @@ ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl converge --apply'
 ```
 
 `converge` is what `gui/$UID/io.github.hughesyadaddy.deskflow-converge`
-runs every 60 s: it re-renders stale plists, `launchctl enable`s and
-bootstraps unloaded agents, kickstarts loaded-but-dead ones, and never kills
-anything. It stays quiet while any of these hold:
+runs every 60 s -- from the launchd-safe copy `~/Library/Deskflow/bin/deskflow-ctl`,
+never the checkout (see 1d): it re-renders stale plists, `launchctl enable`s
+and bootstraps unloaded agents, kickstarts loaded-but-dead ones, and never
+kills anything. It refuses to bootstrap/kickstart a core or GUI while a
+process launchd does not own is already running (`refused ... already running
+outside launchd`, exit 1: that is the duplicate-core path) and holds the GUI
+while the core is refused. The refusal names the remedy that works, per pid:
+this user's -> `deskflow-ctl stop` then `start` (`stop` TERM/KILLs every
+`deskflow-core`/`Deskflow` of this user from *any* path, a dev build or
+`Deskflow.app.bak` included, logging each pid with its path); another uid's
+-> the exact `sudo kill <pid>  # <path>` line, which `stop` never signals and
+exits 1 on instead of claiming "stopped". A plist re-rendered while its label
+is loaded is only a pending change (`render ... (takes effect at next
+deskflow-ctl start/restart)`, then `rebootstrap ...` and `needs_rebootstrap:
+true` in `health.json` until `start`/`restart` replaces launchd's loaded
+definition; the tick never boots a loaded label out). It stays quiet while any
+of these hold:
 
 - `~/Library/Application Support/Deskflow/quit-intent` is newer than the last
   boot (written by tray Quit and `deskflow-ctl stop`; removed by
@@ -68,6 +82,8 @@ anything. It stays quiet while any of these hold:
 - `~/Library/Deskflow/deploy.lock` is younger than 30 min (`install-macos.sh`).
 - 3 start actions already happened in the last hour (report-only after that;
   `health.json` says `action budget exhausted`, and `converge --apply` exits 1).
+- its own agent cannot run its program (`converge agent cannot execute its
+  program (TCC): <path>`; report-only, exit 1, until `deskflow-ctl start`) -- 1d.
 
 State: `~/Library/Application Support/Deskflow/health.json` (counts, plan,
 actions, assert-single) and `~/Library/Logs/Deskflow/converge.log`. A toast
@@ -83,6 +99,73 @@ lock/unlock/wake and at core start.
 ```bash
 ssh <mac> 'sudo launchctl kickstart -k loginwindow/org.deskflow.vhid-bridge'
 ```
+
+### 1d. The self-heal tick is dead: converge exit 126 / "Operation not permitted"
+
+Symptom (macbookpro, 2026-09-25): `launchctl print gui/$UID/io.github.hughesyadaddy.deskflow-converge`
+shows `state = not running`, `last exit code = 126` and `runs` climbing once a
+minute; `~/Library/Logs/Deskflow/converge.log` is nothing but
+
+```
+/bin/bash: /Users/alexhughes/Desktop/deskflow/scripts/deskflow-ctl: Operation not permitted
+```
+
+and `~/Library/Application Support/Deskflow/health.json` never appears.
+`deskflow-ctl assert-single` / `converge` print `converge agent cannot execute
+its program (TCC): <path>` and `tools/fleet-health --check converge` FAILs.
+
+Cause: the agent's `ProgramArguments` named the checkout under `~/Desktop`.
+macOS TCC (Files and Folders) guards `~/Desktop`, `~/Documents` and
+`~/Downloads` per *consenting app*; a launchd job has no app to consent for
+it, so `bash` gets EPERM opening the script -- no prompt, exit 126 -- and the
+tick had been dead since deploy. Hand runs never showed it: Remote Login
+grants `sshd` Full Disk Access and Terminal has its own grant, so every
+`ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl ...'` worked.
+
+Fix (in `deskflow-ctl start` from this branch): the tick runs the launchd-safe
+copy `~/Library/Deskflow/bin/deskflow-ctl` (+ `launchd/` templates +
+`fleet-soak`), refreshed by `deskflow-ctl start` / `safe-copy`
+(diff-and-replace, 755/644) and by `install-macos.sh`; the converge, soak and
+prio renders never contain a checkout path (`render-plist` refuses one; the
+refusal list is canonical and case-insensitive -- `~/desktop`,
+`~/Library/../Desktop`, a symlink into `~/Desktop`, iCloud Drive and
+`/Volumes` count), and `start` appends a marker to `converge.log` so the old
+EPERM block stops counting as evidence. `start` compares what launchd LOADED
+for each label (`launchctl print` argv + environment) with the fresh render:
+only a label whose loaded definition differs is booted out and bootstrapped
+again (here the converge label, still holding the checkout path); a current
+core/GUI is only kickstarted. A `converge --apply` by hand (1b) re-renders the
+FILE but cannot replace the loaded definition, so on its own it changes
+nothing -- `start` (or `restart`) is the repair. On the seat:
+
+```bash
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl start'   # refreshes ~/Library/Deskflow/bin, re-renders, boots out + bootstraps the converge label (loaded definition differed), kickstarts core + GUI
+ssh <mac> 'launchctl print gui/$(id -u)/io.github.hughesyadaddy.deskflow-converge | grep -E "Deskflow/bin|state|last exit"'   # arguments now name ~/Library/Deskflow/bin/deskflow-ctl; last exit code 0 after the next tick
+ssh <mac> 'tail -3 ~/Library/Logs/Deskflow/converge.log; ls -l ~/Library/Application\ Support/Deskflow/health.json'   # health.json rewritten every minute
+ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl assert-single'   # OK: no "cannot execute its program", no "rebootstrap" pending
+tools/fleet-health --check converge --host <mac>
+```
+
+What the 2026-09-25 review established about duplicate cores: on macbookpro
+the tick had exited 126 since install -- it never ran, so it never spawned
+anything; the converge design's own gap was latent (a tick that *could* run
+decided from launchd's view only, "label not loaded" or "loaded, no pid", and
+would have bootstrapped / kickstarted launchd's core next to a core that was
+already running: the GUI's own child on the old build, an orphan, a copy still
+exiting after a `bootout`). The path that does start a core without looking
+at the process table is the GUI's own `kickstartExternalCore`
+(`src/lib/gui/core/CoreProcess.cpp`, `launchctl kickstart -k`; follow-up in
+the plan). `converge`, `start` and `restart` now consult the process table
+first and refuse with `refused kickstart io.github.hughesyadaddy.deskflow-core:
+deskflow-core pid N already running outside launchd; deskflow-ctl stop (...)
+first, then start` (exit 1, no `launchctl` call, no budget spent); `stop`
+clears every `deskflow-core`/`Deskflow` of this user from any path (TERM,
+then KILL, each pid logged with its path) and names another uid's with the
+exact `sudo kill <pid>` line (exit 1, never "stopped"). `start` also waits
+for the old pid to exit after a `bootout` (launchd SIGKILLs at its 5 s exit
+timeout) before bootstrapping the fresh render. Never re-enable a converge
+agent whose program is under `~/Desktop`, `~/Documents`, `~/Downloads`,
+iCloud Drive or `/Volumes`.
 
 ## 2. Redeploy one seat from the branch
 
@@ -217,7 +300,8 @@ and `ALL_OK=0` on any ad-hoc, non-hardened, or settings mismatch.
 ssh tiny11 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\alexh\Desktop\deskflow\scripts\deskflow-ctl.ps1 assert-single'
 ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl assert-single'
 ssh <mac> '~/Desktop/deskflow/scripts/deskflow-ctl converge'        # plan must be empty, assert-single OK
-ssh <mac> 'launchctl print gui/$(id -u)/io.github.hughesyadaddy.deskflow-converge | grep -E "state|last exit"'
+ssh <mac> 'launchctl print gui/$(id -u)/io.github.hughesyadaddy.deskflow-converge | grep -E "Deskflow/bin|state|last exit"'   # program = ~/Library/Deskflow/bin/deskflow-ctl, never exit 126 (1d)
+tools/fleet-health --check converge --host <mac>   # tick loaded + executable (no TCC EPERM), health.json fresh, no installed plist under ~/Desktop|Documents|Downloads
 # signatures + TCC + Mouser bridge + LoginWindow bridge
 tools/fleet-health --check all --host all
 tools/fleet-health --check loginbridge --host <mac>   # plist lints, program = installed bundle, log 600, 0 keystrokes;
@@ -226,9 +310,10 @@ tools/fleet-health --check loginbridge --host <mac>   # plist lints, program = i
 # ≤0.1 MB/h; leak-class counts flat). Install the sampler once per Mac seat
 # (user agent; recipe in tools/launchd/com.fleet.soak.plist; --heap-classes
 # needs the sudoers line from docs/runbooks/mouser-heap-classes-soak.md):
-ssh <mac> 'cd ~/Desktop/deskflow && sed -e "s#__REPO__#$PWD#g" -e "s#__HOME__#$HOME#g" tools/launchd/com.fleet.soak.plist > ~/Library/LaunchAgents/com.fleet.soak.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet.soak.plist; launchctl kickstart gui/$(id -u)/com.fleet.soak'
+# (runs from ~/Library/Deskflow/bin and writes ~/Library/Deskflow/soak -- a launchd job cannot read ~/Desktop, see 1d)
+ssh <mac> 'cd ~/Desktop/deskflow && scripts/deskflow-ctl safe-copy && scripts/deskflow-ctl render-plist com.fleet.soak > ~/Library/LaunchAgents/com.fleet.soak.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet.soak.plist; launchctl kickstart gui/$(id -u)/com.fleet.soak'
 # after ≥24 h (72 h for the full contract), on each Mac:
-ssh <mac> 'cd ~/Desktop/deskflow && tools/fleet-soak report --in harness/soak/latest/$(hostname -s | tr A-Z a-z)-mouser.jsonl --proc mouser --window 24 --min-hours 24 --slope-max 0.1 --cap 200 --class-slope-max 10'
+ssh <mac> 'cd ~/Desktop/deskflow && tools/fleet-soak report --in ~/Library/Deskflow/soak/latest/$(hostname -s | tr A-Z a-z)-mouser.jsonl --proc mouser --window 24 --min-hours 24 --slope-max 0.1 --cap 200 --class-slope-max 10'
 ssh <mac> 'grep "\[mem\]" ~/Library/Logs/Mouser/mouser.log | tail -3'   # growth_mb_h and passthrough_guard_skipped
 # capitalization + stuck keys
 ssh <mac> 'grep -c "stuck-release" ~/Library/Deskflow/deskflow-core.log'           # want 0
@@ -266,6 +351,7 @@ the seat deploy above.
 | Mouser lock | `~/Library/Application Support/Mouser/mouser.lock`; Windows mutex `Local\MouserSingleInstance` |
 | launchd agents | `~/Library/LaunchAgents/io.github.hughesyadaddy.{deskflow,deskflow-core,deskflow-converge,mouser}.plist`, `/Library/LaunchAgents/org.deskflow.vhid-bridge.plist`, `/Library/LaunchDaemons/io.github.hughesyadaddy.deskflow-prio.plist` |
 | converge state | `~/Library/Application Support/Deskflow/{health.json,quit-intent,converge-actions}`, `~/Library/Deskflow/deploy.lock` (install in progress), `~/Library/Logs/Deskflow/converge.log` |
+| launchd-safe ctl copy | `~/Library/Deskflow/bin/{deskflow-ctl,fleet-soak,launchd/*.plist}` -- what the converge/soak agents execute (`deskflow-ctl start`/`safe-copy` refresh it; never a checkout path: TCC gives launchd EPERM under `~/Desktop`); soak output `~/Library/Deskflow/soak/` |
 | Bridge plist generator | `scripts/install-login-bridge-macos.sh` (`--dry-run` prints the plist; run under `sudo` over ssh; the GUI calls the same script) |
 | Windows service | `Deskflow` (`deskflow-daemon.exe`, LocalSystem); GUI + Mouser via HKCU Run |
 | Mouser⇄Deskflow bridge | Mouser listens `127.0.0.1:19795`; token `~/Library/Application Support/Mouser/bridge.token` / `%APPDATA%\Mouser\bridge.token` |

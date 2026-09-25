@@ -19,6 +19,16 @@
 
   Set FLEET_DESKFLOW_CHECKOUT below if the repo lives somewhere other than
   ~/Desktop/deskflow. A missed slot (machine asleep) runs at next wake.
+
+  TCC (2026-09-25): a launchd job gets EPERM (no prompt, exit 126) on
+  anything under ~/Desktop, ~/Documents or ~/Downloads, so this job CANNOT
+  run from the default ~/Desktop/deskflow checkout -- it rebuilds, so it
+  cannot move to the launchd-safe copy either. Point FLEET_DESKFLOW_CHECKOUT
+  (EnvironmentVariables) at a clone outside those folders, e.g.
+  ~/Projects/deskflow, before installing; `deskflow-ctl render-plist
+  com.fleet.selftest` refuses to render the default, and
+  `tools/fleet-health --check converge` flags any installed plist that still
+  points there.
 -->
 <plist version="1.0">
 <dict>
