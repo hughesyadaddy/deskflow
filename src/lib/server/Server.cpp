@@ -2294,18 +2294,24 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
   // Keyboard rescue: a burst of plain Esc downs, decided once it has ended
   // (5..9 = restart every seat's core, 10+ = stop everything everywhere).
   // Nothing fires on a press; the settle timer calls settleEscBurst().
-  if (const auto closed = m_escTapRescue.noteKeyDown(id, mask); closed != deskflow::coordination::RescueAction::None) {
+  // (In auto mode the coordinator's off-loop monitor counts the same taps;
+  // the coordinator dedupes the two requests. This on-loop counter keeps
+  // the ledger release and the swallowing, and is the only counter in
+  // plain --server mode.)
+  const auto closed = m_escTapRescue.noteKeyDown(id, mask);
+  if (m_escTapRescue.pending()) {
+    // Also when this press closed a stale burst: it opened the next one.
+    armEscBurstTimer();
+  }
+  if (closed != deskflow::coordination::RescueAction::None) {
     // A stale burst the timer missed: its decision is still owed.
     fireEscRescue(closed);
     return;
   }
-  if (m_escTapRescue.pending()) {
-    armEscBurstTimer();
-    if (m_escTapRescue.swallowing()) {
-      // From the 5th tap on this is a rescue in progress: the Esc that
-      // completes it and every later one in the burst stay off the wire.
-      return;
-    }
+  if (m_escTapRescue.pending() && m_escTapRescue.swallowing()) {
+    // From the 5th tap on this is a rescue in progress: the Esc that
+    // completes it and every later one in the burst stay off the wire.
+    return;
   }
 
   // Deferred Super (chord screens only): hold back the Super down until we

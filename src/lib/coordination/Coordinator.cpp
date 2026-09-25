@@ -15,6 +15,7 @@
 #include "coordination/CoordinationProtocol.h"
 #include "coordination/FleetStateMerge.h"
 #include "coordination/KeyboardRescue.h"
+#include "common/ExitCodes.h"
 #include "coordination/KeyboardRouter.h"
 #include "coordination/RelayKeyEvent.h"
 #include "coordination/WakeOnLan.h"
@@ -70,8 +71,10 @@ RelayKeyEvent relayEventFromMessage(const Message &message)
 
 Coordinator::Coordinator(CoordinatorConfig config)
     : m_config(std::move(config)),
+      m_peerAllowlist(peerAddressEntries(m_config.peers)),
       m_election(m_config.selfName, m_config.tuning, monotonicSeconds),
-      m_escSettleTimer([this] { settleEscBurst(); })
+      m_escSettleTimer([this] { settleEscBurst(); }),
+      m_rescueWatchdog([this](int code, const std::string &reason) { exitProcess(code, reason); })
 {
   m_fleetState.peers.reserve(m_config.peers.size());
   for (const auto &peer : m_config.peers) {
@@ -142,8 +145,12 @@ bool Coordinator::start()
   for (auto &[name, outbox] : m_outboxes) {
     outbox->start();
   }
+  // The Esc rescue counter lives on the monitor's thread in every role:
+  // the core event loop may be the very thing that is wedged.
+  m_inputMonitor->setKeyDownSink([this](KeyID id, KeyModifierMask mask) { onLocalKeyDown(id, mask); });
   m_inputMonitor->start([this] { onGenuineInput(); });
   m_startedAt = monotonicSeconds();
+  m_peerAllowlist.start(m_startedAt);
   m_workerStop = false;
   m_worker = std::thread([this] { workerLoop(); });
   // Settle every lane's reachability early so the first key forward does
@@ -164,10 +171,15 @@ void Coordinator::stop()
     g_rescueCoordinator = nullptr;
   }
   m_escSettleTimer.cancel();
+  m_rescueWatchdog.cancel();
   {
     std::scoped_lock lock{m_mutex};
     m_workerStop = true;
     m_quit = true;
+    if (m_events != nullptr && m_probeHandlerInstalled) {
+      m_events->removeHandler(EventTypes::CoordinationRescueProbe, m_events->getSystemTarget());
+      m_probeHandlerInstalled = false;
+    }
   }
   m_workerWake.notify_all();
   m_decisionReady.notify_all();
@@ -180,6 +192,7 @@ void Coordinator::stop()
     outbox->stop(); // before the mesh: lanes send through it
   }
   m_mesh->stop();
+  m_peerAllowlist.stop();
 }
 
 RoleDecision Coordinator::awaitRoleDecision()
@@ -245,7 +258,18 @@ bool Coordinator::hasPendingDecision()
 void Coordinator::setEventQueue(IEventQueue *events)
 {
   std::scoped_lock lock{m_mutex};
+  if (m_events != nullptr && m_probeHandlerInstalled) {
+    m_events->removeHandler(EventTypes::CoordinationRescueProbe, m_events->getSystemTarget());
+    m_probeHandlerInstalled = false;
+  }
   m_events = events;
+  if (m_events != nullptr) {
+    // Dispatched only by a live core event loop (see armRescueAckWatchdog).
+    m_events->addHandler(EventTypes::CoordinationRescueProbe, m_events->getSystemTarget(), [this](const Event &) {
+      onRescueProbeProcessed();
+    });
+    m_probeHandlerInstalled = true;
+  }
 }
 
 void Coordinator::setRunningRole(Role role)
@@ -614,6 +638,9 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
     break;
 
   case Message::Type::Rescue: {
+    if (!sourceAllowed(message, "rescue")) {
+      break;
+    }
     {
       std::scoped_lock lock{m_mutex};
       const double now = monotonicSeconds();
@@ -631,6 +658,9 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
   }
 
   case Message::Type::StopAll:
+    if (!sourceAllowed(message, "stop-all")) {
+      break;
+    }
     // Never re-broadcast (the originator fanned out); requestLocalStopAll
     // itself ignores repeats, so duplicate deliveries cannot loop.
     LOG_INFO("coordination: fleet stop-all received -- stopping every Deskflow instance and service here");
@@ -790,27 +820,17 @@ KeyForwardResult Coordinator::sendKeyForward(
     return KeyForwardResult::Local;
   }
 
-  // Observe Downs (including when routing is Local) so the Esc rescue still
-  // works while the cursor is on this machine. Nothing fires on a press:
-  // the burst is decided once it has ended (RescueBurst; the settle timer
-  // calls settleEscBurst). From the 5th tap on the burst is a rescue in
-  // progress, so those Escs are Swallowed = eaten WITHOUT recording them as
-  // held on a peer (their Ups then stay local).
-  if (phase == Message::KeyPhase::Down) {
-    RescueAction closed = RescueAction::None;
+  // The Esc burst is COUNTED by the local input monitor (onLocalKeyDown,
+  // every role, off the event loop), never here. This path only keeps a
+  // rescue in progress off the wire: from the 5th tap on, plain Esc downs
+  // are Swallowed = eaten WITHOUT recording them as held on a peer (their
+  // Ups then stay local).
+  if (phase == Message::KeyPhase::Down && id == kKeyEscape) {
+    constexpr KeyModifierMask chordMods = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
     bool swallow = false;
-    {
+    if ((mask & chordMods) == 0) {
       std::scoped_lock lock{m_mutex};
-      const auto now = EscTapRescue::Clock::now();
-      closed = m_escTapRescue.noteKeyDown(id, mask, now);
       swallow = m_escTapRescue.swallowing();
-      if (m_escTapRescue.pending()) {
-        m_escSettleTimer.arm(m_escTapRescue.deadline());
-      }
-    }
-    if (closed != RescueAction::None) {
-      // A stale burst the settle timer missed: its decision is still owed.
-      fireRescueAction(closed);
     }
     if (swallow) {
       return KeyForwardResult::Swallowed;
@@ -931,16 +951,24 @@ void Coordinator::requestLocalCoreRestart()
 
 void Coordinator::requestFleetRescue()
 {
-  LOG_INFO("coordination: fleet keyboard rescue -- restarting every peer");
   std::string line;
   {
     std::scoped_lock lock{m_mutex};
     if (m_quit) {
       return;
     }
+    const double now = monotonicSeconds();
+    if (now - m_lastFleetRescueAt < kFleetRescueDedupeS) {
+      // The off-loop monitor counter and the Server's on-loop counter both
+      // saw this burst; one fleet restart is enough.
+      LOG_DEBUG("coordination: fleet rescue already requested %.1f s ago; ignoring repeat", now - m_lastFleetRescueAt);
+      return;
+    }
+    m_lastFleetRescueAt = now;
     line = protocol::encodeRescue(m_config.token);
     m_rescueTimes.push_back(std::chrono::steady_clock::now());
   }
+  LOG_INFO("coordination: fleet keyboard rescue -- restarting every peer");
   // Boundary (I4): nothing forwarded before the rescue is worth delivering
   // after it. Queued keys would land on a restarting peer as phantom
   // Downs, and every forwarded hold is re-labelled Local so its Up passes
@@ -975,6 +1003,7 @@ void Coordinator::fireRescueAction(RescueAction action)
     // machine is usually a different one.
     LOG_INFO("keyboard rescue: 5x Esc burst ended -- requesting a fleet restart");
     requestFleetRescue();
+    armRescueAckWatchdog();
     break;
   case RescueAction::StopAll:
     LOG_INFO("keyboard rescue: 10x Esc burst ended -- requesting a fleet stop-all");
@@ -1024,13 +1053,105 @@ void Coordinator::requestLocalStopAll()
   runLocalStopAll();
 }
 
-void Coordinator::runLocalStopAll()
+bool Coordinator::runLocalStopAll()
 {
+  bool started = true;
   if (m_localStopAllHook) {
     m_localStopAllHook();
+  } else {
+    started = deskflow::coordination::requestLocalStopAll(m_config.selfName);
+  }
+  if (!started) {
+    // Nothing could be started (no executor registered): a later 10x Esc
+    // must be allowed to try again rather than be swallowed forever.
+    std::scoped_lock lock{m_mutex};
+    m_stopAllTriggered = false;
+  }
+  return started;
+}
+
+void Coordinator::onLocalKeyDown(KeyID id, KeyModifierMask mask)
+{
+  RescueAction closed = RescueAction::None;
+  {
+    std::scoped_lock lock{m_mutex};
+    if (m_quit) {
+      return;
+    }
+    closed = m_escTapRescue.noteKeyDown(id, mask);
+    if (m_escTapRescue.pending()) {
+      // Also after a late press closed a stale burst: it opened a new one.
+      m_escSettleTimer.arm(m_escTapRescue.deadline());
+    }
+  }
+  if (closed != RescueAction::None) {
+    // A stale burst the settle timer missed: its decision is still owed.
+    fireRescueAction(closed);
+  }
+}
+
+void Coordinator::armRescueAckWatchdog()
+{
+  IEventQueue *events = nullptr;
+  {
+    std::scoped_lock lock{m_mutex};
+    events = m_events;
+  }
+  if (events == nullptr) {
+    LOG_DEBUG("keyboard rescue: no event queue to probe; skipping the liveness watchdog");
     return;
   }
-  deskflow::coordination::requestLocalStopAll(m_config.selfName);
+  // The restart request itself never needs the core event loop (peers via
+  // the lanes, the local restart via the IPC thread), but a seat whose
+  // loop is wedged would keep running as a dead server. The probe is
+  // dispatched only by a live loop; a wedged one never gets to it, and
+  // the process hard-exits non-zero so launchd KeepAlive / the daemon
+  // relaunch the core -- a hung server must always come back on 5x Esc.
+  m_rescueWatchdog.arm(
+      m_rescueAckTimeout, s_exitFailed, "the core event loop did not acknowledge the 5x Esc rescue in time"
+  );
+  events->addEvent(Event(EventTypes::CoordinationRescueProbe, events->getSystemTarget()));
+}
+
+void Coordinator::onRescueProbeProcessed()
+{
+  if (m_rescueWatchdog.armed()) {
+    LOG_INFO("keyboard rescue: the core event loop acknowledged the restart request");
+  }
+  m_rescueWatchdog.cancel();
+}
+
+void Coordinator::exitProcess(int code, const std::string &reason)
+{
+  if (m_exitProcessHook) {
+    m_exitProcessHook(code);
+    return;
+  }
+  hardExit(code, reason);
+}
+
+bool Coordinator::sourceAllowed(const Message &message, const char *kind)
+{
+  if (!message.sourceAddress.empty() && m_peerAllowlist.allows(message.sourceAddress)) {
+    return true;
+  }
+  LOG_WARN(
+      "coordination: dropping fleet %s from %s: not an address of a configured peer", kind,
+      message.sourceAddress.empty() ? "<unknown source>" : message.sourceAddress.c_str()
+  );
+  // A peer's address may have changed: re-resolve early (off this thread).
+  m_peerAllowlist.noteMiss(monotonicSeconds());
+  return false;
+}
+
+std::vector<std::string> Coordinator::peerAddressEntries(const PeerList &peers)
+{
+  std::vector<std::string> entries;
+  for (const auto &peer : peers) {
+    entries.push_back(peer.ip);
+    entries.push_back(peer.lan);
+  }
+  return entries;
 }
 
 bool Coordinator::isKnownPeer(const std::string &name) const
@@ -1203,6 +1324,7 @@ void Coordinator::workerLoop()
     }
     ++tick;
     const double now = monotonicSeconds();
+    m_peerAllowlist.refreshIfDue(now);
     if (broadcastNow) {
       broadcastClaim();
       lastHeartbeatAt = now;

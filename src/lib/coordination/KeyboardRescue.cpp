@@ -9,7 +9,14 @@
 #include "base/Log.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <utility>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace deskflow::coordination {
 
@@ -43,7 +50,7 @@ RescueAction RescueBurst::actionFor(int count)
 RescueAction RescueBurst::observeEsc(int64_t nowMs)
 {
   RescueAction closed = RescueAction::None;
-  if (m_count > 0 && nowMs - m_lastMs > kMaxGapMs) {
+  if (m_count > 0 && nowMs - m_lastMs >= kSettleMs) {
     // The previous burst ended without a settle poll (late timer): its
     // decision belongs to it, not to the press that starts the next one.
     closed = actionFor(m_count);
@@ -216,6 +223,129 @@ void RescueSettleTimer::loop()
 }
 
 //
+// ExitWatchdog
+//
+
+ExitWatchdog::ExitWatchdog(ExitFn exitFn) : m_exitFn(std::move(exitFn))
+{
+  if (!m_exitFn) {
+    m_exitFn = [](int code, const std::string &reason) { hardExit(code, reason); };
+  }
+}
+
+ExitWatchdog::~ExitWatchdog()
+{
+  {
+    std::scoped_lock lock{m_mutex};
+    m_stop = true;
+  }
+  m_wake.notify_all();
+  if (m_thread.joinable()) {
+    m_thread.join();
+  }
+}
+
+void ExitWatchdog::arm(std::chrono::milliseconds delay, int code, std::string reason)
+{
+  {
+    std::scoped_lock lock{m_mutex};
+    if (m_stop) {
+      return;
+    }
+    m_deadline = Clock::now() + delay;
+    m_code = code;
+    m_reason = std::move(reason);
+    if (!m_thread.joinable()) {
+      m_thread = std::thread([this] { loop(); });
+    }
+  }
+  m_wake.notify_all();
+}
+
+void ExitWatchdog::cancel()
+{
+  {
+    std::scoped_lock lock{m_mutex};
+    m_deadline.reset();
+  }
+  m_wake.notify_all();
+}
+
+bool ExitWatchdog::armed() const
+{
+  std::scoped_lock lock{m_mutex};
+  return m_deadline.has_value();
+}
+
+void ExitWatchdog::loop()
+{
+  std::unique_lock lock{m_mutex};
+  while (!m_stop) {
+    if (!m_deadline) {
+      m_wake.wait(lock, [this] { return m_stop || m_deadline.has_value(); });
+      continue;
+    }
+    const auto deadline = *m_deadline;
+    if (Clock::now() < deadline) {
+      m_wake.wait_until(lock, deadline, [this, deadline] { return m_stop || m_deadline != deadline; });
+      continue;
+    }
+    m_deadline.reset();
+    const int code = m_code;
+    const std::string reason = m_reason;
+    lock.unlock();
+    m_exitFn(code, reason);
+    lock.lock();
+  }
+}
+
+//
+// Process exit helpers
+//
+
+namespace {
+
+std::mutex g_processExitMutex;
+ProcessExitFn g_processExitForTests;
+
+} // namespace
+
+void hardExit(int code, const std::string &reason)
+{
+  // The logger may be blocked on the very wedge being escaped: a second
+  // thread exits regardless one second later.
+  std::thread([code] {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    _exit(code);
+  }).detach();
+  LOG_ERR("[rescue] %s; exiting with %d so the supervisor relaunches this core", reason.c_str(), code);
+  _exit(code);
+}
+
+void setProcessExitHandlerForTests(ProcessExitFn fn)
+{
+  std::scoped_lock lock{g_processExitMutex};
+  g_processExitForTests = std::move(fn);
+}
+
+void armProcessExitFallback(std::chrono::milliseconds delay, int code, std::string reason)
+{
+  std::thread([delay, code, reason = std::move(reason)] {
+    std::this_thread::sleep_for(delay);
+    ProcessExitFn exitFn;
+    {
+      std::scoped_lock lock{g_processExitMutex};
+      exitFn = g_processExitForTests;
+    }
+    if (exitFn) {
+      exitFn(code, reason);
+      return;
+    }
+    hardExit(code, reason);
+  }).detach();
+}
+
+//
 // Process-wide hooks
 //
 
@@ -295,11 +425,11 @@ void resetStopAllStateForTests()
   g_stopAllInProgress = false;
 }
 
-void requestLocalStopAll(const std::string &seat)
+bool requestLocalStopAll(const std::string &seat)
 {
   if (g_stopAllInProgress.exchange(true)) {
     LOG_INFO("[rescue] stop-all already in progress on %s; ignoring repeat", seat.c_str());
-    return;
+    return true;
   }
   // The WARNING line goes first on every seat, before anything is touched.
   LOG_WARN("[rescue] 10x Esc: stopping ALL Deskflow instances and services on %s", seat.c_str());
@@ -311,11 +441,14 @@ void requestLocalStopAll(const std::string &seat)
   if (!handler) {
     LOG_ERR("[rescue] no local stop-all executor registered on %s; nothing stopped", seat.c_str());
     g_stopAllInProgress = false;
-    return;
+    return false;
   }
   // Off the caller's thread: this may run inside an OS input hook or the
-  // core event loop, and the executor spawns processes and waits.
+  // core event loop, and the executor spawns processes and waits. The
+  // executor never depends on the event loop (a wedged loop is the case
+  // this gesture exists for).
   std::thread([handler, seat] { handler(seat); }).detach();
+  return true;
 }
 
 void setLocalCoreQuitHandler(LocalCoreQuitFn fn)

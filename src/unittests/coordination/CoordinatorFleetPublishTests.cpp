@@ -442,12 +442,16 @@ void CoordinatorFleetPublishTests::fiveEsc_requestsLocalCoreRestart()
   coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
   QVERIFY(!coordinator.relayPassThroughLocal());
 
+  coordinator.m_exitProcessHook = [](int) {};
   for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
-    // Taps 1–4 still attempt forward (return depends on mesh reachability).
+    // The monitor counts (off the loop); taps 1–4 still attempt forward
+    // (return depends on mesh reachability).
+    coordinator.onLocalKeyDown(kKeyEscape, 0);
     coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en");
     QCOMPARE(restartCalls, 0);
   }
   // Fifth Esc: swallowed; the restart waits for the burst to end.
+  coordinator.onLocalKeyDown(kKeyEscape, 0);
   QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"), KeyForwardResult::Swallowed);
   QCOMPARE(restartCalls, 0);
   coordinator.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
@@ -480,10 +484,13 @@ void CoordinatorFleetPublishTests::fiveEsc_localPass_requestsLocalCoreRestart()
   coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
   QVERIFY(coordinator.relayPassThroughLocal());
 
+  coordinator.m_exitProcessHook = [](int) {};
   for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
+    coordinator.onLocalKeyDown(kKeyEscape, 0);
     QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"), KeyForwardResult::Local);
     QCOMPARE(restartCalls, 0);
   }
+  coordinator.onLocalKeyDown(kKeyEscape, 0);
   QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en"), KeyForwardResult::Swallowed);
   QCOMPARE(restartCalls, 0);
   coordinator.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
@@ -515,8 +522,10 @@ void CoordinatorFleetPublishTests::fiveEsc_repeatPhase_doesNotRestart()
   inbound.screens = {FleetScreen{"hackintosh"}, FleetScreen{"macbookpro"}};
   coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
 
+  // Repeats never reach the monitor's sink, and the relay never counts:
+  // ten Esc repeats are nothing.
   for (int i = 0; i < deskflow::coordination::RescueBurst::kStopAllTaps; ++i) {
-    coordinator.sendKeyForward(Message::KeyPhase::Repeat, kKeyEscape, 0, 1, "en");
+    QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Repeat, kKeyEscape, 0, 1, "en"), KeyForwardResult::Local);
   }
   coordinator.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
   QCOMPARE(restartCalls, 0);
@@ -549,8 +558,10 @@ void CoordinatorFleetPublishTests::tenEsc_requestsFleetStopAllNotRestart()
   inbound.screens = {FleetScreen{"hackintosh"}, FleetScreen{"macbookpro"}};
   coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
 
+  coordinator.m_exitProcessHook = [](int) {};
   // Exactly ten: never a restart on the way, and the tail is swallowed.
   for (int i = 0; i < deskflow::coordination::RescueBurst::kStopAllTaps; ++i) {
+    coordinator.onLocalKeyDown(kKeyEscape, 0);
     const auto result = coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en");
     if (i >= deskflow::coordination::RescueBurst::kRestartTaps - 1) {
       QCOMPARE(result, KeyForwardResult::Swallowed);

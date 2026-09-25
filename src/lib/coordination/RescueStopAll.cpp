@@ -30,6 +30,15 @@ void terminateStrays(IStopAllCommands &commands)
   }
 }
 
+//! Leave through the real quit path, and hard-exit if that never lands
+//! (SIGTERM alone only ends an epoch; a wedged loop swallows even the
+//! runner's quit).
+void quitForReal(IStopAllCommands &commands)
+{
+  commands.quitSelf();
+  commands.armExitFallback(kQuitExitFallbackMs);
+}
+
 } // namespace
 
 void runMacStopAllSequence(IStopAllCommands &commands)
@@ -42,16 +51,17 @@ void runMacStopAllSequence(IStopAllCommands &commands)
   LOG_INFO("[rescue] the login-window bridge (org.deskflow.vhid-bridge) needs root and is left running");
 
   // 2. Prefer the canonical script: it is the one owner of the launchd
-  //    sequence and escalates by PID exactly like an operator would.
+  //    sequence and escalates by PID exactly like an operator would. It is
+  //    spawned detached and NOT waited for: it boots this core out as part
+  //    of its job, so we leave right away through the real quit path
+  //    instead of sitting in its TERM→KILL escalation.
   if (commands.canonicalStopAvailable()) {
-    LOG_INFO("[rescue] running the launchd-safe deskflow-ctl stop");
-    if (commands.runCanonicalStop()) {
-      // Every agent is booted out (including ours, normally: launchd's
-      // SIGTERM already ended the epoch loop). Not launchd-owned? Leave.
-      commands.quitSelf();
+    LOG_INFO("[rescue] spawning the launchd-safe deskflow-ctl stop");
+    if (commands.spawnCanonicalStop()) {
+      quitForReal(commands);
       return;
     }
-    LOG_WARN("[rescue] deskflow-ctl stop failed or timed out; falling back to the in-process sequence");
+    LOG_WARN("[rescue] deskflow-ctl stop could not be spawned; falling back to the in-process sequence");
   } else {
     LOG_INFO("[rescue] no launchd-safe deskflow-ctl copy; using the in-process sequence");
   }
@@ -61,9 +71,9 @@ void runMacStopAllSequence(IStopAllCommands &commands)
   commands.bootout(kMacGuiLabel, true);
   terminateStrays(commands);
   // Self last. launchd SIGTERMs us for this one, so never wait on it; the
-  // explicit quit below covers a core that launchd does not own (dev run).
+  // explicit quit covers a core that launchd does not own (dev run).
   commands.bootout(kMacCoreLabel, false);
-  commands.quitSelf();
+  quitForReal(commands);
 }
 
 } // namespace deskflow::coordination

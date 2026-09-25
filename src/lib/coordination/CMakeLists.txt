@@ -21,6 +21,8 @@ add_library(coordination STATIC
   LocalInputMonitor.h
   Peer.cpp
   Peer.h
+  PeerAddressAllowlist.cpp
+  PeerAddressAllowlist.h
   PreConnectHosts.cpp
   PreConnectHosts.h
   RelayKeyEvent.h

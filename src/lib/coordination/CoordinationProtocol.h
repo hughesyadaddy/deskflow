@@ -77,6 +77,10 @@ struct Message
   int meshVersion = 0;
   // fleet fragment (decoded from `fleet` messages)
   FleetFragment fleet;
+  //! Numeric address the line arrived from (set by the transport, never
+  //! decoded from the wire). Fleet-wide commands (`rescue`, `stopall`) are
+  //! accepted only from an address a configured peer resolves to.
+  std::string sourceAddress;
 };
 
 namespace protocol {

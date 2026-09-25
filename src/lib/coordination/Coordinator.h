@@ -14,6 +14,7 @@
 #include "coordination/KeyboardRescue.h"
 #include "coordination/LocalInputMonitor.h"
 #include "coordination/Peer.h"
+#include "coordination/PeerAddressAllowlist.h"
 #include "coordination/WedgeDetector.h"
 #include "deskflow/KeyTypes.h"
 
@@ -40,6 +41,13 @@ namespace deskflow::coordination {
 //! Mesh protocol version spoken by this build. Peers announcing a lower
 //! version in their hello are rejected; there is no v1 compatibility mode.
 inline constexpr int kMeshProtocolVersion = 2;
+
+//! Grace for the core event loop to acknowledge an off-loop 5x Esc restart
+//! before the process hard-exits for a supervisor relaunch.
+inline constexpr std::chrono::milliseconds kRescueAckTimeout{3000};
+//! Two counters (off-loop monitor, on-loop Server) see the same taps: a
+//! second fleet rescue request inside this window is a duplicate.
+inline constexpr double kFleetRescueDedupeS = 5.0;
 
 //! Coordinator configuration (from Settings; see design.md).
 struct CoordinatorConfig
@@ -225,13 +233,28 @@ private:
   sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
   void requestLocalCoreRestart();
   //! Stop this seat (m_localStopAllHook in tests, else the process-wide
-  //! executor); guarded so it runs at most once per process.
+  //! executor); guarded so it runs at most once per process. The guard is
+  //! released when no executor could be started, so a later burst retries.
   void requestLocalStopAll();
-  void runLocalStopAll();
+  bool runLocalStopAll();
+  //! A genuine (non-repeat) key down seen by the local input monitor, on
+  //! its thread, in EVERY role: the one Esc-burst counter of this process.
+  //! Never touches the core event loop (a wedged loop is what the gesture
+  //! is for).
+  void onLocalKeyDown(KeyID id, KeyModifierMask mask);
   //! Settle poll for the Esc burst (RescueSettleTimer thread, or tests
   //! with an injected clock): decides and fires the burst's action.
   void settleEscBurst(EscTapRescue::Clock::time_point now = EscTapRescue::Clock::now());
   void fireRescueAction(RescueAction action);
+  //! Off-loop restart: post a liveness probe to the core event loop and
+  //! hard-exit (supervisor relaunch) unless it is dispatched in time.
+  void armRescueAckWatchdog();
+  void onRescueProbeProcessed();
+  void exitProcess(int code, const std::string &reason);
+  //! Fleet-wide commands are accepted only from a configured peer's
+  //! address (see PeerAddressAllowlist); drops are logged once per line.
+  bool sourceAllowed(const Message &message, const char *kind);
+  static std::vector<std::string> peerAddressEntries(const PeerList &peers);
 
   bool isKnownPeer(const std::string &name) const;
   bool relayPassThroughLocal();
@@ -246,6 +269,8 @@ private:
   void clearVersionMismatch(const std::string &peerName);
 
   CoordinatorConfig m_config;
+  //! Addresses the configured peers resolve to (rescue/stop-all gating).
+  PeerAddressAllowlist m_peerAllowlist;
   std::unique_ptr<CoordinationMesh> m_mesh;
   //! One outbound lane per configured peer (self excluded), keyed by peer
   //! name. Declared after m_mesh: the lanes send through it and must be
@@ -293,6 +318,10 @@ private:
   std::map<std::string, int64_t> m_lastClaimSeqBySender;
   //! When the last fleet rescue was accepted (guarded by m_mutex).
   double m_lastRescueAt = -1.0e9;
+  //! When this seat last REQUESTED a fleet rescue (guarded by m_mutex):
+  //! the off-loop counter and the Server's on-loop counter see the same
+  //! taps, so the second request inside kFleetRescueDedupeS is dropped.
+  double m_lastFleetRescueAt = -1.0e9;
   std::function<void(const std::string &)> m_keyClearAllHandler; //!< guarded by m_mutex
   //! Esc burst counter (guarded by m_mutex; fed from the keyboard hook).
   EscTapRescue m_escTapRescue;
@@ -304,6 +333,14 @@ private:
   bool m_stopAllTriggered = false;
   //! Wakes settleEscBurst() once the burst has been silent for kSettleMs.
   RescueSettleTimer m_escSettleTimer;
+  //! Hard-exits the process when the event loop never acknowledges an
+  //! off-loop 5x Esc restart (CoordinationRescueProbe).
+  ExitWatchdog m_rescueWatchdog;
+  //! How long the loop gets to dispatch the probe (tests shrink it).
+  std::chrono::milliseconds m_rescueAckTimeout{kRescueAckTimeout};
+  //! When set (unit tests), used instead of hardExit().
+  std::function<void(int)> m_exitProcessHook;
+  bool m_probeHandlerInstalled = false; //!< guarded by m_mutex
   std::set<std::string> m_versionMismatchPeers;
   //! Last wake action per peer (rate limit; guarded by m_mutex).
   std::map<std::string, std::chrono::steady_clock::time_point> m_lastWakeAt;

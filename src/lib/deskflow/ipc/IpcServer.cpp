@@ -9,9 +9,12 @@
 #include "base/Log.h"
 #include "common/Constants.h"
 #include "common/VersionInfo.h"
+#include "coordination/KeyboardRescue.h"
 
 #include <QLocalServer>
 #include <QLocalSocket>
+
+#include <chrono>
 
 #if defined(Q_OS_WIN)
 #include <QCoreApplication>
@@ -321,6 +324,11 @@ void IpcServer::requestLocalStopAll()
       LOG_WARN("[rescue] still alive 5 s after asking the daemon; stopping the GUI and this core directly");
       terminateProcessesUnderRoot(L"deskflow.exe", QCoreApplication::applicationDirPath());
       requestStopProcess();
+      // The quit goes through the core event loop; a wedged loop must not
+      // keep this seat alive.
+      deskflow::coordination::armProcessExitFallback(
+          std::chrono::milliseconds(3000), 0, "stop-all: the event loop did not finish the quit in time"
+      );
     });
     return;
   }
@@ -331,6 +339,9 @@ void IpcServer::requestLocalStopAll()
   // GUI first: in Desktop process mode it would otherwise relaunch the core.
   terminateProcessesUnderRoot(L"deskflow.exe", QCoreApplication::applicationDirPath());
   requestStopProcess();
+  deskflow::coordination::armProcessExitFallback(
+      std::chrono::milliseconds(3000), 0, "stop-all: the event loop did not finish the quit in time"
+  );
 #else
   // macOS runs the launchd sequence in coordination/OSXRescueStopAll.mm;
   // nothing here owns a service on other platforms.

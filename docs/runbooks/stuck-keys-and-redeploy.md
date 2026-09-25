@@ -84,12 +84,13 @@ lock/unlock/wake and at core start.
 ssh <mac> 'sudo launchctl kickstart -k loginwindow/org.deskflow.vhid-bridge'
 ```
 
-### 1d. Keyboard rescue from any keyboard: 5×Esc restarts, 10×Esc stops everything
+### 1e. Keyboard rescue from any keyboard: 5×Esc restarts, 10×Esc stops everything
 
 Tap plain **Esc** (no Shift/Ctrl/Alt/Cmd; Caps/Num state is ignored) in a
-burst, each tap within 800 ms of the previous. The burst is decided **only
-once it has ended** (700 ms without another Esc) -- nothing fires on the 5th
-press, so heading for 10 never restarts you on the way:
+burst, each tap within 700 ms of the previous. The burst is decided **only
+once it has ended** (700 ms without another Esc; the same 700 ms is the join
+gap) -- nothing fires on the 5th press, so heading for 10 never restarts you
+on the way:
 
 | Taps in the burst | Effect on **every seat** (mesh broadcast; the seat that saw the taps included) |
 |---|---|
@@ -99,6 +100,22 @@ press, so heading for 10 never restarts you on the way:
 
 From the 5th tap on, the Escs stay off the wire (a rescue in progress is not
 typed into the remote app). A non-Esc key abandons the burst.
+
+The taps are counted **off the core event loop** in every role (macOS:
+the coordinator's listen-only event tap; Windows: its Raw Input sink) --
+a seat whose event loop is wedged is exactly the case this exists for. On a
+10×Esc the stop-all executor never touches that loop; on a 5×Esc the
+restart request goes out at once and the core hard-exits non-zero
+(`[rescue] ... exiting with 1`) if its loop has not acknowledged within 3 s,
+so launchd KeepAlive / the Windows service relaunch it. Plain
+`deskflow-core --server` (no coordinator) keeps only the on-loop counter.
+
+Trust: without a `[coordination] token`, `rescue`/`stopall` are accepted
+only from an address a configured peer resolves to (its LAN name and
+Tailscale FQDN entries, IPv4+IPv6, re-resolved every 5 min or after a
+miss); anything else is dropped with one `coordination: dropping fleet
+stop-all from <addr>` WARN. A shared token is stronger and, when set, is
+still required.
 
 What stop-all does per seat:
 

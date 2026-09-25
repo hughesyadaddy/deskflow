@@ -51,6 +51,11 @@ public:
     return true;
   }
 
+  void setKeyDownSink(KeyDownSink sink) override
+  {
+    m_keyDownSink = std::move(sink);
+  }
+
   void stop() override
   {
     m_running = false;
@@ -84,17 +89,55 @@ private:
     }
 
     const auto sourcePid = CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID);
-    if (sourcePid == 0 && !deskflow::platform::isInjectedEvent(event) && self->m_callback) {
+    if (sourcePid != 0 || deskflow::platform::isInjectedEvent(event)) {
+      return event;
+    }
+    if (type == kCGEventKeyDown) {
+      // Keys feed ONLY the Esc rescue counter (off the core event loop).
+      // They never count as genuine input for the election: a client
+      // seat's keyboard is relayed to the cursor host on purpose, and
+      // typing there must not promote that seat.
+      if (self->m_keyDownSink && CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) == 0) {
+        const auto keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        self->m_keyDownSink(keycode == kEscapeKeycode ? kKeyEscape : kKeyNone, maskFromFlags(CGEventGetFlags(event)));
+      }
+      return event;
+    }
+    if (self->m_callback) {
       self->m_callback();
     }
     return event;
+  }
+
+  //! ANSI/ISO keycode of Escape (layout independent).
+  static constexpr int64_t kEscapeKeycode = 53;
+
+  static KeyModifierMask maskFromFlags(CGEventFlags flags)
+  {
+    KeyModifierMask mask = 0;
+    if ((flags & kCGEventFlagMaskShift) != 0) {
+      mask |= KeyModifierShift;
+    }
+    if ((flags & kCGEventFlagMaskControl) != 0) {
+      mask |= KeyModifierControl;
+    }
+    if ((flags & kCGEventFlagMaskAlternate) != 0) {
+      mask |= KeyModifierAlt;
+    }
+    if ((flags & kCGEventFlagMaskCommand) != 0) {
+      mask |= KeyModifierSuper;
+    }
+    if ((flags & kCGEventFlagMaskAlphaShift) != 0) {
+      mask |= KeyModifierCapsLock;
+    }
+    return mask;
   }
 
   void runLoop()
   {
     const CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDown) |
                              CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown) |
-                             CGEventMaskBit(kCGEventScrollWheel);
+                             CGEventMaskBit(kCGEventScrollWheel) | CGEventMaskBit(kCGEventKeyDown);
 
     m_tap = CGEventTapCreate(
         kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask, tapCallback, this
@@ -148,6 +191,7 @@ private:
   }
 
   Callback m_callback;
+  KeyDownSink m_keyDownSink;
   std::thread m_thread;
   std::atomic<bool> m_running{false};
   std::atomic<bool> m_active{false}; //!< tap installed and pumping

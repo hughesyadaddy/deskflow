@@ -24,6 +24,7 @@ using deskflow::coordination::IStopAllCommands;
 using deskflow::coordination::kMacConvergeLabel;
 using deskflow::coordination::kMacCoreLabel;
 using deskflow::coordination::kMacGuiLabel;
+using deskflow::coordination::kQuitExitFallbackMs;
 using deskflow::coordination::kStrayTermGraceMs;
 using deskflow::coordination::runMacStopAllSequence;
 
@@ -53,7 +54,7 @@ struct RecordingCommands final : IStopAllCommands
     calls.push_back("canonical?");
     return canonicalAvailable;
   }
-  bool runCanonicalStop() override
+  bool spawnCanonicalStop() override
   {
     calls.push_back("canonical-stop");
     return canonicalOk;
@@ -81,6 +82,10 @@ struct RecordingCommands final : IStopAllCommands
   void quitSelf() override
   {
     calls.push_back("quit-self");
+  }
+  void armExitFallback(int ms) override
+  {
+    calls.push_back("exit-fallback " + std::to_string(ms));
   }
 };
 
@@ -152,6 +157,7 @@ void RescueStopAllTests::macSequence_fallbackOrder_quitIntentConvergeGuiStraysCo
       "kill 43",
       std::string("bootout ") + kMacCoreLabel + " (nowait)",
       "quit-self",
+      "exit-fallback " + std::to_string(kQuitExitFallbackMs),
   };
   QCOMPARE(joined(commands.calls), joined(expected));
 }
@@ -164,7 +170,12 @@ void RescueStopAllTests::macSequence_canonicalStop_runsScriptThenQuits()
 
   runMacStopAllSequence(commands);
 
-  const std::vector<std::string> expected = {"quit-intent", "canonical?", "canonical-stop", "quit-self"};
+  // The script is spawned and NOT waited for (it boots this core out as
+  // part of its job); we leave through the real quit path at once, with a
+  // bounded hard-exit behind it.
+  const std::vector<std::string> expected = {
+      "quit-intent", "canonical?", "canonical-stop", "quit-self", "exit-fallback " + std::to_string(kQuitExitFallbackMs)
+  };
   QCOMPARE(joined(commands.calls), joined(expected));
 }
 
@@ -186,6 +197,7 @@ void RescueStopAllTests::macSequence_canonicalFailure_fallsBackInProcess()
       "strays",
       std::string("bootout ") + kMacCoreLabel + " (nowait)",
       "quit-self",
+      "exit-fallback " + std::to_string(kQuitExitFallbackMs),
   };
   QCOMPARE(joined(commands.calls), joined(expected));
 }
@@ -198,7 +210,9 @@ void RescueStopAllTests::macSequence_noStrays_skipsTheGrace()
     QVERIFY2(call.rfind("sleep", 0) != 0, "no strays: the sequence must not pause");
     QVERIFY2(call.rfind("term", 0) != 0 && call.rfind("kill", 0) != 0, "no strays: nothing to signal");
   }
-  QCOMPARE(commands.calls.back(), std::string("quit-self"));
+  QVERIFY(commands.calls.size() >= 2);
+  QCOMPARE(commands.calls[commands.calls.size() - 2], std::string("quit-self"));
+  QCOMPARE(commands.calls.back(), "exit-fallback " + std::to_string(kQuitExitFallbackMs));
 }
 
 void RescueStopAllTests::requestLocalStopAll_runsExecutorOnceAndIgnoresRepeats()
@@ -213,11 +227,11 @@ void RescueStopAllTests::requestLocalStopAll_runsExecutorOnceAndIgnoresRepeats()
   });
 
   QVERIFY(!deskflow::coordination::stopAllInProgress());
-  deskflow::coordination::requestLocalStopAll("macbookpro");
+  QVERIFY(deskflow::coordination::requestLocalStopAll("macbookpro"));
   QVERIFY(deskflow::coordination::stopAllInProgress());
   // Repeats while stopping (duplicate mesh delivery, a second burst) are ignored.
-  deskflow::coordination::requestLocalStopAll("macbookpro");
-  deskflow::coordination::requestLocalStopAll("macbookpro");
+  QVERIFY(deskflow::coordination::requestLocalStopAll("macbookpro"));
+  QVERIFY(deskflow::coordination::requestLocalStopAll("macbookpro"));
 
   QVERIFY(waitFor([&runs] { return runs.load() >= 1; }, 2000));
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -232,7 +246,7 @@ void RescueStopAllTests::requestLocalStopAll_withoutExecutor_doesNothingAndRearm
 {
   // No executor registered (a bare unit-test process): logged, and the
   // in-progress flag is released so a later registration can still act.
-  deskflow::coordination::requestLocalStopAll("tiny11");
+  QVERIFY(!deskflow::coordination::requestLocalStopAll("tiny11"));
   QVERIFY(!deskflow::coordination::stopAllInProgress());
 }
 

@@ -33,4 +33,9 @@ private Q_SLOTS:
   void settleTimer_firesOnceAfterDeadline();
   void settleTimer_rearmReplacesDeadline();
   void settleTimer_cancelSuppresses();
+  // ExitWatchdog: hard-exits (injected here) unless cancelled in time.
+  void exitWatchdog_firesAfterDelayWithCodeAndReason();
+  void exitWatchdog_cancelSuppresses();
+  void exitWatchdog_rearmReplacesDeadline();
+  void processExitFallback_usesInjectedExit();
 };

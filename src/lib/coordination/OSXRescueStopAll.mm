@@ -35,9 +35,6 @@ namespace deskflow::coordination {
 namespace {
 
 constexpr int kLaunchctlWaitMs = 5000;
-//! deskflow-ctl stop: bootout + wait_gone (10 s) + TERM/KILL escalation
-//! (5 s each). We are normally dead long before this.
-constexpr int kCanonicalStopWaitMs = 25000;
 
 std::string homeDir()
 {
@@ -151,16 +148,18 @@ public:
     return ctl.isFile() && ctl.isExecutable();
   }
 
-  bool runCanonicalStop() override
+  bool spawnCanonicalStop() override
   {
+    // Own session, no wait: the script boots this core out as part of its
+    // job (bootout + wait_gone + TERM/KILL escalation, up to ~25 s); the
+    // sequence leaves through the real quit path right after this.
     const auto path = canonicalCtlPath();
     const pid_t pid = spawnDetached({path, "stop"});
     if (pid < 0) {
       return false;
     }
-    const int code = waitBounded(pid, kCanonicalStopWaitMs);
-    LOG_INFO("[rescue] %s stop exited with %d", path.c_str(), code);
-    return code == 0;
+    LOG_INFO("[rescue] spawned %s stop (pid %d)", path.c_str(), static_cast<int>(pid));
+    return true;
   }
 
   bool bootout(const std::string &label, bool wait) override
@@ -241,13 +240,20 @@ public:
   {
     requestLocalCoreQuit();
   }
+
+  void armExitFallback(int ms) override
+  {
+    armProcessExitFallback(
+        std::chrono::milliseconds(ms), 0, "stop-all: the event loop did not finish the quit in time"
+    );
+  }
 };
 
 } // namespace
 
 void runMacStopAll(const std::string &seat)
 {
-  LOG_INFO("[rescue] stop-all on %s: quit-intent, converge, GUI, strays, then this core", seat.c_str());
+  LOG_INFO("[rescue] stop-all on %s: quit-intent, deskflow-ctl stop (or converge, GUI, strays, core), then quit", seat.c_str());
   OSXStopAllCommands commands;
   runMacStopAllSequence(commands);
 }

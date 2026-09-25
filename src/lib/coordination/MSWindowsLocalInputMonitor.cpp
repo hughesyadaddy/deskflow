@@ -44,6 +44,11 @@ public:
     return true;
   }
 
+  void setKeyDownSink(KeyDownSink sink) override
+  {
+    m_keyDownSink = std::move(sink);
+  }
+
   void stop() override
   {
     m_running = false;
@@ -79,10 +84,74 @@ private:
       return;
     }
     // Null device == synthesized (SendInput); only real hardware counts.
-    if (header.hDevice != nullptr && m_callback) {
+    if (header.hDevice == nullptr) {
+      return;
+    }
+    if (header.dwType == RIM_TYPEKEYBOARD) {
+      // Keys feed ONLY the Esc rescue counter. They never count as genuine
+      // input for the election: a client seat's keyboard is relayed to the
+      // cursor host on purpose, and typing there must not promote that seat.
+      if (m_keyDownSink) {
+        handleRawKeyboard(lParam);
+      }
+      return;
+    }
+    if (m_callback) {
       logDeviceOnce(header.hDevice);
       m_callback();
     }
+  }
+
+  //! A genuine key transition: feed non-repeat downs to the sink (the
+  //! Esc rescue counter). Raw Input carries no repeat flag; a down for a
+  //! key already recorded down is a repeat.
+  void handleRawKeyboard(LPARAM lParam)
+  {
+    RAWINPUT raw{};
+    UINT size = sizeof(raw);
+    const auto rc = GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER));
+    if (rc == static_cast<UINT>(-1) || raw.header.dwType != RIM_TYPEKEYBOARD) {
+      return;
+    }
+    const auto &keyboard = raw.data.keyboard;
+    const bool keyUp = (keyboard.Flags & RI_KEY_BREAK) != 0;
+    const bool isEscape = keyboard.VKey == VK_ESCAPE;
+    if (keyUp) {
+      if (isEscape) {
+        m_escapeDown = false;
+      }
+      return;
+    }
+    if (isEscape && m_escapeDown) {
+      return; // autorepeat
+    }
+    if (isEscape) {
+      m_escapeDown = true;
+    }
+    m_keyDownSink(isEscape ? kKeyEscape : kKeyNone, heldModifiers());
+  }
+
+  //! Shift/Ctrl/Alt/Win currently held (OS view; delivered after the key
+  //! state update, so a chord modifier is visible here), plus Caps Lock.
+  static KeyModifierMask heldModifiers()
+  {
+    KeyModifierMask mask = 0;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
+      mask |= KeyModifierShift;
+    }
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
+      mask |= KeyModifierControl;
+    }
+    if (GetAsyncKeyState(VK_MENU) & 0x8000) {
+      mask |= KeyModifierAlt;
+    }
+    if ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000)) {
+      mask |= KeyModifierSuper;
+    }
+    if (GetKeyState(VK_CAPITAL) & 1) {
+      mask |= KeyModifierCapsLock;
+    }
+    return mask;
   }
 
   //! Name each genuine input device the first time it is seen (bounded).
@@ -123,12 +192,16 @@ private:
     }
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
 
-    RAWINPUTDEVICE devices[1]{};
+    RAWINPUTDEVICE devices[2]{};
     devices[0].usUsagePage = 0x01; // generic desktop
     devices[0].usUsage = 0x02;     // mouse
     devices[0].dwFlags = RIDEV_INPUTSINK;
     devices[0].hwndTarget = hwnd;
-    if (!RegisterRawInputDevices(devices, 1, sizeof(RAWINPUTDEVICE))) {
+    devices[1].usUsagePage = 0x01; // generic desktop
+    devices[1].usUsage = 0x06;     // keyboard (Esc rescue counter, every role)
+    devices[1].dwFlags = RIDEV_INPUTSINK;
+    devices[1].hwndTarget = hwnd;
+    if (!RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE))) {
       LOG_WARN("coordination: raw input registration failed");
       DestroyWindow(hwnd);
       return;
@@ -146,6 +219,8 @@ private:
   }
 
   Callback m_callback;
+  KeyDownSink m_keyDownSink;
+  bool m_escapeDown = false;      //!< raw-input thread only (repeat detection)
   std::set<HANDLE> m_seenDevices; //!< raw-input thread only
   std::thread m_thread;
   std::atomic<bool> m_running{false};

@@ -17,6 +17,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace deskflow::coordination {
@@ -91,7 +92,9 @@ public:
 private:
   void serveLoop();
   void handlerLoop();
-  void handleClient(int clientFd);
+  //! \p source is the numeric peer address of the connection (stamped on
+  //! every message so the receiver can gate fleet-wide commands by peer).
+  void handleClient(int clientFd, const std::string &source);
 
   int m_port;
   std::string m_token;
@@ -105,7 +108,7 @@ private:
   // join the pool (handlers must never outlive *this).
   std::mutex m_clientsMutex;
   std::condition_variable m_pendingReady;
-  std::deque<int> m_pendingFds;
+  std::deque<std::pair<int, std::string>> m_pendingFds; //!< fd + source address
   std::set<int> m_clientFds;
   std::atomic<int> m_activeClients{0};
   std::vector<std::thread> m_handlers;

@@ -10,9 +10,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <string>
 #include <thread>
 
 using deskflow::coordination::EscTapRescue;
+using deskflow::coordination::ExitWatchdog;
 using deskflow::coordination::RescueAction;
 using deskflow::coordination::RescueBurst;
 using deskflow::coordination::RescueSettleTimer;
@@ -105,7 +108,7 @@ void KeyboardRescueTests::burst_spacedBeyondGap_none()
   RescueBurst burst;
   int64_t at = 0;
   for (int i = 0; i < 10; ++i) {
-    at = i * (RescueBurst::kMaxGapMs + 100);
+    at = i * (RescueBurst::kSettleMs + 200);
     QCOMPARE(burst.observeEsc(at), RescueAction::None);
     QCOMPARE(burst.count(), 1);
   }
@@ -164,12 +167,14 @@ void KeyboardRescueTests::burst_latePressClosesStaleBurst()
   RescueBurst burst;
   const auto last = tap(burst, 10);
   QVERIFY(last >= 0);
-  QCOMPARE(burst.observeEsc(last + RescueBurst::kMaxGapMs + 1), RescueAction::StopAll);
+  // The effective join gap is exactly kSettleMs, on the timer and on a
+  // late press alike: at kSettleMs the burst is over.
+  QCOMPARE(burst.observeEsc(last + RescueBurst::kSettleMs), RescueAction::StopAll);
   QCOMPARE(burst.count(), 1);
-  // Inside the gap the press just joins the burst (timer jitter slack).
+  // One ms inside the gap the press just joins the burst.
   RescueBurst joined;
   const auto joinedLast = tap(joined, 4);
-  QCOMPARE(joined.observeEsc(joinedLast + RescueBurst::kMaxGapMs), RescueAction::None);
+  QCOMPARE(joined.observeEsc(joinedLast + RescueBurst::kSettleMs - 1), RescueAction::None);
   QCOMPARE(joined.count(), 5);
 }
 
@@ -274,6 +279,63 @@ void KeyboardRescueTests::settleTimer_cancelSuppresses()
   QVERIFY(!timer.armed());
   std::this_thread::sleep_for(std::chrono::milliseconds(120));
   QCOMPARE(fired.load(), 0);
+}
+
+void KeyboardRescueTests::exitWatchdog_firesAfterDelayWithCodeAndReason()
+{
+  std::mutex mutex;
+  int code = -1;
+  std::string reason;
+  std::atomic<int> fired{0};
+  ExitWatchdog watchdog([&](int exitCode, const std::string &why) {
+    std::scoped_lock lock{mutex};
+    code = exitCode;
+    reason = why;
+    ++fired;
+  });
+  QVERIFY(!watchdog.armed());
+  const auto armedAt = Clock::now();
+  watchdog.arm(std::chrono::milliseconds(60), 7, "loop wedged");
+  QVERIFY(watchdog.armed());
+  QVERIFY(waitFor([&fired] { return fired.load() == 1; }, 2000));
+  QVERIFY(Clock::now() - armedAt >= std::chrono::milliseconds(60));
+  QVERIFY(!watchdog.armed());
+  std::scoped_lock lock{mutex};
+  QCOMPARE(code, 7);
+  QCOMPARE(reason, std::string("loop wedged"));
+}
+
+void KeyboardRescueTests::exitWatchdog_cancelSuppresses()
+{
+  std::atomic<int> fired{0};
+  ExitWatchdog watchdog([&fired](int, const std::string &) { ++fired; });
+  watchdog.arm(std::chrono::milliseconds(40), 1, "x");
+  watchdog.cancel();
+  QVERIFY(!watchdog.armed());
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  QCOMPARE(fired.load(), 0);
+}
+
+void KeyboardRescueTests::exitWatchdog_rearmReplacesDeadline()
+{
+  std::atomic<int> fired{0};
+  ExitWatchdog watchdog([&fired](int, const std::string &) { ++fired; });
+  watchdog.arm(std::chrono::milliseconds(40), 1, "x");
+  watchdog.arm(std::chrono::milliseconds(200), 1, "x");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  QCOMPARE(fired.load(), 0);
+  QVERIFY(waitFor([&fired] { return fired.load() == 1; }, 2000));
+}
+
+void KeyboardRescueTests::processExitFallback_usesInjectedExit()
+{
+  std::atomic<int> code{-1};
+  deskflow::coordination::setProcessExitHandlerForTests([&code](int exitCode, const std::string &) {
+    code = exitCode;
+  });
+  deskflow::coordination::armProcessExitFallback(std::chrono::milliseconds(20), 0, "test");
+  QVERIFY(waitFor([&code] { return code.load() == 0; }, 2000));
+  deskflow::coordination::setProcessExitHandlerForTests({});
 }
 
 QTEST_MAIN(KeyboardRescueTests)
