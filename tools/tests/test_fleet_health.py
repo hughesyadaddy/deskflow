@@ -153,6 +153,7 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.login_bridge_calibrate_cmd()): (0, "1\n", ""),
         (hid, fh.login_bridge_log_since_start_cmd()): (0, LOGIN_BRIDGE_LOG_OK, ""),
         (hid, fh.keys_log_cmd()): (0, "level=INFO\n", ""),
+        (hid, fh.crashloop_log_cmd()): (0, "fds=76\n", ""),
     }
     for p in peers:
         t[(hid, fh.nc_cmd(p, fh.DEFAULT_MESH_PORT))] = (0, "", "")
@@ -1286,3 +1287,141 @@ def test_identifier_filename_derived_accepts_ld_hash_and_version_variants():
     ]
     for name, ident in bad:
         assert not fh.identifier_is_filename_derived("/Applications/Deskflow.app/Contents/PlugIns/x/" + name, ident), (name, ident)
+
+
+# ---------------------------------------------------------------- crashloop
+# K8 (2026-09-25): a server epoch whose listener leaked in-process was rebuilt
+# every 500 ms against EADDRINUSE for 30 minutes; the core never exited, so
+# launchd never replaced it. The check reads the same rotated log as `keys`.
+
+def crash_line(mark, when, level="FATAL"):
+    return f"[{when.strftime('%Y-%m-%dT%H:%M:%S')}.{when.microsecond // 1000:03d}] {level}: x {mark} y"
+
+
+def test_crashloop_cmd_reads_conf_log_generations_and_core_fd_count_under_sh():
+    assert "crashloop" in fh.ALL_CHECKS and "crashloop" in fh.MAC_ONLY
+    cmd = fh.crashloop_log_cmd()
+    assert cmd.startswith("sh -c ")
+    script = shlex.split(cmd)[2]
+    assert "conf=~/Library/Deskflow/Deskflow.conf" in script
+    assert "log=~/Library/Deskflow/deskflow-core.log" in script
+    assert "Library/Logs" not in script
+    assert "exit 4" in script and "exit 3" in script and "sudo" not in script
+    assert '"$f".1 "$f".2 "$f".3' in script
+    for mark in fh.CRASHLOOP_MARKS:
+        assert f"-e '{mark}'" in script
+    assert "launchctl print" in script and fh.CORE_LAUNCHD_LABEL in script
+    assert "/usr/sbin/lsof -p" in script and "fds=" in script
+    # sh tilde-expands the word of ${f#word}: only an escaped ~ strips the
+    # literal "~" from a `file=~/...` value (else "$HOME~/Library/...").
+    assert "${f#\\~}" in script and "${f#~}" not in script
+
+
+def test_crashloop_and_keys_cmds_resolve_a_tilde_log_path_under_real_sh(tmp_path):
+    import os
+    import subprocess
+    home = tmp_path / "home"
+    conf_dir = home / "Library" / "Deskflow"
+    conf_dir.mkdir(parents=True)
+    (conf_dir / "Deskflow.conf").write_text("[log]\nfile=~/Library/Deskflow/deskflow-core.log\nlevel=DEBUG\n")
+    log = conf_dir / "deskflow-core.log"
+    from datetime import datetime, timedelta
+    t0 = datetime(2026, 9, 25, 17, 0, 0)
+    log.write_text("\n".join(crash_line("cannot bind address", t0 + timedelta(seconds=i)) for i in range(5)) + "\n")
+    (conf_dir / "deskflow-core.log.1").write_text(crash_line("failed to load config", t0 - timedelta(minutes=1)) + "\n")
+    env = dict(os.environ, HOME=str(home), PATH="/usr/bin:/bin:/usr/sbin:/sbin")
+    for cmd in (fh.crashloop_log_cmd(), fh.keys_log_cmd()):
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env, timeout=120)
+        assert r.returncode == 0, (cmd, r.stderr)
+    out = subprocess.run(fh.crashloop_log_cmd(), shell=True, capture_output=True, text=True, env=env,
+                         timeout=120).stdout
+    lines = out.splitlines()
+    assert lines[0].startswith("fds=")  # "fds=-" when no launchd-owned core, a number otherwise
+    assert sum("cannot bind address" in ln for ln in lines) == 5
+    assert sum("failed to load config" in ln for ln in lines) == 1  # the .1 generation is read too
+    status, detail = fh.parse_crashloop_log(out, now=t0 + timedelta(minutes=5))
+    assert status == "FAIL" and "5 'cannot bind address'" in detail
+
+
+def test_parse_crashloop_fails_on_more_than_three_bind_failures_within_60s():
+    from datetime import datetime, timedelta
+    now = datetime(2026, 9, 25, 17, 30, 0)
+    t0 = now - timedelta(minutes=10)
+    out = "fds=76\n" + "\n".join(crash_line("cannot bind address", t0 + timedelta(milliseconds=550 * i))
+                                 for i in range(4)) + "\n"
+    status, detail = fh.parse_crashloop_log(out, now=now)
+    assert status == "FAIL"
+    assert "4 'cannot bind address'" in detail and ">3 inside 60s" in detail
+
+
+def test_parse_crashloop_three_hits_in_a_minute_is_not_a_loop():
+    from datetime import datetime, timedelta
+    now = datetime(2026, 9, 25, 17, 30, 0)
+    t0 = now - timedelta(minutes=10)
+    out = "fds=76\n" + "\n".join(crash_line("cannot bind address", t0 + timedelta(seconds=20 * i))
+                                 for i in range(3)) + "\n"
+    status, detail = fh.parse_crashloop_log(out, now=now)
+    assert status == "PASS" and "3x 'cannot bind address'" in detail and "fds=76" in detail
+    # Four spread over more than a minute: the epoch loop backing off, not looping.
+    out = "fds=76\n" + "\n".join(crash_line("cannot bind address", t0 + timedelta(seconds=25 * i))
+                                 for i in range(4)) + "\n"
+    assert fh.parse_crashloop_log(out, now=now)[0] == "PASS"
+
+
+def test_parse_crashloop_fails_on_display_shape_and_config_bursts_too():
+    from datetime import datetime, timedelta
+    now = datetime(2026, 9, 25, 8, 30, 0)
+    t0 = now - timedelta(minutes=30)
+    shape = "\n".join(crash_line("failed to initialize screen shape", t0 + timedelta(seconds=10 * i))
+                      for i in range(4))
+    status, detail = fh.parse_crashloop_log("fds=80\n" + shape + "\n", now=now)
+    assert status == "FAIL" and "'failed to initialize screen shape'" in detail
+    config = "\n".join(crash_line("failed to load config", t0 + timedelta(milliseconds=500 * i))
+                       for i in range(4))
+    status, detail = fh.parse_crashloop_log("fds=80\n" + config + "\n", now=now)
+    assert status == "FAIL" and "'failed to load config'" in detail
+
+
+def test_parse_crashloop_old_burst_warns_and_ancient_burst_is_ignored():
+    from datetime import datetime, timedelta
+    now = datetime(2026, 9, 25, 20, 0, 0)
+    old = now - timedelta(hours=3)  # cleared by a restart this afternoon
+    out = "fds=70\n" + "\n".join(crash_line("cannot bind address", old + timedelta(seconds=i)) for i in range(6)) + "\n"
+    status, detail = fh.parse_crashloop_log(out, now=now)
+    assert status == "WARN" and "6 'cannot bind address'" in detail
+    ancient = now - timedelta(hours=30)
+    out = "fds=70\n" + "\n".join(crash_line("cannot bind address", ancient + timedelta(seconds=i)) for i in range(6)) + "\n"
+    assert fh.parse_crashloop_log(out, now=now)[0] == "PASS"
+
+
+def test_parse_crashloop_fd_count_thresholds_and_missing_core():
+    from datetime import datetime
+    now = datetime(2026, 9, 25, 17, 45, 0)
+    status, detail = fh.parse_crashloop_log("fds=2612\n", now=now)
+    assert status == "FAIL" and "2612 fds" in detail and "EMFILE" in detail
+    status, detail = fh.parse_crashloop_log("fds=640\n", now=now)
+    assert status == "WARN" and "640 fds" in detail
+    status, detail = fh.parse_crashloop_log("fds=76\n", now=now)
+    assert status == "PASS" and "fds=76" in detail
+    status, detail = fh.parse_crashloop_log("fds=-\n", now=now)
+    assert status == "PASS" and "no launchd-owned core running" in detail
+
+
+def test_crashloop_check_maps_runner_exit_codes_like_keys():
+    hosts = [mac("macbookpro", "local")]
+    seen = {}
+
+    def runner_for(rc, out="", err=""):
+        def runner(host, cmd):
+            seen["cmd"] = cmd
+            return rc, out, err
+        return runner
+
+    for rc, expected in ((4, "SKIP"), (3, "FAIL"), (2, "FAIL")):
+        checker = fh.FleetHealth(hosts, {}, runner=runner_for(rc, err="boom"))
+        checker.run(["crashloop"], explicit=True)
+        assert [r.status for r in checker.results] == [expected], rc
+        assert "lsof" in seen["cmd"]
+    checker = fh.FleetHealth(hosts, {}, runner=runner_for(0, out="fds=76\n"))
+    checker.run(["crashloop"], explicit=True)
+    assert [r.status for r in checker.results] == ["PASS"]

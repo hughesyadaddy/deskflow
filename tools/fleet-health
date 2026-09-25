@@ -56,6 +56,17 @@ Checks:
                              release behind them, or when `[log] level` is
                              too quiet for those lines to ever land in the
                              file. SKIP when the log directory does not exist.
+  crashloop                  the core is not rebuilding its role epoch in a
+                             loop (macOS; same rotated log as `keys`). FAIL
+                             when more than 3 "cannot bind address", "failed
+                             to initialize screen shape" or "failed to load
+                             config" lines land inside any 60 s window in
+                             the last hour (2026-09-25: a leaked listener
+                             made every server epoch EADDRINUSE at 500 ms
+                             until the fd table filled), WARN when such a
+                             burst happened earlier in the last 24 h, and
+                             FAIL/WARN when the launchd-owned core holds
+                             more than 1000/500 fds (lsof -p).
   loginbridge                the LoginWindow bridge agent (macOS): the plist
                              exists and lints, its program is the installed
                              bundle's deskflow-vhid-bridge and it passes
@@ -110,8 +121,8 @@ DEFAULT_ENV_FILE = REPO_ROOT / "scripts" / "fleet.env"
 IDENTIFIERS_FILE = TOOLS_DIR / "fleet-health.identifiers"
 
 ALL_CHECKS = ("sign", "no-adhoc", "identifiers", "tcc", "authenticode", "session", "mesh", "instances", "bridge",
-              "loginbridge", "keys")
-MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc", "loginbridge", "keys"}
+              "loginbridge", "keys", "crashloop")
+MAC_ONLY = {"sign", "no-adhoc", "identifiers", "tcc", "loginbridge", "keys", "crashloop"}
 WIN_ONLY = {"authenticode"}
 
 MAC_APPS = ("/Applications/Deskflow.app", "/Applications/Mouser.app")
@@ -164,6 +175,19 @@ KEYS_HELD_MARK = "[keys] post-switch held="  # INFO
 KEYS_SWEEP_SKIPPED_MARK = "[keys] stale-modifier sweep skipped"  # INFO
 KEYS_SECURE_INPUT_MARK = "[keys] secure-input="  # INFO (OSXScreen)
 KEYS_WINDOW_H = 24
+# Crash-loop marks (src/lib/deskflow/ServerApp.cpp startServer, platform
+# OSXScreen.mm, deskflow-core config load) and the launchd label that owns
+# the core (tools/launchd/*deskflow-core.plist). More than CRASHLOOP_MAX_HITS
+# of one mark inside CRASHLOOP_WINDOW_S is a loop: the epoch is rebuilt
+# against the same fault instead of backing off / handing over to launchd.
+CRASHLOOP_MARKS = ("cannot bind address", "failed to initialize screen shape", "failed to load config")
+CRASHLOOP_WINDOW_S = 60
+CRASHLOOP_MAX_HITS = 3
+CRASHLOOP_RECENT_H = 1   # a burst inside this -> FAIL
+CRASHLOOP_HISTORY_H = 24 # a burst inside this (but older than RECENT) -> WARN
+CRASHLOOP_FD_FAIL = 1000
+CRASHLOOP_FD_WARN = 500
+CORE_LAUNCHD_LABEL = "io.github.hughesyadaddy.deskflow-core"
 # src/lib/common/LogLevel.h order: quietest first.
 LOG_LEVELS = ("FATAL", "ERROR", "WARNING", "INFO", "DEBUG", "VERBOSE")
 
@@ -557,7 +581,7 @@ def keys_log_cmd(conf: str = CORE_CONF, default_log: str = CORE_LOG) -> str:
         "  f=$(sed -n '/^\\[log\\]/,/^\\[/p' \"$conf\" | sed -n 's/^file=//p' | tail -n 1); "
         "  lvl=$(sed -n '/^\\[log\\]/,/^\\[/p' \"$conf\" | sed -n 's/^level=//p' | tail -n 1); "
         "fi; "
-        "case \"$f\" in '') f=$log;; '~'*) f=$HOME${f#~};; esac; "
+        "case \"$f\" in '') f=$log;; '~'*) f=$HOME${f#\\~};; esac; "
         "d=$(dirname \"$f\"); "
         "test -d \"$d\" || { echo \"no log dir $d\" >&2; exit 4; }; "
         "test -f \"$f\" || { echo \"missing $f (toFile off?)\" >&2; exit 3; }; "
@@ -632,6 +656,113 @@ def parse_keys_log(output: str, now: Optional[datetime] = None, window_h: int = 
     if log_level_hides(level, "INFO"):
         return WARN, f"[log] level={level} hides '{KEYS_HELD_MARK}' (INFO) lines; only stuck-release visible{note}"
     return PASS, f"no stuck-key lines in {window_h}h (level={level}){note}"
+
+
+def crashloop_log_cmd(conf: str = CORE_CONF, default_log: str = CORE_LOG, label: str = CORE_LAUNCHD_LABEL) -> str:
+    """Crash-loop marks from the core's rotated log plus the core's fd count.
+
+    Same log resolution and exit codes as keys_log_cmd (4 = no log dir ->
+    SKIP, 3 = no log file -> FAIL). The first stdout line is `fds=<n>` for
+    the launchd-owned core (`fds=-` when no core is running; lsof is slow
+    but this is a one-off per check), then the matching log lines."""
+    marks = " ".join(f"-e {shlex.quote(m)}" for m in CRASHLOOP_MARKS)
+    script = (
+        f"conf={conf}; log={default_log}; "
+        "if [ -f \"$conf\" ]; then "
+        "  f=$(sed -n '/^\\[log\\]/,/^\\[/p' \"$conf\" | sed -n 's/^file=//p' | tail -n 1); "
+        "fi; "
+        "case \"$f\" in '') f=$log;; '~'*) f=$HOME${f#\\~};; esac; "
+        "d=$(dirname \"$f\"); "
+        "test -d \"$d\" || { echo \"no log dir $d\" >&2; exit 4; }; "
+        "test -f \"$f\" || { echo \"missing $f (toFile off?)\" >&2; exit 3; }; "
+        f"pid=$(launchctl print \"gui/$(id -u)/{label}\" 2>/dev/null | sed -n 's/^[[:space:]]*pid = //p' | head -n 1); "
+        "if [ -n \"$pid\" ]; then n=$(/usr/sbin/lsof -p \"$pid\" 2>/dev/null | wc -l | tr -d ' '); "
+        "  echo \"fds=${n:-0}\"; else echo 'fds=-'; fi; "
+        f"grep -h -F {marks} \"$f\" \"$f\".1 \"$f\".2 \"$f\".3 2>/dev/null"
+        " | head -n 20000; exit 0"
+    )
+    return "sh -c " + shlex.quote(script)
+
+
+def _burst(times: List[datetime], window_s: int = CRASHLOOP_WINDOW_S, max_hits: int = CRASHLOOP_MAX_HITS
+           ) -> Optional[datetime]:
+    """Newest timestamp at which more than `max_hits` of `times` fall inside
+    one `window_s` window (sliding), or None."""
+    times = sorted(times)
+    found = None
+    start = 0
+    for end, at in enumerate(times):
+        while (at - times[start]).total_seconds() > window_s:
+            start += 1
+        if end - start + 1 > max_hits:
+            found = at
+    return found
+
+
+def parse_crashloop_log(output: str, now: Optional[datetime] = None) -> Tuple[str, str]:
+    """Fold `fds=...` plus crash-loop mark lines into (status, detail).
+
+    Per mark, more than CRASHLOOP_MAX_HITS lines inside any CRASHLOOP_WINDOW_S
+    sliding window is a burst. A burst inside the last CRASHLOOP_RECENT_H is
+    a FAIL (the loop is happening or just happened); inside CRASHLOOP_HISTORY_H
+    a WARN (it happened today; the restart that cleared it is worth a look).
+    Independently, an fd count above CRASHLOOP_FD_FAIL / _WARN fails / warns:
+    a looping core leaks fds until it cannot open its own config. Timestamps
+    are the seat's naive local clock, like parse_keys_log."""
+    now = now or datetime.now()
+    fds: Optional[int] = None
+    fds_seen = False
+    by_mark: Dict[str, List[datetime]] = {m: [] for m in CRASHLOOP_MARKS}
+    unstamped = 0
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("fds="):
+            fds_seen = True
+            value = line[len("fds="):].strip()
+            fds = int(value) if value.isdigit() else None
+            continue
+        m = _LOG_TS.match(line)
+        if not m:
+            unstamped += 1
+            continue
+        try:
+            at = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            unstamped += 1
+            continue
+        if at < now - timedelta(hours=CRASHLOOP_HISTORY_H):
+            continue
+        for mark in CRASHLOOP_MARKS:
+            if mark in line:
+                by_mark[mark].append(at)
+    problems: List[str] = []
+    warnings: List[str] = []
+    for mark, times in by_mark.items():
+        burst_at = _burst(times)
+        if burst_at is None:
+            continue
+        text = (f"{len(times)} '{mark}' in {CRASHLOOP_HISTORY_H}h, >{CRASHLOOP_MAX_HITS} inside "
+                f"{CRASHLOOP_WINDOW_S}s (newest burst {burst_at.strftime('%Y-%m-%dT%H:%M:%S')})")
+        if burst_at >= now - timedelta(hours=CRASHLOOP_RECENT_H):
+            problems.append(text)
+        else:
+            warnings.append(text)
+    if fds is not None and fds > CRASHLOOP_FD_FAIL:
+        problems.append(f"core holds {fds} fds (>{CRASHLOOP_FD_FAIL}: leaking, will hit EMFILE)")
+    elif fds is not None and fds > CRASHLOOP_FD_WARN:
+        warnings.append(f"core holds {fds} fds (>{CRASHLOOP_FD_WARN})")
+    note = f"; {unstamped} unstamped line(s) ignored" if unstamped else ""
+    if fds_seen and fds is None:
+        note += "; no launchd-owned core running (fd count unavailable)"
+    if problems:
+        return FAIL, "; ".join(problems + warnings) + note
+    if warnings:
+        return WARN, "; ".join(warnings) + note
+    counts = ", ".join(f"{len(v)}x '{k}'" for k, v in by_mark.items() if v) or "no crash-loop lines"
+    fd_text = f"fds={fds}" if fds is not None else "fds=n/a"
+    return PASS, f"{counts} in {CRASHLOOP_HISTORY_H}h, no burst; {fd_text}{note}"
 
 
 def ps1_cmd(root: str, checks: Sequence[str], thumbprint: str, port: int, peers: Sequence[str]) -> str:
@@ -1028,6 +1159,21 @@ class FleetHealth:
         status, detail = parse_keys_log(out)
         self._add(host, "keys", status, detail)
 
+    def check_crashloop_mac(self, host: Host) -> None:
+        rc, out, err = self.runner(host, crashloop_log_cmd())
+        if rc == 4:
+            self._add(host, "crashloop", SKIP, f"no core log directory: {(err or out).strip()[:120]}")
+            return
+        if rc == 3:
+            self._add(host, "crashloop", FAIL,
+                      f"core log missing ([log] toFile must stay on): {(err or out).strip()[:120]}")
+            return
+        if rc != 0:
+            self._add(host, "crashloop", FAIL, f"core log grep rc={rc}: {(err or out).strip()[:120]}")
+            return
+        status, detail = parse_crashloop_log(out)
+        self._add(host, "crashloop", status, detail)
+
     def check_mesh_leg_mac(self, src: Host, dst: Host) -> None:
         rc, out, err = self.runner(src, nc_cmd(dst.addr, self.mesh_port))
         status = PASS if rc == 0 else FAIL
@@ -1100,6 +1246,8 @@ class FleetHealth:
                     self.check_login_bridge_mac(host)
                 elif c == "keys":
                     self.check_keys_mac(host)
+                elif c == "crashloop":
+                    self.check_crashloop_mac(host)
                 elif c == "mesh":
                     if not peers:
                         self._add(host, "mesh", SKIP, "no peers")

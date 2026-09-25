@@ -13,7 +13,17 @@
 
   KeepAlive/SuccessfulExit=false restarts the core only after a crash or
   non-zero exit; a clean `bootout` stays down. ThrottleInterval keeps a
-  crash loop from spinning faster than once per 5 s.
+  crash loop from spinning faster than once per 10 s.
+
+  The core paces itself before launchd ever has to: a role epoch that ends
+  in failure (port taken, no display, unreadable config) is retried with an
+  exponential backoff of 1 s doubling to 30 s, and after 5 consecutive
+  failures the process exits non-zero on purpose (AutoModeRunner
+  EpochFailurePolicy) so this KeepAlive replaces it with a clean one -- a
+  fresh fd table, a fresh listener, a fresh display wait. So a persistent
+  fault costs one restart every ~1 min at most (31 s of in-process backoff
+  + the throttle), never a hot loop, and a fault that clears mid-way is
+  picked up by the next epoch without a restart.
 
   The login-window bridge stays separate:
   /Library/LaunchAgents/org.deskflow.vhid-bridge.plist (LoginWindow, KeepAlive).
@@ -40,7 +50,7 @@
     <false/>
   </dict>
   <key>ThrottleInterval</key>
-  <integer>5</integer>
+  <integer>10</integer>
   <key>EnvironmentVariables</key>
   <dict>
     <key>DESKFLOW_LAUNCHD</key>
