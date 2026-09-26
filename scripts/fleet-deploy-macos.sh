@@ -95,6 +95,27 @@ fail() {
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 SEAT_ID="$(lower "$HOST_TAG")"
 
+# Bare `python3` is whatever Homebrew's generic symlink currently points at,
+# which drifts every time a newer python@3.x formula is installed (2026-09-26:
+# hackintosh had python@3.14 installed alongside the pinned python@3.13, and
+# /usr/local/bin/python3 silently repointed at 3.14 -- Mouser's build script
+# ran fine under it right up until a plistlib/pyexpat import against a
+# mismatched system libexpat crashed the whole deploy, well after the actual
+# app was already built, signed and installed). Mouser pins its interpreter
+# via .python-version (verify_python_provenance checks packages, not this);
+# prefer that exact dotted binary when it exists, matching its own pin,
+# falling back to bare python3 only when it doesn't (a seat without that
+# specific minor version installed).
+mouser_python() {
+  local pv="$MOUSER_ROOT/.python-version" ver bin
+  if [[ -f "$pv" ]]; then
+    ver="$(tr -d '[:space:]' <"$pv")"
+    bin="python$ver"
+    command -v "$bin" >/dev/null 2>&1 && { echo "$bin"; return; }
+  fi
+  echo "python3"
+}
+
 # `bash -x` must never echo a password: every line that expands one runs
 # between xtrace_off and xtrace_restore (the trace of `set +x` itself is
 # discarded by the redirect).
@@ -772,12 +793,13 @@ deploy_mouser() {
 
   # MOUSER_RESTART=1 is scoped to the Mouser step only: the Mouser installer
   # owns Mouser's restart. The Deskflow step above never touches Mouser.
+  local py; py="$(mouser_python)"
   if [[ "$KEYCHAIN_SSH_READY" == "1" ]]; then
-    echo "== [$HOST_TAG] Mouser build + install (this session, MOUSER_RESTART=1) =="
-    MOUSER_RESTART=1 python3 scripts/build_and_install.py
+    echo "== [$HOST_TAG] Mouser build + install (this session, MOUSER_RESTART=1, $py) =="
+    MOUSER_RESTART=1 "$py" scripts/build_and_install.py
   else
-    echo "== [$HOST_TAG] Mouser build + install (GUI session, MOUSER_RESTART=1) =="
-    MOUSER_RESTART=1 python3 scripts/build_macos_gui_session.py
+    echo "== [$HOST_TAG] Mouser build + install (GUI session, MOUSER_RESTART=1, $py) =="
+    MOUSER_RESTART=1 "$py" scripts/build_macos_gui_session.py
   fi
 
   # Checkpoint 2: the installer must not have touched settings at all.
