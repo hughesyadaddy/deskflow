@@ -49,8 +49,25 @@ while [ $# -gt 0 ]; do
 done
 target="$1"; shift
 printf '%s\t%s\n' "$target" "$*" >> "$SHIM_LOG/ssh.log"
+# A piped stdin is the controller's password transport: record it per target
+# (under bats a test's stdin is a socket, so this reads only the pipe case).
+if [ -p /dev/stdin ]; then cat > "$SHIM_LOG/ssh-stdin.$target"; fi
 case " ${SHIM_SSH_DOWN:-} " in *" $target "*) exit 255 ;; esac
 case " ${SHIM_SSH_FAIL:-} " in *" $target "*) exit 7 ;; esac
+# SHIM_SSH_EXEC=1: behave like the far end and run the remote command through
+# SHIM_SSH_SHELL (default /bin/sh; the fleet's login shell is zsh) with the
+# recorded stdin, so the read -rs preamble, the git shims and the seat-script
+# stub in $REPO all really execute.
+if [ -n "${SHIM_SSH_EXEC:-}" ]; then
+  case "$*" in *fleet-deploy-macos.sh*)
+    if [ -f "$SHIM_LOG/ssh-stdin.$target" ]; then
+      "${SHIM_SSH_SHELL:-/bin/sh}" -c "$*" < "$SHIM_LOG/ssh-stdin.$target"
+    else
+      "${SHIM_SSH_SHELL:-/bin/sh}" -c "$*" < /dev/null
+    fi
+    exit $? ;;
+  esac
+fi
 case "$*" in *rev-parse*) echo "cafe0000$(printf '%s' "$target" | cksum | cut -c1-8)" ;; esac
 # A deploy command's seat output: SHIM_SSH_SETTINGS_<host> fakes the
 # FLEET_SETTINGS=... marker the per-OS scripts print for Mouser.
@@ -77,12 +94,46 @@ fi
 case "$1" in *fleet-deploy-macos.sh) exec "$REAL_BASH" "$@" ;; esac
 exit 0
 EOF
+  cat > "$SHIM/brew" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
   chmod +x "$SHIM"/*
   export REAL_BASH="$BASH"
   export SHIM_LOG="$LOG"
   export PATH="$SHIM:$PATH"
-  unset FLEET_LOCAL_ID SHIM_SSH_DOWN SHIM_SSH_FAIL
+  unset FLEET_LOCAL_ID SHIM_SSH_DOWN SHIM_SSH_FAIL SHIM_SSH_EXEC SHIM_SSH_SHELL
+  unset DESKFLOW_KEYCHAIN_PASSWORD DESKFLOW_SUDO_PASSWORD
+  # Most tests have no .env: the preflight that refuses a Mac seat without a
+  # FLEET_SEAT_PASSWORD_<id> line is exercised by its own tests below.
+  export FLEET_ALLOW_PROMPTS=1
 }
+
+# A stand-in fleet-deploy-macos.sh (local seat via the bash shim, remote seat
+# via SHIM_SSH_EXEC) that records the two seat variables and whether any
+# FLEET_SEAT_PASSWORD_* line reached its environment.
+stub_seat_script() {
+  cat > "$REPO/scripts/fleet-deploy-macos.sh" <<'EOF'
+#!/usr/bin/env bash
+seat=""; for v in ${!FLEET_SEAT_PASSWORD_@}; do seat="$seat $v"; done
+printf 'KC=%s SUDO=%s SEAT=%s\n' "${DESKFLOW_KEYCHAIN_PASSWORD:-unset}" "${DESKFLOW_SUDO_PASSWORD:-unset}" "${seat:-none}" >> "$SHIM_LOG/seat-env.log"
+echo "== seat script ran =="
+EOF
+  chmod +x "$REPO/scripts/fleet-deploy-macos.sh"
+}
+
+write_dotenv() { # lines... -> $REPO/.env (mode 600)
+  printf '%s\n' "$@" > "$REPO/.env"
+  chmod 600 "$REPO/.env"
+}
+
+# $output / string assertions that FAIL the test: under bash 3.2 a false
+# `[[ ... ]]` mid-test is silently ignored by bats; a function returning 1 is not.
+out_has() { if [[ "$output" != *"$1"* ]]; then echo "expected in output: $1" >&2; return 1; fi; }
+out_lacks() { if [[ "$output" == *"$1"* ]]; then echo "unexpected in output: $1" >&2; return 1; fi; }
+str_has() { if [[ "$1" != *"$2"* ]]; then echo "expected in string: $2" >&2; return 1; fi; }
+str_lacks() { if [[ "$1" == *"$2"* ]]; then echo "unexpected in string: $2" >&2; return 1; fi; }
+file_lacks() { if grep -qF -- "$2" "$1" 2>/dev/null; then echo "unexpected in $1: $2" >&2; return 1; fi; }
 
 teardown() {
   rm -rf "$WORK"
@@ -623,5 +674,168 @@ EOF
   mkdir -p "$REPO/tools/state/deploy.lock.d"
   echo "$$" > "$REPO/tools/state/deploy.lock.d/pid"
   run_deploy --dry-run --json -
+  [ "$status" -eq 0 ]
+}
+
+# --- seat passwords: FLEET_SEAT_PASSWORD_<id> in the controller's .env ------------
+
+remote_cmd() { grep -v rev-parse "$LOG/ssh.log" | grep "^$1"$'\t' | head -n1 | cut -f2-; }
+
+@test "FLEET_SEAT_PASSWORD_<id> reaches a remote Mac on the SSH session's stdin only (never argv), and only the seat script sees it" {
+  write_dotenv "FLEET_SEAT_PASSWORD_hackintosh='hunter 2'"
+  stub_seat_script
+  SHIM_SSH_EXEC=1 run_deploy --host hackintosh
+  [ "$status" -eq 0 ]
+  out_has "seat password: FLEET_SEAT_PASSWORD_hackintosh from $REPO/.env (on the SSH session's stdin"
+  out_has "== seat script ran =="
+  out_lacks "hunter 2"
+  # argv of ssh (the remote command) never holds the value; stdin does, as exactly one line
+  file_lacks "$LOG/ssh.log" "hunter"
+  [ "$(cat "$LOG/ssh-stdin.alex@hackintosh")" = "hunter 2" ]
+  [ "$(wc -l < "$LOG/ssh-stdin.alex@hackintosh" | tr -d ' ')" -eq 1 ]
+  cmd="$(remote_cmd alex@hackintosh)"
+  str_has "$cmd" 'IFS= read -rs FLEET_SEAT_PASSWORD || FLEET_SEAT_PASSWORD=""; set -euo pipefail;'
+  str_has "$cmd" '&& DESKFLOW_KEYCHAIN_PASSWORD="$FLEET_SEAT_PASSWORD" DESKFLOW_SUDO_PASSWORD="$FLEET_SEAT_PASSWORD" bash scripts/fleet-deploy-macos.sh'
+  # the far end: git sync ran without the variables, the seat script got both and no FLEET_SEAT_PASSWORD_* line
+  [ "$(cat "$LOG/seat-env.log")" = "KC=hunter 2 SUDO=hunter 2 SEAT=none" ]
+  grep -q '^git fetch origin main' "$LOG/git.log"
+}
+
+@test "the remote preamble also works under zsh (the seats' login shell)" {
+  command -v zsh >/dev/null 2>&1 || skip "zsh not installed"
+  write_dotenv 'FLEET_SEAT_PASSWORD_hackintosh="p@ss #word"'
+  stub_seat_script
+  SHIM_SSH_EXEC=1 SHIM_SSH_SHELL="$(command -v zsh)" run_deploy --host hackintosh
+  [ "$status" -eq 0 ]
+  [ "$(cat "$LOG/seat-env.log")" = "KC=p@ss #word SUDO=p@ss #word SEAT=none" ]
+  file_lacks "$LOG/ssh.log" "p@ss"
+}
+
+@test ".env values parse like source: quotes stripped, an unquoted value ends at a trailing comment, the last line wins" {
+  write_dotenv "FLEET_SEAT_PASSWORD_hackintosh=first" "export FLEET_SEAT_PASSWORD_hackintosh=plain # not part of it"
+  run_deploy --host hackintosh
+  [ "$status" -eq 0 ]
+  [ "$(cat "$LOG/ssh-stdin.alex@hackintosh")" = "plain" ]
+}
+
+@test "a seat without a line gets nothing on stdin and no preamble; Windows seats never get one" {
+  write_dotenv "FLEET_SEAT_PASSWORD_macbookpro=local-pw" "FLEET_SEAT_PASSWORD_tiny11=never-sent"
+  run_deploy --host hackintosh
+  [ "$status" -eq 0 ]
+  [ ! -e "$LOG/ssh-stdin.alex@hackintosh" ]
+  cmd="$(remote_cmd alex@hackintosh)"
+  str_lacks "$cmd" "read -rs"
+  str_lacks "$cmd" "PASSWORD"
+  out_lacks "seat password"
+
+  rm -f "$LOG/ssh.log"
+  run_deploy --host tiny11
+  [ "$status" -eq 0 ]
+  [ ! -e "$LOG/ssh-stdin.alexh@tiny11" ]
+  cmd="$(remote_cmd alexh@tiny11)"
+  str_lacks "$cmd" "PASSWORD"
+  str_lacks "$cmd" "never-sent"
+  out_lacks "seat password"
+  file_lacks "$LOG/ssh.log" "never-sent"
+}
+
+@test "the local seat gets the two in-process exports (and no FLEET_SEAT_PASSWORD_* line); they are gone once its script returns" {
+  write_dotenv "FLEET_SEAT_PASSWORD_macbookpro=local-pw" "FLEET_SEAT_PASSWORD_hackintosh=remote-pw"
+  stub_seat_script
+  run_deploy --host macbookpro
+  [ "$status" -eq 0 ]
+  [ "$(cat "$LOG/seat-env.log")" = "KC=local-pw SUDO=local-pw SEAT=none" ]
+  out_has "seat password: FLEET_SEAT_PASSWORD_macbookpro from $REPO/.env (in-process"
+  out_lacks "local-pw"
+  file_lacks "$LOG/bash.log" "local-pw"
+  file_lacks "$LOG/local-cmd.log" "local-pw"
+  # a following ssh deploy in the same run inherits nothing from the local step
+  rm -f "$LOG/seat-env.log"
+  SHIM_SSH_EXEC=1 run_deploy
+  [ "$status" -eq 0 ]
+  grep -q '^KC=remote-pw SUDO=remote-pw SEAT=none$' "$LOG/seat-env.log"
+  grep -q '^KC=local-pw SUDO=local-pw SEAT=none$' "$LOG/seat-env.log"
+  [ "$(grep -c . "$LOG/seat-env.log")" -eq 2 ]
+}
+
+@test "bash -x never echoes a seat password (controller side)" {
+  write_dotenv "FLEET_SEAT_PASSWORD_hackintosh=hunter2" "FLEET_SEAT_PASSWORD_macbookpro=local-pw"
+  stub_seat_script
+  SHIM_SSH_EXEC=1 run "$REAL_BASH" -x "$SCRIPT" --host hackintosh
+  [ "$status" -eq 0 ]
+  out_has "+ deploy_host"       # the trace really was on
+  out_lacks "hunter2"
+  out_lacks "local-pw"
+  file_lacks "$LOG/ssh.log" "hunter2"
+  run "$REAL_BASH" -x "$SCRIPT" --host macbookpro
+  [ "$status" -eq 0 ]
+  out_lacks "local-pw"
+  out_lacks "hunter2"
+}
+
+@test "a .env holding a password that is not mode 600 is refused before anything runs" {
+  printf 'FLEET_SEAT_PASSWORD_hackintosh=hunter2\n' > "$REPO/.env"
+  chmod 644 "$REPO/.env"
+  run_deploy --host hackintosh
+  [ "$status" -ne 0 ]
+  out_has "$REPO/.env holds FLEET_SEAT_PASSWORD_hackintosh but is mode 644; run: chmod 600 $REPO/.env"
+  out_lacks "hunter2"
+  [ ! -e "$LOG/ssh.log" ]
+  [ ! -e "$REPO/tools/state/deploy.lock.d" ]
+  # even a dry run is refused: the file is misconfigured
+  run_deploy --dry-run
+  [ "$status" -ne 0 ]
+  # an empty template value needs no mode
+  printf 'FLEET_SEAT_PASSWORD_hackintosh=\nDESKFLOW_KEYCHAIN_PASSWORD=""\n' > "$REPO/.env"
+  run_deploy --dry-run
+  [ "$status" -eq 0 ]
+}
+
+@test "--pull-only never transports a password" {
+  write_dotenv "FLEET_SEAT_PASSWORD_hackintosh=hunter2" "FLEET_SEAT_PASSWORD_macbookpro=local-pw"
+  run_deploy --pull-only
+  [ "$status" -eq 0 ]
+  [ ! -e "$LOG/ssh-stdin.alex@hackintosh" ]
+  file_lacks "$LOG/ssh.log" "read -rs"
+  out_lacks "seat password"
+}
+
+# --- preflight: a deploy that would prompt is refused up front ---------------------
+
+@test "without FLEET_ALLOW_PROMPTS a Mac seat with no FLEET_SEAT_PASSWORD_<id> line is refused with the key to add; --allow-prompts and a local .env password let it through" {
+  unset FLEET_ALLOW_PROMPTS
+  run_deploy --host hackintosh
+  [ "$status" -ne 0 ]
+  out_has "no FLEET_SEAT_PASSWORD_hackintosh in $REPO/.env -- deploying hackintosh would prompt"
+  out_has "printf 'FLEET_SEAT_PASSWORD_hackintosh=…\\n' >> $REPO/.env && chmod 600 $REPO/.env"
+  out_has "--allow-prompts"
+  [ ! -e "$LOG/ssh.log" ]
+  [ ! -e "$REPO/tools/state/deploy.lock.d" ]
+  # the whole fleet: refused on the FIRST Mac lacking a line (server or client), Windows never needs one
+  write_dotenv "FLEET_SEAT_PASSWORD_hackintosh=hunter2"
+  run_deploy
+  [ "$status" -ne 0 ]
+  out_has "no FLEET_SEAT_PASSWORD_macbookpro in $REPO/.env"
+  [ ! -e "$LOG/ssh.log" ]
+  # the local seat is also covered by its own .env keys
+  write_dotenv "FLEET_SEAT_PASSWORD_hackintosh=hunter2" "DESKFLOW_SUDO_PASSWORD=local-pw"
+  run_deploy
+  [ "$status" -eq 0 ]
+  # --allow-prompts / FLEET_ALLOW_PROMPTS=1 opt out (seat's own .env or GUI route)
+  rm -f "$REPO/.env" "$LOG/ssh.log"
+  run_deploy --host hackintosh --allow-prompts
+  [ "$status" -eq 0 ]
+  grep -q 'fleet-deploy-macos.sh' "$LOG/ssh.log"
+  rm -f "$LOG/ssh.log"
+  FLEET_ALLOW_PROMPTS=1 run_deploy --host hackintosh
+  [ "$status" -eq 0 ]
+  # a pull or a dry run never needs a password
+  rm -f "$LOG/ssh.log"
+  run_deploy --pull-only --host hackintosh
+  [ "$status" -eq 0 ]
+  run_deploy --dry-run
+  [ "$status" -eq 0 ]
+  # Windows-only runs never need one either
+  run_deploy --host tiny11
   [ "$status" -eq 0 ]
 }

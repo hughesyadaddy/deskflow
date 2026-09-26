@@ -40,6 +40,19 @@
 #                                       (keepalive log); print, never run, the sudo
 #                                       lines for the root-owned ones. Exit 2 while
 #                                       root steps remain.
+#   ... --sudo-stdin                    (any verb) read ONE line -- the sudo password
+#                                       -- from stdin, then run the root steps of
+#                                       `prio` (install + bootstrap the LaunchDaemon),
+#                                       `retire` (rm the root-owned files) and
+#                                       `login-items audit` (`sfltool dumpbtm` when
+#                                       the unprivileged call is refused) through
+#                                       `sudo -S -k`, password on sudo's stdin, never
+#                                       on argv, never in the environment of any
+#                                       child. A rejected password is reported once
+#                                       and the sudo lines are printed instead. This
+#                                       is how scripts/fleet-deploy-macos.sh drives
+#                                       the ctl unattended; without it nothing here
+#                                       ever escalates (no plain sudo, no osascript).
 #   scripts/deskflow-ctl converge [--apply] [--quiet]
 #                                       report-and-repair: re-render stale plists,
 #                                       enable + bootstrap unloaded agents, kickstart
@@ -208,6 +221,59 @@ usage() { sed -n '2,/^set -euo pipefail/p' "${BASH_SOURCE[0]}" | sed '$d'; }
 die() { echo "deskflow-ctl: $*" >&2; exit 1; }
 warn() { echo "deskflow-ctl: warning: $*" >&2; }
 log() { echo "== deskflow-ctl: $* =="; }
+
+# ------------------------------------------------------------ --sudo-stdin
+# SUDO_PW holds the one line read from stdin by --sudo-stdin: a plain shell
+# variable (never exported, so launchctl/sfltool/rm never see it), expanded
+# only with xtrace off (`bash -x` must not echo it), and handed to sudo on
+# ITS stdin. SUDO_REJECTED remembers a refusal so it is reported once.
+SUDO_PW=""
+SUDO_PW_SET=0
+SUDO_REJECTED=0
+XTRACE_ON=0
+xtrace_off() { if [[ $- == *x* ]]; then XTRACE_ON=1; else XTRACE_ON=0; fi; { set +x; } 2>/dev/null; }
+xtrace_restore() { if (( XTRACE_ON )); then set -x; fi; }
+
+read_sudo_stdin() {
+  xtrace_off
+  IFS= read -rs SUDO_PW || true # fleet:allow EOF on stdin = no password; handled as print mode below
+  [[ -n "$SUDO_PW" ]] && SUDO_PW_SET=1
+  xtrace_restore
+  (( SUDO_PW_SET )) || log "--sudo-stdin: empty password line on stdin; root steps will be printed, not run"
+}
+
+# (a flag, not `-n "$SUDO_PW"`: the test would put the value in a `bash -x` trace)
+have_sudo_pw() { (( SUDO_PW_SET )) && (( SUDO_REJECTED == 0 )); }
+
+# sudo_stdin cmd... : `sudo -S -p '' -k cmd...` with SUDO_PW on stdin. printf
+# may lose the race against a sudo that exits at once; a SIGPIPE there must
+# not turn sudo's exit code into 141 under pipefail. A rejected password
+# (sudo exits 1 without running the command) flips to print mode for the
+# rest of the run and is reported exactly once.
+sudo_stdin() {
+  local rc=0
+  xtrace_off
+  { printf '%s\n' "$SUDO_PW" || true; } 2>/dev/null | sudo -S -p '' -k "$@" || rc=$? # fleet:allow printf SIGPIPE when sudo exits first; sudo's status is what counts
+  xtrace_restore
+  if (( rc != 0 )) && ! sudo_password_ok; then
+    SUDO_REJECTED=1
+    echo "deskflow-ctl: sudo password rejected for $(hostname -s) (stdin password); root steps will be printed instead" >&2
+  fi
+  return "$rc"
+}
+
+# True when sudo accepts SUDO_PW for a no-op; cached after the first probe.
+SUDO_PROBED=""
+sudo_password_ok() {
+  if [[ -z "$SUDO_PROBED" ]]; then
+    local rc=0
+    xtrace_off
+    { printf '%s\n' "$SUDO_PW" || true; } 2>/dev/null | sudo -S -p '' -k true || rc=$? # fleet:allow printf SIGPIPE when sudo exits first; sudo's status is what counts
+    xtrace_restore
+    if (( rc == 0 )); then SUDO_PROBED=ok; else SUDO_PROBED=rejected; fi
+  fi
+  [[ "$SUDO_PROBED" == ok ]]
+}
 
 # ---------------------------------------------------------------- inventory
 # Every Deskflow-named process on the box, by executable path (never by
@@ -399,8 +465,34 @@ cmd_prio() {
     return 0
   fi
 
-  # No privilege escalation inside the ctl (no sudo prompts from a deploy
-  # over SSH, no osascript). Documented human step, exact commands:
+  # --sudo-stdin: the same steps, each through `sudo -S` with the password on
+  # sudo's stdin. Any failure falls through to the printed commands (exit 1:
+  # the daemon is still not converged).
+  if have_sudo_pw; then
+    log "prio: installing $installed and bootstrapping system/$PRIO_LABEL (sudo -S, password on stdin)"
+    if sudo_stdin install -d "$DAEMON_DIR" &&
+       sudo_stdin install -d -m 1777 "$MACHINE_LOCK_DIR" &&
+       sudo_stdin install -m 644 -o root -g wheel "$staged" "$installed" &&
+       sudo_stdin chown root:wheel "$bin" &&
+       { ! daemon_loaded "$PRIO_LABEL" || sudo_stdin launchctl bootout "system/$PRIO_LABEL"; } &&
+       sudo_stdin launchctl bootstrap system "$installed" &&
+       daemon_loaded "$PRIO_LABEL"; then
+      log "prio: system/$PRIO_LABEL bootstrapped, $installed installed, $bin is root:wheel"
+      return 0
+    fi
+    echo "deskflow-ctl: prio: a root step failed under sudo -S; the remaining commands:" >&2
+    prio_print_steps "$staged" "$installed" "$bin"
+    return 1
+  fi
+
+  # No privilege escalation inside the ctl otherwise (no sudo prompts from a
+  # deploy over SSH, no osascript). Documented human step, exact commands:
+  prio_print_steps "$staged" "$installed" "$bin"
+  return 0
+}
+
+prio_print_steps() { # staged installed bin
+  local staged="$1" installed="$2" bin="$3"
   cat <<EOF
 == deskflow-ctl: prio: system/$PRIO_LABEL needs root; run once as admin: ==
   sudo install -d $DAEMON_DIR
@@ -410,7 +502,6 @@ cmd_prio() {
   sudo launchctl bootout system/$PRIO_LABEL 2>/dev/null; sudo launchctl bootstrap system "$installed"
 (rendered from $TEMPLATE_DIR/$PRIO_LABEL.plist; verify with: sudo launchctl print system/$PRIO_LABEL)
 EOF
-  return 0
 }
 
 # ------------------------------------------- loaded definition vs render
@@ -1333,13 +1424,30 @@ btm_evaluate() {
 }
 
 btm_dump() {
-  # Runs `sfltool dumpbtm` (a PATH shim in tests). Prints the dump; returns 3
-  # when the tool refused for lack of privilege (SKIP, never PASS), 1 on any
-  # other failure.
+  # Runs `sfltool dumpbtm` (a PATH shim in tests), unprivileged first -- that
+  # works on the fleet's seats. Only when it is refused for lack of privilege
+  # AND --sudo-stdin supplied a password is it retried through `sudo -S`
+  # (never a plain `sudo`: nothing here may raise an interactive prompt from
+  # a launchd tick or an SSH session). Prints the dump; returns 3 when the
+  # tool refused for lack of privilege (SKIP, never PASS), 1 on any other
+  # failure.
   local out rc=0
   out="$(sfltool dumpbtm 2>&1)" || rc=$?
   if (( rc != 0 )) || ! grep -q 'Records for UID' <<<"$out"; then
     if grep -qiE 'root|privilege|permission|not permitted|must be run|operation not' <<<"$out" || (( rc != 0 )); then
+      if have_sudo_pw; then
+        # Not in a $( ): a rejection must set SUDO_REJECTED in THIS shell and
+        # its one-time message must reach stderr, not a captured string.
+        local stmp src=0
+        stmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+        sudo_stdin sfltool dumpbtm >"$stmp" 2>/dev/null || src=$?
+        if (( src == 0 )) && grep -q 'Records for UID' "$stmp"; then
+          cat "$stmp"
+          rm -f "$stmp"
+          return 0
+        fi
+        rm -f "$stmp"
+      fi
       echo "$out"
       return 3
     fi
@@ -1440,6 +1548,15 @@ cmd_retire() {
       log "retire: removed $f"
     fi
   done
+  # --sudo-stdin: the root-owned leftovers go through `sudo -S rm -f`; whatever
+  # survives (rejected password, rm failure) is printed below as before.
+  if have_sudo_pw && present="$(retired_root_files_present)"; then
+    for f in $present; do
+      if sudo_stdin rm -f "$f" && [[ ! -e "$f" && ! -L "$f" ]]; then
+        log "retire: removed $f (sudo -S, password on stdin)"
+      fi
+    done
+  fi
   if present="$(retired_root_files_present)"; then
     cat <<EOF
 == deskflow-ctl: retire: root-owned retired files remain; run once as admin: ==
@@ -1554,6 +1671,18 @@ cmd_assert_single() {
   fi
   echo "deskflow-ctl assert-single: OK (core=1 launchd-owned ppid 1, gui=1 launchd-owned, bridge=$bridge, login-items clean)"
 }
+
+# --sudo-stdin may sit anywhere on the command line; it is consumed here so
+# the verbs never see it.
+_args=()
+for _a in "$@"; do
+  case "$_a" in
+    --sudo-stdin) read_sudo_stdin ;;
+    *) _args+=("$_a") ;;
+  esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+unset _args _a
 
 case "${1:-}" in
   stop) cmd_stop ;;

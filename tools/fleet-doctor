@@ -298,6 +298,29 @@ class Probe:
 # --------------------------------------------------------------------------- checks
 
 
+# Any *PASSWORD* key. fleet.env* must hold none at all (it is copied to every
+# seat); a seat's .env may hold them only at mode 600 and untracked.
+PASSWORD_KEY_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*PASSWORD[A-Za-z0-9_]*)[ \t]*=(.*)$", re.M)
+
+
+def password_keys(text: str, non_empty_only: bool = False) -> List[str]:
+    """Names (never values) of *PASSWORD* keys assigned in KEY=VALUE text, in order.
+
+    With non_empty_only, template lines such as `DESKFLOW_SUDO_PASSWORD=` or
+    `KEY=""` do not count.
+    """
+    keys: List[str] = []
+    for m in PASSWORD_KEY_RE.finditer(text):
+        key, val = m.group(1), m.group(2).strip()
+        if val in ('""', "''"):
+            val = ""
+        if non_empty_only and not val:
+            continue
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
 def env_key_has_value(text: str, key: str) -> bool:
     """True when `KEY=<non-empty>` appears on ONE line of `text`.
 
@@ -329,9 +352,29 @@ def check_env(p: Probe, rep: Report) -> None:
     leaky: List[str] = []
     for f in p.glob(join(h, h.deskflow_path, "scripts", "fleet.env*")):
         body = p.read_file(f) or ""
-        if "KEYCHAIN_PASSWORD" in body:
-            leaky.append(os.path.basename(f))
-    rep.add(h.id, "env", not leaky, "KEYCHAIN_PASSWORD in " + ", ".join(leaky) if leaky else "no KEYCHAIN_PASSWORD in fleet.env*")
+        leaky.extend(f"{k} in {os.path.basename(f)}" for k in password_keys(body))
+    rep.add(h.id, "env", not leaky, "password key " + ", ".join(leaky) if leaky else "no *PASSWORD* key in fleet.env*")
+
+    # A seat's .env may hold passwords (the unattended deploy's
+    # DESKFLOW_KEYCHAIN_PASSWORD / DESKFLOW_SUDO_PASSWORD, the controller's
+    # FLEET_SEAT_PASSWORD_<id> lines): then it must be mode 600, never tracked,
+    # and never on a Windows seat (signtool + the SCM run in the SSH session).
+    if dotenv is not None:
+        dotenv_path = join(h, h.deskflow_path, ".env")
+        secrets = password_keys(dotenv, non_empty_only=True)
+        if h.is_windows:
+            if secrets:
+                rep.add(h.id, "env", False, ".env holds " + ", ".join(secrets)
+                        + ": a Windows seat needs no password (signtool + the SCM run in the SSH session); remove it")
+        elif secrets:
+            rc, out, _ = p.sh(f"stat -f %Lp {q(h, dotenv_path)}")
+            mode = out.strip().splitlines()[-1] if out.strip() else ""
+            ok = rc == 0 and mode == "600"
+            rep.add(h.id, "env", ok, f".env holds {', '.join(secrets)}; mode {mode or '?'}"
+                    + ("" if ok else f" (want 600: chmod 600 {dotenv_path})"))
+        rc, _, _ = p.sh(f"git -C {q(h, h.deskflow_path)} ls-files --error-unmatch .env")
+        rep.add(h.id, "env", rc != 0,
+                ".env is tracked by git (git rm --cached .env; it may hold passwords)" if rc == 0 else ".env untracked")
 
     baks = p.glob(join(h, h.deskflow_path, "scripts", "fleet.env.bak-*"))
     rep.add(h.id, "env", not baks, "stale " + ", ".join(os.path.basename(b) for b in baks) if baks else "no fleet.env.bak-*")

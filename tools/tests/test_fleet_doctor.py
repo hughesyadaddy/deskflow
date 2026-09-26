@@ -235,7 +235,9 @@ def test_probe_failure_marks_unreachable(fleet_doctor, healthy, fleet_env):
     ("hackintosh", 'deskflow/.env{q}', (0, "DESKFLOW_CODESIGN_ID=\n"), "lacks DESKFLOW_CODESIGN_ID"),
     ("tiny11", "deskflow/.env'", (0, "QT_PREFIX=C:/Qt\n"), "lacks DESKFLOW_SIGN_THUMBPRINT"),
     ("macbookpro", 'scripts/fleet.env{q}', (1, ""), "scripts/fleet.env missing"),
-    ("hackintosh", 'fleet.env.example{q}', (0, "FLEET_KEYCHAIN_PASSWORD_hackintosh=hunter2\n"), "KEYCHAIN_PASSWORD in fleet.env.example"),
+    ("hackintosh", 'fleet.env.example{q}', (0, "FLEET_KEYCHAIN_PASSWORD_hackintosh=hunter2\n"), "FLEET_KEYCHAIN_PASSWORD_hackintosh in fleet.env.example"),
+    ("hackintosh", 'fleet.env.example{q}', (0, "FLEET_SEAT_PASSWORD_hackintosh=hunter2\n"), "FLEET_SEAT_PASSWORD_hackintosh in fleet.env.example"),
+    ("tiny11", "deskflow/.env'", (0, WIN_DOTENV + "DESKFLOW_SUDO_PASSWORD=hunter2\n"), "a Windows seat needs no password"),
     ("hackintosh", "fleet.env.bak-*", (0, "/x/scripts/fleet.env.bak-20260901\n"), "fleet.env.bak-20260901"),
     ("tiny11", "fleet.env.bak-*'", (0, "C:\\x\\scripts\\fleet.env.bak-1\n"), "fleet.env.bak-1"),
 ])
@@ -272,6 +274,50 @@ def test_env_secret_not_echoed(fleet_doctor, healthy, fleet_env):
     code, text = run(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "env")
     assert code == 1
     assert "hunter2" not in text
+
+
+MAC_DOTENV_STAT = "stat -f %Lp '/Users/u/Desktop/deskflow/.env'"
+
+
+def test_env_password_in_dotenv_requires_mode_600(fleet_doctor, healthy, fleet_env):
+    healthy.set("hackintosh", 'deskflow/.env{q}', 0, MAC_DOTENV + "DESKFLOW_SUDO_PASSWORD=hunter2\nFLEET_SEAT_PASSWORD_macbookpro='x y'\n")
+    healthy.set("hackintosh", MAC_DOTENV_STAT, 0, "644\n")
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "env")
+    assert code == 1
+    fails = rows(payload, host="hackintosh", check="env", status="fail")
+    assert len(fails) == 1
+    detail = fails[0]["detail"]
+    assert "DESKFLOW_SUDO_PASSWORD, FLEET_SEAT_PASSWORD_macbookpro" in detail and "mode 644" in detail and "chmod 600" in detail
+    assert "hunter2" not in json.dumps(payload) and "x y" not in json.dumps(payload)
+
+    healthy.set("hackintosh", MAC_DOTENV_STAT, 0, "600\n")
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "env")
+    assert code == 0
+    assert any("mode 600" in r["detail"] for r in rows(payload, host="hackintosh", check="env", status="pass"))
+    assert any(r["detail"] == ".env untracked" for r in rows(payload, host="hackintosh", check="env", status="pass"))
+
+
+def test_env_empty_password_template_keys_need_no_mode(fleet_doctor, healthy, fleet_env):
+    healthy.set("hackintosh", 'deskflow/.env{q}', 0, MAC_DOTENV + 'DESKFLOW_KEYCHAIN_PASSWORD=\nDESKFLOW_SUDO_PASSWORD=""\n# FLEET_SEAT_PASSWORD_macbookpro=\n')
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", "hackintosh", "--check", "env")
+    assert code == 0
+    assert not any("stat -f" in c for _, c in healthy.calls)
+
+
+@pytest.mark.parametrize("host", ["macbookpro", "tiny11"])
+def test_env_tracked_dotenv_fails(fleet_doctor, healthy, fleet_env, host):
+    healthy.set(host, "ls-files --error-unmatch .env", 0, ".env\n")
+    code, payload = run_json(fleet_doctor, healthy, fleet_env, "--host", host, "--check", "env")
+    assert code == 1
+    fails = rows(payload, host=host, check="env", status="fail")
+    assert len(fails) == 1 and "tracked by git" in fails[0]["detail"] and "git rm --cached .env" in fails[0]["detail"]
+
+
+def test_password_keys_helper(fleet_doctor):
+    pk = fleet_doctor.password_keys
+    text = "A=1\nDESKFLOW_SUDO_PASSWORD=x\nexport FLEET_SEAT_PASSWORD_h='y z'\n# DESKFLOW_KEYCHAIN_PASSWORD=z\nEMPTY_PASSWORD=\nQ_PASSWORD=\"\"\n"
+    assert pk(text) == ["DESKFLOW_SUDO_PASSWORD", "FLEET_SEAT_PASSWORD_h", "EMPTY_PASSWORD", "Q_PASSWORD"]
+    assert pk(text, non_empty_only=True) == ["DESKFLOW_SUDO_PASSWORD", "FLEET_SEAT_PASSWORD_h"]
 
 
 # ----------------------------------------------------------------------------- repo

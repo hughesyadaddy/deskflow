@@ -35,6 +35,8 @@ check ".env.example is not tracked" bash -c '! git ls-files --error-unmatch .env
 # --- no secrets in the fleet template ---------------------------------------
 check "no KEYCHAIN_PASSWORD in $FLEET_EXAMPLE" bash -c "! grep -q KEYCHAIN_PASSWORD '$FLEET_EXAMPLE'"
 check "no KEYCHAIN_PASSWORD in any scripts/fleet.env*" bash -c '! grep -rq KEYCHAIN_PASSWORD scripts/fleet.env*'
+check "no *PASSWORD* key (even commented) in any scripts/fleet.env*" \
+  bash -c '! grep -Eq "^#? ?(export )?[A-Za-z0-9_]*PASSWORD[A-Za-z0-9_]*=" scripts/fleet.env*'
 check "no unlock_keychain mention in $FLEET_EXAMPLE" bash -c "! grep -qi unlock.keychain '$FLEET_EXAMPLE'"
 
 # --- required keys: scripts/fleet.env.example -------------------------------
@@ -55,14 +57,22 @@ check "$FLEET_EXAMPLE does not define LOCAL_ID (derived from hostname)" \
 
 # --- required keys: env.example ---------------------------------------------
 for key in DESKFLOW_CODESIGN_ID DESKFLOW_QT_PATH OPENSSL_ROOT_DIR \
-           DESKFLOW_INSTALL_DIR DESKFLOW_BUILD_DIR DESKFLOW_SIGN_THUMBPRINT; do
+           DESKFLOW_INSTALL_DIR DESKFLOW_BUILD_DIR DESKFLOW_SIGN_THUMBPRINT \
+           DESKFLOW_KEYCHAIN_PASSWORD DESKFLOW_SUDO_PASSWORD \
+           FLEET_SEAT_PASSWORD_hackintosh FLEET_SEAT_PASSWORD_macbookpro; do
   check "$ENV_EXAMPLE declares $key" has_key "$ENV_EXAMPLE" "$key"
 done
 check "$ENV_EXAMPLE points at 'security find-identity -v -p codesigning'" \
   grep -q 'security find-identity -v -p codesigning' "$ENV_EXAMPLE"
+check "$ENV_EXAMPLE ships every password value EMPTY" \
+  bash -c "! grep -Eq '^#? ?(export )?[A-Za-z0-9_]*PASSWORD[A-Za-z0-9_]*=.' '$ENV_EXAMPLE'"
+check "$ENV_EXAMPLE states the mode-600 rule" grep -q 'chmod 600 .env' "$ENV_EXAMPLE"
+check "$ENV_EXAMPLE states Windows needs no password" grep -Eqi 'windows.*no password|no password.*windows' "$ENV_EXAMPLE"
+check "$ENV_EXAMPLE has no FLEET_SEAT_PASSWORD line for the Windows seat" \
+  bash -c "! grep -q 'FLEET_SEAT_PASSWORD_tiny11' '$ENV_EXAMPLE'"
 
 # --- .gitignore: per-seat files and tool state ignored ----------------------
-for p in .env scripts/fleet.env tools/state/x harness/runs/x harness/soak/x harness/.hackintosh.lock; do
+for p in .env .env.local scripts/fleet.env tools/state/x harness/runs/x harness/soak/x harness/.hackintosh.lock; do
   check "git ignores $p" git check-ignore -q "$p"
 done
 

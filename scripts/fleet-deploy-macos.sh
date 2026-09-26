@@ -3,10 +3,24 @@
 #
 # No silent success: every step either succeeds or the script exits non-zero.
 # The signing identity comes ONLY from `.env` DESKFLOW_CODESIGN_ID; there is no
-# "any Apple Development cert" fallback. With `.env` DESKFLOW_KEYCHAIN_PASSWORD
-# (mode 600) the seat signs directly in this shell, SSH included; without it,
-# steps that need the login keychain are routed through tools/fleet-gui-exec.py,
-# which execs them in the console GUI session.
+# "any Apple Development cert" fallback.
+#
+# Passwords (all optional, none ever on argv or in a log line):
+#   DESKFLOW_KEYCHAIN_PASSWORD  login keychain: codesign directly in this
+#                               shell, SSH included; without it every step
+#                               that needs the keychain is routed through
+#                               tools/fleet-gui-exec.py (console GUI session)
+#   DESKFLOW_SUDO_PASSWORD      root steps (LoginWindow bridge plist, the
+#                               deskflow-prio LaunchDaemon, root-owned retired
+#                               files, bridge-log hygiene) run here through
+#                               `sudo -S` with the password on stdin; without
+#                               it -- or after one rejection -- they are
+#                               printed for a human
+# Each comes from the seat's own `.env` (mode 600), else from the environment
+# (scripts/fleet-deploy.sh transports FLEET_SEAT_PASSWORD_<id> that way), else
+# from a FLEET_SEAT_PASSWORD_<this seat> line in `.env`; one defaults to the
+# other. Both are captured and unset before any build step runs, so no child
+# (cmake, python3, codesign, the installers) ever inherits them.
 set -euo pipefail
 
 # Non-interactive SSH shells skip login profiles; Homebrew tools must be on PATH.
@@ -44,9 +58,14 @@ MOUSER_FORK_URL="${FLEET_MOUSER_FORK_URL:-https://github.com/hughesyadaddy/Mouse
 # gate reads the latter. Overridable for tests only.
 MOUSER_SETTINGS_DIR="${MOUSER_SETTINGS_DIR:-$HOME/Library/Application Support/Mouser}"
 MOUSER_LOG="${MOUSER_LOG:-$HOME/Library/Logs/Mouser/mouser.log}"
+# The LoginWindow bridge's plist and log: root steps here install the former
+# and chmod/scrub the latter (through sudo). Overridable for tests only.
+LOGIN_BRIDGE_PLIST="${DESKFLOW_LOGIN_BRIDGE_PLIST:-/Library/LaunchAgents/org.deskflow.vhid-bridge.plist}"
+LOGIN_BRIDGE_LOG="${DESKFLOW_LOGIN_BRIDGE_LOG:-/var/log/deskflow-vhid-bridge.log}"
+LOGIN_BRIDGE_KEYSTROKE_MARK='key down id='
 
 if [[ -n "${BATS_TEST_FILENAME:-}" ]]; then
-  for _sandbox_check_path in "$DESKFLOW_ROOT" "$MOUSER_ROOT" "$MOUSER_SETTINGS_DIR" "$MOUSER_LOG"; do
+  for _sandbox_check_path in "$DESKFLOW_ROOT" "$MOUSER_ROOT" "$MOUSER_SETTINGS_DIR" "$MOUSER_LOG" "$LOGIN_BRIDGE_PLIST" "$LOGIN_BRIDGE_LOG"; do
     case "$_sandbox_check_path" in
       "$TMPDIR"*|/tmp/*|/private/tmp/*|/private/var/folders/*|"${BATS_TMPDIR:-__unset__}"*|\
       "${BATS_RUN_TMPDIR:-__unset__}"*|"${BATS_TEST_TMPDIR:-__unset__}"*|"${BATS_FILE_TMPDIR:-__unset__}"*)
@@ -73,6 +92,100 @@ fail() {
   echo "error: [$HOST_TAG] $*" >&2
   exit 1
 }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+SEAT_ID="$(lower "$HOST_TAG")"
+
+# `bash -x` must never echo a password: every line that expands one runs
+# between xtrace_off and xtrace_restore (the trace of `set +x` itself is
+# discarded by the redirect).
+XTRACE_ON=0
+xtrace_off() { if [[ $- == *x* ]]; then XTRACE_ON=1; else XTRACE_ON=0; fi; { set +x; } 2>/dev/null; }
+xtrace_restore() { if (( XTRACE_ON )); then set -x; fi; }
+
+# Names (never values) of *PASSWORD* keys with a non-empty value in a
+# KEY=VALUE file, one per line (same rule as scripts/fleet-deploy.sh).
+dotenv_password_keys() { # file
+  awk '
+    /^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*PASSWORD[A-Za-z0-9_]*[[:space:]]*=/ {
+      key = $0; sub(/=.*$/, "", key); sub(/^[[:space:]]*(export[[:space:]]+)?/, "", key); sub(/[[:space:]]*$/, "", key)
+      val = substr($0, index($0, "=") + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+      if (val == "\"\"" || val == "'"'"''"'"'") val = ""
+      if (val != "") print key
+    }' "$1"
+}
+
+# --- root steps ---------------------------------------------------------------
+# ROOT_MODE=sudo: DESKFLOW_SUDO_PASSWORD was present and `sudo -S -k true`
+# accepted it once, so every root step runs here through run_root. The
+# password lives in ROOT_PW, a plain (unexported) shell variable captured by
+# init_root_mode before the environment copy is unset: children never inherit
+# it. ROOT_MODE=print: no password, or it was rejected (reported loudly, once)
+# -- every root step is printed for a human and collected in ROOT_STEPS.
+ROOT_MODE="print"
+ROOT_PW=""
+KEYCHAIN_PW=""
+ROOT_STEPS=()
+HUMAN_NOTES=()
+
+# The first thing after load_dotenv, before ANY child process: both passwords
+# move from the environment into plain shell variables and the environment
+# copies are unset, so not even `security` (which needs the keychain one on
+# argv) inherits the other.
+capture_passwords() {
+  xtrace_off
+  KEYCHAIN_PW="${DESKFLOW_KEYCHAIN_PASSWORD:-}"
+  ROOT_PW="${DESKFLOW_SUDO_PASSWORD:-}"
+  unset DESKFLOW_KEYCHAIN_PASSWORD DESKFLOW_SUDO_PASSWORD
+  xtrace_restore
+}
+
+init_root_mode() {
+  local have=0
+  xtrace_off
+  [[ -n "$ROOT_PW" ]] && have=1
+  xtrace_restore
+  if (( ! have )); then
+    ROOT_MODE="print"
+    echo "== [$HOST_TAG] root steps: no DESKFLOW_SUDO_PASSWORD; they will be printed, not run =="
+    return 0
+  fi
+  if sudo_stdin true; then
+    ROOT_MODE="sudo"
+    echo "== [$HOST_TAG] root steps: sudo password verified (DESKFLOW_SUDO_PASSWORD); running them here =="
+  else
+    ROOT_MODE="print"
+    ROOT_PW=""
+    echo "error: [$HOST_TAG] sudo password rejected for $HOST_TAG; check FLEET_SEAT_PASSWORD_${SEAT_ID} (controller .env) or DESKFLOW_SUDO_PASSWORD (this seat's .env) -- root steps will be printed, not run" >&2
+  fi
+}
+
+# sudo_stdin cmd... : `sudo -S -p '' -k cmd...` with ROOT_PW on stdin -- never
+# argv, never traced. printf may lose the race against a sudo that exits at
+# once; a SIGPIPE there must not turn sudo's exit code into 141 under pipefail.
+sudo_stdin() {
+  local rc=0
+  xtrace_off
+  { printf '%s\n' "$ROOT_PW" || true; } 2>/dev/null | sudo -S -p '' -k "$@" || rc=$? # fleet:allow printf SIGPIPE when sudo exits first; sudo's status is what counts
+  xtrace_restore
+  return "$rc"
+}
+
+# run_root cmd... : a root step. Only callable in ROOT_MODE=sudo; callers
+# decide between run_root and appending the printed line to ROOT_STEPS.
+run_root() {
+  [[ "$ROOT_MODE" == "sudo" ]] || fail "run_root without a verified sudo password (bug)"
+  sudo_stdin "$@"
+}
+
+# ctl_sudo_stdin verb [args...] : scripts/deskflow-ctl <verb> --sudo-stdin,
+# fed ROOT_PW on stdin so the ctl runs its own root commands.
+ctl_sudo_stdin() {
+  local ctl="$DESKFLOW_ROOT/scripts/deskflow-ctl" install_app="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}" rc=0
+  xtrace_off
+  { printf '%s\n' "$ROOT_PW" || true; } 2>/dev/null | DESKFLOW_INSTALL_APP="$install_app" "$ctl" "$@" --sudo-stdin || rc=$? # fleet:allow printf SIGPIPE when the ctl exits first; its status is what counts
+  xtrace_restore
+  return "$rc"
+}
 
 # Run a command in a session that can reach the login keychain.
 # With DESKFLOW_KEYCHAIN_PASSWORD in the seat's .env, prepare_keychain_for_ssh
@@ -98,20 +211,27 @@ gui_exec() {
 # briefly visible in `ps` on the seat itself -- the seat owner already holds
 # it. The password is never printed, logged or exported past this function.
 prepare_keychain_for_ssh() {
-  local pw="${DESKFLOW_KEYCHAIN_PASSWORD:-}"
-  [[ -n "$pw" ]] || return 0
-  local envfile="$DESKFLOW_ROOT/.env"
-  local mode
-  mode="$(stat -f %Lp "$envfile")"
-  [[ "$mode" == "600" ]] || fail ".env holds DESKFLOW_KEYCHAIN_PASSWORD but is mode $mode; run: chmod 600 $envfile"
+  local pw have=0
+  xtrace_off
+  pw="$KEYCHAIN_PW"
+  KEYCHAIN_PW=""
+  [[ -n "$pw" ]] && have=1
+  xtrace_restore
+  (( have )) || return 0
   local kc="${DESKFLOW_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
   local id
   id="$(resolve_codesign_id)"
   echo "== [$HOST_TAG] preparing $kc for codesign over SSH =="
-  security unlock-keychain -p "$pw" "$kc" >/dev/null 2>&1 \
-    || fail "security unlock-keychain failed for $kc (wrong DESKFLOW_KEYCHAIN_PASSWORD?)"
-  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" >/dev/null 2>&1 \
-    || fail "security set-key-partition-list failed for $kc"
+  local rc=0
+  xtrace_off
+  security unlock-keychain -p "$pw" "$kc" >/dev/null 2>&1 || rc=$?
+  xtrace_restore
+  (( rc == 0 )) || fail "security unlock-keychain failed for $kc (wrong DESKFLOW_KEYCHAIN_PASSWORD?)"
+  xtrace_off
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" >/dev/null 2>&1 || rc=$?
+  pw=""
+  xtrace_restore
+  (( rc == 0 )) || fail "security set-key-partition-list failed for $kc"
   local probe
   probe="$(mktemp "${TMPDIR:-/tmp}/deskflow-sign-probe.XXXXXX")"
   cp /bin/ls "$probe"
@@ -121,8 +241,7 @@ prepare_keychain_for_ssh() {
   fi
   rm -f "$probe"
   # The key ACL is now persistent and the keychain is unlocked; nothing
-  # downstream needs the password, so children must not inherit it.
-  unset DESKFLOW_KEYCHAIN_PASSWORD
+  # downstream needs the password (it was unset above, before any child ran).
   KEYCHAIN_SSH_READY=1
   echo "== [$HOST_TAG] codesign verified from this session; not routing through the GUI =="
 }
@@ -130,17 +249,31 @@ prepare_keychain_for_ssh() {
 DOTENV_LOADED=0
 load_dotenv() {
   cd "$DESKFLOW_ROOT"
-  # Once only: re-sourcing would re-export DESKFLOW_KEYCHAIN_PASSWORD after
-  # prepare_keychain_for_ssh deliberately unset it.
+  # Once only: re-sourcing would re-export the passwords after
+  # prepare_keychain_for_ssh / init_root_mode deliberately unset them.
   [[ "$DOTENV_LOADED" == "1" ]] && return 0
   DOTENV_LOADED=1
+  # Password resolution runs with xtrace off: .env and the environment may
+  # both carry one, and `bash -x` must never print it.
+  xtrace_off
+  local self_var="FLEET_SEAT_PASSWORD_${SEAT_ID}" self_pw="" kc_pw su_pw
   if [[ -f .env ]]; then
+    local pw_keys
+    pw_keys="$(dotenv_password_keys .env | tr '\n' ' ')"
+    if [[ -n "$pw_keys" ]]; then
+      local mode
+      mode="$(stat -f %Lp .env)"
+      [[ "$mode" == "600" ]] || fail ".env holds ${pw_keys% } but is mode $mode; run: chmod 600 $DESKFLOW_ROOT/.env"
+    fi
     # .env is this seat's persistent config; an explicit environment
     # variable set on invocation (as tests/CI callers do) must win, not get
     # silently clobbered -- preserve and restore anything .env also declares
     # that was already set. See scripts/install-macos.sh for the same fix.
     # Plain indexed array only: /usr/bin/env bash on macOS is 3.2, no
-    # `declare -A`.
+    # `declare -A`. Exception: a NON-EMPTY password in .env beats one the
+    # controller transported (the seat owner put it there deliberately), and
+    # FLEET_SEAT_PASSWORD_* lines are never restored -- they are the
+    # controller's, not this process's.
     _env_overrides=()
     while IFS='=' read -r _env_key _; do
       [[ -z "$_env_key" || "$_env_key" == \#* ]] && continue
@@ -154,11 +287,28 @@ load_dotenv() {
     set +a
     if [[ ${#_env_overrides[@]} -gt 0 ]]; then
       for _env_kv in "${_env_overrides[@]}"; do
+        _env_key="${_env_kv%%=*}"
+        case "$_env_key" in
+          DESKFLOW_KEYCHAIN_PASSWORD|DESKFLOW_SUDO_PASSWORD) [[ -z "${!_env_key:-}" ]] || continue ;;
+          FLEET_SEAT_PASSWORD_*) continue ;;
+        esac
         export "$_env_kv"
       done
     fi
+    # This seat's own FLEET_SEAT_PASSWORD line (the controller's format) is
+    # the fallback for both; every other seat's line is dropped unread so no
+    # child inherits a sibling's password through `set -a`.
+    self_pw="${!self_var:-}"
+    # shellcheck disable=SC2086  # the names are the point
+    unset ${!FLEET_SEAT_PASSWORD_@}
     unset _env_overrides _env_key _env_kv
   fi
+  kc_pw="${DESKFLOW_KEYCHAIN_PASSWORD:-}"
+  su_pw="${DESKFLOW_SUDO_PASSWORD:-}"
+  [[ -n "$kc_pw" ]] || kc_pw="${self_pw:-$su_pw}"
+  [[ -n "$su_pw" ]] || su_pw="${self_pw:-$kc_pw}"
+  export DESKFLOW_KEYCHAIN_PASSWORD="$kc_pw" DESKFLOW_SUDO_PASSWORD="$su_pw"
+  xtrace_restore
 }
 
 # The ONLY source of the signing identity. Empty or ad-hoc ("-") is fatal:
@@ -229,11 +379,31 @@ configure_deskflow() {
     return 0
   fi
 
-  echo "== [$HOST_TAG] cmake configure (signed, strict): $reason =="
+  # A cache that disagrees with the identity / strict-signing requirements
+  # is reconfigured automatically, in place first (object files survive).
+  if [[ -f "$cache" && "$RECONFIGURE" != "1" ]]; then
+    echo "== [$HOST_TAG] cmake cache mismatch → reconfiguring: $reason =="
+  else
+    echo "== [$HOST_TAG] cmake configure (signed, strict): $reason =="
+  fi
+  if cmake_configure "$codesign_id"; then
+    return 0
+  fi
+  # A cache from another generator, source dir or CMake version makes the
+  # in-place configure fail outright: discard it and configure once more
+  # from scratch (FLEET_RECONFIGURE=1 remains the manual override).
+  [[ -f "$cache" ]] || fail "cmake configure failed"
+  echo "== [$HOST_TAG] cmake configure failed over the existing cache; discarding $cache + build/CMakeFiles and reconfiguring from scratch =="
+  rm -f "$cache"
+  rm -rf build/CMakeFiles
+  cmake_configure "$codesign_id" || fail "cmake configure failed after discarding the stale cache"
+}
+
+cmake_configure() { # codesign_id
   gui_exec cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$(brew --prefix qt);$(brew --prefix openssl@3)" \
     -DFLEET_STRICT_SIGNING=ON \
-    -DAPPLE_CODESIGN_DEV="$codesign_id" \
+    -DAPPLE_CODESIGN_DEV="$1" \
     -DSKIP_BUILD_TESTS=ON \
     -DBUILD_TESTS=OFF
 }
@@ -257,51 +427,102 @@ build_install_deskflow() {
   verify_login_bridge_plist "$install_app"
 }
 
-# The ONE fatal single-launcher gate, after everything is installed (agents,
-# bridge check, Mouser): install-macos.sh's own assert-single is report-only
-# so a seat with pending human steps (a BTM login item, root-owned retired
-# files) is still fully deployed before this exits non-zero.
+# The ONE single-launcher gate, after everything is installed (agents, bridge
+# check, Mouser): install-macos.sh's own assert-single is report-only so a
+# seat with pending human steps is still fully deployed before this decides.
+# With a sudo password the prio LaunchDaemon and the root-owned retired files
+# are converged here first (deskflow-ctl --sudo-stdin). What assert-single
+# still reports is then split: a BTM Login Item can only be removed in System
+# Settings (listed, never fatal); everything else (a second core, a process
+# outside the bundle, a retired file nobody could remove, an audit that could
+# not run) is a real blocker and fails the run.
 final_single_launcher_gate() {
   local ctl="$DESKFLOW_ROOT/scripts/deskflow-ctl"
   local install_app="${DESKFLOW_INSTALL_APP:-/Applications/Deskflow.app}"
   [[ -x "$ctl" ]] || fail "deskflow-ctl missing at $ctl; cannot assert a single launcher"
-  echo "== [$HOST_TAG] retired files (deskflow-ctl retire) =="
   local retire_out
-  retire_out="$(DESKFLOW_INSTALL_APP="$install_app" "$ctl" retire 2>&1)" || true # fleet:allow exit 2 = root steps, listed below
-  echo "$retire_out"
-  echo "== [$HOST_TAG] single launcher (deskflow-ctl assert-single, fatal) =="
+  if [[ "$ROOT_MODE" == "sudo" ]]; then
+    echo "== [$HOST_TAG] prio LaunchDaemon (deskflow-ctl prio --sudo-stdin) =="
+    ctl_sudo_stdin prio || fail "deskflow-ctl prio --sudo-stdin failed on $HOST_TAG"
+    echo "== [$HOST_TAG] retired files (deskflow-ctl retire --sudo-stdin) =="
+    retire_out="$(ctl_sudo_stdin retire 2>&1)" || { echo "$retire_out"; fail "deskflow-ctl retire --sudo-stdin left root-owned files on $HOST_TAG"; }
+    echo "$retire_out"
+  else
+    echo "== [$HOST_TAG] retired files (deskflow-ctl retire) =="
+    retire_out="$(DESKFLOW_INSTALL_APP="$install_app" "$ctl" retire 2>&1)" || true # fleet:allow exit 2 = root steps, listed below
+    echo "$retire_out"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && ROOT_STEPS+=("$line")
+    done < <(echo "$retire_out" | grep -E '^\s*sudo ' | sed 's/^ *//')
+  fi
+  echo "== [$HOST_TAG] single launcher (deskflow-ctl assert-single) =="
   local assert_out
   if assert_out="$(DESKFLOW_INSTALL_APP="$install_app" "$ctl" assert-single 2>&1)"; then
     echo "$assert_out"
+    print_human_notes
     return 0
   fi
   echo "$assert_out"
+  local line blockers=() settings_only=()
+  while IFS= read -r line; do
+    [[ "$line" == "  "* ]] || continue
+    line="${line#  }"
+    case "$line" in
+      "login-items audit FAIL:"*) settings_only+=("$line") ;;
+      *) blockers+=("$line") ;;
+    esac
+  done <<<"$assert_out"
   local steps
   steps="$(DESKFLOW_INSTALL_APP="$install_app" "$ctl" login-items print-steps 2>&1 || true)" # fleet:allow best-effort detail for the block below
-  cat <<EOF
-
-################################################################################
-# HUMAN STEP REQUIRED on $HOST_TAG -- the seat IS deployed (agents, bridge,
-# Mouser), but more than one launcher survives. Fix each line, then re-run:
-#   $ctl assert-single
-################################################################################
-$(echo "$assert_out" | sed -n '2,$p' | sed 's/^  /  - /')
-
-  exact commands / UI paths:
-$(echo "$retire_out" | grep -E '^\s*sudo ' | sed 's/^ */    /')
-$(echo "$steps" | grep -vE 'nothing to remove' | sed 's/^ */    /')
-    (retired root files: $ctl retire; login items: $ctl login-items print-steps)
-################################################################################
-EOF
-  fail "deskflow-ctl assert-single failed on $HOST_TAG after a full deploy -- see HUMAN STEP REQUIRED above"
+  echo
+  echo "################################################################################"
+  echo "# HUMAN STEP REQUIRED on $HOST_TAG -- the seat IS deployed (agents, bridge,"
+  echo "# Mouser), but more than one launcher survives. Re-check with:"
+  echo "#   $ctl assert-single"
+  echo "################################################################################"
+  if (( ${#settings_only[@]} )); then
+    echo "  System Settings only (no command can do this; the run does not fail for it):"
+    printf '  - %s\n' "${settings_only[@]}"
+    echo "$steps" | grep -vE 'nothing to remove' | sed 's/^ */      /'
+  fi
+  if (( ${#blockers[@]} )); then
+    echo "  BLOCKERS (this run fails):"
+    printf '  - %s\n' "${blockers[@]}"
+    if (( ${#ROOT_STEPS[@]} )); then
+      echo "    exact commands:"
+      printf '      %s\n' "${ROOT_STEPS[@]}"
+    fi
+    echo "    (retired root files: $ctl retire; login items: $ctl login-items print-steps)"
+  fi
+  echo "################################################################################"
+  print_human_notes
+  if (( ${#blockers[@]} == 0 )); then
+    echo "== [$HOST_TAG] deployed; only the System Settings step above remains (not fatal) =="
+    return 0
+  fi
+  fail "deskflow-ctl assert-single failed on $HOST_TAG after a full deploy -- see BLOCKERS above"
 }
 
-# The LoginWindow bridge plist lives in /Library/LaunchAgents (root) and this
-# script never escalates, so it can only be rendered and compared here; a
-# stale one is reported as a root step, never fixed silently.
+# Notes for the human that never fail the run, plus the root steps still
+# pending when no sudo password was available.
+print_human_notes() {
+  local n
+  for n in ${HUMAN_NOTES[@]+"${HUMAN_NOTES[@]}"}; do
+    echo "== [$HOST_TAG] note: $n =="
+  done
+  if [[ "$ROOT_MODE" != "sudo" ]] && (( ${#ROOT_STEPS[@]} )); then
+    echo "== [$HOST_TAG] root steps still pending (no DESKFLOW_SUDO_PASSWORD on this seat; set FLEET_SEAT_PASSWORD_${SEAT_ID} in the controller's .env to run them unattended): =="
+    printf '    %s\n' "${ROOT_STEPS[@]}"
+  fi
+}
+
+# The LoginWindow bridge plist lives in /Library/LaunchAgents (root). It is
+# rendered and compared here; a stale one is installed through run_root when
+# a sudo password is available and reported as a root step otherwise. Either
+# way the agent only loads at the next login window.
 verify_login_bridge_plist() {
   local install_app="$1" renderer="$DESKFLOW_ROOT/scripts/install-login-bridge-macos.sh"
-  local installed="${DESKFLOW_LOGIN_BRIDGE_PLIST:-/Library/LaunchAgents/org.deskflow.vhid-bridge.plist}"
+  local installed="$LOGIN_BRIDGE_PLIST"
   local rendered render_err
   rendered="$(mktemp "${TMPDIR:-/tmp}/vhid-bridge.XXXXXX.plist")"
   render_err="$(mktemp "${TMPDIR:-/tmp}/vhid-bridge.XXXXXX.err")"
@@ -324,10 +545,63 @@ verify_login_bridge_plist() {
   fi
   if [[ -f "$installed" ]] && cmp -s "$rendered" "$installed"; then
     echo "== [$HOST_TAG] bridge plist up to date: $installed =="
+  elif [[ "$ROOT_MODE" == "sudo" ]]; then
+    echo "== [$HOST_TAG] bridge plist stale — installing it (root step through sudo -S) =="
+    # The renderer resolves the settings owner from SUDO_USER; the test-only
+    # path overrides travel with it so nothing escapes a sandbox.
+    local bridge_env=("DESKFLOW_INSTALL_APP=$install_app") v
+    for v in DESKFLOW_SETTINGS DESKFLOW_LOGIN_BRIDGE_PLIST DESKFLOW_LOGIN_BRIDGE_LOG DESKFLOW_MACHINE_LOCK_DIR; do
+      [[ -n "${!v:-}" ]] && bridge_env+=("$v=${!v}")
+    done
+    if ! run_root env "${bridge_env[@]}" bash "$renderer"; then
+      rm -f "$rendered"
+      fail "install-login-bridge-macos.sh failed under sudo"
+    fi
+    if [[ -f "$installed" ]] && cmp -s "$rendered" "$installed"; then
+      echo "== [$HOST_TAG] bridge plist installed: $installed; takes effect at next login window =="
+      HUMAN_NOTES+=("LoginWindow bridge plist installed; takes effect at the next login window (log out or reboot) -- nothing to do now")
+    else
+      rm -f "$rendered"
+      fail "bridge plist still differs from the render after install-login-bridge-macos.sh ran as root"
+    fi
   else
     echo "== [$HOST_TAG] bridge plist stale — run root step: sudo env DESKFLOW_INSTALL_APP=$install_app bash $renderer =="
+    ROOT_STEPS+=("sudo env DESKFLOW_INSTALL_APP=$install_app bash $renderer   # then log out or reboot: LoginWindow agents load at the next login window")
   fi
   rm -f "$rendered"
+}
+
+# The bridge log holds relayed login-window input: it must be root-only
+# (0600) and must not hold keystroke lines from an old bridge build. With a
+# sudo password both are fixed here; a 644 log can be inspected as this user
+# and its two root steps are printed; a 600 log without a password is left to
+# tools/fleet-health --check loginbridge.
+bridge_log_hygiene() {
+  local log="$LOGIN_BRIDGE_LOG" mode n=""
+  [[ -e "$log" ]] || return 0
+  mode="$(stat -f %Lp "$log" 2>/dev/null || echo '?')"
+  if [[ "$ROOT_MODE" == "sudo" ]]; then
+    n="$(run_root grep -c "$LOGIN_BRIDGE_KEYSTROKE_MARK" "$log" 2>/dev/null || true)" # fleet:allow grep -c exits 1 on zero matches; the count is what matters
+    n="$(printf '%s' "$n" | tail -n 1)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    if [[ "$mode" != "600" ]]; then
+      run_root chmod 600 "$log" || fail "chmod 600 $log failed under sudo"
+      echo "== [$HOST_TAG] bridge log: mode $mode -> 600 =="
+    fi
+    if (( n > 0 )); then
+      run_root sed -i '' "/${LOGIN_BRIDGE_KEYSTROKE_MARK}/d" "$log" || fail "scrubbing keystroke lines from $log failed under sudo"
+      echo "== [$HOST_TAG] bridge log: $n '$LOGIN_BRIDGE_KEYSTROKE_MARK' line(s) removed from $log =="
+    else
+      echo "== [$HOST_TAG] bridge log: 600, 0 keystroke lines =="
+    fi
+    return 0
+  fi
+  if [[ "$mode" != "600" ]]; then
+    n="$(grep -c "$LOGIN_BRIDGE_KEYSTROKE_MARK" "$log" 2>/dev/null || true)" # fleet:allow grep -c exits 1 on zero matches; unreadable = unknown
+    echo "== [$HOST_TAG] bridge log: mode $mode (want 600)${n:+, $n keystroke line(s)} — run root steps: sudo chmod 600 $log; sudo sed -i '' '/$LOGIN_BRIDGE_KEYSTROKE_MARK/d' $log =="
+    ROOT_STEPS+=("sudo chmod 600 $log")
+    ROOT_STEPS+=("sudo sed -i '' '/$LOGIN_BRIDGE_KEYSTROKE_MARK/d' $log")
+  fi
 }
 
 # --- Mouser settings-survival proof ----------------------------------------
@@ -528,11 +802,18 @@ deploy_mouser() {
 main() {
   echo "=== fleet-deploy-macos on $HOST_TAG ==="
   load_dotenv
+  capture_passwords
   prepare_keychain_for_ssh
+  init_root_mode
+  # Belt and braces: both were captured (and unset) above; from here on no
+  # child process -- cmake, python3, codesign, the installers -- can inherit
+  # a password. ROOT_PW is a plain shell variable, never exported.
+  unset DESKFLOW_KEYCHAIN_PASSWORD DESKFLOW_SUDO_PASSWORD
   if [[ "$DEPLOY_DESKFLOW" == "1" ]]; then
     git_pull_deskflow
     configure_deskflow
     build_install_deskflow
+    bridge_log_hygiene
   fi
   deploy_mouser
   final_single_launcher_gate

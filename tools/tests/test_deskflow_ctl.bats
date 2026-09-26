@@ -93,7 +93,8 @@ EOF
   make_shim sfltool <<'EOF'
 echo "sfltool $*" >> "$SHIM_LOG"
 [[ "${1:-}" == "dumpbtm" ]] || { echo "unexpected sfltool verb $1" >&2; exit 64; }
-if [[ -f "$SHIM_STATE/btm.rc" ]]; then
+# SHIM_AS_ROOT=1 (set by the sudo shim below) lifts the faked privilege refusal.
+if [[ -f "$SHIM_STATE/btm.rc" && -z "${SHIM_AS_ROOT:-}" ]]; then
   cat "$SHIM_STATE/btm.err" 2>/dev/null >&2
   exit "$(cat "$SHIM_STATE/btm.rc")"
 fi
@@ -130,6 +131,7 @@ EOF
   # Retired root-owned files: never probe the real /usr/local or /Library.
   export DESKFLOW_CTL_RETIRED_PRIO_APPLY="$TMP/usr-local-bin/deskflow-prio-apply.sh"
   export DESKFLOW_CTL_RETIRED_SYNERGY_AGENT="$TMP/LibraryLaunchAgents/com.symless.synergy-agent.plist"
+  unset SHIM_SUDO_EXPECT_PW SHIM_AS_ROOT
 }
 
 teardown() {
@@ -1500,4 +1502,163 @@ make_fake_checkout() {
   [[ "$output" == *"differs from this checkout"* ]]
   [[ "$output" != *"render $CONVERGE"* ]]
   grep -q "<integer>60</integer>" "$DESKFLOW_CTL_AGENT_DIR/$CONVERGE.plist"
+}
+
+# --- --sudo-stdin: root steps through sudo -S, password on stdin -------------------
+
+# sudo shim for these tests only (setup() leaves tools/tests/fakebin/sudo, exit
+# 97, on PATH): logs the argv -- which must never hold the password -- records
+# every stdin line in $SHIM_STATE/sudo-stdin.log, rejects anything but
+# SHIM_SUDO_EXPECT_PW when that is set, then runs launchctl/sfltool/rm through
+# the shims (sandbox paths only) and merely acknowledges install/chown/true.
+make_sudo_shim() {
+  make_shim sudo <<'EOF'
+opts=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -S|-k) opts+=("$1"); shift ;;
+    -p) opts+=("$1" "$2"); shift 2 ;;
+    *) break ;;
+  esac
+done
+echo "sudo ${opts[*]} $*" >> "$SHIM_LOG"
+pw=""
+if [[ " ${opts[*]} " == *" -S "* ]]; then
+  IFS= read -r pw || pw=""
+  printf '%s\n' "$pw" >> "$SHIM_STATE/sudo-stdin.log"
+else
+  echo "sudo shim: called without -S" >> "$SHIM_LOG"
+fi
+if [[ -n "${SHIM_SUDO_EXPECT_PW:-}" && "$pw" != "$SHIM_SUDO_EXPECT_PW" ]]; then
+  echo "Sorry, try again." >&2
+  exit 1
+fi
+case "$1" in
+  launchctl|rm) exec "$@" ;;
+  sfltool) SHIM_AS_ROOT=1 exec "$@" ;;
+  install|chown|true) exit 0 ;;
+  *) echo "sudo shim: unexpected command: $*" >&2; exit 98 ;;
+esac
+EOF
+}
+
+with_stdin() { # pw verb args... -> run the ctl with pw as its one stdin line
+  local pw="$1"; shift
+  run bash -c 'printf "%s\n" "$0" | bash "$1" "${@:2}"' "$pw" "$SCRIPT" "$@"
+}
+
+# $output assertions that FAIL the test (a false [[ ]] mid-test is ignored under bash 3.2 bats).
+out_has() { if [[ "$output" != *"$1"* ]]; then echo "expected in output: $1" >&2; return 1; fi; }
+out_lacks() { if [[ "$output" == *"$1"* ]]; then echo "unexpected in output: $1" >&2; return 1; fi; }
+
+@test "prio --sudo-stdin installs and bootstraps the LaunchDaemon through sudo -S (password on stdin, never argv)" {
+  add_prio_binary
+  make_sudo_shim
+  export SHIM_SUDO_EXPECT_PW=r00t
+  with_stdin r00t prio --sudo-stdin
+  [ "$status" -eq 0 ]
+  staged="$DESKFLOW_CTL_DAEMON_STAGE_DIR/$PRIO.plist"
+  log_has "sudo -S -p  -k install -d $DESKFLOW_CTL_DAEMON_DIR"
+  log_has "sudo -S -p  -k install -d -m 1777 /private/var/db/deskflow"
+  log_has "sudo -S -p  -k install -m 644 -o root -g wheel $staged $DESKFLOW_CTL_DAEMON_DIR/$PRIO.plist"
+  log_has "sudo -S -p  -k chown root:wheel $APP/Contents/MacOS/deskflow-prio"
+  log_has "sudo -S -p  -k launchctl bootstrap system $DESKFLOW_CTL_DAEMON_DIR/$PRIO.plist"
+  [ "$(grep -c '^sudo ' "$SHIM_LOG")" -eq "$(grep -c '^sudo -S -p  -k ' "$SHIM_LOG")" ]
+  log_lacks "r00t"
+  log_lacks "without -S"
+  [ "$(sort -u "$SHIM_STATE/sudo-stdin.log")" = "r00t" ]
+  [ -f "$SHIM_STATE/loaded/$PRIO" ]
+  out_has "system/$PRIO bootstrapped"
+  out_lacks "needs root"
+  # a loaded daemon whose installed plist is stale is booted out first, through sudo too
+  : >"$SHIM_LOG"
+  mkdir -p "$DESKFLOW_CTL_DAEMON_DIR"
+  echo "<plist>old</plist>" >"$DESKFLOW_CTL_DAEMON_DIR/$PRIO.plist"
+  with_stdin r00t prio --sudo-stdin
+  [ "$status" -eq 0 ]
+  log_has "sudo -S -p  -k launchctl bootout system/$PRIO"
+  log_has "sudo -S -p  -k launchctl bootstrap system $DESKFLOW_CTL_DAEMON_DIR/$PRIO.plist"
+  log_lacks "r00t"
+}
+
+@test "retire --sudo-stdin removes the root-owned files through sudo -S rm and exits 0" {
+  make_sudo_shim
+  mkdir -p "$(dirname "$DESKFLOW_CTL_RETIRED_PRIO_APPLY")" "$(dirname "$DESKFLOW_CTL_RETIRED_SYNERGY_AGENT")"
+  : >"$DESKFLOW_CTL_RETIRED_PRIO_APPLY"
+  ln -s /nonexistent "$DESKFLOW_CTL_RETIRED_SYNERGY_AGENT"
+  with_stdin r00t retire --sudo-stdin
+  [ "$status" -eq 0 ]
+  log_has "sudo -S -p  -k rm -f $DESKFLOW_CTL_RETIRED_PRIO_APPLY"
+  log_has "sudo -S -p  -k rm -f $DESKFLOW_CTL_RETIRED_SYNERGY_AGENT"
+  [ ! -e "$DESKFLOW_CTL_RETIRED_PRIO_APPLY" ]
+  [ ! -L "$DESKFLOW_CTL_RETIRED_SYNERGY_AGENT" ]
+  out_has "removed $DESKFLOW_CTL_RETIRED_PRIO_APPLY (sudo -S"
+  out_has "nothing left to retire"
+  log_lacks "r00t"
+}
+
+@test "login-items audit --sudo-stdin retries dumpbtm through sudo -S only after the unprivileged call is refused; without it SKIP and no sudo at all" {
+  make_sudo_shim
+  echo 1 >"$SHIM_STATE/btm.rc"; echo "Error: dumpbtm requires root privileges" >"$SHIM_STATE/btm.err"
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 3 ]
+  log_lacks "sudo"
+  : >"$SHIM_LOG"
+  with_stdin r00t login-items audit --sudo-stdin
+  [ "$status" -eq 0 ]
+  out_has "login-items: OK"
+  [ "$(grep -c '^sfltool dumpbtm' "$SHIM_LOG")" -eq 2 ]      # unprivileged first, then under sudo
+  log_has "sudo -S -p  -k sfltool dumpbtm"
+  [ "$(grep -c '^sudo ' "$SHIM_LOG")" -eq 1 ]
+  log_lacks "r00t"
+  # when the unprivileged call works, sudo is never used even with a password
+  rm -f "$SHIM_STATE/btm.rc" "$SHIM_STATE/btm.err"; : >"$SHIM_LOG"
+  with_stdin r00t login-items audit --sudo-stdin
+  [ "$status" -eq 0 ]
+  log_lacks "sudo"
+  # and assert-single (what converge runs every 60 s) never escalates on its own
+  healthy_seat
+  echo 1 >"$SHIM_STATE/btm.rc"; : >"$SHIM_LOG"
+  run bash "$SCRIPT" assert-single
+  [ "$status" -eq 1 ]
+  log_lacks "sudo"
+}
+
+@test "a rejected stdin password is reported once and the sudo lines are printed: prio exits 1, retire exits 2" {
+  add_prio_binary
+  make_sudo_shim
+  export SHIM_SUDO_EXPECT_PW=r00t
+  with_stdin wrong prio --sudo-stdin
+  [ "$status" -eq 1 ]
+  out_has "sudo password rejected for $(hostname -s)"
+  [ "$(grep -c 'sudo password rejected' <<<"$output")" -eq 1 ]
+  out_has "needs root; run once as admin"
+  out_has "sudo launchctl bootstrap system"
+  log_lacks "wrong"
+  [ ! -f "$SHIM_STATE/loaded/$PRIO" ]
+  mkdir -p "$(dirname "$DESKFLOW_CTL_RETIRED_PRIO_APPLY")"; : >"$DESKFLOW_CTL_RETIRED_PRIO_APPLY"
+  with_stdin wrong retire --sudo-stdin
+  [ "$status" -eq 2 ]
+  out_has "sudo rm -f \"$DESKFLOW_CTL_RETIRED_PRIO_APPLY\""
+  [ -e "$DESKFLOW_CTL_RETIRED_PRIO_APPLY" ]
+}
+
+@test "--sudo-stdin with an empty line falls back to print mode without touching sudo" {
+  add_prio_binary
+  make_sudo_shim
+  with_stdin "" prio --sudo-stdin
+  [ "$status" -eq 0 ]
+  out_has "empty password line on stdin"
+  out_has "needs root; run once as admin"
+  log_lacks "sudo"
+}
+
+@test "bash -x never echoes the stdin password" {
+  make_sudo_shim
+  mkdir -p "$(dirname "$DESKFLOW_CTL_RETIRED_PRIO_APPLY")"; : >"$DESKFLOW_CTL_RETIRED_PRIO_APPLY"
+  run bash -c 'printf "%s\n" "$0" | bash -x "$1" retire --sudo-stdin' r00t "$SCRIPT"
+  [ "$status" -eq 0 ]
+  out_has "+ cmd_retire"
+  out_lacks "r00t"
+  log_lacks "r00t"
 }
