@@ -74,7 +74,13 @@ $cmakeArgs = @(
   '-DBUILD_TESTS=OFF'
 )
 $buildTargets = 'deskflow-core;deskflow-daemon;deskflow;deskflow-vhid-bridge'
-cmd /c "`"$vcvars`" >nul 2>&1 && cmake $($cmakeArgs -join ' ') && cmake --build `"$build`" --config Release --target $buildTargets -j $env:NUMBER_OF_PROCESSORS"
+# One cl.exe per parallel MSBuild project can use 1-3 GB on the heavier Qt/STL
+# translation units (2026-09-25: 10-way on a 36 GB seat with ~30 GB already
+# committed hit "C1060: compiler is out of heap space" on 4 files). Override
+# with DESKFLOW_BUILD_JOBS when the seat is memory-constrained; unset keeps
+# today's behavior (one job per logical processor).
+$jobs = if ($env:DESKFLOW_BUILD_JOBS) { $env:DESKFLOW_BUILD_JOBS } else { $env:NUMBER_OF_PROCESSORS }
+cmd /c "`"$vcvars`" >nul 2>&1 && cmake $($cmakeArgs -join ' ') && cmake --build `"$build`" --config Release --target $buildTargets -j $jobs"
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Host "Build OK -> $build"
 
