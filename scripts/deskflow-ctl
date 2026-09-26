@@ -1254,23 +1254,28 @@ cmd_converge() {
   converge_agent "$CONVERGE_LABEL" "$apply" "$starts_ok" 0
   local gate="$CONVERGE_GATE"
 
-  # A second launcher (BTM app / login item) cannot be repaired from here: it
-  # is a manual System Settings step, surfaced as an error (toast, exit 1)
-  # under --apply and as a pending plan item otherwise.
-  local audit_out audit_rc=0 audit_line
-  audit_out="$(login_items_audit tool)" || audit_rc=$?
-  case "$audit_rc" in
-    0) ;;
-    3) CONVERGE_PLAN+=("login-items audit skipped: $(echo "$audit_out" | sed -n '2p' | sed 's/^ *//')") ;;
-    *)
-      audit_line="$(echo "$audit_out" | grep -m1 'FAIL:' | sed 's/^ *FAIL: //')"
-      if (( apply )); then
-        CONVERGE_ERRORS+=("login-items: ${audit_line:-second launcher present}; remove it in System Settings -> General -> Login Items (deskflow-ctl login-items print-steps)")
-      else
-        CONVERGE_PLAN+=("login-items: ${audit_line:-second launcher present} (manual: deskflow-ctl login-items print-steps)")
-      fi
-      ;;
-  esac
+  # A second launcher (BTM app / login item) is a manual System Settings
+  # step; login-items auditing is NEVER run from this unattended tick.
+  #
+  # 2026-09-25 REMOVED from the tick: on this seat's macOS build, the
+  # unprivileged `sfltool dumpbtm` in login_items_audit -> btm_dump does not
+  # fail cleanly with "needs privileges" text the way it does elsewhere --
+  # it blocks on a native "sfltool wants to make changes" authorization
+  # dialog. Nothing can be piped into that dialog (it is not stdin, and no
+  # password should ever be entered into it); a launchd tick has no one
+  # watching to dismiss it, so every 60 s tick left ANOTHER sfltool process
+  # (and its parent converge chain) hung waiting on the last one's dialog --
+  # a growing pile that surfaced as the dialog popping "a ton" (killing the
+  # stuck chain dismisses its dialog: the OS cancels an orphaned
+  # authorization request when its process exits). `deskflow-ctl login-items
+  # audit` (a human, present, able to respond to any OS prompt) and
+  # fleet-health's own instance checks (process-based, not sfltool-based --
+  # see check_instances_mac) remain the ways to catch a duplicate launcher.
+  # Plan mode only: an --apply run (quiet or not) reports on repairs made,
+  # not on a check we deliberately never perform here -- surfacing it there
+  # would turn every clean, fully-repaired tick into a permanent non-"nothing
+  # to do" state.
+  (( apply )) || CONVERGE_PLAN+=("login-items audit skipped: not run from the unattended tick (run: deskflow-ctl login-items audit)")
 
   # A checkout ahead of the safe copy is a pending `start`, never something
   # the tick does on its own (it must not hot-swap its own program).
@@ -1279,7 +1284,7 @@ cmd_converge() {
   fi
 
   local assert_out assert_rc=0
-  assert_out="$(cmd_assert_single 2>&1)" || assert_rc=$?
+  assert_out="$(cmd_assert_single skip-login-items 2>&1)" || assert_rc=$?
   local assert_summary="OK"
   (( assert_rc == 0 )) || assert_summary="FAIL: $(echo "$assert_out" | sed -n '2,$p' | sed 's/^  //' | paste -sd ';' -)"
 
@@ -1425,14 +1430,40 @@ btm_evaluate() {
 
 btm_dump() {
   # Runs `sfltool dumpbtm` (a PATH shim in tests), unprivileged first -- that
-  # works on the fleet's seats. Only when it is refused for lack of privilege
-  # AND --sudo-stdin supplied a password is it retried through `sudo -S`
-  # (never a plain `sudo`: nothing here may raise an interactive prompt from
-  # a launchd tick or an SSH session). Prints the dump; returns 3 when the
-  # tool refused for lack of privilege (SKIP, never PASS), 1 on any other
-  # failure.
-  local out rc=0
-  out="$(sfltool dumpbtm 2>&1)" || rc=$?
+  # works on most of the fleet's seats. Only when it is refused for lack of
+  # privilege AND --sudo-stdin supplied a password is it retried through
+  # `sudo -S` (never a plain `sudo`: nothing here may raise an interactive
+  # prompt from a launchd tick or an SSH session).
+  #
+  # BOUNDED (2026-09-25): on at least one seat's macOS build, the
+  # unprivileged call does not fail cleanly -- it blocks on a native
+  # "sfltool wants to make changes" authorization dialog that nothing here
+  # can answer (not stdin; a password must never be entered into it). This
+  # caller may be a human at `deskflow-ctl login-items audit` (who could in
+  # principle see and dismiss it) or fleet-health probing a seat over SSH
+  # (who never could); either way an unbounded hang is unacceptable, so the
+  # call is capped at kBtmDumpTimeoutSecs. No `timeout`/`gtimeout` dependency
+  # (not guaranteed installed on every seat) -- a background job plus a
+  # watchdog that SIGTERMs it, both pure bash/coreutils. A caller still
+  # waiting past the cap gets the same SKIP (rc=3) as "needs privilege".
+  local -r kBtmDumpTimeoutSecs=5
+  local out rc=0 outfile dump_pid watchdog_pid
+  outfile="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+  sfltool dumpbtm >"$outfile" 2>&1 &
+  dump_pid=$!
+  ( sleep "$kBtmDumpTimeoutSecs"; kill -TERM "$dump_pid" 2>/dev/null ) &
+  watchdog_pid=$!
+  wait "$dump_pid" 2>/dev/null || rc=$?
+  kill "$watchdog_pid" 2>/dev/null
+  wait "$watchdog_pid" 2>/dev/null
+  out="$(cat "$outfile" 2>/dev/null)"
+  rm -f "$outfile"
+  if (( rc != 0 )) && ! grep -qiE 'root|privilege|permission|not permitted|must be run|operation not' <<<"$out"; then
+    # Killed by the watchdog (SIGTERM) with no error text of its own: treat
+    # exactly like "needs privilege" (SKIP), not a hard failure -- the tool
+    # never told us why, but it was never going to answer either way.
+    out="${out}${out:+$'\n'}sfltool dumpbtm: no response within ${kBtmDumpTimeoutSecs}s (likely blocked on an authorization dialog nothing here can answer)"
+  fi
   if (( rc != 0 )) || ! grep -q 'Records for UID' <<<"$out"; then
     if grep -qiE 'root|privilege|permission|not permitted|must be run|operation not' <<<"$out" || (( rc != 0 )); then
       if have_sudo_pw; then
@@ -1605,6 +1636,14 @@ cmd_status() {
 }
 
 cmd_assert_single() {
+  # $1 = "skip-login-items" when called from the unattended converge tick
+  # (see cmd_converge): login_items_audit -> btm_dump's unprivileged sfltool
+  # call can block on a native OS authorization dialog nothing here can
+  # answer (2026-09-25); every 60 s tick left another one hung, popping
+  # another dialog. A human running `deskflow-ctl assert-single`/`start`
+  # directly still gets the full check (btm_dump is itself bounded, so even
+  # here a hang costs seconds, not forever).
+  local skip_login_items="${1:-}"
   local problems=() pid uid path
   local cores gui bridge core_pid launchd_pid
   cores="$(count_role deskflow-core)"
@@ -1644,13 +1683,20 @@ cmd_assert_single() {
   local rb
   rb="$(domain_services | grep -oE "application\.$GUI_LABEL(\.[^[:space:]]*)?" | head -1 || true)" # fleet:allow no match = no runningboard instance
   [[ -z "$rb" ]] || problems+=("runningboard instance $rb in $DOMAIN (GUI launched by a Login Item/Finder, not launchd)")
-  local audit_out audit_rc=0
-  audit_out="$(login_items_audit tool)" || audit_rc=$?
-  case "$audit_rc" in
-    0) ;;
-    3) problems+=("login-items audit SKIPPED (never a pass): $(echo "$audit_out" | sed -n '2p' | sed 's/^ *//')") ;;
-    *) problems+=("login-items audit FAIL: $(echo "$audit_out" | grep -m1 'FAIL:' | sed 's/^ *FAIL: //')") ;;
-  esac
+  if [[ "$skip_login_items" != "skip-login-items" ]]; then
+    # Deliberately NOT a problem (does not fail assert-single, does not
+    # touch CONVERGE_ERRORS): cmd_converge already reports the skip itself
+    # as a plan-only line, and treating "we deliberately didn't check" as a
+    # failure would make the tick report FAILED and fire a desktop
+    # notification every 60s forever, for a condition that isn't one.
+    local audit_out audit_rc=0
+    audit_out="$(login_items_audit tool)" || audit_rc=$?
+    case "$audit_rc" in
+      0) ;;
+      3) problems+=("login-items audit SKIPPED (never a pass): $(echo "$audit_out" | sed -n '2p' | sed 's/^ *//')") ;;
+      *) problems+=("login-items audit FAIL: $(echo "$audit_out" | grep -m1 'FAIL:' | sed 's/^ *FAIL: //')") ;;
+    esac
+  fi
   local f
   for f in "$RETIRED_KEEPALIVE_LOG" "$RETIRED_KEEPALIVE_LOG_OLD" "$RETIRED_PRIO_APPLY" "$RETIRED_SYNERGY_AGENT"; do
     [[ -e "$f" || -L "$f" ]] && problems+=("retired file present: $f (deskflow-ctl retire)")

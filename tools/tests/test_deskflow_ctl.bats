@@ -734,7 +734,7 @@ healthy() {
   log_lacks "launchctl bootstrap"
   log_lacks "launchctl enable"
   log_lacks "osascript"
-  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['mode']=='plan' and d['plan']==['bootstrap $GUI'] and d['actions']==[]" "$STATE/health.json"
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['mode']=='plan' and d['plan']==['bootstrap $GUI', \"login-items audit skipped: not run from the unattended tick (run: deskflow-ctl login-items audit)\"] and d['actions']==[]" "$STATE/health.json"
 
   autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
   run bash "$SCRIPT" converge --apply
@@ -780,25 +780,47 @@ healthy() {
   [ "$status" -eq 0 ]
 }
 
-@test "converge --apply exits 1 with a toast while a BTM app record is enabled; plan mode only reports it" {
+@test "converge NEVER runs the login-items/sfltool audit, apply or plan mode, BTM state notwithstanding" {
+  # 2026-09-25: the unattended tick used to call this every 60s; on at least
+  # one seat's real macOS build the unprivileged `sfltool dumpbtm` blocked on
+  # a native OS authorization dialog nothing here can answer, and every tick
+  # left another hung process behind it -- a growing pile whose dialogs kept
+  # popping. `login-items audit` (a human, present) and fleet-health's own
+  # process-based instance checks are the only paths left to catch this; the
+  # tick reports a plan-only "skipped" line and never touches sfltool, no
+  # matter what the fixture says -- a duplicate BTM record must never fail
+  # or notify from here again.
   healthy_seat; load_agent $CONVERGE
   use_btm two-app-records
   run bash "$SCRIPT" converge --apply --quiet
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"converge: FAILED: login-items: enabled BTM app record"* ]]
-  [[ "$output" == *"System Settings -> General -> Login Items"* ]]
-  log_has "osascript -e display notification"
-  log_lacks "delete login item"
-  grep -q '"errors": \["login-items: ' "$STATE/health.json"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"login-items: enabled BTM app record"* ]]
+  log_lacks "sfltool"
+  log_lacks "osascript -e display notification"
+  ! grep -q '"errors": \["login-items: ' "$STATE/health.json"
   : >"$SHIM_LOG"
   run bash "$SCRIPT" converge
   [ "$status" -eq 0 ]
-  [[ "$output" == *"converge: plan (plan): login-items: enabled BTM app record"* ]]
-  log_lacks "osascript -e display notification"
+  [[ "$output" == *"login-items audit skipped: not run from the unattended tick"* ]]
+  [[ "$output" == *"deskflow-ctl login-items audit"* ]]
+  log_lacks "sfltool"
   use_btm fleet-agents-only
   run bash "$SCRIPT" converge --apply --quiet
   [ "$status" -eq 0 ]
+  log_lacks "sfltool"
 }
+
+@test "login-items audit (the manual command, not the tick) is still fully wired and unaffected" {
+  # Companion to the test above: the tick no longer calls this, but a human
+  # running it directly must see the exact same behavior as before.
+  healthy_seat
+  use_btm two-app-records
+  run bash "$SCRIPT" login-items audit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL: enabled BTM app record"* ]]
+  log_has "sfltool dumpbtm"
+}
+
 
 @test "converge re-renders a stale plist of a LOADED agent even when gated, but reports it as pending, not repaired" {
   healthy
