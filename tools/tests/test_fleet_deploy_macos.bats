@@ -1015,6 +1015,12 @@ reset_shim_state() { rm -rf "$SHIM_STATE"; mkdir -p "$SHIM_STATE"; : >"$SHIM_LOG
   log_has "deskflow-ctl retire --sudo-stdin"
   [ "$(cat "$SHIM_STATE/ctl-stdin.prio")" = "r00t-pw" ]
   [ "$(cat "$SHIM_STATE/ctl-stdin.retire")" = "r00t-pw" ]
+  # 2026-09-28: assert-single must ALSO run with --sudo-stdin here -- without
+  # this its unprivileged login-items check always reported SKIPPED (never a
+  # pass) and failed the whole deploy as a human-step blocker, on every seat,
+  # every time, even with this exact working password sitting unused.
+  log_has "deskflow-ctl assert-single --sudo-stdin"
+  [ "$(cat "$SHIM_STATE/ctl-stdin.assert-single")" = "r00t-pw" ]
   # on disk: the plist is installed, the log is 600 with the keystroke line gone and the rest kept
   [ "$(cat "$DESKFLOW_LOGIN_BRIDGE_PLIST")" = "$BRIDGE_PLIST" ]
   [ "$(stat -f %Lp "$DESKFLOW_LOGIN_BRIDGE_LOG")" = 600 ]

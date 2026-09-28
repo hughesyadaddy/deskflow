@@ -476,9 +476,23 @@ final_single_launcher_gate() {
       [[ -n "$line" ]] && ROOT_STEPS+=("$line")
     done < <(echo "$retire_out" | grep -E '^\s*sudo ' | sed 's/^ *//')
   fi
-  echo "== [$HOST_TAG] single launcher (deskflow-ctl assert-single) =="
+  echo "== [$HOST_TAG] single launcher (deskflow-ctl assert-single${ROOT_MODE:+, sudo-stdin})=="
   local assert_out
-  if assert_out="$(DESKFLOW_INSTALL_APP="$install_app" "$ctl" assert-single 2>&1)"; then
+  # 2026-09-28: with a verified sudo password (ROOT_MODE=sudo), assert-single
+  # must run with the SAME --sudo-stdin every other root step here uses --
+  # `--sudo-stdin` is a generic flag deskflow-ctl consumes for ANY verb
+  # (scripts/deskflow-ctl: "may sit anywhere on the command line"), and
+  # login_items_audit already falls back to `sudo -S sfltool dumpbtm`
+  # whenever a password is available. Without this, assert-single's
+  # unprivileged sfltool call always reported SKIPPED (never a pass) and
+  # failed the whole deploy as a "HUMAN STEP REQUIRED" -- on every seat,
+  # every time, even with a working password sitting unused right next to it.
+  if [[ "$ROOT_MODE" == "sudo" ]]; then
+    assert_fn() { ctl_sudo_stdin assert-single; }
+  else
+    assert_fn() { DESKFLOW_INSTALL_APP="$install_app" "$ctl" assert-single; }
+  fi
+  if assert_out="$(assert_fn 2>&1)"; then
     echo "$assert_out"
     print_human_notes
     return 0
