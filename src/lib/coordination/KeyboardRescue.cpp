@@ -105,8 +105,16 @@ RescueAction EscTapRescue::noteKeyDown(KeyID id, KeyModifierMask mask, Clock::ti
   constexpr KeyModifierMask chordMods = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
   if (id != kKeyEscape || (mask & chordMods) != 0) {
     // Non-Esc (or Esc with chord mods) breaks the streak; Caps/Num on plain Esc still count.
+    // A burst that had ALREADY reached the restart threshold is a completed,
+    // earned decision sitting out its settle window, not an aborted one --
+    // mirror observeEsc's stale-burst handling and fire it now instead of
+    // discarding it silently. 2026-09-28 (hackintosh incident): a clean,
+    // correctly-timed 5xEsc followed by ordinary typing before the 700ms
+    // settle elapsed was thrown away with zero effect and no log line; the
+    // user needed a second, redundant burst to actually trigger the rescue.
+    const RescueAction owed = RescueBurst::actionFor(m_burst.count());
     m_burst.breakBurst();
-    return RescueAction::None;
+    return owed;
   }
   if (!m_origin) {
     m_origin = now;

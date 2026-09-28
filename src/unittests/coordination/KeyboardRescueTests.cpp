@@ -213,18 +213,60 @@ void KeyboardRescueTests::escTap_capsLockIgnored_stillCounts()
 
 void KeyboardRescueTests::escTap_nonEscBreaksStreak()
 {
+  // Below kRestartTaps: a non-Esc key breaks the streak and owes nothing --
+  // there was never a completed decision to lose.
   EscTapRescue rescue;
   const auto t0 = Clock::now();
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < 4; ++i) {
     QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(50 * i)), RescueAction::None);
   }
-  QCOMPARE(rescue.count(), 6);
+  QCOMPARE(rescue.count(), 4);
   QCOMPARE(rescue.noteKeyDown('a', 0, t0 + std::chrono::milliseconds(300)), RescueAction::None);
   QCOMPARE(rescue.count(), 0);
   QCOMPARE(rescue.settle(t0 + std::chrono::seconds(5)), RescueAction::None);
   // The streak restarts from one.
   QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(350)), RescueAction::None);
   QCOMPARE(rescue.count(), 1);
+}
+
+void KeyboardRescueTests::escTap_nonEscAfterThresholdFiresOwedDecision()
+{
+  // 2026-09-28 (hackintosh incident) regression: once a burst has ALREADY
+  // reached kRestartTaps, it is a completed, earned decision waiting out its
+  // 700 ms settle window -- ordinary typing landing inside that window must
+  // not discard it. A clean 5xEsc followed immediately by "hey" did exactly
+  // this live and the rescue never fired until a second, redundant burst.
+  EscTapRescue rescue;
+  const auto t0 = Clock::now();
+  for (int i = 0; i < 6; ++i) {
+    QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(50 * i)), RescueAction::None);
+  }
+  QCOMPARE(rescue.count(), 6);
+  QVERIFY(rescue.pending());
+  // Six taps (5..9 range): a non-Esc key well inside the settle window must
+  // fire the owed Restart immediately, not silently drop it.
+  QCOMPARE(rescue.noteKeyDown('h', 0, t0 + std::chrono::milliseconds(300)), RescueAction::Restart);
+  QCOMPARE(rescue.count(), 0);
+  QVERIFY(!rescue.pending());
+  // The burst is genuinely closed: no double-fire from the settle timer,
+  // and a fresh streak starts clean afterward.
+  QCOMPARE(rescue.settle(t0 + std::chrono::seconds(5)), RescueAction::None);
+  QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(350)), RescueAction::None);
+  QCOMPARE(rescue.count(), 1);
+}
+
+void KeyboardRescueTests::escTap_nonEscAfterTenPlusFiresStopAll()
+{
+  // Same gap, StopAll range (10+): must owe StopAll, never silently downgrade
+  // to nothing or to Restart.
+  EscTapRescue rescue;
+  const auto t0 = Clock::now();
+  for (int i = 0; i < 11; ++i) {
+    QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(50 * i)), RescueAction::None);
+  }
+  QCOMPARE(rescue.count(), 11);
+  QCOMPARE(rescue.noteKeyDown('x', 0, t0 + std::chrono::milliseconds(600)), RescueAction::StopAll);
+  QCOMPARE(rescue.count(), 0);
 }
 
 void KeyboardRescueTests::escTap_swallowsFromFifthTap()

@@ -28,6 +28,8 @@ private Q_SLOTS:
   void escTap_modifiersDoNotCount();
   void escTap_capsLockIgnored_stillCounts();
   void escTap_nonEscBreaksStreak();
+  void escTap_nonEscAfterThresholdFiresOwedDecision();
+  void escTap_nonEscAfterTenPlusFiresStopAll();
   void escTap_swallowsFromFifthTap();
   // RescueSettleTimer: wakes once the deadline passes, re-arm replaces.
   void settleTimer_firesOnceAfterDeadline();

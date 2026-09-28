@@ -2304,7 +2304,15 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
     armEscBurstTimer();
   }
   if (closed != deskflow::coordination::RescueAction::None) {
-    // A stale burst the timer missed: its decision is still owed.
+    // A stale burst the timer missed: its decision is still owed. If a
+    // timer from THIS now-closed burst is still armed (it fires only via
+    // settleEscBurst(), which we are bypassing here), cancel it -- an
+    // uncanceled one-shot timer firing later, after fireEscRescue() may
+    // have torn this Server down as part of a local core restart, is a
+    // callback into a dead object, not just a harmless no-op (found while
+    // testing the 2026-09-28 owed-decision fix: this exact path left
+    // m_escBurstTimer armed and non-null after an immediate fire).
+    clearEscBurstTimer();
     fireEscRescue(closed);
     return;
   }

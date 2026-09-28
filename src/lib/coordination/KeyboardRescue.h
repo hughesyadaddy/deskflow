@@ -44,6 +44,18 @@ previous one belongs to a new burst, whether or not the settle poll ran in
 between (the poll may be late; the press then closes the stale burst and
 returns its decision so it is never lost). So the effective join gap is
 exactly kSettleMs (700 ms), on the timer and on a late press alike.
+
+A burst that has already reached kRestartTaps is a COMPLETED, earned
+decision merely waiting out its settle window to see if the user keeps
+going for kStopAllTaps -- it is not "still open" in the sense that
+anything can still abandon it for free. breakBurst() therefore does not
+discard it silently: any caller that reaches the threshold and then
+observes something other than the next Esc (see EscTapRescue::noteKeyDown)
+must fire actionFor(count()) itself before calling breakBurst(), exactly
+like the stale-burst path above, or an earned rescue the user is actively
+waiting on is lost with no log line (2026-09-28 hackintosh incident: a
+clean 5xEsc followed by ordinary typing before the settle timer fired was
+silently thrown away).
 */
 class RescueBurst
 {

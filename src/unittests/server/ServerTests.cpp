@@ -854,6 +854,63 @@ void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
   }
 }
 
+void ServerTests::fiveEscThenOrdinaryKey_firesRestartImmediatelyAndEatsThatKey()
+{
+  // 2026-09-28 (hackintosh incident) regression, at the Server integration
+  // level rather than the pure EscTapRescue unit level: a burst that has
+  // ALREADY reached the restart threshold must fire the instant the next
+  // key arrives, without waiting for the settle timer -- and, per adversarial
+  // review, the interrupting key on this on-loop path is deliberately eaten
+  // (fireEscRescue already mutates chord/ledger state and returns before any
+  // relay would run; precedented by the existing late-Escape-closes-a-stale-
+  // burst path, which has always behaved the same way). This test locks that
+  // asymmetry in place so a future refactor can't silently flip it back to
+  // the discard bug without a test going red.
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    int restartCalls = 0;
+    server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+
+    for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps; ++i) {
+      server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+    }
+    QCOMPARE(restartCalls, 0); // not yet -- still inside the settle window
+    QVERIFY(server.m_escBurstTimer != nullptr);
+    remote.clearKeys();
+
+    // An ordinary key well inside the settle window must fire the owed
+    // restart RIGHT NOW, not silently drop it and not wait for the timer.
+    server.onKeyDown('h', 0, 1, "en", nullptr);
+    QCOMPARE(restartCalls, 1);
+    QVERIFY(server.m_escBurstTimer == nullptr);
+    // The triggering key itself is not relayed (only the ledger's Esc-up
+    // traffic, if any, may appear) -- confirm 'h' specifically never reached
+    // the remote client.
+    for (const auto &key : remote.keys()) {
+      QVERIFY(key.id != 'h');
+    }
+
+    // A fresh burst afterward is unaffected: ordinary Esc taps count from
+    // one, proving the fired burst was fully reset, not left half-open.
+    remote.clearKeys();
+    server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+    QCOMPARE(remote.keys().size(), static_cast<size_t>(1));
+    QCOMPARE(remote.keys()[0].id, kKeyEscape);
+
+    server.m_clients.erase("remote");
+  }
+}
+
 void ServerTests::tenEsc_requestsStopAllNotRestart()
 {
   LeakedServerFixture fixture;
