@@ -37,6 +37,7 @@ struct PlatformCall
     SetToggle,
     Sanitize,
     ReleaseInjected,
+    ForceReleaseOs,
   };
   Kind kind;
   KeyID id = kKeyNone;
@@ -176,6 +177,10 @@ public:
   void releaseInjectedKeys(KeyModifierMask keep = 0) override
   {
     calls.push_back({PlatformCall::Kind::ReleaseInjected, kKeyNone, 0, keep});
+  }
+  void forceReleaseOsModifiers(KeyModifierMask bits) override
+  {
+    calls.push_back({PlatformCall::Kind::ForceReleaseOs, kKeyNone, 0, bits});
   }
 
   // IPlatformScreen
@@ -862,6 +867,85 @@ void KeyStateLedgerTests::postSwitchVerifier_keepsNothingAfterShiftReleased()
   const auto *release = f.platform->find(PlatformCall::Kind::ReleaseInjected);
   QVERIFY(release != nullptr);
   QCOMPARE(release->mask, KeyModifierMask(0));
+  QVERIFY(f.screen->leave());
+}
+
+void KeyStateLedgerTests::postSwitchVerifier_forceReleasesNonLedgeredModifierServerDisagreedAbout()
+{
+  // The 2026-09-29 hackintosh bug: the server's enter mask says Alt is NOT
+  // held, but our OS reports Alt down anyway -- never something this
+  // process injected, so never reasserted and never ledgered. Old
+  // behavior: the WARN fired but releaseInjectedKeys() only ever walks the
+  // injected ledger, so a modifier never in it was silently never visited
+  // -- "stuck-release" logged with nothing actually released. Now: the
+  // server's mask already, unambiguously said no, so this bit is
+  // force-released regardless of ledger membership.
+  SecondaryFixture f;
+  f.platform->osModifiers = KeyModifierAlt; // OS already disagrees at the crossing
+
+  f.screen->enter(0); // server's mask: nothing held
+
+  // a disagreement must never be treated as something to reassert
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyDown), 0);
+  f.platform->calls.clear();
+
+  // still down at both verifier checks, nothing typed
+  pumpUntil(f.events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 3.0, [&] {
+    return f.platform->count(PlatformCall::Kind::ForceReleaseOs) > 0;
+  });
+  QCOMPARE(f.platform->count(PlatformCall::Kind::ForceReleaseOs), 1);
+  const auto *forced = f.platform->find(PlatformCall::Kind::ForceReleaseOs);
+  QVERIFY(forced != nullptr);
+  QCOMPARE(forced->mask, KeyModifierMask(KeyModifierAlt));
+  QVERIFY(f.screen->leave());
+}
+
+void KeyStateLedgerTests::postSwitchVerifier_neverForceReleasesWhenServerAgreedItWasHeld()
+{
+  // The safety boundary the whole design rests on: when the server's mask
+  // AND the OS agree a modifier is held at the crossing, it is genuinely
+  // ambiguous -- possibly a real, still-in-progress cross-machine hold --
+  // and must never be force-released, however long it stays down with
+  // nothing typed. Only releaseInjectedKeys() (ledger-scoped, already
+  // covered by postSwitchVerifier_keepsReassertedModifiers above) may ever
+  // touch it.
+  SecondaryFixture f;
+  f.platform->osModifiers = KeyModifierAlt; // both agree: held
+
+  f.screen->enter(KeyModifierAlt);
+  // both already agree: no reassert press, and never marked as disagreeing
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyDown), 0);
+  f.platform->calls.clear();
+
+  // still down at both verifier checks, nothing typed
+  pumpUntil(f.events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 3.0, [&] {
+    return f.platform->count(PlatformCall::Kind::ReleaseInjected) > 0;
+  });
+  QCOMPARE(f.platform->count(PlatformCall::Kind::ReleaseInjected), 1);
+  QCOMPARE(f.platform->count(PlatformCall::Kind::ForceReleaseOs), 0);
+  QVERIFY(f.screen->leave());
+}
+
+void KeyStateLedgerTests::postSwitchVerifier_forceReleasesMultipleDisagreeingModifiers()
+{
+  // Review coverage note: the single-modifier test above cannot distinguish
+  // a correct `m_osDisagreeModifiers |= mod.bit` from a regression to `=`
+  // (which would silently keep only the last disagreeing bit processed).
+  // Two modifiers disagreeing at once must both end up offered together.
+  SecondaryFixture f;
+  f.platform->osModifiers = KeyModifierAlt | KeyModifierControl; // both disagree
+
+  f.screen->enter(0); // server's mask: nothing held
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyDown), 0);
+  f.platform->calls.clear();
+
+  pumpUntil(f.events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 3.0, [&] {
+    return f.platform->count(PlatformCall::Kind::ForceReleaseOs) > 0;
+  });
+  QCOMPARE(f.platform->count(PlatformCall::Kind::ForceReleaseOs), 1);
+  const auto *forced = f.platform->find(PlatformCall::Kind::ForceReleaseOs);
+  QVERIFY(forced != nullptr);
+  QCOMPARE(forced->mask, KeyModifierMask(KeyModifierAlt | KeyModifierControl));
   QVERIFY(f.screen->leave());
 }
 

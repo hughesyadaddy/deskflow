@@ -593,6 +593,68 @@ void OSXKeyStateTests::releaseInjectedKeysReleasesLedgeredCmd()
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift));
 }
 
+void OSXKeyStateTests::forceReleaseOsModifiersReleasesStaleNonLedgeredModifier()
+{
+  // The actual 2026-09-29 hackintosh bug this exists for: Alt reads held,
+  // was never in this process's ledger (the caller -- Screen's post-switch
+  // verifier -- only ever offers a bit here when the server's own mask said
+  // NOT held, so it could never have been reasserted/ledgered), and nothing
+  // on this machine's own keyboard explains it either (no hardware event at
+  // all) -- a stale ghost, safe to release even though never ledgered.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.updateKeyMap();
+  QVERIFY(keyState.injectedModifiers().empty());
+
+  os.osFlags = kCGEventFlagMaskAlternate;
+  // no noteHardwareModifierFlags() call at all: never backed by hardware
+
+  keyState.forceReleaseOsModifiers(KeyModifierAlt);
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(int(os.posted[0].virtualKey), int(kVK_Option));
+  QVERIFY(!os.posted[0].down);
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(0));
+}
+
+void OSXKeyStateTests::forceReleaseOsModifiersLeavesFreshLocalHoldAlone()
+{
+  // Review CRITICAL finding (2026-09-29): the server's mask disagreeing is
+  // NOT sufficient on its own to force-release a bit -- it only rules out
+  // an ACTIVE CROSS-MACHINE hold (the server would have said held for one
+  // of those), never a genuine LOCAL hold, which the server can never
+  // observe at all. A recent hardware press on THIS machine's own keyboard
+  // must still be left alone here, exactly like sanitizeInjectedKeys()'s
+  // equivalent gate (sanitizeKeepsModifiersBackedByRecentHardwarePress
+  // above) -- an earlier version of this function skipped this check
+  // entirely and would have released a key the user was still holding.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  OSXKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.updateKeyMap();
+
+  os.osFlags = kCGEventFlagMaskAlternate;
+  keyState.noteHardwareModifierFlags(kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK, os.now - 0.5);
+
+  keyState.forceReleaseOsModifiers(KeyModifierAlt);
+
+  QVERIFY(os.posted.empty());
+  QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlternate));
+
+  // ... but once it goes stale (no further hardware backing it), the same
+  // bit offered again IS released -- the gate is about freshness, not a
+  // one-time exemption.
+  os.now += OSXKeyState::kHardwareModifierFreshS + 0.5;
+  keyState.forceReleaseOsModifiers(KeyModifierAlt);
+  QCOMPARE(os.posted.size(), size_t(1));
+  QVERIFY(!os.posted[0].down);
+}
+
 void OSXKeyStateTests::fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet()
 {
   // K2 gap b1: leave() runs fakeAllKeysUp(), which used to clear() the

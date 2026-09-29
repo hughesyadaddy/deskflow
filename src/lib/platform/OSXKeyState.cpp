@@ -1002,6 +1002,82 @@ void OSXKeyState::releaseInjectedKeys(KeyModifierMask keep)
   releaseLedgeredModifiers(osModifierFlags(), keepFlags);
 }
 
+void OSXKeyState::forceReleaseOsModifiers(KeyModifierMask bits)
+{
+  // Unlike releaseLedgeredModifiers() above, this never consults
+  // m_injectedModifiers: the caller has already established these specific
+  // bits are not a hold the SERVER is vouching for (Screen::enterSecondary's
+  // m_osDisagreeModifiers -- its own mask said NOT held at the crossing), so
+  // ledger membership is irrelevant.
+  //
+  // K2 review (2026-09-29): that alone is NOT sufficient. It only rules out
+  // an ACTIVE CROSS-MACHINE relay -- if the server were driving this bit
+  // right now, its mask would have said held. It says nothing about a
+  // genuine LOCAL press on THIS machine's own keyboard, which the server
+  // can never observe and which can start well after the crossing. An
+  // earlier version of this function skipped the hardware-freshness gate
+  // entirely on exactly that flawed theory, and would have force-released a
+  // modifier the user is, at that instant, physically holding down here --
+  // precisely the failure mode secureInputEnabled()/hardwareObservableFor()
+  // exist to prevent elsewhere in this file (see their use in
+  // sanitizeInjectedKeys() below, and OSXScreen.mm's own comment on why the
+  // event tap feeds them: without it, "every held modifier reads as stale,
+  // releasing it out from under the user").
+  //
+  // So a bit is released here only when NEITHER explanation accounts for
+  // it: not vouched for by the server, AND no recent local hardware event
+  // backs it either. That is exactly the shape of a stale ghost (the
+  // 2026-09-29 hackintosh incident this exists for: no chord sent to it,
+  // and nothing on its own keyboard explained the hold either) and exactly
+  // NOT the shape of a real hold, cross-machine or local.
+  CGEventFlags wantFlags = 0;
+  if ((bits & KeyModifierShift) != 0) {
+    wantFlags |= kCGEventFlagMaskShift;
+  }
+  if ((bits & KeyModifierControl) != 0) {
+    wantFlags |= kCGEventFlagMaskControl;
+  }
+  if ((bits & KeyModifierAlt) != 0) {
+    wantFlags |= kCGEventFlagMaskAlternate;
+  }
+  if ((bits & KeyModifierSuper) != 0) {
+    wantFlags |= kCGEventFlagMaskCommand;
+  }
+  if (wantFlags == 0) {
+    return;
+  }
+  const double at = now();
+  if (secureInputEnabled()) {
+    LOG_INFO("[keys] force-release skipped: a password field owns input (hardware presses invisible)");
+    return;
+  }
+  if (!hardwareObservableFor(kHardwareModifierFreshS, at)) {
+    LOG_INFO("[keys] force-release skipped: hardware not observable for %.0f s", kHardwareModifierFreshS);
+    return;
+  }
+  reseedShadowFlagsFromOS();
+  const CGEventFlags os = osModifierFlags();
+  for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
+    const auto vk = static_cast<uint8_t>(virtualKey);
+    const CGEventFlags flag = modifierFlagForVirtualKey(vk);
+    if ((wantFlags & flag) == 0 || (os & flag) == 0) {
+      continue;
+    }
+    const int slot = hardwareSlotForVirtualKey(vk);
+    const double seenAt = slot < 0 ? at : m_lastHardwareModifierAt[slot].load(std::memory_order_relaxed);
+    if ((at - seenAt) <= kHardwareModifierFreshS) {
+      LOG_DEBUG("leaving physically held modifier 0x%02x (server disagreed, but hardware is fresh)", virtualKey);
+      continue;
+    }
+    setKeyboardModifiers(vk, false);
+    if (postHIDVirtualKey(vk, false) != KERN_SUCCESS) {
+      postKeyboardKey(vk, false);
+    }
+    m_injectedModifiers.erase(vk); // defensive: never expected to be ledgered here
+    LOG_INFO("force-released non-ledgered modifier 0x%02x (server disagreed, hardware stale)", virtualKey);
+  }
+}
+
 void OSXKeyState::sanitizeInjectedKeys()
 {
   // Start from OS truth so the release we post below carries the real

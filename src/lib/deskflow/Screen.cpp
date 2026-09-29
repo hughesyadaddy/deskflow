@@ -579,11 +579,19 @@ void Screen::enterSecondary(KeyModifierMask mask)
   //    mask -- a Start-menu flash on every Win+Shift crossing.
   const KeyModifierMask osMods = m_screen->pollActiveModifiers();
   KeyModifierMask desired = osMods & ~IKeyState::s_lockModifierMask;
+  m_osDisagreeModifiers = 0;
   for (const auto &mod : kReassertedModifiers) {
-    if ((mask & mod.bit) == 0 || (osMods & mod.bit) != 0) {
+    if ((mask & mod.bit) == 0) {
+      if ((osMods & mod.bit) != 0) {
+        // the opposite case from a reassert: the server's mask is the one
+        // authority on a real cross-machine hold, and it just said this bit
+        // is NOT held -- whatever the OS reports here is a local artifact,
+        // never a hold worth protecting (see m_osDisagreeModifiers).
+        m_osDisagreeModifiers |= mod.bit;
+      }
       continue;
     }
-    if (m_reassertedModifiers.contains(mod.bit)) {
+    if ((osMods & mod.bit) != 0 || m_reassertedModifiers.contains(mod.bit)) {
       continue;
     }
     desired |= mod.bit;
@@ -621,6 +629,7 @@ void Screen::leaveSecondary()
   // here without releasing it). Deliberately no sanitize sweep: a modifier
   // held on this machine's own keyboard must survive the crossing.
   m_reassertedModifiers.clear();
+  m_osDisagreeModifiers = 0;
   m_screen->fakeAllKeysUp();
 }
 
@@ -715,6 +724,34 @@ void Screen::handlePostSwitchVerifier()
     keep |= bit;
   }
   m_screen->releaseInjectedKeys(keep);
+  // Bits the server's own enter mask said were NOT held: never an ACTIVE
+  // CROSS-MACHINE hold to protect, whether or not this process's ledger
+  // happens to know about them -- unlike releaseInjectedKeys() above,
+  // offered to forceReleaseOsModifiers() regardless of ledger membership
+  // (K2 gap: a non-ledgered stuck modifier used to log as "stuck-release"
+  // with nothing downstream ever actually visiting it, since
+  // releaseInjectedKeys() only ever walks the injected ledger). That still
+  // says nothing about a genuine LOCAL hold on the target's own keyboard,
+  // which this mask can never see -- forceReleaseOsModifiers()'s contract
+  // requires the platform to apply its own local-hardware evidence before
+  // actually clearing any of it, exactly like sanitizeInjectedKeys() does
+  // at other boundaries.
+  const KeyModifierMask forceClear = held & m_osDisagreeModifiers;
+  if (forceClear != 0) {
+    m_screen->forceReleaseOsModifiers(forceClear);
+  }
+  // Whatever remains down after both attempts is not necessarily a
+  // failure: the server may have agreed it was held (left alone above as a
+  // possible still-in-progress cross-machine hold), or the platform may
+  // have found it hardware-fresh (a possible still-in-progress LOCAL hold).
+  // Deliberately not sharing the "stuck-release" text above: fleet-health's
+  // keys check greps that substring per line with no dedup, and this is a
+  // separate, often-benign observation about the same event, not a second
+  // occurrence of it.
+  const KeyModifierMask stillHeld = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & held;
+  if (stillHeld != 0) {
+    LOG_INFO("[keys] post-remediation still-down 0x%04x", stillHeld);
+  }
 }
 
 std::string Screen::getSecureInputApp() const

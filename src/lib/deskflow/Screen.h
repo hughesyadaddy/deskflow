@@ -343,6 +343,21 @@ private:
   // up (see keyUp) or by leaveSecondary(), whichever comes first.
   std::map<KeyModifierMask, KeyButton> m_reassertedModifiers;
 
+  // Modifiers the server's enter mask said were NOT held, but our OS
+  // disagreed with at the same instant: the opposite case from
+  // m_reassertedModifiers. The server is the one authority on whether an
+  // ACTIVE CROSS-MACHINE hold is in progress, so a bit it explicitly denies
+  // can never be one of those -- but it says nothing about a genuine LOCAL
+  // hold on THIS machine's own keyboard, which the server cannot see at
+  // all. Computed once in enterSecondary(); the post-switch verifier offers
+  // whatever of this set is still down to forceReleaseOsModifiers() even if
+  // it was never in this process's injected ledger (K2 gap: a non-ledgered
+  // stuck modifier used to be logged as "released" while the release loop
+  // silently never visited it) -- the platform implementation still has to
+  // apply its own local-hardware evidence before actually releasing any of
+  // it (see IKeyState::forceReleaseOsModifiers's contract).
+  KeyModifierMask m_osDisagreeModifiers = 0;
+
   IEventQueue *m_events = nullptr;
 
   // Post-switch verifier (secondary only): a one-shot armed on enter that
