@@ -39,6 +39,7 @@ public:
   bool supervised = false;
   bool windowsService = false;
   int kickstarts = 0;
+  int bootstraps = 0;
 
   //! Simulate the child process ending, exactly as QProcess::finished would deliver it.
   void finish(int exitCode, QProcess::ExitStatus status)
@@ -65,6 +66,10 @@ protected:
   {
     ++kickstarts;
   }
+  void bootstrapExternalCore() override
+  {
+    ++bootstraps;
+  }
   bool isWindowsServiceInstalled() const override
   {
     return windowsService;
@@ -83,6 +88,7 @@ public:
 
   int spawnCount = 0;
   int kickstarts = 0;
+  int bootstraps = 0;
 
 protected:
   bool spawnCoreProcess(QProcess *, const QString &, const QStringList &) override
@@ -93,6 +99,10 @@ protected:
   void kickstartExternalCore() override
   {
     ++kickstarts;
+  }
+  void bootstrapExternalCore() override
+  {
+    ++bootstraps;
   }
 };
 
@@ -304,12 +314,18 @@ void CoreProcessTests::externally_supervised_core_attaches_via_ipc_and_kickstart
   QCOMPARE(core.processState(), ProcessState::Started);
   QCOMPARE(core.spawnCount, 0);
   QCOMPARE(core.processObjects(), 0);
+  // start() always ensures the agent is actually loaded: kickstart -k (used
+  // on restart, below) fails outright on an agent that was fully unloaded
+  // (deskflow-ctl stop, or the 10x-Esc fleet rescue), and nothing else would
+  // load it back before the ipc client gives up waiting.
+  QCOMPARE(core.bootstraps, 1);
   stateSpy.clear();
 
   // Restart is one kickstart: no stop()/start() bounce, so the state never leaves
   // Started and the IPC client (not a respawn) is what re-attaches.
   core.restart();
   QCOMPARE(core.kickstarts, 1);
+  QCOMPARE(core.bootstraps, 1); // unchanged: restart()'s path is kickstart, not start()
   QCOMPARE(core.spawnCount, 0);
   QCOMPARE(core.processState(), ProcessState::Started);
   QCOMPARE(stateSpy.count(), 0);
@@ -323,11 +339,15 @@ void CoreProcessTests::externally_supervised_core_attaches_via_ipc_and_kickstart
   FakeCoreProcess stopped(config);
   stopped.supervised = true;
   stopped.start(ProcessMode::Desktop);
+  QCOMPARE(stopped.bootstraps, 1);
   stopped.stop();
   QCOMPARE(stopped.processState(), ProcessState::Stopped);
   stopped.restart();
   QCOMPARE(stopped.kickstarts, 0);
   QCOMPARE(stopped.spawnCount, 0);
+  // restart()'s not-currently-Started path is stop()+start(), so this start()
+  // ensures the agent is loaded again exactly like the very first one did.
+  QCOMPARE(stopped.bootstraps, 2);
   QCOMPARE(stopped.processState(), ProcessState::Started);
   stopped.stop();
 }
@@ -347,6 +367,7 @@ void CoreProcessTests::macos_gui_never_spawns_a_core()
 #endif
   QCOMPARE(core.isExternallySupervised(), launchdOwned);
   QCOMPARE(core.spawnCount, launchdOwned ? 0 : 1);
+  QCOMPARE(core.bootstraps, launchdOwned ? 1 : 0);
   core.restart();
   QCOMPARE(core.kickstarts, launchdOwned ? 1 : 0);
   QCOMPARE(core.spawnCount, launchdOwned ? 0 : 2);

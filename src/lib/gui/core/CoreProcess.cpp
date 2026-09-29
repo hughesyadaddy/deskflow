@@ -53,6 +53,11 @@ QString launchdCoreTarget()
 }
 #endif
 
+QString CoreProcess::safeCtlPath()
+{
+  return QDir::homePath() + QStringLiteral("/Library/Deskflow/bin/deskflow-ctl");
+}
+
 QString CoreProcess::processModeToString(const Settings::ProcessMode mode)
 {
   return QVariant::fromValue(mode).toString().toLower();
@@ -299,18 +304,55 @@ void CoreProcess::kickstartExternalCore()
   connect(launchctl, &QProcess::finished, this, [this, launchctl](int exitCode, QProcess::ExitStatus status) {
     launchctl->deleteLater();
     if (status != QProcess::NormalExit || exitCode != 0) {
-      qWarning("launchctl kickstart failed with exit code %d", exitCode);
-      kickstartFailed();
+      // kickstart -k only restarts an ALREADY-loaded job; it fails exactly
+      // like this when the agent was fully unloaded (deskflow-ctl stop, or
+      // the 10x-Esc fleet rescue stop-all -- both bootout it). Fall back to
+      // loading it fresh rather than reporting "could not be started" for a
+      // condition that is fixable without the user's help.
+      qWarning("launchctl kickstart failed with exit code %d; trying to load the core agent", exitCode);
+      bootstrapExternalCore();
     }
   });
   connect(launchctl, &QProcess::errorOccurred, this, [this, launchctl](QProcess::ProcessError) {
     if (launchctl->state() == QProcess::NotRunning) {
       qWarning("launchctl kickstart could not run: %s", qPrintable(launchctl->errorString()));
       launchctl->deleteLater();
-      kickstartFailed();
+      bootstrapExternalCore();
     }
   });
   launchctl->start(QStringLiteral("/bin/launchctl"), {QStringLiteral("kickstart"), QStringLiteral("-k"), target});
+#endif
+}
+
+void CoreProcess::bootstrapExternalCore()
+{
+#ifdef Q_OS_MACOS
+  const auto ctl = safeCtlPath();
+  if (!QFile::exists(ctl)) {
+    qWarning("cannot load the core agent: %s not found", qPrintable(ctl));
+    kickstartFailed();
+    return;
+  }
+  qInfo("loading core agent: %s ensure-core", qPrintable(ctl));
+  auto *process = new QProcess(this);
+  connect(process, &QProcess::finished, this, [this, process](int exitCode, QProcess::ExitStatus status) {
+    process->deleteLater();
+    if (status != QProcess::NormalExit || exitCode != 0) {
+      qWarning("deskflow-ctl ensure-core failed with exit code %d", exitCode);
+      kickstartFailed();
+    }
+    // On success the core agent is loaded; the IPC client's own forever
+    // reconnect loop (see start()) picks it up on its next attempt without
+    // any further action here.
+  });
+  connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError) {
+    if (process->state() == QProcess::NotRunning) {
+      qWarning("deskflow-ctl ensure-core could not run: %s", qPrintable(process->errorString()));
+      process->deleteLater();
+      kickstartFailed();
+    }
+  });
+  process->start(ctl, {QStringLiteral("ensure-core")});
 #endif
 }
 
@@ -615,6 +657,14 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
 
   if (m_externallySupervised) {
     qInfo("core is supervised by launchd, attaching via ipc without spawning");
+    // The agent's plist can exist (hasExternalSupervisor() true) while the
+    // job itself is not currently loaded at all -- deskflow-ctl stop and the
+    // 10x-Esc fleet rescue stop-all both bootout it, and nothing else reloads
+    // it. Without this, an ordinary app launch after either would sit here
+    // "Started" while the ipc client retries a core that will never appear
+    // until someone runs deskflow-ctl start by hand. Idempotent and cheap
+    // when core is already loaded and running (see cmd_ensure_core).
+    bootstrapExternalCore();
     setProcessState(ProcessState::Started);
   } else if (processMode == ProcessMode::Desktop) {
     startForegroundProcess(args);

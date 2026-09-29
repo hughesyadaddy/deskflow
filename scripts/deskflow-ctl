@@ -14,6 +14,11 @@
 #                                       again; a current one is only kickstarted.
 #   scripts/deskflow-ctl restart        launchctl kickstart -k (bootstrap if unloaded;
 #                                       bootout+bootstrap if the loaded definition is stale)
+#   scripts/deskflow-ctl ensure-core    clear quit-intent + bootstrap core only (no GUI_LABEL,
+#                                       no CONVERGE_LABEL, no prio) -- for the GUI itself to
+#                                       call on its own launch or a tray Start; kickstarting
+#                                       GUI_LABEL from inside the running GUI would ask
+#                                       launchd to kill and replace the very process asking
 #   scripts/deskflow-ctl status         inventory: launchd state + every Deskflow process
 #   scripts/deskflow-ctl assert-single  exit 0 only when exactly one core (owned by
 #                                       launchd) and exactly one GUI run from the
@@ -990,6 +995,28 @@ cmd_stop() {
   log "$how"
 }
 
+cmd_ensure_core() {
+  # Narrow counterpart to `start`, for the GUI to call on its own (ordinary
+  # launch, or a tray/menu Start after `stop` or the 10x-Esc fleet stop-all
+  # bootout the agent -- see write_quit_intent). `launchctl kickstart -k`
+  # only restarts an ALREADY-loaded job; it cannot load one that stop()
+  # bootout'd entirely, which is exactly that state. This does only what a
+  # GUI launch needs -- clear the quit-intent sentinel and load core -- and
+  # deliberately skips GUI_LABEL (the GUI calling this already IS running),
+  # CONVERGE_LABEL and cmd_prio, so a silent, no-prompt call from app launch
+  # can never surface a sudo prompt or duplicate-instance churn.
+  [[ -d "$APP" ]] || die "bundle missing: $APP"
+  [[ -x "$APP/Contents/MacOS/deskflow-core" ]] || die "missing $APP/Contents/MacOS/deskflow-core"
+  clear_quit_intent
+  bootstrap_agent "$CORE_LABEL"
+  local deadline=$(( $(date +%s) + START_TIMEOUT ))
+  while [[ -z "$(agent_pid "$CORE_LABEL")" ]]; do
+    (( $(date +%s) >= deadline )) && die "deskflow-core did not start under launchd within ${START_TIMEOUT}s (see $LOG_DIR/deskflow-core.log)"
+    sleep 0.5
+  done
+  log "ensure-core: core pid $(agent_pid "$CORE_LABEL")"
+}
+
 cmd_start() {
   [[ -d "$APP" ]] || die "bundle missing: $APP"
   [[ -x "$APP/Contents/MacOS/deskflow-core" ]] || die "missing $APP/Contents/MacOS/deskflow-core"
@@ -1734,6 +1761,7 @@ case "${1:-}" in
   stop) cmd_stop ;;
   start) cmd_start ;;
   restart) cmd_restart ;;
+  ensure-core) cmd_ensure_core ;;
   status) cmd_status ;;
   assert-single) cmd_assert_single ;;
   prio) cmd_prio ;;

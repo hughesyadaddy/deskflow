@@ -146,6 +146,11 @@ protected:
   virtual bool hasExternalSupervisor() const;
   //! Ask the external supervisor to restart the core (launchctl kickstart -k); never blocks.
   virtual void kickstartExternalCore();
+  //! Ask the external supervisor to load the core agent if it is not currently loaded at
+  //! all (e.g. after `deskflow-ctl stop` or the fleet-wide rescue stop-all bootout it) --
+  //! kickstart -k only restarts an ALREADY-loaded job and fails on one that was fully
+  //! removed. Never blocks; idempotent and cheap when core is already loaded and running.
+  virtual void bootstrapExternalCore();
   //! True when the Deskflow Windows service is installed (always false off Windows).
   virtual bool isWindowsServiceInstalled() const;
 
@@ -174,6 +179,10 @@ private:
   QString correctedAddress(const QString &address) const;
   void setupDaemonLogTail(const QString &logPath);
   static QString makeQuotedArgs(const QString &app, const QStringList &args);
+  //! The launchd-safe deskflow-ctl copy the converge agent also runs from
+  //! (~/Library/Deskflow/bin/deskflow-ctl) -- never this checkout, which may
+  //! not exist or may be mid-edit on a dev machine.
+  static QString safeCtlPath();
   static QString processModeToString(const Settings::ProcessMode mode);
   static QString processStateToString(const CoreProcess::ProcessState state);
   static QString wrapIpv6(const QString &address);

@@ -320,6 +320,41 @@ DOMAIN="gui/$(id -u)"
   [ ! -e "$HOME/Library/Application Support/Deskflow/quit-intent" ]
 }
 
+@test "ensure-core clears quit-intent and loads a fully unloaded core agent, touching neither GUI nor converge" {
+  # The exact post-stop state: `stop` (directly, or via the 10x-Esc fleet
+  # rescue) bootout's all three agents and leaves the sentinel behind, and
+  # `launchctl kickstart -k` (what the GUI used to rely on) cannot load an
+  # agent back from that state -- only bootstrap can. ensure-core exists so
+  # the GUI's own launch (or a tray Start) can recover without a human
+  # running `start`/`restart` from a terminal.
+  mkdir -p "$HOME/Library/Application Support/Deskflow"
+  date +%s >"$HOME/Library/Application Support/Deskflow/quit-intent"
+  autostart $CORE 400 "$APP/Contents/MacOS/deskflow-core"
+  run bash "$SCRIPT" ensure-core
+  [ "$status" -eq 0 ]
+  [ ! -e "$HOME/Library/Application Support/Deskflow/quit-intent" ]
+  log_has "launchctl bootstrap $DOMAIN $DESKFLOW_CTL_AGENT_DIR/$CORE.plist"
+  # The whole point: this must never touch the GUI's own agent (kickstarting
+  # it from inside the running GUI would ask launchd to kill and replace the
+  # very process calling this) or the converge tick. $GUI is a string prefix
+  # of $CORE ("...deskflow" vs "...deskflow-core"), so log_lacks "$GUI" would
+  # false-positive on the CORE lines above -- ".plist" is the unambiguous
+  # suffix (a "-core.plist" tail can never match a bare ".plist" one).
+  log_lacks "$GUI.plist"
+  log_lacks "$CONVERGE.plist"
+}
+
+@test "ensure-core on an already-loaded, current core is a cheap kickstart, not a bootout+bootstrap" {
+  load_agent $CORE 100; add_proc 100 "$APP/Contents/MacOS/deskflow-core"
+  run bash "$SCRIPT" ensure-core
+  [ "$status" -eq 0 ]
+  log_has "launchctl kickstart $DOMAIN/$CORE"
+  log_lacks "launchctl kickstart -k"
+  log_lacks "launchctl bootout"
+  log_lacks "$GUI.plist"
+  log_lacks "$CONVERGE.plist"
+}
+
 @test "start kickstarts (without -k) an agent that is already loaded instead of bootstrapping twice" {
   load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
   autostart $GUI 301 "$APP/Contents/MacOS/Deskflow"
