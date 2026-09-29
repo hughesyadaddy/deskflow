@@ -521,8 +521,17 @@ def sudo_probe_cmd() -> str:
     return "sudo -n true"
 
 
-def login_bridge_agent_cmd(label: str = LOGIN_BRIDGE_LABEL) -> str:
-    return f"sudo -n launchctl print loginwindow/{label}"
+def login_bridge_pgrep_cmd(binary: str = LOGIN_BRIDGE_BIN) -> str:
+    """Whether the bridge process is actually running, via the process table --
+    not `launchctl print loginwindow/...`, which is unreadable from outside an
+    actual login-type security session (confirmed 2026-09-29: fails identically
+    as root over SSH AND from a plain local non-interactive shell, on both
+    hackintosh and macbookpro, for a bridge KNOWN to be correctly loaded on
+    macbookpro at the time -- so rc!=0 there means nothing about whether the
+    bridge is loaded, only that this process can't ask). pgrep exits 1 with no
+    match, which is the normal, expected state outside the login window.
+    """
+    return f"sudo -n pgrep -f {shlex.quote(binary)}"
 
 
 def login_bridge_keystroke_cmd(log: str = LOGIN_BRIDGE_LOG, mark: str = LOGIN_BRIDGE_KEYSTROKE_MARK) -> str:
@@ -1250,12 +1259,14 @@ class FleetHealth:
         agent = ""
         ready = ""
         if sudo_ok:
-            rc, out, err = self.runner(host, login_bridge_agent_cmd())
-            if rc != 0:
-                problems.append(f"loginwindow/{LOGIN_BRIDGE_LABEL} not loaded (launchctl rc={rc})")
+            rc, out, err = self.runner(host, login_bridge_pgrep_cmd())
+            if rc == 0 and out.strip():
+                pid = out.strip().splitlines()[0]
+                agent = f"process pid {pid}"
+            elif rc == 1:
+                agent = "not running (normal outside the login window)"
             else:
-                m = re.search(r"^\s*pid = (\d+)", out, re.M)
-                agent = f"agent pid {m.group(1)}" if m else "agent loaded, no pid (normal outside the login window)"
+                problems.append(f"pgrep for {LOGIN_BRIDGE_BIN} failed: {(err or out).strip()[:80] or f'rc={rc}'}")
             rc, out, err = self.runner(host, login_bridge_keystroke_cmd())
             count = out.strip().splitlines()[-1] if out.strip() else ""
             if not count.isdigit():

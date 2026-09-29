@@ -77,11 +77,6 @@ CTL_FAIL = ("deskflow-ctl assert-single: FAIL\n"
 # Mouser's reply to {"t":"status"} on 127.0.0.1:19795 when deskflow-core is attached.
 BRIDGE_OK = '{"t":"status","attached":true,"peer":"deskflow-core","session":"a1b2","proto":2}'
 
-# `sudo -n launchctl print loginwindow/org.deskflow.vhid-bridge` at a login window.
-LOGIN_BRIDGE_PRINT = ("loginwindow/org.deskflow.vhid-bridge = {\n\tactive count = 1\n\tpath = /Library/LaunchAgents/"
-                      "org.deskflow.vhid-bridge.plist\n\tstate = running\n\n\tprogram = /Applications/Deskflow.app/"
-                      "Contents/MacOS/deskflow-vhid-bridge\n\tpid = 611\n}\n")
-
 # Tail of /var/log/deskflow-vhid-bridge.log from a K3 bridge: a stale run, then
 # a clean start that reaches the daemon in 7 s.
 LOGIN_BRIDGE_LOG_OK = (
@@ -148,7 +143,7 @@ def mac_ok_table(hid="macbookpro", peers=()):
         (hid, fh.login_bridge_plist_cmd()): (0, fh.LOGIN_BRIDGE_BIN + "\n", ""),
         (hid, fh.login_bridge_log_mode_cmd()): (0, "600\n", ""),
         (hid, fh.sudo_probe_cmd()): (0, "", ""),
-        (hid, fh.login_bridge_agent_cmd()): (0, LOGIN_BRIDGE_PRINT, ""),
+        (hid, fh.login_bridge_pgrep_cmd()): (0, "611\n", ""),
         (hid, fh.login_bridge_keystroke_cmd()): (1, "0\n", ""),
         (hid, fh.login_bridge_calibrate_cmd()): (0, "1\n", ""),
         (hid, fh.login_bridge_log_since_start_cmd()): (0, LOGIN_BRIDGE_LOG_OK, ""),
@@ -651,7 +646,7 @@ def test_loginbridge_cmds_target_root_paths_and_use_sudo_n_only():
     assert "ProgramArguments.0" in fh.login_bridge_plist_cmd()
     assert fh.login_bridge_log_mode_cmd() == "stat -f %Lp /var/log/deskflow-vhid-bridge.log"
     assert fh.sudo_probe_cmd() == "sudo -n true"
-    assert fh.login_bridge_agent_cmd() == "sudo -n launchctl print loginwindow/org.deskflow.vhid-bridge"
+    assert fh.login_bridge_pgrep_cmd() == f"sudo -n pgrep -f {fh.LOGIN_BRIDGE_BIN}"
     assert fh.login_bridge_keystroke_cmd() == "sudo -n grep -c 'key down id=' /var/log/deskflow-vhid-bridge.log"
     assert fh.login_bridge_calibrate_cmd() == "grep -c -- --calibrate /Library/LaunchAgents/org.deskflow.vhid-bridge.plist"
     cmd = fh.login_bridge_log_since_start_cmd()
@@ -667,7 +662,7 @@ def test_loginbridge_pass_reports_pid_and_zero_keystrokes():
     results, runner = run_checks([mac()], mac_ok_table(), ["loginbridge"])
     assert [r.check for r in results] == ["loginbridge"]
     assert results[0].status == "PASS", results[0].detail
-    assert "agent pid 611" in results[0].detail and "0 keystrokes" in results[0].detail
+    assert "process pid 611" in results[0].detail and "0 keystrokes" in results[0].detail
     assert "--calibrate" in results[0].detail and "virtual HID ready 7s after start" in results[0].detail
     assert ("macbookpro", fh.login_bridge_keystroke_cmd()) in runner.calls
     assert ("macbookpro", fh.login_bridge_log_since_start_cmd()) in runner.calls
@@ -755,7 +750,7 @@ def test_loginbridge_skips_privileged_parts_without_passwordless_sudo():
     results, runner = run_checks([mac()], t, ["loginbridge"])
     assert results[0].status == "SKIP" and results[0].ok
     assert "passwordless sudo" in results[0].detail and "log mode 600" in results[0].detail
-    assert ("macbookpro", fh.login_bridge_agent_cmd()) not in runner.calls
+    assert ("macbookpro", fh.login_bridge_pgrep_cmd()) not in runner.calls
     assert ("macbookpro", fh.login_bridge_keystroke_cmd()) not in runner.calls
     assert ("macbookpro", fh.login_bridge_log_since_start_cmd()) not in runner.calls
     # the unprivileged --calibrate check still ran
@@ -766,7 +761,7 @@ def test_loginbridge_skips_privileged_parts_without_passwordless_sudo():
     assert results[0].status == "FAIL" and "mode 644" in results[0].detail
 
 
-def test_loginbridge_fails_on_missing_plist_wrong_program_or_agent_not_loaded():
+def test_loginbridge_fails_on_missing_plist_wrong_program_or_pgrep_error():
     t = mac_ok_table()
     t[("macbookpro", fh.login_bridge_plist_cmd())] = (1, "", "")
     results, _ = run_checks([mac()], t, ["loginbridge"])
@@ -778,9 +773,9 @@ def test_loginbridge_fails_on_missing_plist_wrong_program_or_agent_not_loaded():
     assert results[0].status == "FAIL" and "plist program /usr/local/bin/deskflow-vhid-bridge !=" in results[0].detail
 
     t = mac_ok_table()
-    t[("macbookpro", fh.login_bridge_agent_cmd())] = (113, "", "Could not find service")
+    t[("macbookpro", fh.login_bridge_pgrep_cmd())] = (2, "", "pgrep: illegal option")
     results, _ = run_checks([mac()], t, ["loginbridge"])
-    assert results[0].status == "FAIL" and "not loaded" in results[0].detail
+    assert results[0].status == "FAIL" and "pgrep" in results[0].detail and "failed" in results[0].detail
 
 
 def test_loginbridge_fails_when_the_log_holds_keystrokes_or_grep_breaks():
@@ -793,11 +788,13 @@ def test_loginbridge_fails_when_the_log_holds_keystrokes_or_grep_breaks():
     assert results[0].status == "FAIL" and "keystroke grep failed" in results[0].detail
 
 
-def test_loginbridge_agent_loaded_without_pid_is_fine_outside_the_login_window():
+def test_loginbridge_not_running_is_fine_outside_the_login_window():
+    # pgrep exits 1 with empty output when no process matches -- the normal,
+    # expected state whenever the bridge isn't at an active login window.
     t = mac_ok_table()
-    t[("macbookpro", fh.login_bridge_agent_cmd())] = (0, LOGIN_BRIDGE_PRINT.replace("\tpid = 611\n", ""), "")
+    t[("macbookpro", fh.login_bridge_pgrep_cmd())] = (1, "", "")
     results, _ = run_checks([mac()], t, ["loginbridge"])
-    assert results[0].status == "PASS" and "no pid" in results[0].detail
+    assert results[0].status == "PASS" and "not running" in results[0].detail
 
 
 def test_loginbridge_is_mac_only_and_included_in_all(tmp_path, capsys):
