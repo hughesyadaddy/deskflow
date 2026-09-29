@@ -577,8 +577,17 @@ void deskSanitizeStaleModifiers(MSWindowsDesks::StaleModifierAudit *audit, const
     input.ki.dwExtraInfo = kSkipThirdPartyRemapFlag;
     if (SendInput(1, &input, sizeof(input)) == 1) {
       audit->released.push_back(static_cast<WORD>(vk));
-      const bool wasFastTracked =
-          recentlyReleasedBefore[i] != 0 && nowMs - recentlyReleasedBefore[i] < deskflow::platform::kAuditQuietMs;
+      // "re-stuck" must mean the fast-track was the deciding factor, i.e.
+      // this row would otherwise have been BLOCKED by the Win-row quiet
+      // window (see staleModifiersToRelease) -- not merely "was released
+      // recently for any reason", or every ordinary Alt/Ctrl release (which
+      // never has a quiet window to skip) right after an unrelated release
+      // would be mislabeled too.
+      const bool wouldHaveBeenQuietWindowBlocked =
+          ((1u << i) & deskflow::platform::kAuditQuietRows) != 0 && audit->lastSuperChordMs != 0 &&
+          nowMs - audit->lastSuperChordMs < deskflow::platform::kAuditQuietMs;
+      const bool wasFastTracked = wouldHaveBeenQuietWindowBlocked && recentlyReleasedBefore[i] != 0 &&
+                                   nowMs - recentlyReleasedBefore[i] < deskflow::platform::kAuditQuietMs;
       const char *reason = !audit->entered ? "boundary" : wasFastTracked ? "re-stuck" : "audit";
       LOG_WARN("released stuck modifier vk=0x%02x (injected bits 0x%02x, %s)", vk, heldByUsBits, reason);
       // D6: an UP that did not take (wrong desktop) reads os_after=down here

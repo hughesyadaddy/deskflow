@@ -33,4 +33,5 @@ private Q_SLOTS:
   // grace tick) if it turns out to still/again be down.
   void audit_recentlyReleasedWin_skipsQuietWindowOnRepeat();
   void audit_recentlyReleasedExpires_afterQuietWindow();
+  void audit_reledgeredWin_forgetsStaleFastTrack();
 };

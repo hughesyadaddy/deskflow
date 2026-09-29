@@ -83,7 +83,10 @@ inline void forgetReleased(InjectedModifierMap &ledger, const std::vector<uint16
 \p entered      true while the server is driving this screen.
 \p recentlyReleasedMs per-row tick of the last release THIS function issued
                 (any reason); 0 = never. Owned by the caller exactly like
-                \p firstSeen, updated in place.
+                \p firstSeen, updated in place. Cleared early (before its
+                own quiet window would otherwise expire) the moment the row
+                becomes re-ledgered, so a later release of a fresh
+                legitimate hold is never mistaken for the same stale one.
 
 At a boundary (\p entered false) the protocol guarantees the server holds
 nothing here, so every non-ledgered OS-down row is released at once (the
@@ -114,6 +117,15 @@ let the same row sit stuck for two consecutive multi-second cycles in
 practice (seen live 2026-09-29: releases of the same row ~1.9 s apart).
 Only the quiet window is skipped; the grace tick is not, and is never
 skipped for any row or reason.
+
+A row that becomes RE-LEDGERED (we start legitimately holding it again,
+e.g. a genuine second Win+key chord) forgets any earlier fast-track state
+for that row: a hook re-processing THIS new, legitimate chord must get the
+same full quiet window an unrelated earlier release already used up, not
+be judged against that stale timestamp. Only becoming ledgered clears it --
+a row that merely goes OS-up without being ledgered (the exact flap this
+fast-track targets: released, then re-stuck by a hook with no WE-hold in
+between) must keep it.
 */
 inline uint32_t staleModifiersToRelease(
     uint32_t osDownMask, uint32_t ledgerBits, AuditFirstSeen &firstSeen, uint64_t nowMs, uint64_t lastSuperChordMs,
@@ -123,9 +135,13 @@ inline uint32_t staleModifiersToRelease(
   uint32_t release = 0;
   for (size_t i = 0; i < kAuditModifierRows; ++i) {
     const uint32_t bit = 1u << i;
-    const bool candidate = (osDownMask & bit) != 0 && (ledgerBits & bit) == 0;
+    const bool ledgered = (ledgerBits & bit) != 0;
+    const bool candidate = (osDownMask & bit) != 0 && !ledgered;
     if (!candidate) {
       firstSeen[i] = 0;
+      if (ledgered) {
+        recentlyReleasedMs[i] = 0; // a fresh legitimate hold moots any earlier fast-track state
+      }
       continue;
     }
     if (!entered) {

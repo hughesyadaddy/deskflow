@@ -250,4 +250,38 @@ void ModifierLedgerTests::audit_recentlyReleasedExpires_afterQuietWindow()
   QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, later + kTick, chordAt, true, released), 0u);
 }
 
+void ModifierLedgerTests::audit_reledgeredWin_forgetsStaleFastTrack()
+{
+  // Review gap (2026-09-29 fast-track review): the fast-track above must not
+  // outlive a legitimate re-chord on the same row. If we start legitimately
+  // holding LWIN again shortly after an earlier, unrelated release, and a
+  // hook is still processing THAT new chord when the row next comes up as a
+  // candidate, it must get the FULL quiet window -- not be fast-tracked off
+  // a stale timestamp left over from the earlier release.
+  AuditFirstSeen seen{};
+  AuditFirstSeen released{};
+  const uint64_t now = 60 * kTick;
+
+  // An earlier, unrelated release (same shape as the fast-track test above).
+  QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, now, 0, true, released), 0u);
+  QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, now + kTick, 0, true, released), kRowLWin);
+  QCOMPARE(released[0], now + kTick);
+
+  // We legitimately hold LWIN again moments later (a real second chord):
+  // this must forget the release above, not just the sighting.
+  const uint64_t reledgerAt = now + kTick + 100;
+  QCOMPARE(staleModifiersToRelease(kRowLWin, kRowLWin, seen, reledgerAt, 0, true, released), 0u);
+  QCOMPARE(released[0], 0u);
+
+  // We finish that chord; a hook is still legitimately processing it
+  // (a fresh Super-chord timestamp), and the second sighting below lands
+  // only 900 ms after the ORIGINAL release -- well inside what the stale
+  // fast-track window would have been had it survived the re-ledger.
+  const uint64_t chordAt = reledgerAt + 50;
+  const uint64_t t1 = reledgerAt + 400;
+  QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, t1, chordAt, true, released), 0u); // first sighting, new occurrence
+  const uint64_t t2 = t1 + 400; // now - (now + kTick) = 900 ms: would wrongly fast-track pre-fix
+  QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, t2, chordAt, true, released), 0u);
+}
+
 QTEST_MAIN(ModifierLedgerTests)

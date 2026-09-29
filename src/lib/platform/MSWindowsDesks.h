@@ -170,12 +170,16 @@ public:
   audit: a row is released only after two consecutive sightings; the
   LWIN/RWIN rows additionally wait until no Win+key was injected within
   deskflow::platform::kAuditQuietMs (D3). Alt/Ctrl rows get no quiet
-  window, so a stuck one is released even while the user keeps typing. A row
-  this function released within the last kAuditQuietMs skips straight to
-  immediate release on its very next candidacy, no matter the row or the
-  entered/quiet-window rules above: a stray down right after we already
-  cleared the same row is a re-press racing our cleanup (seen live as LWIN
-  re-sticking ~1.9 s after being released), never a fresh legitimate hold.
+  window, so a stuck one is released even while the user keeps typing. A
+  LWIN/RWIN row this function released within the last kAuditQuietMs skips
+  only that quiet window on its very next candidacy -- the two-consecutive-
+  sightings grace still applies in full either way, so a genuinely fleeting
+  local tap is never released without at least one tick to clear on its
+  own. A stray down right after we already cleared the same row is a
+  re-press racing our cleanup (seen live as LWIN re-sticking ~1.9 s after
+  being released), never a fresh legitimate hold -- and a fresh legitimate
+  re-chord on that row forgets this fast-track state, so it always gets the
+  full quiet window (see staleModifiersToRelease).
   */
   std::vector<WORD> sanitizeStaleModifiers(uint32_t heldByUsBits, bool entered, uint64_t lastSuperChordMs) const;
 
