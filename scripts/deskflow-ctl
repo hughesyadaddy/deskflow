@@ -101,7 +101,8 @@
 #      DESKFLOW_CTL_STOP_TIMEOUT / DESKFLOW_CTL_START_TIMEOUT (seconds),
 #      DESKFLOW_CTL_DAEMON_DIR (default /Library/LaunchDaemons),
 #      DESKFLOW_CTL_DAEMON_STAGE_DIR (default ~/Library/Deskflow/launchd),
-#      DESKFLOW_CTL_RETIRED_PRIO_APPLY / DESKFLOW_CTL_RETIRED_SYNERGY_AGENT
+#      DESKFLOW_CTL_RETIRED_PRIO_APPLY / DESKFLOW_CTL_RETIRED_PRIO_BINARY /
+#      DESKFLOW_CTL_RETIRED_SYNERGY_AGENT
 #      (retired root-owned paths; overridable for tests only),
 #      DESKFLOW_CTL_SAFE_DIR (default ~/Library/Deskflow/bin; must not be under
 #      ~/Desktop, ~/Documents, ~/Downloads, iCloud Drive or /Volumes -- checked
@@ -203,11 +204,17 @@ DEPLOY_LOCK_MAX_AGE=1800
 ME_UID="$(id -u)"
 DOMAIN="gui/$ME_UID"
 # Retired launchers/logs from earlier fleet designs. The keepalive log is this
-# user's (retire removes it); the other two are root-owned (retire prints the
-# sudo lines). All three fail assert-single while present.
+# user's (retire removes it); the other three are root-owned (retire prints
+# the sudo lines). All fail assert-single while present.
 RETIRED_KEEPALIVE_LOG="$LOG_DIR/deskflow-keepalive.log"
 RETIRED_KEEPALIVE_LOG_OLD="$HOME/Library/Logs/deskflow-keepalive.log"
 RETIRED_PRIO_APPLY="${DESKFLOW_CTL_RETIRED_PRIO_APPLY:-/usr/local/bin/deskflow-prio-apply.sh}"
+# The old out-of-tree prio binary itself (see src/apps/deskflow-prio/CMakeLists.txt
+# and tools/launchd/io.github.hughesyadaddy.deskflow-prio.plist: deskflow-prio now
+# ships inside Deskflow.app/Contents/MacOS and is signed there). A leftover here
+# is unsigned/untracked and fails fleet-health sign + identifiers forever, since
+# nothing ever re-signs or removes it on its own.
+RETIRED_PRIO_BINARY="${DESKFLOW_CTL_RETIRED_PRIO_BINARY:-/usr/local/bin/deskflow-prio}"
 RETIRED_SYNERGY_AGENT="${DESKFLOW_CTL_RETIRED_SYNERGY_AGENT:-/Library/LaunchAgents/com.symless.synergy-agent.plist}"
 # BTM (Background Task Management) records that may launch Deskflow: the fleet
 # LaunchAgents, the prio LaunchDaemon and the login-window bridge. Any other
@@ -1592,7 +1599,7 @@ cmd_login_items() {
 # ---------------------------------------------------------------- retire
 retired_root_files_present() {
   local f n=0
-  for f in "$RETIRED_PRIO_APPLY" "$RETIRED_SYNERGY_AGENT"; do
+  for f in "$RETIRED_PRIO_APPLY" "$RETIRED_PRIO_BINARY" "$RETIRED_SYNERGY_AGENT"; do
     [[ -e "$f" || -L "$f" ]] && { echo "$f"; n=$((n + 1)); }
   done
   (( n > 0 ))
@@ -1725,7 +1732,7 @@ cmd_assert_single() {
     esac
   fi
   local f
-  for f in "$RETIRED_KEEPALIVE_LOG" "$RETIRED_KEEPALIVE_LOG_OLD" "$RETIRED_PRIO_APPLY" "$RETIRED_SYNERGY_AGENT"; do
+  for f in "$RETIRED_KEEPALIVE_LOG" "$RETIRED_KEEPALIVE_LOG_OLD" "$RETIRED_PRIO_APPLY" "$RETIRED_PRIO_BINARY" "$RETIRED_SYNERGY_AGENT"; do
     [[ -e "$f" || -L "$f" ]] && problems+=("retired file present: $f (deskflow-ctl retire)")
   done
   # The self-heal tick must be able to run at all (TCC: a launchd job gets
