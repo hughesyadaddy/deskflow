@@ -268,19 +268,25 @@ void ModifierLedgerTests::audit_reledgeredWin_forgetsStaleFastTrack()
   QCOMPARE(released[0], now + kTick);
 
   // We legitimately hold LWIN again moments later (a real second chord):
-  // this must forget the release above, not just the sighting.
+  // this must forget the release above, not just the sighting. This next
+  // line is the regression guard -- reverting just the "if (ledgered)"
+  // clear in staleModifiersToRelease makes THIS QCOMPARE fail
+  // (released[0] stays 61000 instead of clearing to 0), independently
+  // confirmed by temporarily reverting only that branch.
   const uint64_t reledgerAt = now + kTick + 100;
   QCOMPARE(staleModifiersToRelease(kRowLWin, kRowLWin, seen, reledgerAt, 0, true, released), 0u);
   QCOMPARE(released[0], 0u);
 
-  // We finish that chord; a hook is still legitimately processing it
-  // (a fresh Super-chord timestamp), and the second sighting below lands
-  // only 900 ms after the ORIGINAL release -- well inside what the stale
-  // fast-track window would have been had it survived the re-ledger.
+  // The rest is a correctness check, not an independently-triggered
+  // regression guard (QCOMPARE's early return means a reverted build never
+  // reaches here, since the assertion above already fails first): with the
+  // state correctly cleared, a hook still legitimately processing the NEW
+  // chord (chordAt) must get the ordinary, full quiet window again, exactly
+  // as if there had been no earlier release at all.
   const uint64_t chordAt = reledgerAt + 50;
   const uint64_t t1 = reledgerAt + 400;
   QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, t1, chordAt, true, released), 0u); // first sighting, new occurrence
-  const uint64_t t2 = t1 + 400; // now - (now + kTick) = 900 ms: would wrongly fast-track pre-fix
+  const uint64_t t2 = t1 + 400; // 750 ms after chordAt: still inside ITS quiet window
   QCOMPARE(staleModifiersToRelease(kRowLWin, 0, seen, t2, chordAt, true, released), 0u);
 }
 

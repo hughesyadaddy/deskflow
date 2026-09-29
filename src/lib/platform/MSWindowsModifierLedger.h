@@ -83,10 +83,12 @@ inline void forgetReleased(InjectedModifierMap &ledger, const std::vector<uint16
 \p entered      true while the server is driving this screen.
 \p recentlyReleasedMs per-row tick of the last release THIS function issued
                 (any reason); 0 = never. Owned by the caller exactly like
-                \p firstSeen, updated in place. Cleared early (before its
-                own quiet window would otherwise expire) the moment the row
-                becomes re-ledgered, so a later release of a fresh
-                legitimate hold is never mistaken for the same stale one.
+                \p firstSeen, updated in place. Cleared on any call this
+                function makes while the row happens to read as ledgered,
+                so a later release of a fresh legitimate hold is not
+                mistaken for the same stale one -- but only IF some call
+                lands while ledgered; see the re-ledger paragraph below for
+                why that is not guaranteed for a short chord.
 
 At a boundary (\p entered false) the protocol guarantees the server holds
 nothing here, so every non-ledgered OS-down row is released at once (the
@@ -126,6 +128,24 @@ be judged against that stale timestamp. Only becoming ledgered clears it --
 a row that merely goes OS-up without being ledgered (the exact flap this
 fast-track targets: released, then re-stuck by a hook with no WE-hold in
 between) must keep it.
+
+CAVEAT (2026-09-29 review): this function is only called from the ~1 Hz
+audit poll (MSWindowsScreen's fix timer), while the ledger itself is
+mutated synchronously on every keystroke. A chord shorter than that poll
+interval -- the common case; live holds have been seen as short as
+13-67 ms -- can be ledgered and un-ledgered again entirely between two
+polls, so the re-ledger clear above may simply never get a call where
+\p ledgerBits reads back set for that row. When that happens the stale
+timestamp survives and a hook still legitimately processing that missed
+chord can have ITS protection fast-tracked away too, same as before this
+paragraph's fix existed. This is bounded, not a regression (worst case:
+the same narrow-window early release the fast-track itself accepts,
+nothing closer to "stuck"), and is deliberately not chased further here --
+doing so would mean sharing state between this desk-thread-polled function
+and the per-keystroke relay thread, which is a materially bigger change to
+a safety-critical path for a gap this narrow. Revisit only if live logs
+ever show the "re-stuck" reason firing on a provably legitimate rapid
+re-chord, not merely a hook race.
 */
 inline uint32_t staleModifiersToRelease(
     uint32_t osDownMask, uint32_t ledgerBits, AuditFirstSeen &firstSeen, uint64_t nowMs, uint64_t lastSuperChordMs,
