@@ -184,7 +184,7 @@ public:
   //! left the actually-broken peer stuck.
   void requestFleetRescue();
 
-  //! Fleet-wide stop-all (10x Esc): tell every peer to stop every Deskflow
+  //! Fleet-wide stop-all (12x Esc): tell every peer to stop every Deskflow
   //! instance and service on its seat, then do the same here. Once per
   //! process: a seat that is already stopping ignores repeats.
   void requestFleetStopAll();

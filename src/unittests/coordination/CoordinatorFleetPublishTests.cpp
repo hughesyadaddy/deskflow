@@ -523,7 +523,7 @@ void CoordinatorFleetPublishTests::fiveEsc_repeatPhase_doesNotRestart()
   coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
 
   // Repeats never reach the monitor's sink, and the relay never counts:
-  // ten Esc repeats are nothing.
+  // kStopAllTaps Esc repeats are nothing.
   for (int i = 0; i < deskflow::coordination::RescueBurst::kStopAllTaps; ++i) {
     QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Repeat, kKeyEscape, 0, 1, "en"), KeyForwardResult::Local);
   }
@@ -533,7 +533,7 @@ void CoordinatorFleetPublishTests::fiveEsc_repeatPhase_doesNotRestart()
   coordinator.stop();
 }
 
-void CoordinatorFleetPublishTests::tenEsc_requestsFleetStopAllNotRestart()
+void CoordinatorFleetPublishTests::stopAllTapsEsc_requestsFleetStopAllNotRestart()
 {
   auto config = testConfig();
   config.selfName = "macbookpro";
@@ -559,7 +559,7 @@ void CoordinatorFleetPublishTests::tenEsc_requestsFleetStopAllNotRestart()
   coordinator.handleFleetMessage(protocol::decode(protocol::encodeFleet(inbound, "test-token")));
 
   coordinator.m_exitProcessHook = [](int) {};
-  // Exactly ten: never a restart on the way, and the tail is swallowed.
+  // Exactly kStopAllTaps: never a restart on the way, and the tail is swallowed.
   for (int i = 0; i < deskflow::coordination::RescueBurst::kStopAllTaps; ++i) {
     coordinator.onLocalKeyDown(kKeyEscape, 0);
     const auto result = coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 1, "en");

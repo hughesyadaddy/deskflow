@@ -440,7 +440,7 @@ bool requestLocalStopAll(const std::string &seat)
     return true;
   }
   // The WARNING line goes first on every seat, before anything is touched.
-  LOG_WARN("[rescue] 10x Esc: stopping ALL Deskflow instances and services on %s", seat.c_str());
+  LOG_WARN("[rescue] 12x Esc: stopping ALL Deskflow instances and services on %s", seat.c_str());
   LocalStopAllFn handler;
   {
     std::scoped_lock lock{g_stopAllMutex};

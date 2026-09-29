@@ -369,7 +369,7 @@ void Server::fireEscRescue(deskflow::coordination::RescueAction action)
   releaseKeysHeldOnActive();
   releaseKeysHeldOnBroadcast(nullptr);
   if (action == RescueAction::StopAll) {
-    LOG_INFO("keyboard rescue: 10x Esc burst ended -- requesting a fleet stop-all");
+    LOG_INFO("keyboard rescue: 12x Esc burst ended -- requesting a fleet stop-all");
     requestLocalStopAll();
     return;
   }

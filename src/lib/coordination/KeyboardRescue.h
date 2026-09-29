@@ -36,7 +36,7 @@ const char *rescueActionName(RescueAction action);
 A burst is a run of plain Esc downs. It ENDS after kSettleMs of silence,
 and only then is it decided: fewer than kRestartTaps → nothing,
 kRestartTaps..kStopAllTaps-1 → Restart, kStopAllTaps or more → StopAll.
-Nothing fires at the 5th press any more, so a user heading for 10 never
+Nothing fires at the 5th press any more, so a user heading for 12 never
 triggers a restart on the way.
 
 There is ONE gap constant: a press that lands kSettleMs or later after the
@@ -61,7 +61,7 @@ class RescueBurst
 {
 public:
   static constexpr int kRestartTaps = 5;
-  static constexpr int kStopAllTaps = 10;
+  static constexpr int kStopAllTaps = 12;
   //! Silence after the last press that ends a burst: decide() is due, and
   //! a press this late starts a new burst.
   static constexpr int64_t kSettleMs = 700;
@@ -222,7 +222,7 @@ using FleetRescueFn = void (*)();
 void setFleetRescueHandler(FleetRescueFn fn);
 void requestFleetRescue();
 
-//! Process-wide FLEET stop-all hook (Coordinator): 10x Esc stops every
+//! Process-wide FLEET stop-all hook (Coordinator): 12x Esc stops every
 //! Deskflow instance and service on every seat. Falls back to a local-only
 //! stop when no mesh is running.
 using FleetStopAllFn = void (*)();

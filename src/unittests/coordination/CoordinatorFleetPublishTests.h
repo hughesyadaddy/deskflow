@@ -35,7 +35,7 @@ private Q_SLOTS:
   void fiveEsc_requestsLocalCoreRestart();
   void fiveEsc_localPass_requestsLocalCoreRestart();
   void fiveEsc_repeatPhase_doesNotRestart();
-  void tenEsc_requestsFleetStopAllNotRestart();
+  void stopAllTapsEsc_requestsFleetStopAllNotRestart();
   void keyForward_gatingMatrix();
   void sendKeyForward_returnsFalseWithoutDestination();
   void sendKeyForward_returnsFalseWhenMeshUnreachable();

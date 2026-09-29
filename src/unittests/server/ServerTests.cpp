@@ -911,7 +911,7 @@ void ServerTests::fiveEscThenOrdinaryKey_firesRestartImmediatelyAndEatsThatKey()
   }
 }
 
-void ServerTests::tenEsc_requestsStopAllNotRestart()
+void ServerTests::stopAllTapsEsc_requestsStopAllNotRestart()
 {
   LeakedServerFixture fixture;
   QVERIFY(fixture.config.addScreen("server"));
@@ -930,7 +930,7 @@ void ServerTests::tenEsc_requestsStopAllNotRestart()
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
     server.m_localStopAllHook = [&stopCalls] { ++stopCalls; };
 
-    // Exactly ten: no restart on the way, taps 5..10 stay off the wire.
+    // Exactly kStopAllTaps: no restart on the way, taps 5..kStopAllTaps stay off the wire.
     for (int i = 0; i < deskflow::coordination::RescueBurst::kStopAllTaps; ++i) {
       server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
       QCOMPARE(restartCalls, 0);

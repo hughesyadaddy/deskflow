@@ -398,7 +398,7 @@ private:
   //! Queue the active session's held out-mods for delivery on reconnect.
   void rememberUndeliveredChordModClear();
   void requestLocalCoreRestart();
-  //! 10x Esc: stop every Deskflow instance and service on every seat.
+  //! 12x Esc: stop every Deskflow instance and service on every seat.
   void requestLocalStopAll();
   //! Settle poll for the Esc burst (one-shot timer on m_events; tests
   //! inject the clock): decides and fires the burst's action.

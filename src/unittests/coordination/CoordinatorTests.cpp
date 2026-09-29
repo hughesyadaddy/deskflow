@@ -80,7 +80,7 @@ private Q_SLOTS:
   void stopAll_tenEscBurstBroadcastsAndStopsLocallyOnce();
   void fleetCommands_unknownSourceIsDropped();
   void fleetCommands_knownPeerSourceIsAccepted();
-  void offLoop_tenEscWithBlockedEventLoop_stopsAll();
+  void offLoop_stopAllTapsEscWithBlockedEventLoop_stopsAll();
   void offLoop_fiveEscWithBlockedEventLoop_exitsAfterAckTimeout();
   void offLoop_fiveEscWithLiveEventLoop_noExit();
   void claim_duplicateDeliveryEvaluatedOnce();
@@ -1094,7 +1094,7 @@ void CoordinatorTests::stopAll_tenEscBurstBroadcastsAndStopsLocallyOnce()
 
   // Taps 1-4 ride the lane; from the 5th on the burst is a rescue in
   // progress and every Esc is swallowed -- but NOTHING fires on the way
-  // to ten (no restart at five). The monitor counts, the relay consults.
+  // to kStopAllTaps (no restart at five). The monitor counts, the relay consults.
   for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
     coordinator.onLocalKeyDown(kKeyEscape, 0);
     const auto expected = i < RescueBurst::kRestartTaps - 1 ? KeyForwardResult::Local : KeyForwardResult::Swallowed;
@@ -1230,13 +1230,13 @@ struct CoordinatorTests::BlockedLoopSeat
   }
 };
 
-void CoordinatorTests::offLoop_tenEscWithBlockedEventLoop_stopsAll()
+void CoordinatorTests::offLoop_stopAllTapsEscWithBlockedEventLoop_stopsAll()
 {
   BlockedLoopSeat seat;
   seat.tap(deskflow::coordination::RescueBurst::kStopAllTaps);
   QCOMPARE(seat.stops, 0);
   seat.settle();
-  // Reached StopAll from ten observed taps with the loop never serviced.
+  // Reached StopAll from kStopAllTaps observed taps with the loop never serviced.
   QCOMPARE(seat.stops, 1);
   QCOMPARE(seat.restarts, 0);
   QCOMPARE(seat.relay->resyncs.load(), 1);

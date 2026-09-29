@@ -85,12 +85,13 @@ void KeyboardRescueTests::burst_sevenTaps_restart()
   QCOMPARE(settleAfter(burst, last), RescueAction::Restart);
 }
 
-void KeyboardRescueTests::burst_tenTaps_stop()
+void KeyboardRescueTests::burst_elevenTaps_restart()
 {
+  // One tap short of kStopAllTaps: still the Restart range, not StopAll.
   RescueBurst burst;
-  const auto last = tap(burst, 10);
+  const auto last = tap(burst, RescueBurst::kStopAllTaps - 1);
   QVERIFY(last >= 0);
-  QCOMPARE(settleAfter(burst, last), RescueAction::StopAll);
+  QCOMPARE(settleAfter(burst, last), RescueAction::Restart);
   QCOMPARE(burst.count(), 0);
 }
 
@@ -115,10 +116,10 @@ void KeyboardRescueTests::burst_spacedBeyondGap_none()
   QCOMPARE(settleAfter(burst, at), RescueAction::None);
 }
 
-void KeyboardRescueTests::burst_exactlyTenNeverYieldsRestart()
+void KeyboardRescueTests::burst_exactlyTwelveNeverYieldsRestart()
 {
-  // A user heading for 10 must not be restarted on the way: no press and
-  // no early poll may ever answer Restart.
+  // A user heading for kStopAllTaps must not be restarted on the way: no
+  // press and no early poll may ever answer Restart.
   RescueBurst burst;
   for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
     const int64_t at = i * kSpacingMs;
@@ -165,7 +166,7 @@ void KeyboardRescueTests::burst_latePressClosesStaleBurst()
   // The settle poll never ran (late timer); the next press, beyond the
   // gap, still owes the previous burst its decision and starts anew.
   RescueBurst burst;
-  const auto last = tap(burst, 10);
+  const auto last = tap(burst, RescueBurst::kStopAllTaps);
   QVERIFY(last >= 0);
   // The effective join gap is exactly kSettleMs, on the timer and on a
   // late press alike: at kSettleMs the burst is over.
@@ -255,17 +256,23 @@ void KeyboardRescueTests::escTap_nonEscAfterThresholdFiresOwedDecision()
   QCOMPARE(rescue.count(), 1);
 }
 
-void KeyboardRescueTests::escTap_nonEscAfterTenPlusFiresStopAll()
+void KeyboardRescueTests::escTap_nonEscAfterStopAllThresholdFiresStopAll()
 {
-  // Same gap, StopAll range (10+): must owe StopAll, never silently downgrade
-  // to nothing or to Restart.
+  // Same gap, StopAll range (kStopAllTaps+): must owe StopAll, never silently
+  // downgrade to nothing or to Restart.
   EscTapRescue rescue;
   const auto t0 = Clock::now();
-  for (int i = 0; i < 11; ++i) {
-    QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(50 * i)), RescueAction::None);
+  int64_t lastTapMs = 0;
+  for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
+    lastTapMs = 50 * i;
+    QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(lastTapMs)), RescueAction::None);
   }
-  QCOMPARE(rescue.count(), 11);
-  QCOMPARE(rescue.noteKeyDown('x', 0, t0 + std::chrono::milliseconds(600)), RescueAction::StopAll);
+  QCOMPARE(rescue.count(), RescueBurst::kStopAllTaps);
+  // 100 ms after the last tap: well inside kSettleMs, so the burst is still
+  // pending when the non-Esc arrives.
+  QCOMPARE(
+      rescue.noteKeyDown('x', 0, t0 + std::chrono::milliseconds(lastTapMs + 100)), RescueAction::StopAll
+  );
   QCOMPARE(rescue.count(), 0);
 }
 

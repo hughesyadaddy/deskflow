@@ -8,7 +8,7 @@
 
 #include <QTest>
 
-//! 10x Esc stop-all: the macOS sequence through a command recorder, and the
+//! 12x Esc stop-all: the macOS sequence through a command recorder, and the
 //! process-wide once-only executor plumbing.
 class RescueStopAllTests : public QObject
 {

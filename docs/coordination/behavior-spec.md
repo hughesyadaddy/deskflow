@@ -244,9 +244,9 @@ coordinator emits `CoordinationFleetStateChanged`; the first non-empty
 Sent by the seat whose keyboard saw a plain-Esc burst, to every configured
 peer, once the burst has ended (700 ms of silence; the same 700 ms is the
 join gap between taps).
-`rescue` (5–9 taps): the receiver restarts its local core (deduplicated for
-2 s: older peers send each line to both `ip` and `lan`). `stopall` (10+
-taps): the receiver logs `WARNING: [rescue] 10x Esc: stopping ALL Deskflow
+`rescue` (5–11 taps): the receiver restarts its local core (deduplicated for
+2 s: older peers send each line to both `ip` and `lan`). `stopall` (12+
+taps): the receiver logs `WARNING: [rescue] 12x Esc: stopping ALL Deskflow
 instances and services on <seat>` and stops every Deskflow instance and
 service it owns (macOS: quit-intent + launchd bootout of converge, GUI,
 strays, then the core; Windows: daemon `stopAll` IPC → every core/GUI under

@@ -1006,7 +1006,7 @@ void Coordinator::fireRescueAction(RescueAction action)
     armRescueAckWatchdog();
     break;
   case RescueAction::StopAll:
-    LOG_INFO("keyboard rescue: 10x Esc burst ended -- requesting a fleet stop-all");
+    LOG_INFO("keyboard rescue: 12x Esc burst ended -- requesting a fleet stop-all");
     requestFleetStopAll();
     break;
   default:
@@ -1062,7 +1062,7 @@ bool Coordinator::runLocalStopAll()
     started = deskflow::coordination::requestLocalStopAll(m_config.selfName);
   }
   if (!started) {
-    // Nothing could be started (no executor registered): a later 10x Esc
+    // Nothing could be started (no executor registered): a later 12x Esc
     // must be allowed to try again rather than be swallowed forever.
     std::scoped_lock lock{m_mutex};
     m_stopAllTriggered = false;

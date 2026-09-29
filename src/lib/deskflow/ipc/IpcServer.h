@@ -31,7 +31,7 @@ public:
   void requestStopProcess();
   //! Soft-restart via GUI or stop when none — always on this object's thread.
   void requestLocalCoreRestart();
-  //! 10x Esc stop-all, Windows: ask the daemon to stop every Deskflow
+  //! 12x Esc stop-all, Windows: ask the daemon to stop every Deskflow
   //! process and the service; with no daemon, stop the GUI and this core
   //! directly — always on this object's thread.
   void requestLocalStopAll();
@@ -45,7 +45,7 @@ Q_SIGNALS:
   //! Daemon only: relaunch the core (keyboard rescue with no GUI attached).
   void restartProcessRequested();
   //! Daemon only: stop every Deskflow process under the install root in
-  //! every session, then stop the service itself cleanly (10x Esc).
+  //! every session, then stop the service itself cleanly (12x Esc).
   void stopAllRequested();
 
 protected:

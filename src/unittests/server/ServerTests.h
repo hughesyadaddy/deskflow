@@ -21,7 +21,7 @@ private Q_SLOTS:
   void requestWakePeer_postsEventOncePerThrottleWindow();
   void requestWakePeer_refiresAfterThrottleWindow();
   void fiveEsc_requestsLocalCoreRestartAndSwallows();
-  void tenEsc_requestsStopAllNotRestart();
+  void stopAllTapsEsc_requestsStopAllNotRestart();
   void fiveEscThenOrdinaryKey_firesRestartImmediatelyAndEatsThatKey();
   void chordRemapHoldThrough_superTabKeepsAltUntilSuperUp();
   void chordRemapHoldThrough_relaySuperUpClearsSession();

@@ -120,7 +120,7 @@ void showHelp(const CoreArgParser &parser)
   QTextStream(stdout) << parser.helpText();
 }
 
-//! 10x Esc stop-all executor for this seat (runs on a detached thread; the
+//! 12x Esc stop-all executor for this seat (runs on a detached thread; the
 //! WARNING line was already logged by requestLocalStopAll).
 void localStopAllExecutor(const std::string &seat)
 {
@@ -270,7 +270,7 @@ int main(int argc, char **argv)
 
     const auto ipcServer = new deskflow::core::ipc::CoreIpcServer(&app); // NOSONAR - Qt managed
     deskflow::coordination::setLocalCoreRestartHandler(&ipcRequestLocalCoreRestart);
-    // 10x Esc: the executor's final step is this graceful quit; the handler
+    // 12x Esc: the executor's final step is this graceful quit; the handler
     // is cleared below before `runner` goes away.
     deskflow::coordination::setLocalCoreQuitHandler([&runner] { runner.requestQuit(); });
     deskflow::coordination::setLocalStopAllHandler(&localStopAllExecutor);

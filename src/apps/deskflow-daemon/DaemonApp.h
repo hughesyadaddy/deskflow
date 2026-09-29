@@ -50,7 +50,7 @@ private:
   void applyWatchdogCommand() const;
   void clearWatchdogCommand();
   void restartWatchdogProcess() const;
-  //! 10x Esc stop-all: stop every Deskflow process under the install root
+  //! 12x Esc stop-all: stop every Deskflow process under the install root
   //! (every session), then stop this service cleanly.
   void stopAllProcesses();
   void clearSettings();

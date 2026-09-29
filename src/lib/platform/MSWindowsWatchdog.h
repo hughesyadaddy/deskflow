@@ -131,7 +131,7 @@ public:
   void requestRestart();
 
   /**
-   * @brief Stop-all (10x Esc): stop every Deskflow process under @p installRoot and never respawn.
+   * @brief Stop-all (12x Esc): stop every Deskflow process under @p installRoot and never respawn.
    *
    * Clears the command (nothing is relaunched; daemon/configFile stays
    * persisted for the next explicit start), queues the graceful stop of the

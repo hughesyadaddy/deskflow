@@ -155,7 +155,7 @@ void DaemonApp::stopAllProcesses()
     seat = QSysInfo::machineHostName();
   }
   // The WARNING line goes first, before anything is touched.
-  LOG_WARN("[rescue] 10x Esc: stopping ALL Deskflow instances and services on %s", qPrintable(seat));
+  LOG_WARN("[rescue] 12x Esc: stopping ALL Deskflow instances and services on %s", qPrintable(seat));
 
   // Clears the command (nothing is relaunched, daemon/configFile stays
   // persisted for the next `deskflow-ctl.ps1 start`), queues the stop of

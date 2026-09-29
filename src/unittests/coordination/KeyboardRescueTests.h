@@ -16,10 +16,10 @@ private Q_SLOTS:
   void burst_fourTaps_none();
   void burst_fiveTaps_restart();
   void burst_sevenTaps_restart();
-  void burst_tenTaps_stop();
+  void burst_elevenTaps_restart();
   void burst_twelveTaps_stop();
   void burst_spacedBeyondGap_none();
-  void burst_exactlyTenNeverYieldsRestart();
+  void burst_exactlyTwelveNeverYieldsRestart();
   void burst_pauseAtFiveThenContinue_restartThenFreshCount();
   void burst_decideBeforeSettle_none();
   void burst_latePressClosesStaleBurst();
@@ -29,7 +29,7 @@ private Q_SLOTS:
   void escTap_capsLockIgnored_stillCounts();
   void escTap_nonEscBreaksStreak();
   void escTap_nonEscAfterThresholdFiresOwedDecision();
-  void escTap_nonEscAfterTenPlusFiresStopAll();
+  void escTap_nonEscAfterStopAllThresholdFiresStopAll();
   void escTap_swallowsFromFifthTap();
   // RescueSettleTimer: wakes once the deadline passes, re-arm replaces.
   void settleTimer_firesOnceAfterDeadline();

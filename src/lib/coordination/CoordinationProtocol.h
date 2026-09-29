@@ -38,7 +38,7 @@ struct Message
     Hello,
     Fleet,
     Rescue,
-    //! Fleet-wide stop (10x Esc): every peer stops every Deskflow instance
+    //! Fleet-wide stop (12x Esc): every peer stops every Deskflow instance
     //! and service on its seat. Mesh v2 extension, no version bump: a peer
     //! that predates it decodes the line as Invalid and drops it silently.
     StopAll,
@@ -95,7 +95,7 @@ std::string encodePromote(const std::string &token);
 
 //! Fleet-wide keyboard rescue: every peer restarts its local core.
 std::string encodeRescue(const std::string &token);
-//! Fleet-wide stop-all (10x Esc): every peer stops every Deskflow instance
+//! Fleet-wide stop-all (12x Esc): every peer stops every Deskflow instance
 //! and service on its seat (`{"t":"stopall"}`; unknown to older peers).
 std::string encodeStopAll(const std::string &token);
 std::string encodeStatus(const std::string &token);
