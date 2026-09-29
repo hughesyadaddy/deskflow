@@ -519,7 +519,8 @@ void deskSanitizeStaleModifiers(MSWindowsDesks::StaleModifierAudit *audit, const
       sizeof(kModifiers) / sizeof(kModifiers[0]) == deskflow::platform::kAuditModifierRows,
       "audit table rows must match the pure decision helper"
   );
-  static deskflow::platform::AuditFirstSeen s_firstSeen{}; // desk-thread private (see above)
+  static deskflow::platform::AuditFirstSeen s_firstSeen{};         // desk-thread private (see above)
+  static deskflow::platform::AuditFirstSeen s_recentlyReleasedMs{}; // desk-thread private, same lifetime
 
   uint32_t osDownMask = 0;
   for (size_t i = 0; i < deskflow::platform::kAuditModifierRows; ++i) {
@@ -527,8 +528,12 @@ void deskSanitizeStaleModifiers(MSWindowsDesks::StaleModifierAudit *audit, const
       osDownMask |= (1u << i);
     }
   }
+  // Snapshot before the call (which updates s_recentlyReleasedMs in place)
+  // purely so the log line below can say WHY each row was released.
+  const uint64_t nowMs = GetTickCount64();
+  const deskflow::platform::AuditFirstSeen recentlyReleasedBefore = s_recentlyReleasedMs;
   const uint32_t releaseBits = deskflow::platform::staleModifiersToRelease(
-      osDownMask, heldByUsBits, s_firstSeen, GetTickCount64(), audit->lastSuperChordMs, audit->entered
+      osDownMask, heldByUsBits, s_firstSeen, nowMs, audit->lastSuperChordMs, audit->entered, s_recentlyReleasedMs
   );
   if (releaseBits == 0) {
     return;
@@ -572,10 +577,10 @@ void deskSanitizeStaleModifiers(MSWindowsDesks::StaleModifierAudit *audit, const
     input.ki.dwExtraInfo = kSkipThirdPartyRemapFlag;
     if (SendInput(1, &input, sizeof(input)) == 1) {
       audit->released.push_back(static_cast<WORD>(vk));
-      LOG_WARN(
-          "released stuck modifier vk=0x%02x (injected bits 0x%02x, %s)", vk, heldByUsBits,
-          audit->entered ? "audit" : "boundary"
-      );
+      const bool wasFastTracked =
+          recentlyReleasedBefore[i] != 0 && nowMs - recentlyReleasedBefore[i] < deskflow::platform::kAuditQuietMs;
+      const char *reason = !audit->entered ? "boundary" : wasFastTracked ? "re-stuck" : "audit";
+      LOG_WARN("released stuck modifier vk=0x%02x (injected bits 0x%02x, %s)", vk, heldByUsBits, reason);
       // D6: an UP that did not take (wrong desktop) reads os_after=down here
       // with no further Deskflow traffic; a re-press by another hook reads
       // os_after=up now and down again on the next tick.

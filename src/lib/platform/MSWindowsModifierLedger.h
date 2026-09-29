@@ -81,6 +81,9 @@ inline void forgetReleased(InjectedModifierMap &ledger, const std::vector<uint16
                 Win+key we sent (0 = never). NOT the last key-down of any
                 kind: see below.
 \p entered      true while the server is driving this screen.
+\p recentlyReleasedMs per-row tick of the last release THIS function issued
+                (any reason); 0 = never. Owned by the caller exactly like
+                \p firstSeen, updated in place.
 
 At a boundary (\p entered false) the protocol guarantees the server holds
 nothing here, so every non-ledgered OS-down row is released at once (the
@@ -95,10 +98,26 @@ would otherwise never be released while the user keeps typing (each letter
 becoming Ctrl+letter), and a plain letter after a chord says nothing about
 who is holding Win. A row that is up, or ledgered, resets its first-seen
 stamp.
+
+A row THIS FUNCTION released within the last kAuditQuietMs skips ONLY the
+Win-row quiet window on its very next candidacy -- the two-consecutive-
+sightings grace still applies, unchanged, so a genuinely fleeting physical
+tap (a local user actually at this machine's own keyboard, not a hook
+artifact) is never fought without at least one full tick to clear on its
+own, exactly as before. What changes is a row that stays down past that
+first fresh sighting: normally a Win row then waits out a full FRESH
+kAuditQuietMs in case a hook is re-processing our chord, but we already
+paid that wait once for this same row moments ago (by construction, \p
+ledgerBits already excludes anything we still believe we hold, so this is
+never a hold WE are vouching for) -- paying it twice back to back is what
+let the same row sit stuck for two consecutive multi-second cycles in
+practice (seen live 2026-09-29: releases of the same row ~1.9 s apart).
+Only the quiet window is skipped; the grace tick is not, and is never
+skipped for any row or reason.
 */
 inline uint32_t staleModifiersToRelease(
     uint32_t osDownMask, uint32_t ledgerBits, AuditFirstSeen &firstSeen, uint64_t nowMs, uint64_t lastSuperChordMs,
-    bool entered
+    bool entered, AuditFirstSeen &recentlyReleasedMs
 )
 {
   uint32_t release = 0;
@@ -112,17 +131,21 @@ inline uint32_t staleModifiersToRelease(
     if (!entered) {
       release |= bit; // boundary: nothing the server holds can be here
       firstSeen[i] = 0;
+      recentlyReleasedMs[i] = nowMs;
       continue;
     }
     if (firstSeen[i] == 0) {
-      firstSeen[i] = nowMs; // first sighting: give it a tick
+      firstSeen[i] = nowMs; // first sighting: give it a tick, always, no exceptions
       continue;
     }
-    if ((bit & kAuditQuietRows) != 0 && lastSuperChordMs != 0 && nowMs - lastSuperChordMs < kAuditQuietMs) {
+    const bool justReleased = recentlyReleasedMs[i] != 0 && nowMs - recentlyReleasedMs[i] < kAuditQuietMs;
+    if (!justReleased && (bit & kAuditQuietRows) != 0 && lastSuperChordMs != 0 &&
+        nowMs - lastSuperChordMs < kAuditQuietMs) {
       continue; // Win row, Win+key just sent: a hook may still hold Win around it
     }
     release |= bit;
     firstSeen[i] = 0; // a re-press earns a fresh two-tick grace
+    recentlyReleasedMs[i] = nowMs;
   }
   return release;
 }

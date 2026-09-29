@@ -28,4 +28,9 @@ private Q_SLOTS:
   void audit_boundary_releasesImmediately();
   void audit_upBetweenTicks_resetsGrace();
   void audit_releaseResetsGraceForRepress();
+
+  // 2026-09-29: a row we just released skips the Win quiet window (not the
+  // grace tick) if it turns out to still/again be down.
+  void audit_recentlyReleasedWin_skipsQuietWindowOnRepeat();
+  void audit_recentlyReleasedExpires_afterQuietWindow();
 };
