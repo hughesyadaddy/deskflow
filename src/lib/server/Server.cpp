@@ -2292,7 +2292,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
   assert(m_active != nullptr);
 
   // Keyboard rescue: a burst of plain Esc downs, decided once it has ended
-  // (5..9 = restart every seat's core, 10+ = stop everything everywhere).
+  // (5..11 = restart every seat's core, 12+ = stop everything everywhere).
   // Nothing fires on a press; the settle timer calls settleEscBurst().
   // (In auto mode the coordinator's off-loop monitor counts the same taps;
   // the coordinator dedupes the two requests. This on-loop counter keeps

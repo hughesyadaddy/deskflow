@@ -997,7 +997,7 @@ cmd_stop() {
 
 cmd_ensure_core() {
   # Narrow counterpart to `start`, for the GUI to call on its own (ordinary
-  # launch, or a tray/menu Start after `stop` or the 10x-Esc fleet stop-all
+  # launch, or a tray/menu Start after `stop` or the 12x-Esc fleet stop-all
   # bootout the agent -- see write_quit_intent). `launchctl kickstart -k`
   # only restarts an ALREADY-loaded job; it cannot load one that stop()
   # bootout'd entirely, which is exactly that state. This does only what a

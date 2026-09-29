@@ -23,9 +23,9 @@ namespace deskflow::coordination {
 enum class RescueAction
 {
   None,
-  //! 5..9 taps: every seat restarts its local core (the classic rescue).
+  //! 5..11 taps: every seat restarts its local core (the classic rescue).
   Restart,
-  //! 10+ taps: every seat stops every Deskflow instance and service.
+  //! 12+ taps: every seat stops every Deskflow instance and service.
   StopAll
 };
 

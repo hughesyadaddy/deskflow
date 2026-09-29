@@ -321,7 +321,7 @@ DOMAIN="gui/$(id -u)"
 }
 
 @test "ensure-core clears quit-intent and loads a fully unloaded core agent, touching neither GUI nor converge" {
-  # The exact post-stop state: `stop` (directly, or via the 10x-Esc fleet
+  # The exact post-stop state: `stop` (directly, or via the 12x-Esc fleet
   # rescue) bootout's all three agents and leaves the sentinel behind, and
   # `launchctl kickstart -k` (what the GUI used to rely on) cannot load an
   # agent back from that state -- only bootstrap can. ensure-core exists so

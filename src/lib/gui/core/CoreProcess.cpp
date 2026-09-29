@@ -306,7 +306,7 @@ void CoreProcess::kickstartExternalCore()
     if (status != QProcess::NormalExit || exitCode != 0) {
       // kickstart -k only restarts an ALREADY-loaded job; it fails exactly
       // like this when the agent was fully unloaded (deskflow-ctl stop, or
-      // the 10x-Esc fleet rescue stop-all -- both bootout it). Fall back to
+      // the 12x-Esc fleet rescue stop-all -- both bootout it). Fall back to
       // loading it fresh rather than reporting "could not be started" for a
       // condition that is fixable without the user's help.
       qWarning("launchctl kickstart failed with exit code %d; trying to load the core agent", exitCode);
@@ -659,7 +659,7 @@ void CoreProcess::start(std::optional<ProcessMode> processModeOption)
     qInfo("core is supervised by launchd, attaching via ipc without spawning");
     // The agent's plist can exist (hasExternalSupervisor() true) while the
     // job itself is not currently loaded at all -- deskflow-ctl stop and the
-    // 10x-Esc fleet rescue stop-all both bootout it, and nothing else reloads
+    // 12x-Esc fleet rescue stop-all both bootout it, and nothing else reloads
     // it. Without this, an ordinary app launch after either would sit here
     // "Started" while the ipc client retries a core that will never appear
     // until someone runs deskflow-ctl start by hand. Idempotent and cheap

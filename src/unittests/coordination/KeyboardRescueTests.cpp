@@ -244,7 +244,7 @@ void KeyboardRescueTests::escTap_nonEscAfterThresholdFiresOwedDecision()
   }
   QCOMPARE(rescue.count(), 6);
   QVERIFY(rescue.pending());
-  // Six taps (5..9 range): a non-Esc key well inside the settle window must
+  // Six taps (5..11 range): a non-Esc key well inside the settle window must
   // fire the owed Restart immediately, not silently drop it.
   QCOMPARE(rescue.noteKeyDown('h', 0, t0 + std::chrono::milliseconds(300)), RescueAction::Restart);
   QCOMPARE(rescue.count(), 0);

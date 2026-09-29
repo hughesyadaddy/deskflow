@@ -316,7 +316,7 @@ void CoreProcessTests::externally_supervised_core_attaches_via_ipc_and_kickstart
   QCOMPARE(core.processObjects(), 0);
   // start() always ensures the agent is actually loaded: kickstart -k (used
   // on restart, below) fails outright on an agent that was fully unloaded
-  // (deskflow-ctl stop, or the 10x-Esc fleet rescue), and nothing else would
+  // (deskflow-ctl stop, or the 12x-Esc fleet rescue), and nothing else would
   // load it back before the ipc client gives up waiting.
   QCOMPARE(core.bootstraps, 1);
   stateSpy.clear();
