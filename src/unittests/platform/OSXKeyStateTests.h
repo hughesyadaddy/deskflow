@@ -33,8 +33,6 @@ private Q_SLOTS:
   void sanitizeLeavesOsCapsLockAlone();
   void releaseInjectedKeysLeavesPhysicallyHeldModifierAlone();
   void releaseInjectedKeysReleasesLedgeredCmd();
-  void forceReleaseOsModifiersReleasesStaleNonLedgeredModifier();
-  void forceReleaseOsModifiersLeavesFreshLocalHoldAlone();
   void fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet();
   void primarySweepNeverReleasesPhysicallyCapturedShift();
   void releaseInjectedKeysKeepsReassertedModifier();

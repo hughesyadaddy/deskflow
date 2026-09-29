@@ -345,17 +345,20 @@ private:
 
   // Modifiers the server's enter mask said were NOT held, but our OS
   // disagreed with at the same instant: the opposite case from
-  // m_reassertedModifiers. The server is the one authority on whether an
-  // ACTIVE CROSS-MACHINE hold is in progress, so a bit it explicitly denies
-  // can never be one of those -- but it says nothing about a genuine LOCAL
-  // hold on THIS machine's own keyboard, which the server cannot see at
-  // all. Computed once in enterSecondary(); the post-switch verifier offers
-  // whatever of this set is still down to forceReleaseOsModifiers() even if
-  // it was never in this process's injected ledger (K2 gap: a non-ledgered
-  // stuck modifier used to be logged as "released" while the release loop
-  // silently never visited it) -- the platform implementation still has to
-  // apply its own local-hardware evidence before actually releasing any of
-  // it (see IKeyState::forceReleaseOsModifiers's contract).
+  // m_reassertedModifiers. DIAGNOSTIC ONLY (2026-09-29 review, twice): the
+  // server is the one authority on whether an ACTIVE CROSS-MACHINE hold is
+  // in progress, so a bit it explicitly denies can never be one of those --
+  // but it says nothing about a genuine LOCAL hold on THIS machine's own
+  // keyboard, which the server cannot see at all, and this codebase has no
+  // other signal (aggregate OS modifier flags plus last-hardware-edge
+  // timestamp) that can tell a stale ghost from a real hold that has simply
+  // lasted a while -- a held key emits one edge, at press, and none while
+  // held. Computed once in enterSecondary(), cleared in leaveSecondary();
+  // the post-switch verifier's only use of it is to annotate its "still
+  // down" log line (see handlePostSwitchVerifier), never to act on it. Do
+  // not wire this into a release path without a fundamentally better
+  // signal than elapsed time -- see handlePostSwitchVerifier's comment for
+  // the two prior, reverted attempts and why each failed review.
   KeyModifierMask m_osDisagreeModifiers = 0;
 
   IEventQueue *m_events = nullptr;

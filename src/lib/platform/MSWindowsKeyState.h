@@ -234,15 +234,6 @@ public:
   void setToggleState(KeyModifierMask bit, bool on) override;
   void sanitizeInjectedKeys() override;
   void releaseInjectedKeys(KeyModifierMask keep = 0) override;
-  // forceReleaseOsModifiers() deliberately NOT overridden here (2026-09-29):
-  // inherits IKeyState's no-op default. The live bug it fixes (Screen.cpp's
-  // post-switch verifier finding a non-ledgered stuck modifier) was only
-  // observed on macOS; a Windows implementation needs the same hardware-
-  // freshness protection OSXKeyState's does (see its definition) and that
-  // deserves its own live repro here first, not a same-day port. Until then
-  // a non-ledgered post-switch-stuck modifier on a Windows target is
-  // detected (still logged) but not remediated -- unchanged from before
-  // this fix existed anywhere, not a regression.
 
   // KeyState overrides
   void onKey(KeyButton button, bool down, KeyModifierMask newState) override;

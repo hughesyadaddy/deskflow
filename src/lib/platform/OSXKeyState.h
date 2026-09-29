@@ -91,7 +91,6 @@ public:
   void updateKeyState() override;
   void fakeAllKeysUp() override;
   void releaseInjectedKeys(KeyModifierMask keep = 0) override;
-  void forceReleaseOsModifiers(KeyModifierMask bits) override;
   void setToggleState(KeyModifierMask bit, bool on) override;
   void sanitizeInjectedKeys() override;
 

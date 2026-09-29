@@ -193,27 +193,6 @@ public:
     (void)keep;
   }
 
-  //! Force-release specific OS-reported-held modifier bits, ledger or not
-  /*!
-  Unlike releaseInjectedKeys(), this does NOT require the modifier to be in
-  this process's injected ledger -- it MAY post a real key-up for a bit in
-  \p bits the OS currently reports held, regardless of how it got that way.
-  Callers pass only bits they have established the SERVER is not vouching
-  for (see Screen::enterSecondary's m_osDisagreeModifiers: its own mask
-  explicitly said NOT held at the crossing) -- but that rules out only an
-  active CROSS-MACHINE hold, not a genuine LOCAL one: the server has no
-  channel to observe this machine's own keyboard. A modifier the user is
-  physically holding right here must still never be released, so an
-  implementation MUST apply its own local evidence (a hardware-freshness
-  check, the same kind releaseInjectedKeys()'s callers already rely on
-  sanitizeInjectedKeys() for elsewhere) before treating an OS-held bit as
-  safe to clear -- \p bits alone is never sufficient. Default does nothing.
-  */
-  virtual void forceReleaseOsModifiers(KeyModifierMask bits)
-  {
-    (void)bits;
-  }
-
   //! Fake ctrl+alt+del
   /*!
   Synthesize a press of ctrl+alt+del.  Return true if processing is

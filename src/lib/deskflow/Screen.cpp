@@ -583,10 +583,12 @@ void Screen::enterSecondary(KeyModifierMask mask)
   for (const auto &mod : kReassertedModifiers) {
     if ((mask & mod.bit) == 0) {
       if ((osMods & mod.bit) != 0) {
-        // the opposite case from a reassert: the server's mask is the one
-        // authority on a real cross-machine hold, and it just said this bit
-        // is NOT held -- whatever the OS reports here is a local artifact,
-        // never a hold worth protecting (see m_osDisagreeModifiers).
+        // the opposite case from a reassert: the server's mask said this
+        // bit is NOT held. Recorded PURELY as a diagnostic (see
+        // m_osDisagreeModifiers) -- it is never enough on its own to act on:
+        // it rules out an active CROSS-MACHINE hold, but says nothing about
+        // a genuine LOCAL hold on this machine's own keyboard, which the
+        // server cannot observe at all.
         m_osDisagreeModifiers |= mod.bit;
       }
       continue;
@@ -724,33 +726,41 @@ void Screen::handlePostSwitchVerifier()
     keep |= bit;
   }
   m_screen->releaseInjectedKeys(keep);
-  // Bits the server's own enter mask said were NOT held: never an ACTIVE
-  // CROSS-MACHINE hold to protect, whether or not this process's ledger
-  // happens to know about them -- unlike releaseInjectedKeys() above,
-  // offered to forceReleaseOsModifiers() regardless of ledger membership
-  // (K2 gap: a non-ledgered stuck modifier used to log as "stuck-release"
-  // with nothing downstream ever actually visiting it, since
-  // releaseInjectedKeys() only ever walks the injected ledger). That still
-  // says nothing about a genuine LOCAL hold on the target's own keyboard,
-  // which this mask can never see -- forceReleaseOsModifiers()'s contract
-  // requires the platform to apply its own local-hardware evidence before
-  // actually clearing any of it, exactly like sanitizeInjectedKeys() does
-  // at other boundaries.
-  const KeyModifierMask forceClear = held & m_osDisagreeModifiers;
-  if (forceClear != 0) {
-    m_screen->forceReleaseOsModifiers(forceClear);
-  }
-  // Whatever remains down after both attempts is not necessarily a
-  // failure: the server may have agreed it was held (left alone above as a
-  // possible still-in-progress cross-machine hold), or the platform may
-  // have found it hardware-fresh (a possible still-in-progress LOCAL hold).
-  // Deliberately not sharing the "stuck-release" text above: fleet-health's
-  // keys check greps that substring per line with no dedup, and this is a
-  // separate, often-benign observation about the same event, not a second
-  // occurrence of it.
+  // releaseInjectedKeys() only ever walks this process's own injected
+  // ledger (K2 gap): a modifier the OS reports held that was never in that
+  // ledger -- never reasserted, because the server's own enter mask never
+  // said it was held -- is silently never visited, so the WARN above can
+  // read as remediation that did not happen. A 2026-09-29 attempt to also
+  // force-release such a bit (gated on the server's mask disagreeing, then
+  // on top of that a hardware-edge-freshness check borrowed from
+  // sanitizeInjectedKeys()) was reverted after two rounds of review: a
+  // held modifier key emits exactly one hardware edge, at press, and none
+  // while held, so for anything already held at-or-before the crossing and
+  // held continuously through it, that edge is structurally always older
+  // than kHardwareModifierFreshS by the time this verifier's own two-pass
+  // delay (kPostSwitchFirstCheckS + kPostSwitchSecondCheckS = 2.25s >
+  // kHardwareModifierFreshS's 2.0s) elapses -- the gate could only ever
+  // protect a hold starting strictly AFTER the crossing, which the
+  // disjoint mask/osMods branch above already protects for free without
+  // it. No signal this codebase currently has access to (aggregate OS
+  // modifier flags plus last-edge timestamp) can tell a stale ghost from a
+  // real hold that has simply lasted a while; a IOHIDManager-level read of
+  // the physical keyboards would, but brings its own failure mode (other
+  // legitimate software holding a modifier -- Mouser included -- reads as
+  // a ghost too) and needs its own dedicated review, not a same-day
+  // addition here. This poll only makes the log honest about what
+  // releaseInjectedKeys() did and did not clear; nothing further is
+  // attempted.
   const KeyModifierMask stillHeld = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & held;
   if (stillHeld != 0) {
-    LOG_INFO("[keys] post-remediation still-down 0x%04x", stillHeld);
+    // m_osDisagreeModifiers is diagnostic only here, never actioned: it
+    // narrows "still down" to "and the server said this wasn't its hold"
+    // for whoever reads the log next time this fires, nothing more.
+    LOG_INFO(
+        "[keys] post-switch still-down 0x%04x (ledger release did not clear it; 0x%04x of that the server's "
+        "mask disagreed with at the crossing)",
+        stillHeld, stillHeld & m_osDisagreeModifiers
+    );
   }
 }
 

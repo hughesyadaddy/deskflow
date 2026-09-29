@@ -38,7 +38,4 @@ private Q_SLOTS:
   void primarySweep_neverReleasesPhysicallyCapturedKey();
   void postSwitchVerifier_keepsReassertedModifiers();
   void postSwitchVerifier_keepsNothingAfterShiftReleased();
-  void postSwitchVerifier_forceReleasesNonLedgeredModifierServerDisagreedAbout();
-  void postSwitchVerifier_neverForceReleasesWhenServerAgreedItWasHeld();
-  void postSwitchVerifier_forceReleasesMultipleDisagreeingModifiers();
 };
