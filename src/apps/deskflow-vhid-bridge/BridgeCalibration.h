@@ -383,7 +383,21 @@ private:
 
 // Relative motion chunking. Splits a delta into steps of at most max_chunk
 // counts each, preserving sign; 0 yields no steps. 400 -> 50 x 8.
-constexpr int kMaxChunk = 8;
+// 2026-09-30: raised from 8 after hackintosh showed emit_slam() (127-count
+// reports) reliably moving the cursor while emit_counts()/emit_relative()
+// (the 8-count path -- i.e. ALL normal relayed movement, not just the
+// calibration probe) produced zero measurable displacement, twice,
+// independently (cold boot and 27 min later). Acceleration is confirmed
+// disabled on the virtual pointing service (readback=-1 is IOKit's own
+// "disabled" sentinel for kIOHIDPointerAccelerationKey, not an error) --
+// so the original worry this chunk size protected against (a residual
+// OS acceleration curve) does not explain it. 32 keeps real chunking
+// (unlike the slam's 127, which is a deliberate single-report overshoot,
+// not something to reuse for ordinary tracked movement) while giving
+// each report several times the magnitude of one that measurably failed
+// to register. Unconfirmed by live testing -- only that it is the best-
+// evidenced next attempt, not a proven fix.
+constexpr int kMaxChunk = 32;
 
 inline std::vector<int8_t> chunk_delta(int total, int max_chunk = kMaxChunk)
 {

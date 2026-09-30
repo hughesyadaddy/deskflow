@@ -50,7 +50,7 @@ private Q_SLOTS:
   void drainGateBounded();
 
   // -- chunking ------------------------------------------------------------
-  void chunk400Is50x8();
+  void chunk400Is12x32Plus16();
   void chunkPreservesSign();
   void chunkZero();
   void chunkRemainder();
@@ -395,21 +395,23 @@ void BridgeCalibrationTests::drainGateBounded()
   }
 }
 
-void BridgeCalibrationTests::chunk400Is50x8()
+void BridgeCalibrationTests::chunk400Is12x32Plus16()
 {
   const auto steps = chunk_delta(400);
-  QCOMPARE(steps.size(), size_t{50});
-  for (int8_t s : steps)
-    QCOMPARE(int(s), 8);
+  QCOMPARE(steps.size(), size_t{13});
+  for (size_t i = 0; i < 12; ++i)
+    QCOMPARE(int(steps[i]), 32);
+  QCOMPARE(int(steps[12]), 16);
   QCOMPARE(std::accumulate(steps.begin(), steps.end(), 0), 400);
 }
 
 void BridgeCalibrationTests::chunkPreservesSign()
 {
   const auto steps = chunk_delta(-400);
-  QCOMPARE(steps.size(), size_t{50});
-  for (int8_t s : steps)
-    QCOMPARE(int(s), -8);
+  QCOMPARE(steps.size(), size_t{13});
+  for (size_t i = 0; i < 12; ++i)
+    QCOMPARE(int(steps[i]), -32);
+  QCOMPARE(int(steps[12]), -16);
   QCOMPARE(std::accumulate(steps.begin(), steps.end(), 0), -400);
 }
 
@@ -420,11 +422,11 @@ void BridgeCalibrationTests::chunkZero()
 
 void BridgeCalibrationTests::chunkRemainder()
 {
-  const auto steps = chunk_delta(19);
+  const auto steps = chunk_delta(70);
   QCOMPARE(steps.size(), size_t{3});
-  QCOMPARE(int(steps[0]), 8);
-  QCOMPARE(int(steps[1]), 8);
-  QCOMPARE(int(steps[2]), 3);
+  QCOMPARE(int(steps[0]), 32);
+  QCOMPARE(int(steps[1]), 32);
+  QCOMPARE(int(steps[2]), 6);
   const auto neg = chunk_delta(-3);
   QCOMPARE(neg.size(), size_t{1});
   QCOMPARE(int(neg[0]), -3);
@@ -432,9 +434,9 @@ void BridgeCalibrationTests::chunkRemainder()
 
 void BridgeCalibrationTests::chunkXyLockstep()
 {
-  // +400 x, +300 y (the calibration probe): 50 reports, y runs out first.
+  // +400 x, +300 y (the calibration probe): 13 reports, y runs out first.
   const auto steps = chunk_delta_xy(400, 300);
-  QCOMPARE(steps.size(), size_t{50});
+  QCOMPARE(steps.size(), size_t{13});
   int sx = 0, sy = 0;
   for (const Step &s : steps) {
     QVERIFY(std::abs(int(s.dx)) <= kMaxChunk);
@@ -444,24 +446,22 @@ void BridgeCalibrationTests::chunkXyLockstep()
   }
   QCOMPARE(sx, 400);
   QCOMPARE(sy, 300);
-  QCOMPARE(int(steps[37].dy), 4); // 37*8 = 296, remainder 4
-  QCOMPARE(int(steps[38].dy), 0);
+  QCOMPARE(int(steps[9].dy), 12); // 9*32 = 288, remainder 12
+  QCOMPARE(int(steps[10].dy), 0);
   // Mixed signs stay independent per axis.
   const auto mixed = chunk_delta_xy(-9, 9);
-  QCOMPARE(mixed.size(), size_t{2});
-  QCOMPARE(int(mixed[0].dx), -8);
-  QCOMPARE(int(mixed[0].dy), 8);
-  QCOMPARE(int(mixed[1].dx), -1);
-  QCOMPARE(int(mixed[1].dy), 1);
+  QCOMPARE(mixed.size(), size_t{1});
+  QCOMPARE(int(mixed[0].dx), -9);
+  QCOMPARE(int(mixed[0].dy), 9);
   // The slam path uses 127-count reports.
   QCOMPARE(chunk_delta_xy(254, 0, 127).size(), size_t{2});
 }
 
 void BridgeCalibrationTests::chunkBadMaxFallsBack()
 {
-  QCOMPARE(chunk_delta(16, 0).size(), size_t{2});
-  QCOMPARE(chunk_delta(16, 200).size(), size_t{2});
-  QCOMPARE(chunk_delta(16, -5).size(), size_t{2});
+  QCOMPARE(chunk_delta(40, 0).size(), size_t{2});
+  QCOMPARE(chunk_delta(40, 200).size(), size_t{2});
+  QCOMPARE(chunk_delta(40, -5).size(), size_t{2});
 }
 
 void BridgeCalibrationTests::countsPerPointBasic()
