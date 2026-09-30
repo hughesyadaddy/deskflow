@@ -816,6 +816,27 @@ int32_t takeWheelLines(double &carry, int32_t delta, int32_t notch)
 
 } // namespace
 
+void OSXScreen::logWheelPostGapIfIdle() const
+{
+  // [scroll-diag] temporary instrumentation, see the members' comment in
+  // OSXScreen.h. Only logs when this looks like the first wheel post after
+  // a lull (idle threshold picked well above normal inter-scroll gaps so it
+  // fires once per real transition, not mid-scroll), so it stays silent
+  // during ordinary scrolling.
+  constexpr auto kIdleThreshold = std::chrono::milliseconds(1500);
+  const auto now = std::chrono::steady_clock::now();
+  const auto sinceLastWheel = now - m_lastWheelPostAt;
+  if (!m_isPrimary && sinceLastWheel > kIdleThreshold) {
+    const auto sinceEnterMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastEnterAt).count();
+    const auto sinceWheelMs = std::chrono::duration_cast<std::chrono::milliseconds>(sinceLastWheel).count();
+    LOG_INFO(
+        "[scroll-diag] first wheel post after %lldms idle (%lldms since last enter())",
+        static_cast<long long>(sinceWheelMs), static_cast<long long>(sinceEnterMs)
+    );
+  }
+  m_lastWheelPostAt = now;
+}
+
 void OSXScreen::fakeMouseWheel(ScrollDelta delta) const
 {
   // One wire notch (120) is one line here; the receiver's own OS acceleration
@@ -833,6 +854,7 @@ void OSXScreen::fakeMouseWheel(ScrollDelta delta) const
   CGEventSetFlags(scrollEvent, modifiers);
 
   deskflow::platform::markInjectedEvent(scrollEvent);
+  logWheelPostGapIfIdle();
   CGEventPost(kCGHIDEventTap, scrollEvent);
   CFRelease(scrollEvent);
 }
@@ -876,6 +898,7 @@ void OSXScreen::fakeMouseWheelEx(const WheelEx &in) const
   CGEventSetFlags(scrollEvent, modifiers);
   deskflow::platform::markInjectedEvent(scrollEvent);
 
+  logWheelPostGapIfIdle();
   CGEventPost(kCGHIDEventTap, scrollEvent);
   CFRelease(scrollEvent);
 }
@@ -1074,6 +1097,14 @@ void OSXScreen::enter()
       IORegistryEntrySetCFProperty(entry, CFSTR("IORequestIdle"), kCFBooleanFalse);
       IOObjectRelease(entry);
     }
+
+    // [scroll-diag] see logWheelPostGapIfIdle(): timestamp this so the first
+    // wheel event afterward can log how long it waited on nothing.
+    m_lastEnterAt = std::chrono::steady_clock::now();
+    LOG_INFO(
+        "[scroll-diag] enter(): requested display wake (wrangler entry %s)",
+        entry != MACH_PORT_NULL ? "found" : "MISSING"
+    );
 
     avoidSupression();
   }
