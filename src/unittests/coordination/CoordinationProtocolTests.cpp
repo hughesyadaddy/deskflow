@@ -264,6 +264,19 @@ void CoordinationProtocolTests::helloRoundTrip()
   QCOMPARE(message.token, std::string("secret"));
 }
 
+void CoordinationProtocolTests::helloBuildVersionRoundTripsAndDefaultsEmpty()
+{
+  // A peer that sends its build round-trips exactly.
+  const auto withBuild = protocol::decode(protocol::encodeHello(2, "alpha", "secret", "78bce2b5"));
+  QCOMPARE(withBuild.buildVersion, std::string("78bce2b5"));
+
+  // The default argument (an old caller, or a peer that predates this
+  // field) must decode as empty, never as some sentinel a comparison could
+  // accidentally match against.
+  const auto withoutBuild = protocol::decode(protocol::encodeHello(2, "alpha", "secret"));
+  QVERIFY(withoutBuild.buildVersion.empty());
+}
+
 void CoordinationProtocolTests::fleetRoundTrip()
 {
   FleetFragment fragment;

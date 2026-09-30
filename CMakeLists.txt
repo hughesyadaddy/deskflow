@@ -57,7 +57,25 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
       set(DESKFLOW_VERSION_PATCH ${PATCH})
       set(DESKFLOW_VERSION_TWEAK ${TWEAK})
     else()
-      set(DESKFLOW_VERSION_TWEAK "9999")
+      # No v* tag reachable (every commit on a dev branch like this one) --
+      # TWEAK used to be a static "9999" here, identical for every build
+      # regardless of which commit it was built from, so two seats on
+      # different commits looked identical in the version string. Use the
+      # commit count instead: monotonic (a later commit is always a higher
+      # number, satisfying "increment by 1 every time we deploy" without a
+      # separate counter file to keep in sync across three machines -- git
+      # itself is the counter), and it does not touch MAJOR/MINOR/PATCH, so
+      # it can never collide with or be mistaken for an actual tagged
+      # release version.
+      execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE DESKFLOW_VERSION_TWEAK
+        ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE
+      )
+      if(NOT DESKFLOW_VERSION_TWEAK)
+        set(DESKFLOW_VERSION_TWEAK "9999") # rev-list itself failed: keep the old sentinel
+      endif()
     endif()
     unset(GITREV)
   endif()

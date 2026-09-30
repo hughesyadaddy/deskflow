@@ -224,6 +224,10 @@ Message decode(const std::string &line)
 
   if (message.type == Message::Type::Hello) {
     message.meshVersion = object[QStringLiteral("v")].toInt();
+    // Absent (older peer, or a field this decode doesn't recognize some day)
+    // -> toString() on a missing/undefined QJsonValue is "", same as never
+    // sent; callers never compare against an empty buildVersion.
+    message.buildVersion = object[QStringLiteral("build")].toString().toStdString();
   }
 
   if (message.type == Message::Type::Fleet) {
@@ -302,12 +306,15 @@ int64_t wallClockMs()
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
-std::string encodeHello(int meshVersion, const std::string &name, const std::string &token)
+std::string encodeHello(int meshVersion, const std::string &name, const std::string &token, const std::string &buildVersion)
 {
   QJsonObject object;
   object[QStringLiteral("t")] = QStringLiteral("hello");
   object[QStringLiteral("v")] = meshVersion;
   object[QStringLiteral("name")] = QString::fromStdString(name);
+  if (!buildVersion.empty()) {
+    object[QStringLiteral("build")] = QString::fromStdString(buildVersion);
+  }
   putToken(object, token);
   return serialize(object);
 }

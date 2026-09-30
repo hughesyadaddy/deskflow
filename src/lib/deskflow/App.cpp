@@ -13,6 +13,7 @@
 #include "base/LogOutputters.h"
 #include "common/ExitCodes.h"
 #include "common/Settings.h"
+#include "common/VersionInfo.h"
 #include "deskflow/DeskflowException.h"
 #include "mt/ThreadException.h"
 
@@ -58,7 +59,12 @@ App::~App()
 
 void App::run(QThread &coreThread)
 {
-  LOG_INFO("starting core");
+  // Every build on a dev branch used to log identically here (a static
+  // ".9999" version, same for every commit) -- the fleet-wide version
+  // mismatch this line exists to catch (see also the mesh-hello version
+  // field in Coordinator.cpp) was invisible without opening each seat's
+  // log and reading the exact build timestamp off disk.
+  LOG_INFO("starting core %s", kDisplayVersion);
 
   // Important: Move the daemon app to the daemon thread before creating any more Qt objects
   // owned by the daemon app, as they will be created on the daemon thread.

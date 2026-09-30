@@ -19,6 +19,7 @@
 #include "coordination/KeyboardRouter.h"
 #include "coordination/RelayKeyEvent.h"
 #include "coordination/WakeOnLan.h"
+#include "common/VersionInfo.h"
 
 #include <algorithm>
 #include <cctype>
@@ -428,7 +429,17 @@ void Coordinator::handleHelloMessage(const Message &message, const std::function
     m_lastClaimSeqBySender.erase(message.name);
   }
   LOG_DEBUG("coordination: mesh hello from \"%s\" (v=%d)", message.name.c_str(), message.meshVersion);
-  reply(protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token));
+  // Software build, not mesh protocol: a peer can be wire-compatible (the
+  // check above already passed) while running an older/different commit --
+  // this is purely informational, never a reason to reject or reply
+  // differently, so unlike meshVersion there is no early return here.
+  if (!message.buildVersion.empty() && message.buildVersion != kVersionGitSha) {
+    LOG_WARN(
+        "coordination: peer \"%s\" is on a different build (%s, we are %s) -- redeploy to match",
+        peerName.c_str(), message.buildVersion.c_str(), kVersionGitSha
+    );
+  }
+  reply(protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token, kVersionGitSha));
 }
 
 void Coordinator::handleFleetMessage(const Message &message)
@@ -1434,7 +1445,7 @@ void Coordinator::workerLoop()
 
 void Coordinator::probePeerMeshVersions()
 {
-  const std::string hello = protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token);
+  const std::string hello = protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token, kVersionGitSha);
   for (auto &[name, outbox] : m_outboxes) {
     // The reply handler runs on the lane thread; unreachable peers never
     // reply and keep whatever mismatch state they had.
@@ -1444,6 +1455,14 @@ void Coordinator::probePeerMeshVersions()
         noteVersionMismatch(peerName);
       } else {
         clearVersionMismatch(peerName);
+        // Same "informational only" rule as handleHelloMessage: never
+        // affects mesh-version mismatch tracking, only the log.
+        if (!reply.buildVersion.empty() && reply.buildVersion != kVersionGitSha) {
+          LOG_WARN(
+              "coordination: peer \"%s\" is on a different build (%s, we are %s) -- redeploy to match",
+              peerName.c_str(), reply.buildVersion.c_str(), kVersionGitSha
+          );
+        }
       }
     });
   }

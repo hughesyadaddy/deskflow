@@ -75,6 +75,13 @@ struct Message
   int64_t keySentAtMs = 0;
   // hello version announcement
   int meshVersion = 0;
+  //! hello: sender's exact software build (VersionInfo.h's kVersionGitSha --
+  //! the commit short-sha, not the human MAJOR.MINOR.PATCH.TWEAK string, so
+  //! two peers built from different commits are never mistaken for a match
+  //! even if a tweak-number collision were ever possible). Empty from a
+  //! peer that predates this field -- never compared against in that case,
+  //! only logged as "unknown".
+  std::string buildVersion;
   // fleet fragment (decoded from `fleet` messages)
   FleetFragment fleet;
   //! Numeric address the line arrived from (set by the transport, never
@@ -118,7 +125,9 @@ std::string encodeKeyClearAll(const std::string &from, const std::string &token)
 //! Wall clock now, ms since the Unix epoch (the key sentAt stamp).
 int64_t wallClockMs();
 
-std::string encodeHello(int meshVersion, const std::string &name, const std::string &token);
+std::string encodeHello(
+    int meshVersion, const std::string &name, const std::string &token, const std::string &buildVersion = {}
+);
 std::string encodeFleet(const FleetFragment &fragment, const std::string &token);
 
 //! Status reply (legacy shape: role/server_ip/seq/last_switch/name).

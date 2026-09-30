@@ -29,5 +29,6 @@ private Q_SLOTS:
   void keyRoundTrip();
   void keyFwdPhasesDecode();
   void helloRoundTrip();
+  void helloBuildVersionRoundTripsAndDefaultsEmpty();
   void fleetRoundTrip();
 };
