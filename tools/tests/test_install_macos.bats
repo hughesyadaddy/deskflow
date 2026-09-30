@@ -283,13 +283,22 @@ log_lacks() {
 
   rm -f "$DESKFLOW_CTL_RETIRED_PRIO_APPLY"; : >"$SHIM_LOG"
   run bash "$SCRIPT"
+  # 2026-09-30: this report-only assert-single never passes --sudo-stdin
+  # (install-macos.sh isn't necessarily handed fleet credentials), and
+  # btm_dump no longer ever tries sfltool unprivileged -- this exact,
+  # unprivileged, every-single-install code path was one of the real
+  # sources of the "sfltool wants to make changes" dialog popping
+  # repeatedly. So even with nothing else wrong, login-items now SKIPs
+  # here, same non-fatal "warning" shape as the retired-file case above --
+  # install still completes, just never reaches a clean "assert-single: OK"
+  # from this unprivileged call site. sfltool is correctly never invoked at
+  # all, so there is no bootstrap-vs-audit ordering left to check.
   [ "$status" -eq 0 ]
-  [[ "$output" == *"assert-single: OK"* ]]
+  [[ "$output" == *"assert-single: FAIL"* ]]
+  [[ "$output" == *"login-items audit SKIPPED (never a pass)"* ]]
+  [[ "$output" == *"warning: assert-single reported problems"* ]]
   [[ "$output" == *"== Done:"* ]]
-  # order: start (bootstrap) -> retire -> assert-single (sfltool audit)
-  start_line="$(grep -n 'launchctl bootstrap' "$SHIM_LOG" | tail -1 | cut -d: -f1)"
-  audit_line="$(grep -n '^sfltool dumpbtm' "$SHIM_LOG" | head -1 | cut -d: -f1)"
-  [ "$start_line" -lt "$audit_line" ]
+  log_lacks "sfltool"
   # --no-restart: nothing running, so no assert-single
   : >"$SHIM_LOG"
   run bash "$SCRIPT" --no-restart

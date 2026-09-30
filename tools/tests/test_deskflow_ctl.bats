@@ -411,7 +411,11 @@ DOMAIN="gui/$(id -u)"
   load_agent $CORE 300; add_proc 300 "$APP/Contents/MacOS/deskflow-core"
   load_agent $GUI 301;  add_proc 301 "$APP/Contents/MacOS/Deskflow"
   add_proc 900 "/Applications/Mouser.app/Contents/MacOS/Mouser"
-  run bash "$SCRIPT" assert-single
+  # 2026-09-30: a full PASS needs the login-items sub-check too, which now
+  # needs a real sudo path (see the --sudo-stdin test) -- unrelated to what
+  # this test is actually about (process/launchd ownership).
+  make_sudo_shim
+  with_stdin r00t assert-single --sudo-stdin
   [ "$status" -eq 0 ]
   [[ "$output" == *"assert-single: OK"* ]]
 }
@@ -463,18 +467,20 @@ add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Conte
 
 @test "assert-single fails when core ppid is not 1 (GUI-spawned core)" {
   healthy_seat
+  make_sudo_shim
   set_ppid 300 301
   run bash "$SCRIPT" assert-single
   [ "$status" -eq 1 ]
   [[ "$output" == *"deskflow-core pid 300 ppid=301 (want 1: launchd)"* ]]
   log_has "ps -o ppid= -p 300"
   set_ppid 300 1
-  run bash "$SCRIPT" assert-single
+  with_stdin r00t assert-single --sudo-stdin
   [ "$status" -eq 0 ]
 }
 
 @test "assert-single fails on a runningboard application.* instance in the user domain" {
   healthy_seat
+  make_sudo_shim
   printf 'gui/501 = {\n\tservices = {\n\t\t0\t-\t%s\n\t\t2141\t-\tapplication.%s.1234.5678\n\t\t0\t-\tcom.apple.foo\n\t}\n}\n' "$GUI" "$GUI" >"$SHIM_STATE/domain.txt"
   run bash "$SCRIPT" assert-single
   [ "$status" -eq 1 ]
@@ -482,26 +488,31 @@ add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Conte
   log_has "launchctl print $DOMAIN"
   # the agent's own label in the listing is not an instance
   printf 'gui/501 = {\n\tservices = {\n\t\t301\t-\t%s\n\t}\n}\n' "$GUI" >"$SHIM_STATE/domain.txt"
-  run bash "$SCRIPT" assert-single
+  with_stdin r00t assert-single --sudo-stdin
   [ "$status" -eq 0 ]
 }
 
 @test "assert-single fails on retired files and passes once retire removed the user-owned one" {
   healthy_seat
+  make_sudo_shim
   mkdir -p "$HOME/Library/Logs/Deskflow"; : >"$HOME/Library/Logs/Deskflow/deskflow-keepalive.log"
   run bash "$SCRIPT" assert-single
   [ "$status" -eq 1 ]
   [[ "$output" == *"retired file present: $HOME/Library/Logs/Deskflow/deskflow-keepalive.log"* ]]
   run bash "$SCRIPT" retire
   [ "$status" -eq 0 ]
-  run bash "$SCRIPT" assert-single
+  with_stdin r00t assert-single --sudo-stdin
   [ "$status" -eq 0 ]
 }
 
 @test "assert-single runs the login-items audit and fails on an enabled BTM app record" {
   healthy_seat
   use_btm two-app-records
-  run bash "$SCRIPT" assert-single
+  # 2026-09-30: btm_dump never tries sfltool unprivileged any more (see the
+  # --sudo-stdin test below for why), so this needs a real sudo path to
+  # reach the fixture at all.
+  make_sudo_shim
+  with_stdin r00t assert-single --sudo-stdin
   [ "$status" -eq 1 ]
   [[ "$output" == *"login-items audit FAIL: enabled BTM app record"* ]]
   log_has "sfltool dumpbtm"
@@ -511,7 +522,9 @@ add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Conte
 
 @test "login-items audit parses the dumpbtm fixture and fails on an enabled app record with the manual step" {
   use_btm two-app-records
-  run bash "$SCRIPT" login-items audit
+  # 2026-09-30: real sudo path required -- see the --sudo-stdin test below.
+  make_sudo_shim
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 1 ]
   [[ "$output" == *"login-items: FAIL"* ]]
   [[ "$output" == *"2.io.github.hughesyadaddy.deskflow (file:///Applications/Deskflow.app/)"* ]]
@@ -533,25 +546,28 @@ add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Conte
 }
 
 @test "login-items audit allows the fleet agent records (core, gui, converge, prio daemon, vhid-bridge)" {
+  # 2026-09-30: every call in this test needs the real sudo path now.
+  make_sudo_shim
   use_btm fleet-agents-only
-  run bash "$SCRIPT" login-items audit
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 0 ]
   [[ "$output" == *"login-items: OK"* ]]
   # a foreign enabled login item (Synergy) is a second launcher
   use_btm synergy-login-item
-  run bash "$SCRIPT" login-items audit
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 1 ]
   [[ "$output" == *'remove "Synergy"'* ]]
   # a disabled app record is not a launcher, but two records still fail
   awk '/^ #5:/{skip=1} /^ #6:/{skip=0} !skip' "$BATS_TEST_DIRNAME/fixtures/btm-dump-two-app-records.txt" |
     sed 's/Disposition: \[enabled, allowed, not notified\] (0x3)/Disposition: [disabled, allowed, not notified] (0x2)/' >"$SHIM_STATE/btm.txt"
-  run bash "$SCRIPT" login-items audit
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 0 ]
 }
 
 @test "login-items audit passes the adversarial dump: look-alike names, a sibling's agent, a DISABLED Deskflow login item" {
+  make_sudo_shim
   use_btm adversarial
-  run bash "$SCRIPT" login-items audit
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 0 ]
   [[ "$output" == *"login-items: OK"* ]]
   # "Desk Flow Notes" / "Barrier Breaker" are not launchers of ours; the
@@ -561,22 +577,23 @@ add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Conte
   # flip the Deskflow login item to enabled: the only thing that may fail it
   sed 's/Disposition: \[disabled, allowed, not notified\] (0x2)/Disposition: [enabled, allowed, not notified] (0x3)/' \
     "$BATS_TEST_DIRNAME/fixtures/btm-dump-adversarial.txt" >"$SHIM_STATE/btm.txt"
-  run bash "$SCRIPT" login-items audit
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 1 ]
   [[ "$output" == *"4.io.github.hughesyadaddy.deskflow"* ]]
   [[ "$output" != *"Desk Flow"* ]]
   # a real barrier bundle id (component match) is a launcher
   sed -e 's/2.com.game.barrierbreaker/2.com.github.debauchee.barrier/' -e 's#Barrier%20Breaker.app#Barrier.app#' \
     "$BATS_TEST_DIRNAME/fixtures/btm-dump-adversarial.txt" >"$SHIM_STATE/btm.txt"
-  run bash "$SCRIPT" login-items audit
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 1 ]
   [[ "$output" == *"2.com.github.debauchee.barrier"* ]]
 }
 
 @test "login-items audit URL-decodes the bundle name in the System Events step" {
+  make_sudo_shim
   sed 's#file:///Applications/Deskflow.app/#file:///Applications/Deskflow%20Fleet.app/#' \
     "$BATS_TEST_DIRNAME/fixtures/btm-dump-two-app-records.txt" >"$SHIM_STATE/btm.txt"
-  run bash "$SCRIPT" login-items audit
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 1 ]
   [[ "$output" == *'delete login item "Deskflow Fleet"'* ]]
   [[ "$output" != *'Deskflow%20Fleet'* ]]
@@ -600,11 +617,12 @@ add_prio_binary() { : >"$APP/Contents/MacOS/deskflow-prio"; chmod +x "$APP/Conte
 }
 
 @test "login-items audit --fix tries the legacy System Events delete once, then re-audits; print-steps lists only the steps" {
+  make_sudo_shim
   use_btm two-app-records
-  run bash "$SCRIPT" login-items audit --fix
+  with_stdin r00t login-items audit --fix --sudo-stdin
   [ "$status" -eq 1 ]
   log_has 'osascript -e tell application "System Events" to delete login item "Deskflow"'
-  [ "$(grep -c '^sfltool dumpbtm' "$SHIM_LOG")" = 2 ]
+  [ "$(grep -c '^sfltool dumpbtm' "$SHIM_LOG")" = 2 ]  # pre-fix audit + post-fix re-audit, unrelated to the 2026-09-30 privilege change
   run bash "$SCRIPT" login-items print-steps
   [ "$status" -eq 0 ]
   [[ "$output" == *'remove "Deskflow"'* ]]
@@ -845,12 +863,15 @@ healthy() {
   log_lacks "sfltool"
 }
 
-@test "login-items audit (the manual command, not the tick) is still fully wired and unaffected" {
-  # Companion to the test above: the tick no longer calls this, but a human
-  # running it directly must see the exact same behavior as before.
+@test "login-items audit (the manual command, not the tick) is still fully wired given a password" {
+  # Companion to the test above: the tick no longer calls this at all, and
+  # (2026-09-30) even a human running it directly now needs --sudo-stdin --
+  # the underlying audit logic itself (the fixture parsing, the FAIL
+  # verdict, the manual-step hint) is otherwise unchanged.
   healthy_seat
   use_btm two-app-records
-  run bash "$SCRIPT" login-items audit
+  make_sudo_shim
+  with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 1 ]
   [[ "$output" == *"FAIL: enabled BTM app record"* ]]
   log_has "sfltool dumpbtm"
@@ -1291,10 +1312,16 @@ make_fake_checkout() {
   [ "$status" -eq 0 ]
   [ "$(cat "$SAFE/checkout")" = "$fake_real" ]     # the copy remembers where it came from
   rm -rf "$fake"
+  # 2026-09-30: assert-single and login-items audit now need a real sudo
+  # path for the login-items sub-check (never an unprivileged sfltool
+  # attempt -- see the --sudo-stdin test). A password is piped for every
+  # verb here, not just those two: harmless no-op for verbs that never
+  # read stdin, avoids special-casing the loop.
+  make_sudo_shim
   all="$TMP/all-output.txt"; : >"$all"
-  for verb in "status" "assert-single" "converge" "converge --apply --quiet" "prio" "retire" "login-items audit" "login-items print-steps" "render-plist com.fleet.soak" "render-plist $CORE" "safe-copy" "help" "restart" "stop"; do
+  for verb in "status" "assert-single --sudo-stdin" "converge" "converge --apply --quiet" "prio" "retire" "login-items audit --sudo-stdin" "login-items print-steps" "render-plist com.fleet.soak" "render-plist $CORE" "safe-copy" "help" "restart" "stop"; do
     # shellcheck disable=SC2086
-    run bash "$SAFE/deskflow-ctl" $verb
+    run bash -c 'printf "%s\n" "$0" | bash "$1" "${@:2}"' r00t "$SAFE/deskflow-ctl" $verb
     echo "--- $verb (rc=$status) ---" >>"$all"; echo "$output" >>"$all"
     [ "$status" -eq 0 ] || { echo "verb '$verb' rc=$status: $output" >&2; false; }
   done
@@ -1441,7 +1468,8 @@ make_fake_checkout() {
   log_has_line "launchctl kickstart $DOMAIN/$GUI"
   # the shim keeps args/exit until a bootout, as launchd keeps the loaded definition
   rm -f "$SHIM_STATE/args/$CONVERGE" "$SHIM_STATE/exit/$CONVERGE"
-  run bash "$SCRIPT" assert-single
+  make_sudo_shim
+  with_stdin r00t assert-single --sudo-stdin
   [ "$status" -eq 0 ]
   run bash "$SCRIPT" converge --apply
   [ "$status" -eq 0 ]
@@ -1535,9 +1563,10 @@ make_fake_checkout() {
 
 @test "K10-review: assert-single polices fleet-label plists only: a third party's plist under ~/Documents is ignored, a sibling product's fleet-label plist (any spelling) is not" {
   healthy
+  make_sudo_shim
   mkdir -p "$DESKFLOW_CTL_AGENT_DIR"
   printf '<plist><dict><key>ProgramArguments</key><array><string>%s/Documents/backup.sh</string></array></dict></plist>\n' "$HOME" >"$DESKFLOW_CTL_AGENT_DIR/com.example.backup.plist"
-  run bash "$SCRIPT" assert-single
+  with_stdin r00t assert-single --sudo-stdin
   [ "$status" -eq 0 ]
   printf '<plist><dict><key>ProgramArguments</key><array><string>%s/desktop/Mouser/tools/x</string></array></dict></plist>\n' "$HOME" >"$DESKFLOW_CTL_AGENT_DIR/io.github.hughesyadaddy.mouser.plist"
   run bash "$SCRIPT" assert-single
@@ -1654,31 +1683,36 @@ out_lacks() { if [[ "$output" == *"$1"* ]]; then echo "unexpected in output: $1"
   log_lacks "r00t"
 }
 
-@test "login-items audit --sudo-stdin retries dumpbtm through sudo -S only after the unprivileged call is refused; without it SKIP and no sudo at all" {
+@test "login-items audit --sudo-stdin goes straight to sudo -S, never tries sfltool unprivileged; without it SKIP and no sfltool at all" {
+  # 2026-09-30: the old two-step (try unprivileged, retry under sudo only on
+  # refusal) is gone. On at least one seat's real macOS build the
+  # unprivileged call did not fail cleanly enough to ever reach a retry --
+  # it blocked on a native "sfltool wants to make changes" authorization
+  # dialog that nothing here could answer or dismiss, popping repeatedly on
+  # every caller (a human running this directly, fleet-health over SSH,
+  # every fleet-deploy.sh run's own report-only assert-single check). Now
+  # sfltool is only ever invoked already-privileged, and only when a
+  # password is available; without one it is never invoked at all.
   make_sudo_shim
-  echo 1 >"$SHIM_STATE/btm.rc"; echo "Error: dumpbtm requires root privileges" >"$SHIM_STATE/btm.err"
   run bash "$SCRIPT" login-items audit
   [ "$status" -eq 3 ]
   log_lacks "sudo"
+  log_lacks "sfltool"
   : >"$SHIM_LOG"
   with_stdin r00t login-items audit --sudo-stdin
   [ "$status" -eq 0 ]
   out_has "login-items: OK"
-  [ "$(grep -c '^sfltool dumpbtm' "$SHIM_LOG")" -eq 2 ]      # unprivileged first, then under sudo
+  [ "$(grep -c '^sfltool dumpbtm' "$SHIM_LOG")" -eq 1 ]      # privileged only, never an unprivileged attempt first
   log_has "sudo -S -p  -k sfltool dumpbtm"
   [ "$(grep -c '^sudo ' "$SHIM_LOG")" -eq 1 ]
   log_lacks "r00t"
-  # when the unprivileged call works, sudo is never used even with a password
-  rm -f "$SHIM_STATE/btm.rc" "$SHIM_STATE/btm.err"; : >"$SHIM_LOG"
-  with_stdin r00t login-items audit --sudo-stdin
-  [ "$status" -eq 0 ]
-  log_lacks "sudo"
   # and assert-single (what converge runs every 60 s) never escalates on its own
   healthy_seat
-  echo 1 >"$SHIM_STATE/btm.rc"; : >"$SHIM_LOG"
+  : >"$SHIM_LOG"
   run bash "$SCRIPT" assert-single
   [ "$status" -eq 1 ]
   log_lacks "sudo"
+  log_lacks "sfltool"
 }
 
 @test "a rejected stdin password is reported once and the sudo lines are printed: prio exits 1, retire exits 2" {

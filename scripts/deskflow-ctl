@@ -1463,63 +1463,44 @@ btm_evaluate() {
 }
 
 btm_dump() {
-  # Runs `sfltool dumpbtm` (a PATH shim in tests), unprivileged first -- that
-  # works on most of the fleet's seats. Only when it is refused for lack of
-  # privilege AND --sudo-stdin supplied a password is it retried through
-  # `sudo -S` (never a plain `sudo`: nothing here may raise an interactive
-  # prompt from a launchd tick or an SSH session).
-  #
-  # BOUNDED (2026-09-25): on at least one seat's macOS build, the
-  # unprivileged call does not fail cleanly -- it blocks on a native
-  # "sfltool wants to make changes" authorization dialog that nothing here
-  # can answer (not stdin; a password must never be entered into it). This
-  # caller may be a human at `deskflow-ctl login-items audit` (who could in
-  # principle see and dismiss it) or fleet-health probing a seat over SSH
-  # (who never could); either way an unbounded hang is unacceptable, so the
-  # call is capped at kBtmDumpTimeoutSecs. No `timeout`/`gtimeout` dependency
-  # (not guaranteed installed on every seat) -- a background job plus a
-  # watchdog that SIGTERMs it, both pure bash/coreutils. A caller still
-  # waiting past the cap gets the same SKIP (rc=3) as "needs privilege".
-  local -r kBtmDumpTimeoutSecs=5
-  local out rc=0 outfile dump_pid watchdog_pid
-  outfile="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
-  sfltool dumpbtm >"$outfile" 2>&1 &
-  dump_pid=$!
-  ( sleep "$kBtmDumpTimeoutSecs"; kill -TERM "$dump_pid" 2>/dev/null ) &
-  watchdog_pid=$!
-  wait "$dump_pid" 2>/dev/null || rc=$?
-  kill "$watchdog_pid" 2>/dev/null
-  wait "$watchdog_pid" 2>/dev/null
-  out="$(cat "$outfile" 2>/dev/null)"
-  rm -f "$outfile"
-  if (( rc != 0 )) && ! grep -qiE 'root|privilege|permission|not permitted|must be run|operation not' <<<"$out"; then
-    # Killed by the watchdog (SIGTERM) with no error text of its own: treat
-    # exactly like "needs privilege" (SKIP), not a hard failure -- the tool
-    # never told us why, but it was never going to answer either way.
-    out="${out}${out:+$'\n'}sfltool dumpbtm: no response within ${kBtmDumpTimeoutSecs}s (likely blocked on an authorization dialog nothing here can answer)"
+  # 2026-09-30: the unprivileged attempt this function used to try first is
+  # GONE -- it does not fail cleanly on at least one seat's macOS build, it
+  # blocks on a native "sfltool wants to make changes" authorization dialog
+  # that nothing here can answer (not stdin; a password must never be
+  # entered into it). The 2026-09-25 fix bounded the WAIT (a background job
+  # plus a watchdog that SIGTERMs it after kBtmDumpTimeoutSecs) but killing
+  # the process never dismissed the dialog it had already raised -- every
+  # caller (a human running `deskflow-ctl login-items audit`, fleet-health
+  # probing a seat over SSH, every `fleet-deploy.sh` run's own report-only
+  # assert-single check) kept popping a real, visible, undismissable system
+  # dialog on that seat's screen, repeatedly, with nothing watching to
+  # answer it. Bounding the hang was the wrong fix for a problem that was
+  # never about hanging -- it was about a dialog appearing at all. Only try
+  # `sfltool dumpbtm` when a password is already available to run it
+  # privileged (`sudo -S`, never a plain `sudo`: nothing here may raise an
+  # interactive prompt from a launchd tick or an SSH session either).
+  # Without one, SKIP immediately -- the caller's own message already names
+  # the `--sudo-stdin`/piped-sudo route to actually run this.
+  if ! have_sudo_pw; then
+    echo "sfltool dumpbtm needs privileges here (no --sudo-stdin password supplied; never attempted unprivileged -- see 2026-09-30 note in btm_dump)"
+    return 3
   fi
-  if (( rc != 0 )) || ! grep -q 'Records for UID' <<<"$out"; then
-    if grep -qiE 'root|privilege|permission|not permitted|must be run|operation not' <<<"$out" || (( rc != 0 )); then
-      if have_sudo_pw; then
-        # Not in a $( ): a rejection must set SUDO_REJECTED in THIS shell and
-        # its one-time message must reach stderr, not a captured string.
-        local stmp src=0
-        stmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
-        sudo_stdin sfltool dumpbtm >"$stmp" 2>/dev/null || src=$?
-        if (( src == 0 )) && grep -q 'Records for UID' "$stmp"; then
-          cat "$stmp"
-          rm -f "$stmp"
-          return 0
-        fi
-        rm -f "$stmp"
-      fi
-      echo "$out"
-      return 3
-    fi
+  # Not in a $( ): a rejection must set SUDO_REJECTED in THIS shell and its
+  # one-time message must reach stderr, not a captured string.
+  local stmp src=0 out
+  stmp="$(mktemp "${TMPDIR:-/tmp}/deskflow-ctl.XXXXXX")"
+  sudo_stdin sfltool dumpbtm >"$stmp" 2>/dev/null || src=$?
+  out="$(cat "$stmp" 2>/dev/null)"
+  rm -f "$stmp"
+  if (( src == 0 )) && grep -q 'Records for UID' <<<"$out"; then
     echo "$out"
-    return 1
+    return 0
   fi
   echo "$out"
+  # A password WAS available and used -- this is a real failure (bad/empty
+  # output from a privileged call), not "needs privilege", so the caller's
+  # SKIP-vs-FAIL split (login_items_audit) must see it as rc=1, not rc=3.
+  return 1
 }
 
 login_items_audit() {
