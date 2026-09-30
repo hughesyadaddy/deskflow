@@ -31,6 +31,53 @@ set(DESKFLOW_VERSION_TWEAK 0)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
   find_package(Git)
   if(GIT_FOUND)
+    # 2026-09-30: git-derived values below (SHA, commit count) are computed
+    # ONCE, here, at configure time -- a plain incremental `cmake --build`
+    # never re-runs this block just because HEAD moved, so a commit that
+    # touches no CMake-tracked source file (a script, a test, docs) leaves
+    # every subsequently *built* binary's embedded version silently stale
+    # relative to the actual checkout, even though the checkout itself, and
+    # a fleet-deploy summary reading `git rev-parse` directly, both show the
+    # new commit. Caught live: this exact sequence (a version-numbering
+    # commit immediately followed by a script-only commit, redeployed
+    # without an intervening full reconfigure) left macbookpro's running
+    # deskflow-core reporting the OLDER commit while the checkout and the
+    # deploy log both already showed the newer one -- the peer-mismatch
+    # warning this same feature added then fired on itself, against its own
+    # host, every ~2s. CMAKE_CONFIGURE_DEPENDS tells cmake to treat these
+    # paths like any other configure-time input: if their mtime moves,
+    # reconfigure (which reruns this whole block) before the next build,
+    # with no cost when nothing has changed. Watches both the ref HEAD
+    # currently points to (bumps on every commit made while staying on this
+    # branch -- the common case) and HEAD itself (bumps on checkout/switch,
+    # and is HEAD's own content directly in a detached state).
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} rev-parse --git-path HEAD
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      OUTPUT_VARIABLE GIT_HEAD_FILE
+      ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(GIT_HEAD_FILE AND EXISTS "${GIT_HEAD_FILE}")
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GIT_HEAD_FILE}")
+      file(READ "${GIT_HEAD_FILE}" GIT_HEAD_CONTENT)
+      if(GIT_HEAD_CONTENT MATCHES "^ref: (.*)$")
+        string(STRIP "${CMAKE_MATCH_1}" GIT_HEAD_REF)
+        execute_process(
+          COMMAND ${GIT_EXECUTABLE} rev-parse --git-path "${GIT_HEAD_REF}"
+          WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+          OUTPUT_VARIABLE GIT_HEAD_REF_FILE
+          ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(GIT_HEAD_REF_FILE AND EXISTS "${GIT_HEAD_REF_FILE}")
+          set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GIT_HEAD_REF_FILE}")
+        endif()
+      endif()
+    endif()
+    unset(GIT_HEAD_FILE)
+    unset(GIT_HEAD_CONTENT)
+    unset(GIT_HEAD_REF)
+    unset(GIT_HEAD_REF_FILE)
+
     execute_process(
       COMMAND ${GIT_EXECUTABLE} rev-parse --short=8 HEAD
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
