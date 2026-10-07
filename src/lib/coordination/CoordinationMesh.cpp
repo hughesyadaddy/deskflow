@@ -683,8 +683,8 @@ void PeerOutbox::pump(double now)
       // handled them locally (forward() timed out) and a late delivery is
       // exactly the phantom Down this lane exists to prevent.
       bool expired = false;
-      while (!m_queue.empty() && m_queue.front().isKey && m_queue.front().deadline > 0 &&
-             now > m_queue.front().deadline) {
+      while (!m_queue.empty() && m_queue.front().isKey && m_queue.front().deadline > 0 && now > m_queue.front().deadline
+      ) {
         m_queue.pop_front();
         ++m_expiredKeys;
         expired = true;

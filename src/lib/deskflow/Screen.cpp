@@ -633,6 +633,16 @@ void Screen::leaveSecondary()
   m_reassertedModifiers.clear();
   m_osDisagreeModifiers = 0;
   m_screen->fakeAllKeysUp();
+  // What fakeAllKeysUp() released may still read held: the 2026-10-07
+  // incident's Cmd was re-asserted on enter, released here 0.4 s later,
+  // and stayed in the OS flags (generic bit, no device bit) for the next
+  // three minutes until the following leave. A modifier held on this
+  // machine's own keyboard carries its device bit and is left alone.
+  const KeyModifierMask ghosts =
+      m_screen->releaseGhostModifiers(m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask);
+  if (ghosts != 0) {
+    LOG_INFO("[keys] leave released ghost modifiers 0x%04x", ghosts);
+  }
 }
 
 void Screen::armEnableSweep()
@@ -751,11 +761,27 @@ void Screen::handlePostSwitchVerifier()
   // addition here. This poll only makes the log honest about what
   // releaseInjectedKeys() did and did not clear; nothing further is
   // attempted.
-  const KeyModifierMask stillHeld = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & held;
+  KeyModifierMask stillHeld = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & held;
   if (stillHeld != 0) {
-    // m_osDisagreeModifiers is diagnostic only here, never actioned: it
-    // narrows "still down" to "and the server said this wasn't its hold"
-    // for whoever reads the log next time this fires, nothing more.
+    // What the ledger could not close may still be OURS: a synthetic hold
+    // whose release the OS dropped shows up as a generic modifier bit
+    // with no device bit (see IKeyState::releaseGhostModifiers). That is
+    // the one signal that separates it from a modifier the user is
+    // physically holding at this keyboard, which keeps its device bit for
+    // as long as it is held -- so, unlike the freshness-gated attempts
+    // reverted on 2026-09-29, this cannot drop a real local hold. Only
+    // bits the server's mask disagreed with are offered: a bit the server
+    // claims as its own hold has its own release path.
+    const KeyModifierMask ghosts = m_screen->releaseGhostModifiers(stillHeld & m_osDisagreeModifiers & ~keep);
+    if (ghosts != 0) {
+      LOG_INFO("[keys] post-switch released ghost modifiers 0x%04x", ghosts);
+      stillHeld = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & held;
+    }
+  }
+  if (stillHeld != 0) {
+    // m_osDisagreeModifiers is diagnostic here: it narrows "still down" to
+    // "and the server said this wasn't its hold" for whoever reads the
+    // log next time this fires.
     LOG_INFO(
         "[keys] post-switch still-down 0x%04x (ledger release did not clear it; 0x%04x of that the server's "
         "mask disagreed with at the crossing)",

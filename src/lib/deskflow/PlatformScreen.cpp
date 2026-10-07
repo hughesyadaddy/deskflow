@@ -103,6 +103,11 @@ void PlatformScreen::releaseInjectedKeys(KeyModifierMask keep)
   getKeyState()->releaseInjectedKeys(keep);
 }
 
+KeyModifierMask PlatformScreen::releaseGhostModifiers(KeyModifierMask candidates)
+{
+  return getKeyState()->releaseGhostModifiers(candidates);
+}
+
 std::string PlatformScreen::sidesMaskToString(uint32_t sides)
 {
   using enum DirectionMask;

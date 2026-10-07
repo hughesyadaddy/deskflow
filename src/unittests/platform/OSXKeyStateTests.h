@@ -49,6 +49,9 @@ private Q_SLOTS:
   void lagRaceDoesNotReassertReleasedShift();
   // K6: mid-session secure-input transitions (OSXScreen::secureInputPollTick())
   void midSessionDialogDismissReleasesOnlyLedgeredModifier();
+  void ghostReleaseClearsGenericOnlyModifier();
+  void ghostReleaseLeavesDeviceBackedModifierAlone();
+  void ghostReleaseExaminesOnlyCandidates();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);

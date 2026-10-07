@@ -93,7 +93,46 @@ Monotonic per-cluster gossip: local broadcast increments `seq`; on receive
 
 When a claim carries both addresses, probe `lan` on the coordination port
 (~0.7 s timeout) and use it for the Deskflow connection when reachable;
-fall back to `ip` otherwise.
+fall back to `ip` otherwise. The probe goes to the peer's numeric LAN
+candidate from the address book (below); the election keeps the sender's
+configured strings untouched.
+
+### Peer addressing (lanes never resolve names)
+
+Every mesh connect (lane sends, hello queries, LAN probes) targets a
+NUMERIC IPv4 address; `connectWithTimeout` refuses a name outright
+(`AI_NUMERICHOST`). Names from `coordination/peers` are resolved by the
+per-peer address book (`PeerAddressBook`) on detached background threads:
+at start, every 5 min, early after a lane failure or an eviction. The
+2026-10-07 incident showed why: an mDNS lookup of `macbookpro.local` took
+25-35 s or failed outright on the server, and every relayed key paid for
+it on the lane thread, so a Down whose Up was withdrawn at the forward
+grace stayed held on the peer until the next (also stalled) resync.
+
+Candidate order per peer: the address that most recently ANSWERED, then
+the `lan` tier (configured literal, or at most two IPv4 results of the
+name), then the `ip` tier, then learned addresses (below); at most six.
+A configured literal is the operator's word (loopback included); a
+resolved or learned address must be a routable unicast IPv4 (no
+loopback, unspecified, link-local, multicast, broadcast). A failed
+resolve keeps the previous answers. With no candidate yet (cold start on
+a name that has not resolved) a lane attempt fails WITHOUT a connect and
+the normal backoff window opens; the book wakes the lane the moment a
+name resolves, so no key waits out a 30 s window for an address that just
+arrived. In backoff a lane makes one connect per window, rotating through
+its candidates; Unknown/Reachable attempts try the head and, on failure,
+the next candidate once.
+
+A hello reply naming a different seat evicts the answering address from
+the peer's resolved/learned/last-answered slots (DHCP handed it on); a
+configured literal is only reported.
+
+Learning: when (and only when) a shared `token` is configured, a line
+from a configured peer teaches the book that peer's source address as a
+trailing candidate (newest two kept); it moves ahead of configured
+addresses only once a send to it succeeds. Without a token nothing is
+learned: a name on the wire is not authentication, and a learned address
+is where this seat's relayed keystrokes would go.
 
 ## 4. Role state machine
 

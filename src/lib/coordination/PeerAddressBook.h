@@ -112,7 +112,8 @@ public:
 
   //! True for a numeric IPv4 address that a peer could actually be
   //! listening on (not loopback, unspecified, link-local, multicast or
-  //! broadcast; 240/4 is allowed -- tests use it as a black hole). The canonical text form is returned through \p canonical.
+  //! broadcast; 240/4 is allowed -- tests use it as a black hole). The canonical text form is returned through \p
+  //! canonical.
   static bool usableAddress(const std::string &address, std::string *canonical = nullptr);
   //! Numeric IPv4 of any kind (canonical text through \p canonical).
   static bool parseIPv4(const std::string &address, std::string *canonical = nullptr);
@@ -134,9 +135,9 @@ private:
   {
     mutable std::mutex mutex;
     Resolver resolver;
-    std::map<std::string, Entry> entries;             //!< by configured name
+    std::map<std::string, Entry> entries;                     //!< by configured name
     std::map<std::string, std::vector<std::string>> resolved; //!< name -> addresses
-    std::set<std::string> inFlight;                   //!< names being resolved
+    std::set<std::string> inFlight;                           //!< names being resolved
     ChangedHandler changed;
     bool stopped = false;
     bool refreshRequested = false;

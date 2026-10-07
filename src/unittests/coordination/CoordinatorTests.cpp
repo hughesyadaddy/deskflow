@@ -10,10 +10,10 @@
 // paths against unreachable peers, and the bounded mesh handler pool.
 
 #include "arch/Arch.h"
-#include "base/EventQueue.h"
-#include "base/Log.h"
 #include "base/Event.h"
+#include "base/EventQueue.h"
 #include "base/EventTypes.h"
+#include "base/Log.h"
 #include "common/ExitCodes.h"
 #include "coordination/CoordinationMesh.h"
 #include "coordination/CoordinationProtocol.h"
@@ -274,7 +274,7 @@ void CoordinatorTests::cleanupTestCase()
 void CoordinatorTests::outbox_backoffDoublesToCapAndTriesOneAddressPerWindow()
 {
   FakeClock clock;
-  FakeTransport transport; // always fails: the peer is asleep
+  FakeTransport transport;                 // always fails: the peer is asleep
   FakeBook book({"10.0.0.6", "10.0.0.5"}); // lan tier first, then stable
   PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   outbox.setAddressSink(book.sink());
@@ -786,8 +786,9 @@ void CoordinatorTests::addressBook_rejectsUnusableAddresses()
   QVERIFY(PeerAddressBook::usableAddress("192.168.1.143", &canonical));
   QCOMPARE(canonical, std::string("192.168.1.143"));
   QVERIFY(PeerAddressBook::usableAddress("100.64.0.5"));
-  for (const char *bad : {"127.0.0.1", "0.0.0.0", "169.254.1.2", "224.0.0.251", "255.255.255.255",
-                          "peer.local", "", "::1", "fe80::1", "192.168.1.143:24851"}) {
+  for (const char *bad :
+       {"127.0.0.1", "0.0.0.0", "169.254.1.2", "224.0.0.251", "255.255.255.255", "peer.local", "", "::1", "fe80::1",
+        "192.168.1.143:24851"}) {
     QVERIFY2(!PeerAddressBook::usableAddress(bad), bad);
   }
   // A configured literal is the operator's word (loopback included: tests
@@ -833,7 +834,9 @@ void CoordinatorTests::addressBook_learnAppendsAnswerPromotesEvictDrops()
   // Bounded: the newest kMaxLearned survive.
   book.learn("mac", "192.168.1.144");
   book.learn("mac", "192.168.1.145");
-  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5", "192.168.1.145", "192.168.1.144"}));
+  QCOMPARE(
+      book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5", "192.168.1.145", "192.168.1.144"})
+  );
 
   // An answer promotes; evicting the answered/resolved address drops it
   // from every tier, a configured literal is only reported.
@@ -889,7 +892,9 @@ void CoordinatorTests::mesh_sendToRefusesNames()
 {
   // The transport never resolves: a name is refused immediately instead
   // of blocking the lane thread inside getaddrinfo.
-  deskflow::coordination::CoordinationMesh mesh(0, "", [](const Message &, const std::function<void(const std::string &)> &) {});
+  deskflow::coordination::CoordinationMesh mesh(
+      0, "", [](const Message &, const std::function<void(const std::string &)> &) {}
+  );
   const auto started = std::chrono::steady_clock::now();
   QVERIFY(!mesh.sendTo("peer.local", "hello"));
   QVERIFY(!mesh.probe("peer.local", 700));
@@ -907,7 +912,8 @@ void CoordinatorTests::coordinator_learnsSourceAddressOnlyWithToken()
     config.selfName = "hackintosh";
     config.meshPort = 0;
     config.token = withToken ? "test-token" : "";
-    config.peers = deskflow::coordination::parsePeerList(std::string("macbookpro=") + kBlackholeA + ", hackintosh=10.0.0.1");
+    config.peers =
+        deskflow::coordination::parsePeerList(std::string("macbookpro=") + kBlackholeA + ", hackintosh=10.0.0.1");
     config.addressResolver = [](const std::string &) { return std::vector<std::string>{}; };
     Coordinator coordinator(config);
     const std::string hello =
@@ -915,8 +921,20 @@ void CoordinatorTests::coordinator_learnsSourceAddressOnlyWithToken()
     std::string reply;
     coordinator.onMessage(decodeFrom(hello, "192.168.1.143"), [&reply](const std::string &line) { reply = line; });
     // Our own name and unknown names teach nothing.
-    coordinator.onMessage(decodeFrom(protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "hackintosh", config.token, "abc"), "10.0.0.2"), [](const std::string &) {});
-    coordinator.onMessage(decodeFrom(protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "stranger", config.token, "abc"), "10.0.0.3"), [](const std::string &) {});
+    coordinator.onMessage(
+        decodeFrom(
+            protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "hackintosh", config.token, "abc"),
+            "10.0.0.2"
+        ),
+        [](const std::string &) {}
+    );
+    coordinator.onMessage(
+        decodeFrom(
+            protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "stranger", config.token, "abc"),
+            "10.0.0.3"
+        ),
+        [](const std::string &) {}
+    );
     const auto candidates = coordinator.m_addressBook.candidates("macbookpro");
     if (withToken) {
       QCOMPARE(candidates, (std::vector<std::string>{kBlackholeA, "192.168.1.143"}));
@@ -1182,7 +1200,7 @@ void CoordinatorTests::keyReceive_ignoresWallClockAndDropsDuplicateSeq()
   };
   const int64_t now = protocol::wallClockMs();
   const int64_t skewed = now - protocol::kRelayKeyMaxAgeMs - 5000; // a guest clock 5 s behind
-  const int64_t ahead = now + 60000;                                // or a minute ahead
+  const int64_t ahead = now + 60000;                               // or a minute ahead
 
   // Wall clock is not judged: skewed Downs are injected.
   coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 1, skewed));
@@ -1213,7 +1231,8 @@ void CoordinatorTests::keyReceive_ignoresWallClockAndDropsDuplicateSeq()
   // The sender's core restarted (hello): its counter starts over.
   coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 1, now));
   QCOMPARE(drain(), 0);
-  const auto hello = protocol::decode(protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "tiny11", "test-token"));
+  const auto hello =
+      protocol::decode(protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "tiny11", "test-token"));
   coordinator.onMessage(hello, [](const std::string &) {});
   coordinator.handleKeyForwardMessage(key("tiny11", Message::KeyPhase::Down, 1, now));
   QCOMPARE(drain(), 1);
@@ -1387,16 +1406,12 @@ void CoordinatorTests::rescue_discardsQueuedKeysAndResyncsLedger()
   // lane thread: each is withdrawn after its grace and reported local).
   for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
     coordinator.onLocalKeyDown(kKeyEscape, 0);
-    QCOMPARE(
-        coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Local
-    );
+    QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Local);
   }
   // S6: the fifth is Swallowed -- consumed, NOT reported as forwarded, so
   // the hook records it Local and its Up never chases a hold on the peer.
   coordinator.onLocalKeyDown(kKeyEscape, 0);
-  QCOMPARE(
-      coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Swallowed
-  );
+  QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Swallowed);
   // Nothing fires on the press: the burst is decided once it has ended,
   // and only then is every forwarded hold re-labelled Local for the restart.
   QCOMPARE(relayPtr->resyncs.load(), 0);

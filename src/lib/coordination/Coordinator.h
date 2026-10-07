@@ -235,6 +235,9 @@ private:
   KeyForwardResult
   sendKeyForward(Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
   void requestLocalCoreRestart();
+  //! Stop the relay (flushing forwarded holds to the key lane) and forget
+  //! the lane: nothing forwarded is held anywhere any more.
+  void stopKeyboardRelay();
   //! Stop this seat (m_localStopAllHook in tests, else the process-wide
   //! executor); guarded so it runs at most once per process. The guard is
   //! released when no executor could be started, so a later burst retries.

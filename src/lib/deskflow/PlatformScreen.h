@@ -64,6 +64,7 @@ public:
   void setToggleState(KeyModifierMask toggle, bool on) override;
   void sanitizeInjectedKeys() override;
   void releaseInjectedKeys(KeyModifierMask keep = 0) override;
+  KeyModifierMask releaseGhostModifiers(KeyModifierMask candidates) override;
 
   // IPlatformScreen overrides
   void enable() override = 0;

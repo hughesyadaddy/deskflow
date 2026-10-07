@@ -193,6 +193,25 @@ public:
     (void)keep;
   }
 
+  //! Release GHOST modifiers: bits the OS reports held that no keyboard is
+  //! holding.
+  /*!
+  A modifier a real key is holding carries a per-device bit in the OS flag
+  word (macOS: the NX_DEVICE left/right key masks; a physical press always
+  sets one);
+  a bit left behind by a synthetic press whose release the OS dropped has
+  only the generic bit. That is a structural distinction, not a timing
+  one, so unlike a freshness sweep this cannot touch a modifier the user is
+  physically holding at THIS keyboard however long the hold. Only the bits
+  in \p candidates are examined; the released bits are returned. The
+  default (platforms without such a signal) releases nothing.
+  */
+  virtual KeyModifierMask releaseGhostModifiers(KeyModifierMask candidates)
+  {
+    (void)candidates;
+    return 0;
+  }
+
   //! Fake ctrl+alt+del
   /*!
   Synthesize a press of ctrl+alt+del.  Return true if processing is

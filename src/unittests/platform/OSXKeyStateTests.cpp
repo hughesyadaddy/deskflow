@@ -6,8 +6,8 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 
-#include <QtCore/qglobal.h>
 #include "OSXKeyStateTests.h"
+#include <QtCore/qglobal.h>
 
 #include "base/EventQueue.h"
 
@@ -537,6 +537,106 @@ void OSXKeyStateTests::sanitizeLeavesOsCapsLockAlone()
   keyState.sanitizeInjectedKeys();
   QVERIFY(os.posted.empty());
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskAlphaShift));
+}
+
+void OSXKeyStateTests::ghostReleaseClearsGenericOnlyModifier()
+{
+  // The 2026-10-07 shape: Cmd re-asserted on enter, its Up posted on leave
+  // (ledger empty), yet the OS still reports the generic Cmd bit with NO
+  // device bit -- 0x20100000 in the log. Nothing in the ledger, nothing
+  // fresh: only the device-bit signal can act, and it does.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskCommand;
+  QVERIFY(keyState.injectedModifiers().empty());
+
+  // The ledger-only release has nothing to do ...
+  keyState.releaseInjectedKeys();
+  QVERIFY(os.posted.empty());
+  // ... the ghost release posts exactly one Cmd Up whose flag word drops
+  // the generic bit, and reports what it released.
+  QCOMPARE(keyState.releaseGhostModifiers(KeyModifierSuper | KeyModifierAlt), KeyModifierMask(KeyModifierSuper));
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(os.posted[0].virtualKey, uint8_t(kVK_Command));
+  QVERIFY(!os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskCommand) == 0);
+  QVERIFY((os.osFlags & kCGEventFlagMaskCommand) == 0);
+  QVERIFY((keyState.getModifierStateAsOSXFlags() & kCGEventFlagMaskCommand) == 0);
+
+  // Several ghosts at once (0x200c0000 in the log): each gets its own Up.
+  os.posted.clear();
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate;
+  QCOMPARE(
+      keyState.releaseGhostModifiers(KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper),
+      KeyModifierMask(KeyModifierControl | KeyModifierAlt)
+  );
+  QCOMPARE(os.posted.size(), size_t(2));
+  QCOMPARE(os.osFlags & (kCGEventFlagMaskControl | kCGEventFlagMaskAlternate), CGEventFlags(0));
+
+  // A ghost that was ALSO still ledgered (the restore-around-key case) is
+  // closed in the ledger too.
+  os.posted.clear();
+  keyState.fakeKey(stroke(kVK_Option, true));
+  QVERIFY(keyState.injectedModifiers().count(kVK_Option) == 1);
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskAlternate; // the OS dropped our device bit
+  QCOMPARE(keyState.releaseGhostModifiers(KeyModifierAlt), KeyModifierMask(KeyModifierAlt));
+  QVERIFY(keyState.injectedModifiers().empty());
+}
+
+void OSXKeyStateTests::ghostReleaseLeavesDeviceBackedModifierAlone()
+{
+  // A modifier any keyboard is holding (this machine's own, or a virtual
+  // HID device) carries its device bit -- 0x100008, 0xc0021, 0x40001 in
+  // the log -- and is never released, however long it has been held and
+  // whatever the ledger or the freshness clock say.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  const CGEventFlags everyCandidate = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
+
+  os.osFlags = kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK;
+  QCOMPARE(keyState.releaseGhostModifiers(everyCandidate), KeyModifierMask(0));
+  os.osFlags = kCGEventFlagMaskCommand | NX_DEVICERCMDKEYMASK;
+  QCOMPARE(keyState.releaseGhostModifiers(everyCandidate), KeyModifierMask(0));
+  os.osFlags = kCGEventFlagMaskControl | kCGEventFlagMaskAlternate | NX_DEVICELCTLKEYMASK | NX_DEVICELALTKEYMASK;
+  QCOMPARE(keyState.releaseGhostModifiers(everyCandidate), KeyModifierMask(0));
+  // Mixed: the device-backed Ctrl stays, the ghost Alt goes.
+  os.osFlags =
+      kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK | kCGEventFlagMaskAlternate;
+  QCOMPARE(keyState.releaseGhostModifiers(everyCandidate), KeyModifierMask(KeyModifierAlt));
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(os.posted[0].virtualKey, uint8_t(kVK_Option));
+  QVERIFY((os.osFlags & kCGEventFlagMaskControl) != 0);
+  QVERIFY((os.osFlags & NX_DEVICELCTLKEYMASK) != 0);
+  QVERIFY((os.osFlags & kCGEventFlagMaskAlternate) == 0);
+}
+
+void OSXKeyStateTests::ghostReleaseExaminesOnlyCandidates()
+{
+  // The verifier offers only the bits the server's mask disagreed with
+  // (and leave offers what the OS holds): a bit outside the candidate set
+  // is never touched, nor is a lock bit, nor a bit the OS reports up.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  os.osFlags =
+      kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskShift | kCGEventFlagMaskCommand | kCGEventFlagMaskAlphaShift;
+  QCOMPARE(keyState.releaseGhostModifiers(KeyModifierShift | KeyModifierCapsLock), KeyModifierMask(KeyModifierShift));
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(os.posted[0].virtualKey, uint8_t(kVK_Shift));
+  QVERIFY((os.osFlags & kCGEventFlagMaskCommand) != 0);    // not offered: untouched
+  QVERIFY((os.osFlags & kCGEventFlagMaskAlphaShift) != 0); // lock state: never a ghost
+  QCOMPARE(keyState.releaseGhostModifiers(0), KeyModifierMask(0));
+  os.osFlags = kCGEventFlagMaskNonCoalesced;
+  QCOMPARE(keyState.releaseGhostModifiers(KeyModifierShift | KeyModifierSuper), KeyModifierMask(0));
+  QCOMPARE(os.posted.size(), size_t(1));
 }
 
 void OSXKeyStateTests::releaseInjectedKeysLeavesPhysicallyHeldModifierAlone()

@@ -10,16 +10,16 @@
 #include "base/EventQueue.h"
 #include "base/EventTypes.h"
 #include "base/Log.h"
+#include "common/ExitCodes.h"
 #include "common/FleetCursor.h"
+#include "common/VersionInfo.h"
 #include "coordination/CoordinationEvents.h"
 #include "coordination/CoordinationProtocol.h"
 #include "coordination/FleetStateMerge.h"
 #include "coordination/KeyboardRescue.h"
-#include "common/ExitCodes.h"
 #include "coordination/KeyboardRouter.h"
 #include "coordination/RelayKeyEvent.h"
 #include "coordination/WakeOnLan.h"
-#include "common/VersionInfo.h"
 
 #include <algorithm>
 #include <cctype>
@@ -456,8 +456,8 @@ void Coordinator::handleHelloMessage(const Message &message, const std::function
   // differently, so unlike meshVersion there is no early return here.
   if (!message.buildVersion.empty() && message.buildVersion != kVersionGitSha) {
     LOG_WARN(
-        "coordination: peer \"%s\" is on a different build (%s, we are %s) -- redeploy to match",
-        peerName.c_str(), message.buildVersion.c_str(), kVersionGitSha
+        "coordination: peer \"%s\" is on a different build (%s, we are %s) -- redeploy to match", peerName.c_str(),
+        message.buildVersion.c_str(), kVersionGitSha
     );
   }
   reply(protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token, kVersionGitSha));
@@ -601,7 +601,7 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
       m_loggedKeyForwardReceive = false;
     }
     LOG_DEBUG("coordination: keyboard follow-cursor disabled; relay not started");
-    m_keyboardRelay->stop();
+    stopKeyboardRelay();
     return;
   }
   if (role == Role::Client) {
@@ -638,7 +638,7 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
     m_escTapRescue.reset();
   }
   // Server epoch: keyboard uses Server::onKeyDown → m_active (not key relay).
-  m_keyboardRelay->stop();
+  stopKeyboardRelay();
 }
 
 void Coordinator::onMessage(const Message &message, const std::function<void(const std::string &)> &reply)
@@ -947,6 +947,23 @@ void Coordinator::onPeerLaneFailed(const std::string &peerName)
   // Peer side: one sticky clear-all, delivered on the first attempt that
   // succeeds, however long the backoff runs.
   lane->postSticky(line);
+  // Nothing forwarded is held on the peer any more: forget the lane until
+  // the next key actually goes there. Without this, every later outage of
+  // the lane re-fired this resync for keys that were never sent (1,482
+  // no-op clear-alls in one day on 2026-10-06/07).
+  std::scoped_lock lock{m_mutex};
+  if (m_lastKeyDestination == lane) {
+    m_lastKeyDestination = nullptr;
+  }
+}
+
+void Coordinator::stopKeyboardRelay()
+{
+  // stop() flushes the forwarded holds' Ups to m_lastKeyDestination (the
+  // release sink); only then is the lane forgotten.
+  m_keyboardRelay->stop();
+  std::scoped_lock lock{m_mutex};
+  m_lastKeyDestination = nullptr;
 }
 
 void Coordinator::postForwardedReleases(const std::vector<KeyButton> &buttons)
@@ -962,10 +979,12 @@ void Coordinator::postForwardedReleases(const std::vector<KeyButton> &buttons)
     lines.reserve(buttons.size());
     for (const KeyButton button : buttons) {
       // No sentAt stamp: a release is never stale (see handleKeyForwardMessage).
-      lines.push_back(protocol::encodeKey(
-          m_config.selfName, Message::KeyPhase::Up, static_cast<uint16_t>(kKeyNone), 0, button, {}, m_config.token,
-          ++m_keySeq, 0
-      ));
+      lines.push_back(
+          protocol::encodeKey(
+              m_config.selfName, Message::KeyPhase::Up, static_cast<uint16_t>(kKeyNone), 0, button, {}, m_config.token,
+              ++m_keySeq, 0
+          )
+      );
     }
   }
   for (auto &line : lines) {
@@ -1201,8 +1220,8 @@ void Coordinator::noteHelloReply(const std::string &peerName, const std::string 
   // Logged with the CONFIGURED name and the numeric host only: the wire
   // name is untrusted input.
   LOG_WARN(
-      "coordination: %s answered our hello for peer \"%s\" as a different seat -- dropping that address",
-      host.c_str(), peerName.c_str()
+      "coordination: %s answered our hello for peer \"%s\" as a different seat -- dropping that address", host.c_str(),
+      peerName.c_str()
   );
   m_addressBook.evict(peerName, host);
 }
@@ -1491,7 +1510,7 @@ void Coordinator::workerLoop()
         updateKeyboardRelayForRole(Role::Client);
       } else if (running == Role::Server && m_keyboardRelay->running()) {
         LOG_WARN("coordination: keyboard relay still running in server epoch; stopping");
-        m_keyboardRelay->stop();
+        stopKeyboardRelay();
       }
     }
 
@@ -1503,7 +1522,8 @@ void Coordinator::workerLoop()
 
 void Coordinator::probePeerMeshVersions()
 {
-  const std::string hello = protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token, kVersionGitSha);
+  const std::string hello =
+      protocol::encodeHello(kMeshProtocolVersion, m_config.selfName, m_config.token, kVersionGitSha);
   for (auto &[name, outbox] : m_outboxes) {
     // The reply handler runs on the lane thread; unreachable peers never
     // reply and keep whatever mismatch state they had.

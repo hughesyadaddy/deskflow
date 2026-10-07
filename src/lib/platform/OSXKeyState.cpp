@@ -331,9 +331,7 @@ KeyButton OSXKeyState::mapKeyFromEvent(KeyIDs &ids, KeyModifierMask *maskOut, CG
     if (!currentKeyboardLayout) {
       return nullptr;
     }
-    CFDataRef ref = (CFDataRef)TISGetInputSourceProperty(
-        currentKeyboardLayout.get(), kTISPropertyUnicodeKeyLayoutData
-    );
+    CFDataRef ref = (CFDataRef)TISGetInputSourceProperty(currentKeyboardLayout.get(), kTISPropertyUnicodeKeyLayoutData);
     if (ref) {
       CFRetain(ref);
     }
@@ -502,7 +500,9 @@ int32_t OSXKeyState::pollActiveGroup() const
     return const_cast<OSXKeyState *>(this)->updateActiveGroupCache();
   }
   auto *self = const_cast<OSXKeyState *>(this);
-  dispatch_async(dispatch_get_main_queue(), ^{ self->updateActiveGroupCache(); });
+  dispatch_async(dispatch_get_main_queue(), ^{
+    self->updateActiveGroupCache();
+  });
   return m_activeGroupCache.load(std::memory_order_relaxed);
 }
 
@@ -1000,6 +1000,67 @@ void OSXKeyState::releaseInjectedKeys(KeyModifierMask keep)
   }
   reseedShadowFlagsFromOS();
   releaseLedgeredModifiers(osModifierFlags(), keepFlags);
+}
+
+KeyModifierMask OSXKeyState::releaseGhostModifiers(KeyModifierMask candidates)
+{
+  // Incident 2026-10-07 (macbookpro as client): a modifier re-asserted on
+  // enter, or pressed by the server's relayed Down, stayed held in the OS
+  // after its Up was posted (IOHIDPostEvent returned KERN_SUCCESS; no
+  // "fail to post"); every later key then re-pressed it through KeyMap's
+  // modifier restore, so it survived until the next leave -- minutes of a
+  // "hung" Cmd/Alt/Ctrl. Every such flag word in the logs had the generic
+  // bit and NO device bit (0x20100000, 0x20080000, 0x20040000,
+  // 0x20020000), while every physical press on the same machine carried
+  // one (0x100008, 0xc0021, 0x40001). That device bit is the signal the
+  // 2026-09-29 force-release attempts lacked.
+  struct Candidate
+  {
+    KeyModifierMask bit;
+    uint8_t virtualKey;
+    CGEventFlags generic;
+  };
+  static const Candidate kCandidates[] = {
+      {KeyModifierShift, s_shiftVK, kCGEventFlagMaskShift},
+      {KeyModifierControl, s_controlVK, kCGEventFlagMaskControl},
+      {KeyModifierAlt, s_altVK, kCGEventFlagMaskAlternate},
+      {KeyModifierSuper, s_superVK, kCGEventFlagMaskCommand},
+  };
+  KeyModifierMask released = 0;
+  for (const auto &candidate : kCandidates) {
+    if ((candidates & candidate.bit) == 0) {
+      continue;
+    }
+    const CGEventFlags os = osModifierFlags();
+    if ((os & candidate.generic) == 0) {
+      continue; // not held at all
+    }
+    const CGEventFlags deviceBits =
+        leftDeviceBitForVirtualKey(candidate.virtualKey) | rightDeviceBitForVirtualKey(candidate.virtualKey);
+    if ((os & deviceBits) != 0) {
+      // A keyboard (this machine's own, or a virtual HID device) is
+      // holding it: a real hold, never ours to release here.
+      LOG_DEBUG(
+          "modifier 0x%02x held with device bits (os 0x%llx); not a ghost", candidate.virtualKey,
+          static_cast<unsigned long long>(os)
+      );
+      continue;
+    }
+    setKeyboardModifiers(candidate.virtualKey, false);
+    if (postHIDVirtualKey(candidate.virtualKey, false) != KERN_SUCCESS) {
+      postKeyboardKey(candidate.virtualKey, false);
+    }
+    m_injectedModifiers.erase(candidate.virtualKey);
+    released |= candidate.bit;
+    LOG_INFO(
+        "released ghost modifier 0x%02x (os flags 0x%llx carried no device bit)", candidate.virtualKey,
+        static_cast<unsigned long long>(os)
+    );
+  }
+  if (released != 0) {
+    reseedShadowFlagsFromOS();
+  }
+  return released;
 }
 
 void OSXKeyState::sanitizeInjectedKeys()

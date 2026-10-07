@@ -77,7 +77,7 @@ bool PeerAddressBook::usableAddress(const std::string &address, std::string *can
   const bool unspecified = host == 0;
   const bool loopback = (host >> 24) == 127;
   const bool linkLocal = (host >> 16) == 0xa9fe; // 169.254/16
-  const bool multicast = (host >> 28) == 0xe; // 224/4
+  const bool multicast = (host >> 28) == 0xe;    // 224/4
   const bool broadcast = host == 0xffffffffU;
   if (unspecified || loopback || linkLocal || multicast || broadcast) {
     return false;
