@@ -1156,9 +1156,8 @@ void CoordinatorTests::coordinator_unresolvedLaneRequestsEarlyResolve()
       },
       12000
   ));
-  QCOMPARE(lane->state(), PeerOutbox::State::Backoff);
   // ... and the change woke the lane: the next hello goes out within a
-  // second instead of at the end of a 16 s window.
+  // second instead of at the end of a 16 s window (it may already have).
   QVERIFY(waitFor([lane] { return lane->state() == PeerOutbox::State::Reachable || lane->idle(); }, 2000));
   coordinator.stop();
 
