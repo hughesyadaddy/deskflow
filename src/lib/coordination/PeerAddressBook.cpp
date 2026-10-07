@@ -247,8 +247,12 @@ std::string PeerAddressBook::lanCandidate(const std::string &peerName) const
     return entry->lanLiteral;
   }
   if (const auto found = m_shared->resolved.find(entry->lanName);
-      !entry->lanName.empty() && found != m_shared->resolved.end() && !found->second.empty()) {
-    return found->second.front();
+      !entry->lanName.empty() && found != m_shared->resolved.end()) {
+    for (const auto &address : found->second) {
+      if (!entry->denied.contains(address)) {
+        return address; // the LAN probe never targets a denied address
+      }
+    }
   }
   return {};
 }
@@ -320,7 +324,18 @@ void PeerAddressBook::evict(const std::string &peerName, const std::string &addr
     return;
   }
   bool changed = !entry->denied.contains(canonical);
-  entry->denied[canonical] = now;
+  auto &denial = entry->denied[canonical];
+  denial.at = now;
+  for (const auto *name : {&entry->lanName, &entry->ipName}) {
+    if (name->empty()) {
+      continue;
+    }
+    if (const auto found = m_shared->resolved.find(*name); found != m_shared->resolved.end()) {
+      if (std::find(found->second.begin(), found->second.end(), canonical) != found->second.end()) {
+        denial.names.insert(*name);
+      }
+    }
+  }
   if (entry->lastAnswered == canonical) {
     entry->lastAnswered.clear();
     changed = true;
@@ -363,7 +378,7 @@ void PeerAddressBook::expireDeniedLocked(Shared &shared, double now)
 {
   for (auto &[peerName, entry] : shared.entries) {
     for (auto it = entry.denied.begin(); it != entry.denied.end();) {
-      it = (now - it->second >= kDeniedS) ? entry.denied.erase(it) : std::next(it);
+      it = (now - it->second.at >= kDeniedS) ? entry.denied.erase(it) : std::next(it);
     }
   }
 }
@@ -414,15 +429,24 @@ void PeerAddressBook::storeResolvedLocked(Shared &shared, const std::string &hos
     }
     return;
   }
-  // A denial is lifted once this name stops resolving to the address (the
-  // stale record was corrected); while it keeps coming back it stays out.
+  // A denial is lifted once EVERY name that was resolving to the address
+  // stops returning it (the stale record was corrected); a resolve of a
+  // name that never held it says nothing. Denials with no source name
+  // (learned/answered-only origin) expire by time alone.
   for (auto &[peerName, entry] : shared.entries) {
     if (entry.lanName != host && entry.ipName != host) {
       continue;
     }
     for (auto it = entry.denied.begin(); it != entry.denied.end();) {
-      it =
-          (std::find(usable.begin(), usable.end(), it->first) == usable.end()) ? entry.denied.erase(it) : std::next(it);
+      auto &denial = it->second;
+      const bool stillReturned = std::find(usable.begin(), usable.end(), it->first) != usable.end();
+      if (stillReturned) {
+        denial.names.insert(host);
+        ++it;
+        continue;
+      }
+      const bool wasFromThisName = denial.names.erase(host) > 0;
+      it = (wasFromThisName && denial.names.empty()) ? entry.denied.erase(it) : std::next(it);
     }
   }
   if (slot == usable) {

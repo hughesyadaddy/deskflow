@@ -82,6 +82,7 @@ private Q_SLOTS:
   void addressBook_evictionSurvivesStaleResolve();
   void outbox_wakeIsRateLimitedAndRememberedWhileInFlight();
   void coordinator_unresolvedLaneRequestsEarlyResolve();
+  void keyForward_onlyASentKeyMarksTheLane();
   void protocol_keyCarriesSeqAndSentAt();
   void protocol_keyClearAllRoundTrips();
   void keyReceive_ignoresWallClockAndDropsDuplicateSeq();
@@ -845,10 +846,10 @@ void CoordinatorTests::addressBook_learnAppendsAnswerPromotesEvictDrops()
   // from every tier, a configured literal is only reported.
   book.noteAnswered("mac", "192.168.1.145");
   QCOMPARE(book.candidates("mac").front(), std::string("192.168.1.145"));
-  book.evict("mac", "192.168.1.145");
-  book.evict("mac", "192.168.1.16");
+  book.evict("mac", "192.168.1.145", 1.0);
+  book.evict("mac", "192.168.1.16", 1.0);
   QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5", "192.168.1.144"}));
-  book.evict("mac", "100.64.0.5");
+  book.evict("mac", "100.64.0.5", 1.0);
   QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5", "192.168.1.144"}));
   // Unknown peers and stop() are inert.
   book.learn("ghost", "10.0.0.1");
@@ -1066,6 +1067,26 @@ void CoordinatorTests::addressBook_evictionSurvivesStaleResolve()
   QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5"}));
   book.refreshNow(100.0 + PeerAddressBook::kDeniedS);
   QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5"}));
+
+  // The incident's own shape, TWO names: the stale LAN name keeps returning
+  // the old address while the Tailscale name resolves to something else.
+  // A resolve of the other name must not lift the denial (round-2 review).
+  std::map<std::string, std::vector<std::string>> dns{{"mac.local", {"192.168.1.16"}}, {"mac.ts.net", {"100.64.0.5"}}};
+  PeerAddressBook two(deskflow::coordination::parsePeerList("mac=mac.ts.net|mac.local"), [&dns](const std::string &h) {
+    return dns[h];
+  });
+  two.refreshNow(0.0);
+  QCOMPARE(two.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5"}));
+  two.evict("mac", "192.168.1.16", 10.0);
+  QCOMPARE(two.lanCandidate("mac"), std::string()); // the LAN probe never targets a denied address
+  for (int i = 0; i < 3; ++i) {
+    two.refreshNow(11.0 + i); // both names re-resolve, in whatever order: stays out
+    QCOMPARE(two.candidates("mac"), (std::vector<std::string>{"100.64.0.5"}));
+  }
+  dns["mac.local"] = {"192.168.1.143"}; // record corrected: lifted by the name that held it
+  two.refreshNow(20.0);
+  QCOMPARE(two.candidates("mac"), (std::vector<std::string>{"192.168.1.143", "100.64.0.5"}));
+  QCOMPARE(two.lanCandidate("mac"), std::string("192.168.1.143"));
 }
 
 void CoordinatorTests::outbox_wakeIsRateLimitedAndRememberedWhileInFlight()
@@ -1133,7 +1154,8 @@ void CoordinatorTests::coordinator_unresolvedLaneRequestsEarlyResolve()
   config.meshPort = 0;
   config.peers = deskflow::coordination::parsePeerList("macbookpro=macbookpro.local");
   config.addressResolver = [recovered](const std::string &) {
-    return recovered->load() ? std::vector<std::string>{"192.168.1.143"} : std::vector<std::string>{};
+    // A black hole: this test must never reach a real seat on the LAN.
+    return recovered->load() ? std::vector<std::string>{kBlackholeA} : std::vector<std::string>{};
   };
   EventQueue events;
   Coordinator coordinator(config);
@@ -1152,13 +1174,16 @@ void CoordinatorTests::coordinator_unresolvedLaneRequestsEarlyResolve()
   recovered->store(true);
   QVERIFY(waitFor(
       [&coordinator] {
-        return coordinator.m_addressBook.candidates("macbookpro") == std::vector<std::string>{"192.168.1.143"};
+        return coordinator.m_addressBook.candidates("macbookpro") == std::vector<std::string>{kBlackholeA};
       },
       12000
   ));
-  // ... and the change woke the lane: the next hello goes out within a
-  // second instead of at the end of a 16 s window (it may already have).
-  QVERIFY(waitFor([lane] { return lane->state() == PeerOutbox::State::Reachable || lane->idle(); }, 2000));
+  QCOMPARE(lane->state(), PeerOutbox::State::Backoff);
+  // ... and the change woke the lane: a real connect (to the black hole)
+  // starts within a second instead of at the end of a 16 s window.
+  const auto unresolvedBefore = lane->unresolvedAttempts();
+  QVERIFY(waitFor([lane] { return lane->nextAttemptAt() == 0.0 || !lane->idle(); }, 1500));
+  QCOMPARE(lane->unresolvedAttempts(), unresolvedBefore); // no more synthetic failures
   coordinator.stop();
 
   // The same mechanism, deterministically, at the book/lane level.
@@ -1168,7 +1193,9 @@ void CoordinatorTests::coordinator_unresolvedLaneRequestsEarlyResolve()
   bool dnsUp = false;
   deskflow::coordination::PeerAddressBook book(
       deskflow::coordination::parsePeerList("mac=mac.local"),
-      [&dnsUp](const std::string &) { return dnsUp ? std::vector<std::string>{"192.168.1.143"} : std::vector<std::string>{}; }
+      [&dnsUp](const std::string &) {
+        return dnsUp ? std::vector<std::string>{"192.168.1.143"} : std::vector<std::string>{};
+      }
   );
   PeerOutbox outbox("mac", [&book] { return book.candidates("mac"); }, transport.fn(), clock.fn());
   outbox.setAddressSink([&book, &clock](const std::string &, bool ok) {
@@ -1193,6 +1220,49 @@ void CoordinatorTests::coordinator_unresolvedLaneRequestsEarlyResolve()
   outbox.pump(clock.now);
   QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
   book.stop();
+}
+
+void CoordinatorTests::keyForward_onlyASentKeyMarksTheLane()
+{
+  // Positive half of the "only a sent key marks the lane" rule: a key that
+  // reaches the peer (here our own loopback listener, as in the fleet
+  // publish tests) returns Forwarded and the lane becomes the resync
+  // target; a later lane failure then resyncs once.
+  using deskflow::coordination::Role;
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.token = "test-token";
+  config.peers = deskflow::coordination::parsePeerList("hackintosh=127.0.0.1");
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  auto relay = std::make_unique<FakeKeyboardRelay>();
+  auto *relayPtr = relay.get();
+  coordinator.m_keyboardRelay = std::move(relay);
+  QVERIFY(coordinator.start());
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_election.becameClient("127.0.0.1");
+    coordinator.m_fleetState.cursorHost = "hackintosh";
+  }
+  coordinator.setRunningRole(Role::Client);
+  auto *lane = coordinator.outboxByName("hackintosh");
+  QVERIFY(lane != nullptr);
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_lastKeyDestination == nullptr);
+  }
+  QCOMPARE(
+      coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"), KeyForwardResult::Forwarded
+  );
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_lastKeyDestination == lane);
+  }
+  coordinator.onPeerLaneFailed("hackintosh");
+  QCOMPARE(relayPtr->resyncs.load(), 1);
+  coordinator.stop();
 }
 
 void CoordinatorTests::heartbeat_doesNotBlockOnUnreachablePeers()

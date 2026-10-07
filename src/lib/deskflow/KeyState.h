@@ -84,7 +84,10 @@ protected:
   //! the next mapKey() does not synthesise an Up and a restore Down for a
   //! modifier that is no longer held -- the restore is exactly what
   //! re-pressed a ghost modifier on every key (2026-10-07).
-  void reseedModifierState();
+  //! \p forceOff: bits just released whose OS flag may lag the post
+  //! (IOHIDPostEvent adopts asynchronously); they are masked out of the
+  //! reseeded state so the lag cannot hand the ghost straight back.
+  void reseedModifierState(KeyModifierMask forceOff = 0);
 
   using Keystroke = deskflow::KeyMap::Keystroke;
 

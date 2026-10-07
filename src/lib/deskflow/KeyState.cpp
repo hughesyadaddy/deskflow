@@ -993,10 +993,10 @@ void KeyState::fakeAllKeysUp()
   reseedModifierState();
 }
 
-void KeyState::reseedModifierState()
+void KeyState::reseedModifierState(KeyModifierMask forceOff)
 {
   m_activeModifiers.clear();
-  m_mask = pollActiveModifiers();
+  m_mask = pollActiveModifiers() & ~forceOff;
   // Rebuild the modifier -> key-item table from the reseeded mask, exactly
   // as updateKeyState does (K4 audit B-2): a modifier the OS reports held
   // (the user's own Shift, or one we injected before a resync) needs a key

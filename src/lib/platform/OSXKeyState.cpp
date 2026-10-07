@@ -1077,9 +1077,17 @@ KeyModifierMask OSXKeyState::releaseGhostModifiers(KeyModifierMask candidates)
     // post composes against, and the base class's m_mask/m_activeModifiers
     // that mapKey() consults -- a stale entry there makes the next plain
     // key emit an Up plus a restore Down for the ghost, re-pressing it
-    // with a device bit this time (review finding, 2026-10-07).
+    // with a device bit this time (review finding, 2026-10-07). The OS
+    // adopts a HID post asynchronously (see m_pendingReleases), so neither
+    // reseed may trust a read that can still carry the ghost: the released
+    // bits are forced off in both.
     reseedShadowFlagsFromOS();
-    reseedModifierState();
+    for (const auto &candidate : kCandidates) {
+      if ((released & candidate.bit) != 0) {
+        setKeyboardModifiers(candidate.virtualKey, false);
+      }
+    }
+    reseedModifierState(released);
   }
   return released;
 }

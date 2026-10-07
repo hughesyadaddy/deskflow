@@ -102,7 +102,7 @@ public:
   //! keep it out (see Entry::denied) so the stale DNS record that produced
   //! it cannot put it straight back on the next refresh. \p now = monotonic
   //! seconds (the denial expires after kDeniedS).
-  void evict(const std::string &peerName, const std::string &address, double now = 0.0);
+  void evict(const std::string &peerName, const std::string &address, double now);
 
   //! A command from an unknown address was dropped / a lane failed:
   //! schedule an early refresh of the names (rate-limited).
@@ -135,10 +135,16 @@ private:
     std::string ipName;
     std::string lastAnswered;
     std::deque<std::string> learned; //!< newest first
-    //! Addresses that answered as another seat (evict()), with the time
-    //! of eviction: filtered out of every tier until a resolve of one of
-    //! this peer's names no longer returns them, or kDeniedS elapses.
-    std::map<std::string, double> denied;
+    //! An address that answered as another seat (evict()): filtered out of
+    //! every tier until every configured NAME that was resolving to it
+    //! stops returning it (a resolve of some other name says nothing about
+    //! the stale record), or kDeniedS elapses.
+    struct Denial
+    {
+      double at = 0.0;
+      std::set<std::string> names; //!< names whose resolved slot held it
+    };
+    std::map<std::string, Denial> denied;
   };
   struct Shared
   {

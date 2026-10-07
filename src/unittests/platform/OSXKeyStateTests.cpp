@@ -596,6 +596,25 @@ void OSXKeyStateTests::ghostReleaseClearsGenericOnlyModifier()
   QCOMPARE(keyState.releaseGhostModifiers(KeyModifierSuper), KeyModifierMask(KeyModifierSuper));
   QVERIFY((keyState.getActiveModifiers() & KeyModifierSuper) == 0);
   QVERIFY((keyState.pollActiveModifiers() & KeyModifierSuper) == 0);
+
+  // Round-2 review: the OS adopts the post asynchronously. With a LAGGING
+  // OS (the posted word never lands before the next read) the reseed must
+  // still not hand the ghost back to the base mask or the shadow.
+  HookedState lagging;
+  OSXKeyState::Hooks lagHooks = lagging.hooks();
+  lagHooks.postHIDKey = [&lagging](uint8_t vk, bool down, CGEventFlags flags) {
+    lagging.posted.push_back({vk, down, flags});
+    return KERN_SUCCESS; // osFlags deliberately untouched
+  };
+  InjectingKeyState lagged(&eventQueue, keyMap, {"en"}, true);
+  lagged.setHooks(lagHooks);
+  lagging.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskCommand;
+  lagged.updateKeyState();
+  QVERIFY((lagged.getActiveModifiers() & KeyModifierSuper) != 0);
+  QCOMPARE(lagged.releaseGhostModifiers(KeyModifierSuper), KeyModifierMask(KeyModifierSuper));
+  QVERIFY((lagged.getActiveModifiers() & KeyModifierSuper) == 0);
+  QVERIFY((lagged.getModifierStateAsOSXFlags() & kCGEventFlagMaskCommand) == 0);
+  QCOMPARE(lagging.posted.size(), size_t(1)); // under the hook, no CGEvent retry
 }
 
 void OSXKeyStateTests::ghostReleaseLeavesDeviceBackedModifierAlone()
