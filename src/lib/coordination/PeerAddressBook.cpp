@@ -74,7 +74,7 @@ bool PeerAddressBook::usableAddress(const std::string &address, std::string *can
     return false;
   }
   const uint32_t host = ntohl(v4.s_addr);
-  const bool unspecified = host == 0;
+  const bool unspecified = (host >> 24) == 0; // 0.0.0.0/8
   const bool loopback = (host >> 24) == 127;
   const bool linkLocal = (host >> 16) == 0xa9fe; // 169.254/16
   const bool multicast = (host >> 28) == 0xe;    // 224/4
@@ -138,11 +138,11 @@ PeerAddressBook::PeerAddressBook(const PeerList &peers, Resolver resolver) : m_s
       // Resolved and learned addresses go through the strict usableAddress().
       std::string canonical;
       if (parseIPv4(slot, &canonical)) {
-        if (canonical != "0.0.0.0" && canonical != "255.255.255.255" && !usableAddress(canonical) &&
-            (canonical.rfind("224.", 0) == 0 || canonical.rfind("239.", 0) == 0)) {
-          return; // multicast
-        }
-        if (canonical != "0.0.0.0" && canonical != "255.255.255.255") {
+        in_addr v4{};
+        inet_pton(AF_INET, canonical.c_str(), &v4);
+        const uint32_t host = ntohl(v4.s_addr);
+        const bool unlistenable = (host >> 24) == 0 || host == 0xffffffffU || (host >> 28) == 0xe;
+        if (!unlistenable) {
           literal = canonical;
         }
         return;
@@ -201,10 +201,15 @@ const PeerAddressBook::Entry *PeerAddressBook::entryLocked(const Shared &shared,
 std::vector<std::string> PeerAddressBook::candidatesLocked(const Shared &shared, const Entry &entry)
 {
   std::vector<std::string> out;
-  appendUnique(out, entry.lastAnswered);
+  const auto add = [&](const std::string &address) {
+    if (!entry.denied.contains(address)) {
+      appendUnique(out, address);
+    }
+  };
+  add(entry.lastAnswered);
   const auto appendTier = [&](const std::string &literal, const std::string &name) {
     if (!literal.empty()) {
-      appendUnique(out, literal);
+      appendUnique(out, literal); // the operator's word: never denied
       return;
     }
     if (name.empty()) {
@@ -212,14 +217,14 @@ std::vector<std::string> PeerAddressBook::candidatesLocked(const Shared &shared,
     }
     if (const auto found = shared.resolved.find(name); found != shared.resolved.end()) {
       for (const auto &address : found->second) {
-        appendUnique(out, address);
+        add(address);
       }
     }
   };
   appendTier(entry.lanLiteral, entry.lanName);
   appendTier(entry.ipLiteral, entry.ipName);
   for (const auto &address : entry.learned) {
-    appendUnique(out, address);
+    add(address);
   }
   return out;
 }
@@ -282,6 +287,10 @@ void PeerAddressBook::learn(const std::string &peerName, const std::string &addr
   if (entry == nullptr) {
     return;
   }
+  if (entry->denied.contains(canonical)) {
+    return; // answered as another seat recently; a token-authenticated line
+            // from it would be that other seat impersonating -- stays out
+  }
   // Already a candidate (configured, resolved, answered or learned): nothing
   // to add, and in particular no reordering -- only an answer moves an
   // address forward.
@@ -299,7 +308,7 @@ void PeerAddressBook::learn(const std::string &peerName, const std::string &addr
   }
 }
 
-void PeerAddressBook::evict(const std::string &peerName, const std::string &address)
+void PeerAddressBook::evict(const std::string &peerName, const std::string &address, double now)
 {
   std::string canonical;
   if (!parseIPv4(address, &canonical)) {
@@ -310,7 +319,8 @@ void PeerAddressBook::evict(const std::string &peerName, const std::string &addr
   if (entry == nullptr) {
     return;
   }
-  bool changed = false;
+  bool changed = !entry->denied.contains(canonical);
+  entry->denied[canonical] = now;
   if (entry->lastAnswered == canonical) {
     entry->lastAnswered.clear();
     changed = true;
@@ -338,11 +348,23 @@ void PeerAddressBook::evict(const std::string &peerName, const std::string &addr
     );
   }
   if (changed) {
-    LOG_INFO("coordination: evicted %s as a candidate address for peer \"%s\"", canonical.c_str(), entry->name.c_str());
+    LOG_INFO(
+        "coordination: evicted %s as a candidate address for peer \"%s\" (denied until a resolve stops returning it)",
+        canonical.c_str(), entry->name.c_str()
+    );
     if (m_shared->changed && !m_shared->stopped) {
       m_shared->changed(entry->name);
     }
     m_shared->refreshRequested = true; // the name may have moved: re-resolve early
+  }
+}
+
+void PeerAddressBook::expireDeniedLocked(Shared &shared, double now)
+{
+  for (auto &[peerName, entry] : shared.entries) {
+    for (auto it = entry.denied.begin(); it != entry.denied.end();) {
+      it = (now - it->second >= kDeniedS) ? entry.denied.erase(it) : std::next(it);
+    }
   }
 }
 
@@ -392,6 +414,17 @@ void PeerAddressBook::storeResolvedLocked(Shared &shared, const std::string &hos
     }
     return;
   }
+  // A denial is lifted once this name stops resolving to the address (the
+  // stale record was corrected); while it keeps coming back it stays out.
+  for (auto &[peerName, entry] : shared.entries) {
+    if (entry.lanName != host && entry.ipName != host) {
+      continue;
+    }
+    for (auto it = entry.denied.begin(); it != entry.denied.end();) {
+      it =
+          (std::find(usable.begin(), usable.end(), it->first) == usable.end()) ? entry.denied.erase(it) : std::next(it);
+    }
+  }
   if (slot == usable) {
     return;
   }
@@ -440,6 +473,7 @@ void PeerAddressBook::refreshIfDue(double now)
     }
     m_shared->refreshRequested = false;
     m_shared->lastRefreshStartedAt = now;
+    expireDeniedLocked(*m_shared, now);
     for (const auto &[peerName, entry] : m_shared->entries) {
       for (const auto *name : {&entry.lanName, &entry.ipName}) {
         if (name->empty() || m_shared->inFlight.contains(*name)) {
@@ -469,6 +503,7 @@ void PeerAddressBook::refreshNow(double now)
     }
     m_shared->refreshRequested = false;
     m_shared->lastRefreshStartedAt = now;
+    expireDeniedLocked(*m_shared, now);
     for (const auto &[peerName, entry] : m_shared->entries) {
       for (const auto *name : {&entry.lanName, &entry.ipName}) {
         if (!name->empty() && !m_shared->inFlight.contains(*name) &&

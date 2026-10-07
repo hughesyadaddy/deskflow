@@ -79,6 +79,9 @@ private Q_SLOTS:
   void coordinator_learnsSourceAddressOnlyWithToken();
   void coordinator_evictsAddressAnsweringAsAnotherSeat();
   void keyLaneFailure_nameOnlyPeerWithStalledResolverFailsFast();
+  void addressBook_evictionSurvivesStaleResolve();
+  void outbox_wakeIsRateLimitedAndRememberedWhileInFlight();
+  void coordinator_unresolvedLaneRequestsEarlyResolve();
   void protocol_keyCarriesSeqAndSentAt();
   void protocol_keyClearAllRoundTrips();
   void keyReceive_ignoresWallClockAndDropsDuplicateSeq();
@@ -1021,13 +1024,176 @@ void CoordinatorTests::keyLaneFailure_nameOnlyPeerWithStalledResolverFailsFast()
   QVERIFY(waitFor([lane] { return lane->state() == PeerOutbox::State::Backoff; }, 1500));
   QVERIFY(elapsedMs(started) < 1500.0); // no 700 ms connect was spent on a name
   QVERIFY(lane->unresolvedAttempts() > 0);
-  QVERIFY(waitFor([relayPtr] { return relayPtr->resyncs.load() > 0; }, 1000));
-  QVERIFY(!lane->idle()); // the sticky KeyClearAll waits for an address
+  QVERIFY(waitFor([lane] { return lane->idle(); }, 1000));
+  QCOMPARE(relayPtr->resyncs.load(), 0); // the key never went out: nothing held on the peer
   QCOMPARE(lane->preferredAddress(), std::string());
 
   released->store(true);
   coordinator.stop();
   QVERIFY(elapsedMs(started) < 5000.0); // stop() never joins a stalled resolver
+}
+
+void CoordinatorTests::addressBook_evictionSurvivesStaleResolve()
+{
+  using deskflow::coordination::PeerAddressBook;
+  // Stale DNS keeps returning the old address (the 192.168.1.16 record):
+  // after a hello from there named another seat, the eviction must hold
+  // across the refresh it requests, until DNS stops returning it.
+  std::vector<std::string> answer{"192.168.1.16"};
+  PeerAddressBook book(
+      deskflow::coordination::parsePeerList("mac=100.64.0.5|mac.local"),
+      [&answer](const std::string &) { return answer; }
+  );
+  book.refreshNow(0.0);
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5"}));
+  book.noteAnswered("mac", "192.168.1.16");
+  book.evict("mac", "192.168.1.16", 10.0);
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5"}));
+  book.refreshNow(11.0); // same stale answer: stays out
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5"}));
+  book.learn("mac", "192.168.1.16"); // even a token-authenticated line from it
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5"}));
+  // DNS corrected: the denial lifts with the resolve that no longer returns it.
+  answer = {"192.168.1.143"};
+  book.refreshNow(12.0);
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.143", "100.64.0.5"}));
+  answer = {"192.168.1.16"};
+  book.refreshNow(13.0);
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5"}));
+  // ... or with time, when DNS never changes.
+  book.evict("mac", "192.168.1.16", 100.0);
+  book.refreshNow(100.0 + PeerAddressBook::kDeniedS - 1.0);
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5"}));
+  book.refreshNow(100.0 + PeerAddressBook::kDeniedS);
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5"}));
+}
+
+void CoordinatorTests::outbox_wakeIsRateLimitedAndRememberedWhileInFlight()
+{
+  // A burst of candidate changes must not become a connect storm: one real
+  // connect per kBackoffMinS however often wake() is called. An
+  // unresolved attempt costs nothing, so a wake right after it is free.
+  FakeClock clock;
+  FakeTransport transport; // always fails
+  FakeBook book;
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
+  outbox.post("a");
+  outbox.pump(clock.now); // unresolved at t=0
+  book.addresses = {"10.0.0.5"};
+  outbox.wake();
+  QCOMPARE(outbox.nextAttemptAt(), 0.0);
+  outbox.post("b");
+  outbox.pump(clock.now); // real connect at t=0, fails -> window to t=1 (min delay restarted? no: 2.0)
+  QCOMPARE(transport.hosts.size(), static_cast<size_t>(1));
+  const double window = outbox.nextAttemptAt();
+  QVERIFY(window > clock.now);
+  // Wakes now cannot bring the next connect earlier than t=1 (last attempt + kBackoffMinS).
+  clock.now = 0.2;
+  book.addresses = {"10.0.0.6", "10.0.0.5"};
+  outbox.wake();
+  outbox.wake();
+  QCOMPARE(outbox.nextAttemptAt(), 1.0);
+  outbox.post("c");
+  outbox.pump(clock.now);
+  QCOMPARE(transport.hosts.size(), static_cast<size_t>(1)); // still inside the second
+  clock.now = 1.0;
+  outbox.pump(clock.now);
+  QCOMPARE(transport.hosts.size(), static_cast<size_t>(2));
+
+  // A wake during an in-flight attempt is remembered and applied when the
+  // attempt fails, instead of being overwritten by the new window.
+  FakeClock clock2;
+  FakeTransport slow;
+  std::atomic<bool> wakeDuring{false};
+  FakeBook book2({"10.0.0.7"});
+  PeerOutbox lane("peer", book2.fn(), slow.fn(), clock2.fn());
+  slow.okFor = [&](const std::string &) {
+    lane.wake(); // the book's change handler firing mid-connect
+    wakeDuring = true;
+    return false;
+  };
+  clock2.now = 50.0;
+  lane.post("x");
+  lane.pump(clock2.now);
+  QVERIFY(wakeDuring.load());
+  QCOMPARE(lane.state(), PeerOutbox::State::Backoff);
+  QCOMPARE(lane.nextAttemptAt(), 51.0); // last attempt + kBackoffMinS, not the full window
+}
+
+void CoordinatorTests::coordinator_unresolvedLaneRequestsEarlyResolve()
+{
+  // The incident's first shape: the only name fails to resolve at start.
+  // Every unresolved attempt must count as a miss so the book re-resolves
+  // within seconds (rate-limited), not at the 5 min refresh.
+  // The resolver (shared with the allowlist, so call counts are not
+  // meaningful) answers nothing until DNS "recovers".
+  auto recovered = std::make_shared<std::atomic<bool>>(false);
+  CoordinatorConfig config;
+  config.selfName = "hackintosh";
+  config.meshPort = 0;
+  config.peers = deskflow::coordination::parsePeerList("macbookpro=macbookpro.local");
+  config.addressResolver = [recovered](const std::string &) {
+    return recovered->load() ? std::vector<std::string>{"192.168.1.143"} : std::vector<std::string>{};
+  };
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  QVERIFY(coordinator.start()); // start-up resolve fails
+  auto *lane = coordinator.outboxByName("macbookpro");
+  QVERIFY(lane != nullptr);
+  QVERIFY(waitFor([lane] { return lane->unresolvedAttempts() > 0; }, 4000));
+  QVERIFY(coordinator.m_addressBook.candidates("macbookpro").empty());
+  // The unresolved attempt was reported as a miss: once the 5 s gap has
+  // passed, the next tick's refresh re-resolves (here driven by hand with
+  // a clock past the gap; a refresh still in flight is simply retried).
+  // The gap is measured on the real clock from start-up: the lane keeps
+  // reporting misses at every window (1, 2, 4 s ...), the first past the
+  // 5 s gap sets the refresh, and the worker's next 1 s tick resolves.
+  recovered->store(true);
+  QVERIFY(waitFor(
+      [&coordinator] {
+        return coordinator.m_addressBook.candidates("macbookpro") == std::vector<std::string>{"192.168.1.143"};
+      },
+      12000
+  ));
+  QCOMPARE(lane->state(), PeerOutbox::State::Backoff);
+  // ... and the change woke the lane: the next hello goes out within a
+  // second instead of at the end of a 16 s window.
+  QVERIFY(waitFor([lane] { return lane->state() == PeerOutbox::State::Reachable || lane->idle(); }, 2000));
+  coordinator.stop();
+
+  // The same mechanism, deterministically, at the book/lane level.
+  FakeClock clock;
+  FakeTransport transport;
+  transport.okFor = [](const std::string &) { return true; };
+  bool dnsUp = false;
+  deskflow::coordination::PeerAddressBook book(
+      deskflow::coordination::parsePeerList("mac=mac.local"),
+      [&dnsUp](const std::string &) { return dnsUp ? std::vector<std::string>{"192.168.1.143"} : std::vector<std::string>{}; }
+  );
+  PeerOutbox outbox("mac", [&book] { return book.candidates("mac"); }, transport.fn(), clock.fn());
+  outbox.setAddressSink([&book, &clock](const std::string &, bool ok) {
+    if (!ok) {
+      book.noteMiss(clock.now);
+    }
+  });
+  book.setChangedHandler([&outbox](const std::string &) { outbox.wake(); });
+  book.refreshNow(0.0); // start-up resolve fails
+  outbox.post("hello");
+  outbox.pump(clock.now); // unresolved -> miss inside the gap: ignored
+  book.refreshIfDue(1.0);
+  QVERIFY(book.candidates("mac").empty());
+  dnsUp = true;
+  clock.now = 6.0;
+  outbox.post("hello");
+  outbox.pump(clock.now); // unresolved -> miss past the gap: refresh requested
+  book.refreshNow(6.0);   // what the worker tick's refreshIfDue does once due
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.143"}));
+  QCOMPARE(outbox.nextAttemptAt(), 0.0); // woken
+  outbox.post("hello");
+  outbox.pump(clock.now);
+  QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
+  book.stop();
 }
 
 void CoordinatorTests::heartbeat_doesNotBlockOnUnreachablePeers()
@@ -1312,18 +1478,35 @@ void CoordinatorTests::keyLaneFailure_resyncsLedgerAndPostsStickyClearAll()
 
   // The key rides the (Unknown) lane behind the start-up hello probe, whose
   // connect times out (~700 ms): still queued when the grace runs out, the
-  // key is withdrawn (Local), and the lane fails while it was not in
-  // backoff, which is the moment the peer may be left holding forwarded
-  // keys.
+  // key is withdrawn (Local). It never went out, so the peer cannot be
+  // holding it: the lane failure that follows must NOT resync (that no-op
+  // clear-all is what fired 1,482 times on 2026-10-06/07).
   QCOMPARE(
       coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"), KeyForwardResult::Local
   );
   auto *lane = coordinator.outboxByName("hackintosh");
   QVERIFY(lane != nullptr);
   QVERIFY(waitFor([lane] { return lane->state() == PeerOutbox::State::Backoff; }, 4000));
-  QVERIFY(waitFor([relayPtr] { return relayPtr->resyncs.load() > 0; }, 1000));
+  QVERIFY(waitFor([lane] { return lane->idle(); }, 1000));
+  QCOMPARE(relayPtr->resyncs.load(), 0);
+  QVERIFY(lane->idle()); // no sticky KeyClearAll for a key that was never sent
+
+  // Now a key that DID go out (in flight past the grace counts as sent):
+  // mark the lane by hand the way a Forwarded result does, fail the lane,
+  // and the resync fires exactly once with its sticky clear-all.
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_lastKeyDestination = lane;
+  }
+  coordinator.onPeerLaneFailed("hackintosh");
   QCOMPARE(relayPtr->resyncs.load(), 1);
   QVERIFY(!lane->idle()); // the sticky KeyClearAll waits for the peer
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    QVERIFY(coordinator.m_lastKeyDestination == nullptr); // forgotten after the resync
+  }
+  coordinator.onPeerLaneFailed("hackintosh");
+  QCOMPARE(relayPtr->resyncs.load(), 1); // a second outage of the same lane: nothing to resync
 
   coordinator.stop();
   QCOMPARE(relayPtr->resyncs.load(), 1);
@@ -1364,11 +1547,23 @@ void CoordinatorTests::relayStop_forwardedHoldsAreReleasedOnTheKeyLane()
   relayPtr->stop();
   QVERIFY(lane->idle());
 
-  // A key was forwarded on this lane (the grace expires and the key is
-  // withdrawn, but the lane is now the key destination).
-  (void)coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en");
+  // A key withdrawn at the grace never went out, so it does NOT mark the
+  // lane: stop() still has nowhere to send releases.
+  QCOMPARE(
+      coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"), KeyForwardResult::Local
+  );
   lane->discardKeys();
   QVERIFY(lane->idle());
+  relayPtr->heldOnStop = {0xA0};
+  relayPtr->stop();
+  QVERIFY(lane->idle());
+
+  // A key that was actually forwarded marks the lane (what a Forwarded
+  // result does); the stop flush then goes there.
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_lastKeyDestination = lane;
+  }
   relayPtr->heldOnStop = {0xA0, 0x5B};
   relayPtr->stop();
   QVERIFY(!lane->idle()); // two Ups queued (regular class: kept across backoff)

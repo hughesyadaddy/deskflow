@@ -205,6 +205,12 @@ public:
   physically holding at THIS keyboard however long the hold. Only the bits
   in \p candidates are examined; the released bits are returned. The
   default (platforms without such a signal) releases nothing.
+
+  Accepted exposure: a modifier another PROCESS holds purely through
+  CGEventPost (a macro tool, an accessibility keyboard) has the same
+  generic-only signature and would be released at a crossing or by the
+  verifier. Mouser on this fleet relays pointer input, not held
+  modifiers; nothing else here is known to hold one across a crossing.
   */
   virtual KeyModifierMask releaseGhostModifiers(KeyModifierMask candidates)
   {

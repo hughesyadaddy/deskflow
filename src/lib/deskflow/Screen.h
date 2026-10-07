@@ -345,28 +345,27 @@ private:
 
   // Modifiers the server's enter mask said were NOT held, but our OS
   // disagreed with at the same instant: the opposite case from
-  // m_reassertedModifiers. DIAGNOSTIC ONLY (2026-09-29 review, twice): the
-  // server is the one authority on whether an ACTIVE CROSS-MACHINE hold is
-  // in progress, so a bit it explicitly denies can never be one of those --
-  // but it says nothing about a genuine LOCAL hold on THIS machine's own
-  // keyboard, which the server cannot see at all, and this codebase has no
-  // other signal (aggregate OS modifier flags plus last-hardware-edge
-  // timestamp) that can tell a stale ghost from a real hold that has simply
-  // lasted a while -- a held key emits one edge, at press, and none while
-  // held. Computed once in enterSecondary(), cleared in leaveSecondary();
-  // the post-switch verifier's only use of it is to annotate its "still
-  // down" log line (see handlePostSwitchVerifier), never to act on it. Do
-  // not wire this into a release path without a fundamentally better
-  // signal than elapsed time -- see handlePostSwitchVerifier's comment for
-  // the two prior, reverted attempts and why each failed review.
+  // m_reassertedModifiers. The server is the one authority on whether an
+  // ACTIVE CROSS-MACHINE hold is in progress, so a bit it explicitly
+  // denies can never be one of those -- but it says nothing about a
+  // genuine LOCAL hold on THIS machine's own keyboard, which the server
+  // cannot see. Two 2026-09-29 attempts to act on this with an
+  // elapsed-time gate were reverted (a held key emits one edge, at press,
+  // none while held). Since 2026-10-07 the verifier offers these bits to
+  // IKeyState::releaseGhostModifiers(), which acts on a STRUCTURAL signal
+  // instead: a modifier any keyboard holds carries a per-device bit in the
+  // OS flag word, a leftover synthetic one does not. Computed once in
+  // enterSecondary(), cleared in leaveSecondary().
   KeyModifierMask m_osDisagreeModifiers = 0;
 
   IEventQueue *m_events = nullptr;
 
   // Post-switch verifier (secondary only): a one-shot armed on enter that
   // re-reads the OS modifier state and, when something is still held that
-  // nobody typed since we entered, logs it and closes whatever the platform
-  // ledger still holds via releaseInjectedKeys() (never a freshness sweep).
+  // nobody typed since we entered, logs it, closes whatever the platform
+  // ledger still holds via releaseInjectedKeys() (never a freshness sweep)
+  // and then releases device-bit-less ghosts the server disowned via
+  // releaseGhostModifiers().
   void armPostSwitchVerifier(double delayS);
   void cancelPostSwitchVerifier();
   void handlePostSwitchVerifier();

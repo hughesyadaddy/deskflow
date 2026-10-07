@@ -159,8 +159,10 @@ public:
   //! Called on the lane thread before every attempt, never under the
   //! lane's lock.
   using Candidates = std::function<std::vector<std::string>()>;
-  //! A send to \p address completed (\p ok): the book promotes an address
-  //! that answered. Invoked on the lane thread, no lock held.
+  //! An attempt completed: \p ok with the \p address that answered (the
+  //! book promotes it), or failed -- \p address empty when no candidate
+  //! existed (the book should re-resolve early). Invoked on the lane
+  //! thread, no lock held.
   using AddressSink = std::function<void(const std::string &address, bool ok)>;
 
   static constexpr double kBackoffMinS = 1.0;
@@ -193,8 +195,11 @@ public:
   void setAddressSink(AddressSink sink);
 
   //! The candidate list changed (a name resolved, an address answered or
-  //! was learned): forget the current backoff window and attempt what is
-  //! queued now. Safe from any thread.
+  //! was learned): reopen the backoff window and attempt what is queued
+  //! now -- but never more than one real connect per kBackoffMinS, so a
+  //! burst of changes cannot turn a sleeping peer into a connect storm. A
+  //! wake during an in-flight attempt is remembered and applied when that
+  //! attempt fails. Safe from any thread.
   void wake();
 
   //! Queue \p line for delivery (kept across backoff; the oldest line is
@@ -276,6 +281,10 @@ private:
   State m_state = State::Unknown;
   //! Which candidate the next backoff-window attempt starts at (rotates).
   size_t m_rotation = 0;
+  //! When the last REAL connect attempt started (unresolved attempts do
+  //! not count: they cost nothing); wake() is rate-limited against it.
+  double m_lastAttemptAt = -1.0e9;
+  bool m_wakePending = false;
   std::string m_lastAnswered;
   uint64_t m_unresolvedAttempts = 0;
   bool m_loggedUnresolved = false;

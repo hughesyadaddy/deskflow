@@ -111,6 +111,9 @@ Coordinator::Coordinator(CoordinatorConfig config)
       if (ok) {
         m_addressBook.noteAnswered(name, address);
       } else {
+        // Failed, or (address empty) no numeric candidate at all: ask for
+        // an early re-resolve (rate-limited by the book) instead of
+        // waiting out the 5 min refresh with a lane that has nowhere to go.
         m_addressBook.noteMiss(monotonicSeconds());
       }
     });
@@ -900,7 +903,6 @@ KeyForwardResult Coordinator::sendKeyForward(
     if (destination == nullptr) {
       return KeyForwardResult::Local;
     }
-    m_lastKeyDestination = destination;
     line = protocol::encodeKey(
         m_config.selfName, phase, static_cast<uint16_t>(id), static_cast<uint16_t>(mask), button, lang, m_config.token,
         ++m_keySeq, protocol::wallClockMs()
@@ -920,7 +922,16 @@ KeyForwardResult Coordinator::sendKeyForward(
   // Runs inside the OS keyboard hook: bounded by the grace. Forwarded
   // (swallow the key) only once the send actually completed; on backoff,
   // timeout or failure the key stays local and is never delivered late.
-  return destination->forward(line, kKeyForwardGraceMs) ? KeyForwardResult::Forwarded : KeyForwardResult::Local;
+  if (!destination->forward(line, kKeyForwardGraceMs)) {
+    return KeyForwardResult::Local;
+  }
+  // Only a key that actually went out (or is in flight past the grace)
+  // can be held on the peer: that is what a later lane failure resyncs.
+  // A key refused in backoff or withdrawn at the grace never marks the
+  // lane -- marking it used to post a no-op clear-all for keys never sent.
+  std::scoped_lock lock{m_mutex};
+  m_lastKeyDestination = destination;
+  return KeyForwardResult::Forwarded;
 }
 
 void Coordinator::onPeerLaneFailed(const std::string &peerName)
@@ -1223,7 +1234,7 @@ void Coordinator::noteHelloReply(const std::string &peerName, const std::string 
       "coordination: %s answered our hello for peer \"%s\" as a different seat -- dropping that address", host.c_str(),
       peerName.c_str()
   );
-  m_addressBook.evict(peerName, host);
+  m_addressBook.evict(peerName, host, monotonicSeconds());
 }
 
 std::vector<std::string> Coordinator::peerAddressEntries(const PeerList &peers)

@@ -500,8 +500,13 @@ void PeerOutbox::wake()
     std::scoped_lock lock{m_mutex};
     // Only the schedule changes: the state stays Backoff (so forward()
     // keeps refusing keys) until an attempt actually succeeds, but that
-    // attempt is made now instead of at the end of the window.
-    m_nextAttemptAt = 0.0;
+    // attempt is made now instead of at the end of the window -- subject
+    // to one real connect per kBackoffMinS.
+    if (m_inFlight) {
+      m_wakePending = true; // applied when the in-flight attempt fails
+    } else {
+      m_nextAttemptAt = (std::max)(0.0, (std::min)(m_nextAttemptAt, m_lastAttemptAt + kBackoffMinS));
+    }
   }
   m_wake.notify_all();
 }
@@ -715,6 +720,10 @@ void PeerOutbox::pump(double now)
       }
       m_inFlight = true;
       m_inFlightTicket = job.ticket;
+      m_wakePending = false;
+      if (!unresolved) {
+        m_lastAttemptAt = now;
+      }
       if (expired) {
         m_jobDone.notify_all();
       }
@@ -765,6 +774,12 @@ void PeerOutbox::pump(double now)
         m_backoffS = m_backoffS <= 0.0 ? kBackoffMinS : (std::min)(m_backoffS * 2.0, kBackoffMaxS);
         m_state = State::Backoff;
         m_nextAttemptAt = m_clock() + m_backoffS;
+        if (m_wakePending) {
+          // Candidates changed while this attempt ran: do not wait the
+          // window out for an address that has just arrived.
+          m_wakePending = false;
+          m_nextAttemptAt = (std::max)(0.0, (std::min)(m_nextAttemptAt, m_lastAttemptAt + kBackoffMinS));
+        }
         if (unresolved) {
           // No connect was attempted: the window still opens (nothing to
           // try yet), and wake() closes it again the moment a name lands.
@@ -803,8 +818,8 @@ void PeerOutbox::pump(double now)
     }
     m_jobDone.notify_all();
 
-    if (!unresolved && addressSink) {
-      addressSink(host, ok);
+    if (addressSink) {
+      addressSink(host, ok); // host empty on an unresolved attempt
     }
     if (!ok) {
       if (onFailure) {

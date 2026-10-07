@@ -990,6 +990,11 @@ void KeyState::fakeAllKeysUp()
   }
   fakeKeys(keys, 1);
   memset(&m_serverKeys, 0, sizeof(m_serverKeys));
+  reseedModifierState();
+}
+
+void KeyState::reseedModifierState()
+{
   m_activeModifiers.clear();
   m_mask = pollActiveModifiers();
   // Rebuild the modifier -> key-item table from the reseeded mask, exactly

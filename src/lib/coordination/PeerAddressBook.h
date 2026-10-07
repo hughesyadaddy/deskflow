@@ -69,6 +69,8 @@ public:
   static constexpr size_t kMaxResolvedPerName = 2;
   static constexpr size_t kMaxLearned = 2;
   static constexpr size_t kMaxCandidates = 6;
+  //! How long an evicted address stays out while DNS keeps returning it.
+  static constexpr double kDeniedS = 2 * kRefreshS;
 
   //! \p resolver defaults to getaddrinfo (systemResolve, IPv4 only).
   explicit PeerAddressBook(const PeerList &peers, Resolver resolver = {});
@@ -96,8 +98,11 @@ public:
   //! newest kept); never moved ahead of configured addresses until it
   //! answers. Unusable addresses are ignored.
   void learn(const std::string &peerName, const std::string &address);
-  //! \p address answered as a different seat: drop it from every tier.
-  void evict(const std::string &peerName, const std::string &address);
+  //! \p address answered as a different seat: drop it from every tier and
+  //! keep it out (see Entry::denied) so the stale DNS record that produced
+  //! it cannot put it straight back on the next refresh. \p now = monotonic
+  //! seconds (the denial expires after kDeniedS).
+  void evict(const std::string &peerName, const std::string &address, double now = 0.0);
 
   //! A command from an unknown address was dropped / a lane failed:
   //! schedule an early refresh of the names (rate-limited).
@@ -130,6 +135,10 @@ private:
     std::string ipName;
     std::string lastAnswered;
     std::deque<std::string> learned; //!< newest first
+    //! Addresses that answered as another seat (evict()), with the time
+    //! of eviction: filtered out of every tier until a resolve of one of
+    //! this peer's names no longer returns them, or kDeniedS elapses.
+    std::map<std::string, double> denied;
   };
   struct Shared
   {
@@ -146,6 +155,7 @@ private:
 
   static void resolveOne(const std::shared_ptr<Shared> &shared, const std::string &host);
   static void storeResolvedLocked(Shared &shared, const std::string &host, std::vector<std::string> addresses);
+  static void expireDeniedLocked(Shared &shared, double now);
   static std::vector<std::string> candidatesLocked(const Shared &shared, const Entry &entry);
   static Entry *entryLocked(Shared &shared, const std::string &peerName);
   static const Entry *entryLocked(const Shared &shared, const std::string &peerName);

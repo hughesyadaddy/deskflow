@@ -78,6 +78,14 @@ public:
   }
 
 protected:
+  //! Re-read the OS modifier state into m_mask and rebuild the active
+  //! modifier -> key-item table from it (what fakeAllKeysUp() does after
+  //! its releases). Called after any release that bypassed fakeKey() so
+  //! the next mapKey() does not synthesise an Up and a restore Down for a
+  //! modifier that is no longer held -- the restore is exactly what
+  //! re-pressed a ghost modifier on every key (2026-10-07).
+  void reseedModifierState();
+
   using Keystroke = deskflow::KeyMap::Keystroke;
 
   //! @name protected manipulators

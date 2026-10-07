@@ -439,6 +439,11 @@ CGEventFlags OSXKeyState::getModifierStateAsOSXFlags() const
 
 KeyModifierMask OSXKeyState::pollActiveModifiers() const
 {
+  if (m_hooks.osModifierFlags) {
+    // Tests: the hooked flag word is the whole OS truth, so the base
+    // class's mask (reseedModifierState) can be seeded and asserted.
+    return mapModifiersFromOSX(static_cast<uint32_t>(m_hooks.osModifierFlags()));
+  }
   // falsely assumed that the mask returned by GetCurrentKeyModifiers()
   // was the same as a CGEventFlags (which is what mapModifiersFromOSX
   // expects). patch by Marc
@@ -1051,14 +1056,30 @@ KeyModifierMask OSXKeyState::releaseGhostModifiers(KeyModifierMask candidates)
       postKeyboardKey(candidate.virtualKey, false);
     }
     m_injectedModifiers.erase(candidate.virtualKey);
+    // The incident's Up went out on this same HID path and the OS kept the
+    // flag anyway; when the live word still shows it, send the release
+    // once more through the CGEvent tap (a different entry into the
+    // event system) instead of trusting the first post. Only in
+    // production: under the test hooks the first post is authoritative.
+    CGEventFlags after = osModifierFlags();
+    if ((after & candidate.generic) != 0 && !m_hooks.postHIDKey) {
+      postKeyboardKey(candidate.virtualKey, false);
+      after = osModifierFlags();
+    }
     released |= candidate.bit;
     LOG_INFO(
-        "released ghost modifier 0x%02x (os flags 0x%llx carried no device bit)", candidate.virtualKey,
-        static_cast<unsigned long long>(os)
+        "released ghost modifier 0x%02x (os flags 0x%llx carried no device bit; live after release 0x%llx)",
+        candidate.virtualKey, static_cast<unsigned long long>(os), static_cast<unsigned long long>(after)
     );
   }
   if (released != 0) {
+    // Both layers must forget the modifier: the shadow flags every later
+    // post composes against, and the base class's m_mask/m_activeModifiers
+    // that mapKey() consults -- a stale entry there makes the next plain
+    // key emit an Up plus a restore Down for the ghost, re-pressing it
+    // with a device bit this time (review finding, 2026-10-07).
     reseedShadowFlagsFromOS();
+    reseedModifierState();
   }
   return released;
 }

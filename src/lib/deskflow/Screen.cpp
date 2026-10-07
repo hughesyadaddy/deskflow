@@ -641,7 +641,10 @@ void Screen::leaveSecondary()
   const KeyModifierMask ghosts =
       m_screen->releaseGhostModifiers(m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask);
   if (ghosts != 0) {
-    LOG_INFO("[keys] leave released ghost modifiers 0x%04x", ghosts);
+    // Honest about the outcome: the release is a post, the poll is what the
+    // OS actually did with it.
+    const KeyModifierMask remaining = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & ghosts;
+    LOG_INFO("[keys] leave released ghost modifiers 0x%04x (still reported held: 0x%04x)", ghosts, remaining);
   }
 }
 

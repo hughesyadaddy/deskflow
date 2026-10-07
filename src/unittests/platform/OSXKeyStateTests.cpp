@@ -584,6 +584,18 @@ void OSXKeyStateTests::ghostReleaseClearsGenericOnlyModifier()
   os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskAlternate; // the OS dropped our device bit
   QCOMPARE(keyState.releaseGhostModifiers(KeyModifierAlt), KeyModifierMask(KeyModifierAlt));
   QVERIFY(keyState.injectedModifiers().empty());
+
+  // Review finding: the base class's active-modifier mask must forget the
+  // ghost too, or the next plain key's mapKey() synthesises an Up and a
+  // restore Down for it -- re-pressing the ghost, now with a device bit.
+  // Seed the mask the way leaveSecondary's fakeAllKeysUp() does (from the
+  // OS, ghost included), then release, then check what mapKey() would see.
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskCommand;
+  keyState.updateKeyState();
+  QVERIFY((keyState.getActiveModifiers() & KeyModifierSuper) != 0);
+  QCOMPARE(keyState.releaseGhostModifiers(KeyModifierSuper), KeyModifierMask(KeyModifierSuper));
+  QVERIFY((keyState.getActiveModifiers() & KeyModifierSuper) == 0);
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierSuper) == 0);
 }
 
 void OSXKeyStateTests::ghostReleaseLeavesDeviceBackedModifierAlone()
@@ -597,7 +609,7 @@ void OSXKeyStateTests::ghostReleaseLeavesDeviceBackedModifierAlone()
   InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
   HookedState os;
   keyState.setHooks(os.hooks());
-  const CGEventFlags everyCandidate = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
+  const KeyModifierMask everyCandidate = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
 
   os.osFlags = kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK;
   QCOMPARE(keyState.releaseGhostModifiers(everyCandidate), KeyModifierMask(0));
