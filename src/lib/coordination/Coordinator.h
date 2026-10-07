@@ -15,6 +15,7 @@
 #include "coordination/LocalInputMonitor.h"
 #include "coordination/Peer.h"
 #include "coordination/PeerAddressAllowlist.h"
+#include "coordination/PeerAddressBook.h"
 #include "coordination/WedgeDetector.h"
 #include "deskflow/KeyTypes.h"
 
@@ -62,6 +63,8 @@ struct CoordinatorConfig
   PeerList peers;
   ElectionTuning tuning;
   bool keyboardFollowCursor = true;
+  //! Unit tests only: replaces getaddrinfo for the peer address book.
+  PeerAddressBook::Resolver addressResolver;
 };
 
 //! What the epoch loop should run next.
@@ -255,6 +258,16 @@ private:
   //! address (see PeerAddressAllowlist); drops are logged once per line.
   bool sourceAllowed(const Message &message, const char *kind);
   static std::vector<std::string> peerAddressEntries(const PeerList &peers);
+  //! Mesh v2 address learning: with a shared token configured (the
+  //! transport has already matched it), a message from a configured peer
+  //! teaches the book that peer's current source address. Without a token
+  //! nothing is learned: a name on the wire is not authentication, and a
+  //! learned address is where OUR relayed keys would go.
+  void learnPeerAddress(const Message &message);
+  //! A hello reply came back from \p host on \p peerName's lane: a reply
+  //! naming a different seat means that address is not this peer any more
+  //! (DHCP handed it on) and is evicted from the book.
+  void noteHelloReply(const std::string &peerName, const std::string &host, const Message &reply);
 
   bool isKnownPeer(const std::string &name) const;
   bool relayPassThroughLocal();
@@ -271,6 +284,9 @@ private:
   CoordinatorConfig m_config;
   //! Addresses the configured peers resolve to (rescue/stop-all gating).
   PeerAddressAllowlist m_peerAllowlist;
+  //! Numeric connect candidates per peer (lanes never resolve names).
+  //! Declared before the lanes: they read it until they are destroyed.
+  PeerAddressBook m_addressBook;
   std::unique_ptr<CoordinationMesh> m_mesh;
   //! One outbound lane per configured peer (self excluded), keyed by peer
   //! name. Declared after m_mesh: the lanes send through it and must be

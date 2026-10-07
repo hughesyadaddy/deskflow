@@ -20,10 +20,12 @@
 #include "coordination/Coordinator.h"
 #include "coordination/KeyboardRelayMonitor.h"
 #include "coordination/Peer.h"
+#include "coordination/PeerAddressBook.h"
 #include "deskflow/KeyTypes.h"
 
 #include <QTest>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -68,6 +70,15 @@ private Q_SLOTS:
   void outbox_failureInvokesHandlerOnceAndKeepsStickyLine();
   void outbox_discardKeysLeavesOtherLines();
   void outbox_queueIsCapped();
+  void outbox_unresolvedAttemptCostsNoConnectAndWakeReopensWindow();
+  void addressBook_candidatesAreNumericOrderedAndBounded();
+  void addressBook_rejectsUnusableAddresses();
+  void addressBook_learnAppendsAnswerPromotesEvictDrops();
+  void addressBook_resolutionWakesTheLane();
+  void mesh_sendToRefusesNames();
+  void coordinator_learnsSourceAddressOnlyWithToken();
+  void coordinator_evictsAddressAnsweringAsAnotherSeat();
+  void keyLaneFailure_nameOnlyPeerWithStalledResolverFailsFast();
   void protocol_keyCarriesSeqAndSentAt();
   void protocol_keyClearAllRoundTrips();
   void keyReceive_ignoresWallClockAndDropsDuplicateSeq();
@@ -130,6 +141,29 @@ struct FakeTransport
   }
 };
 
+//! Candidate list the tests mutate directly (stands in for PeerAddressBook):
+//! an address that answers moves to the front, as the book would do.
+struct FakeBook
+{
+  std::vector<std::string> addresses;
+  explicit FakeBook(std::vector<std::string> initial = {}) : addresses(std::move(initial))
+  {
+  }
+  PeerOutbox::Candidates fn()
+  {
+    return [this] { return addresses; };
+  }
+  PeerOutbox::AddressSink sink()
+  {
+    return [this](const std::string &address, bool ok) {
+      if (!ok) {
+        return;
+      }
+      addresses.erase(std::remove(addresses.begin(), addresses.end(), address), addresses.end());
+      addresses.insert(addresses.begin(), address);
+    };
+  }
+};
 //! Relay monitor double: records start/stop so the reconciler is observable,
 //! and the boundary hooks so resyncs are.
 struct FakeKeyboardRelay : public deskflow::coordination::IKeyboardRelayMonitor
@@ -241,14 +275,16 @@ void CoordinatorTests::outbox_backoffDoublesToCapAndTriesOneAddressPerWindow()
 {
   FakeClock clock;
   FakeTransport transport; // always fails: the peer is asleep
-  PeerOutbox outbox("10.0.0.5", "peer.local", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.6", "10.0.0.5"}); // lan tier first, then stable
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
+  outbox.setAddressSink(book.sink());
   QCOMPARE(outbox.state(), PeerOutbox::State::Unknown);
 
   // First attempt (state Unknown): both addresses are tried once, LAN first.
   outbox.post("claim");
   outbox.pump(clock.now);
   QCOMPARE(transport.hosts.size(), static_cast<size_t>(2));
-  QCOMPARE(transport.hosts[0], std::string("peer.local"));
+  QCOMPARE(transport.hosts[0], std::string("10.0.0.6"));
   QCOMPARE(transport.hosts[1], std::string("10.0.0.5"));
   QCOMPARE(outbox.state(), PeerOutbox::State::Backoff);
   QCOMPARE(outbox.nextAttemptAt(), 1.0);
@@ -283,7 +319,9 @@ void CoordinatorTests::outbox_successResetsBackoffAndRemembersAddress()
 {
   FakeClock clock;
   FakeTransport transport;
-  PeerOutbox outbox("10.0.0.5", "peer.local", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.6", "10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
+  outbox.setAddressSink(book.sink());
 
   // Two failed windows, then the peer wakes on its stable address only.
   outbox.post("a");
@@ -331,7 +369,8 @@ void CoordinatorTests::outbox_forwardRefusesInBackoffWithoutQueuing()
 {
   FakeClock clock;
   FakeTransport transport;
-  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   outbox.post("a");
   outbox.pump(clock.now);
   QCOMPARE(outbox.state(), PeerOutbox::State::Backoff);
@@ -351,7 +390,8 @@ void CoordinatorTests::outbox_forwardNeverEnqueuesInBackoffEvenAtBoundary()
   // locally): a phantom Down on the peer. Keys never ride a backoff lane.
   FakeClock clock;
   FakeTransport transport;
-  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   outbox.post("a");
   outbox.pump(clock.now);
   QCOMPARE(outbox.state(), PeerOutbox::State::Backoff);
@@ -378,7 +418,8 @@ void CoordinatorTests::outbox_reachableFailureResettlesOnRetry()
   FakeClock clock;
   FakeTransport transport;
   transport.okFor = [](const std::string &) { return true; };
-  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   outbox.post("a");
   outbox.pump(clock.now);
   QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
@@ -421,7 +462,8 @@ void CoordinatorTests::outbox_forwardUnknownReturnsWithinGrace()
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     return true;
   };
-  PeerOutbox outbox("10.0.0.5", "", slow.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), slow.fn(), clock.fn());
   outbox.start();
 
   // Unknown + slow peer: the hook gets an answer within the grace, not
@@ -437,7 +479,8 @@ void CoordinatorTests::outbox_forwardUnknownReturnsWithinGrace()
   // Unknown + fast peer: the honest result arrives inside the grace.
   FakeTransport fast;
   fast.okFor = [](const std::string &) { return true; };
-  PeerOutbox quick("10.0.0.5", "", fast.fn(), clock.fn());
+  FakeBook quickBook({"10.0.0.5"});
+  PeerOutbox quick("peer", quickBook.fn(), fast.fn(), clock.fn());
   quick.start();
   QVERIFY(quick.forward("key", 1000));
   QCOMPARE(quick.state(), PeerOutbox::State::Reachable);
@@ -456,7 +499,8 @@ void CoordinatorTests::outbox_reachableForwardReportsOnlyCompletedSends()
   FakeClock clock;
   FakeTransport transport;
   transport.okFor = [](const std::string &) { return true; };
-  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   outbox.post("hello");
   outbox.pump(clock.now);
   QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
@@ -486,7 +530,8 @@ void CoordinatorTests::outbox_expiredKeyDiscardedBeforeConnect()
   FakeClock clock;
   FakeTransport transport;
   transport.okFor = [](const std::string &) { return true; };
-  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   outbox.post("hello");
   outbox.pump(clock.now);
   QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
@@ -508,7 +553,8 @@ void CoordinatorTests::outbox_failureInvokesHandlerOnceAndKeepsStickyLine()
   FakeClock clock;
   FakeTransport transport;
   transport.okFor = [](const std::string &) { return true; };
-  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   int failures = 0;
   outbox.setFailureHandler([&outbox, &failures] {
     ++failures;
@@ -553,7 +599,8 @@ void CoordinatorTests::outbox_discardKeysLeavesOtherLines()
   FakeClock clock;
   FakeTransport transport;
   transport.okFor = [](const std::string &) { return true; };
-  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   outbox.post("hello");
   outbox.pump(clock.now);
 
@@ -577,7 +624,8 @@ void CoordinatorTests::outbox_forwardTimeoutWithdrawsQueuedKey()
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     return true;
   };
-  PeerOutbox outbox("10.0.0.5", "", slow.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), slow.fn(), clock.fn());
   outbox.start();
 
   outbox.post("hello"); // picked up by the lane at once: in flight for 300 ms
@@ -603,7 +651,8 @@ void CoordinatorTests::outbox_forwardTimeoutSwallowsInFlightKey()
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     return succeed.load();
   };
-  PeerOutbox outbox("10.0.0.5", "10.0.0.6", slow.fn(), clock.fn());
+  FakeBook book({"10.0.0.6", "10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), slow.fn(), clock.fn());
   int failures = 0;
   outbox.setFailureHandler([&failures] { ++failures; });
   outbox.start();
@@ -632,12 +681,335 @@ void CoordinatorTests::outbox_queueIsCapped()
   FakeClock clock;
   FakeTransport transport;
   transport.okFor = [](const std::string &) { return true; };
-  PeerOutbox outbox("10.0.0.5", "", transport.fn(), clock.fn());
+  FakeBook book({"10.0.0.5"});
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
   for (size_t i = 0; i < PeerOutbox::kMaxQueuedLines * 3; ++i) {
     outbox.post("line");
   }
   outbox.pump(clock.now);
   QCOMPARE(transport.hosts.size(), PeerOutbox::kMaxQueuedLines);
+}
+
+void CoordinatorTests::outbox_unresolvedAttemptCostsNoConnectAndWakeReopensWindow()
+{
+  // A peer configured by name only, whose name has not resolved yet: the
+  // lane fails the attempt WITHOUT a transport call (no 700 ms connect to
+  // nothing), opens the normal backoff window, and reports it as the
+  // lane's failure (keys forwarded earlier would need a resync). When the
+  // name lands, wake() reopens the window at once.
+  FakeClock clock;
+  FakeTransport transport;
+  transport.okFor = [](const std::string &) { return true; };
+  FakeBook book;
+  PeerOutbox outbox("peer", book.fn(), transport.fn(), clock.fn());
+  int failures = 0;
+  outbox.setFailureHandler([&failures] { ++failures; });
+
+  outbox.post("hello");
+  outbox.pump(clock.now);
+  QVERIFY(transport.hosts.empty());
+  QCOMPARE(outbox.state(), PeerOutbox::State::Backoff);
+  QCOMPARE(outbox.nextAttemptAt(), 1.0);
+  QCOMPARE(outbox.unresolvedAttempts(), static_cast<uint64_t>(1));
+  QCOMPARE(failures, 1);
+  QCOMPARE(outbox.preferredAddress(), std::string());
+  QVERIFY(outbox.idle()); // the failed window dropped the stale line
+
+  // Still unresolved inside the window: nothing happens, no connect.
+  clock.now = 0.5;
+  outbox.post("hello");
+  outbox.pump(clock.now);
+  QVERIFY(transport.hosts.empty());
+
+  // The name resolves: wake() lets the queued line go out now, not at 1.0.
+  book.addresses = {"10.0.0.7"};
+  outbox.wake();
+  QCOMPARE(outbox.nextAttemptAt(), 0.0);
+  outbox.pump(clock.now);
+  QCOMPARE(transport.hosts.size(), static_cast<size_t>(1));
+  QCOMPARE(transport.hosts[0], std::string("10.0.0.7"));
+  QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
+  QCOMPARE(outbox.lastAnsweredAddress(), std::string("10.0.0.7"));
+  QCOMPARE(outbox.preferredAddress(), std::string("10.0.0.7"));
+}
+
+void CoordinatorTests::addressBook_candidatesAreNumericOrderedAndBounded()
+{
+  using deskflow::coordination::PeerAddressBook;
+  std::vector<std::string> resolvedHosts;
+  PeerAddressBook book(
+      deskflow::coordination::parsePeerList("mac=mac.ts.net|mac.local, win=100.64.0.9|192.168.1.100"),
+      [&resolvedHosts](const std::string &host) {
+        resolvedHosts.push_back(host);
+        if (host == "mac.local") {
+          return std::vector<std::string>{"192.168.1.143", "192.168.1.143", "10.0.0.1", "10.0.0.2"};
+        }
+        if (host == "mac.ts.net") {
+          return std::vector<std::string>{"100.64.0.5"};
+        }
+        return std::vector<std::string>{};
+      }
+  );
+  // Literals are candidates immediately; names only once resolved.
+  QCOMPARE(book.candidates("win"), (std::vector<std::string>{"192.168.1.100", "100.64.0.9"}));
+  QVERIFY(book.candidates("mac").empty());
+  QCOMPARE(book.lanCandidate("mac"), std::string());
+  QCOMPARE(book.names(), (std::vector<std::string>{"mac.local", "mac.ts.net"}));
+
+  book.refreshNow(0.0);
+  QCOMPARE(resolvedHosts.size(), static_cast<size_t>(2)); // literals are never resolved
+  // lan tier first, at most kMaxResolvedPerName per name, duplicates folded.
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.143", "10.0.0.1", "100.64.0.5"}));
+  QCOMPARE(book.lanCandidate("mac"), std::string("192.168.1.143"));
+  QVERIFY(book.candidates("nobody").empty());
+
+  // The address that answered moves to the front; a failed resolve later
+  // keeps the previous answers (a DNS blip must not strip the lane).
+  book.noteAnswered("MAC", "100.64.0.5"); // names compare case-insensitively
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5", "192.168.1.143", "10.0.0.1"}));
+  resolvedHosts.clear();
+  PeerAddressBook::Resolver failing = [](const std::string &) { return std::vector<std::string>{}; };
+  PeerAddressBook flaky(deskflow::coordination::parsePeerList("mac=mac.local"), [](const std::string &host) {
+    static int calls = 0;
+    return ++calls == 1 ? std::vector<std::string>{"192.168.1.143"} : std::vector<std::string>{};
+  });
+  flaky.refreshNow(0.0);
+  flaky.refreshNow(PeerAddressBook::kRefreshS);
+  QCOMPARE(flaky.candidates("mac"), (std::vector<std::string>{"192.168.1.143"}));
+  (void)failing;
+}
+
+void CoordinatorTests::addressBook_rejectsUnusableAddresses()
+{
+  using deskflow::coordination::PeerAddressBook;
+  std::string canonical;
+  QVERIFY(PeerAddressBook::usableAddress("192.168.1.143", &canonical));
+  QCOMPARE(canonical, std::string("192.168.1.143"));
+  QVERIFY(PeerAddressBook::usableAddress("100.64.0.5"));
+  for (const char *bad : {"127.0.0.1", "0.0.0.0", "169.254.1.2", "224.0.0.251", "255.255.255.255",
+                          "peer.local", "", "::1", "fe80::1", "192.168.1.143:24851"}) {
+    QVERIFY2(!PeerAddressBook::usableAddress(bad), bad);
+  }
+  // A configured literal is the operator's word (loopback included: tests
+  // and single-host setups use it); only unlistenable literals are
+  // dropped. Resolved and learned addresses are filtered strictly.
+  PeerAddressBook book(
+      deskflow::coordination::parsePeerList("p=127.0.0.1|p.local, q=0.0.0.0|224.0.0.1"),
+      [](const std::string &) { return std::vector<std::string>{"0.0.0.0", "169.254.9.9", "127.0.0.2", "10.0.0.3"}; }
+  );
+  QCOMPARE(book.candidates("p"), (std::vector<std::string>{"127.0.0.1"}));
+  QVERIFY(book.candidates("q").empty());
+  book.refreshNow(0.0);
+  QCOMPARE(book.candidates("p"), (std::vector<std::string>{"10.0.0.3", "127.0.0.1"}));
+  book.learn("p", "127.0.0.9");
+  book.learn("p", "224.1.1.1");
+  book.noteAnswered("p", "0.0.0.0");
+  book.noteAnswered("p", "10.9.9.9"); // never handed out: ignored
+  QCOMPARE(book.candidates("p"), (std::vector<std::string>{"10.0.0.3", "127.0.0.1"}));
+  book.noteAnswered("p", "127.0.0.1"); // a configured loopback literal that answered is promoted
+  QCOMPARE(book.candidates("p"), (std::vector<std::string>{"127.0.0.1", "10.0.0.3"}));
+}
+
+void CoordinatorTests::addressBook_learnAppendsAnswerPromotesEvictDrops()
+{
+  using deskflow::coordination::PeerAddressBook;
+  PeerAddressBook book(deskflow::coordination::parsePeerList("mac=100.64.0.5|mac.local"), [](const std::string &) {
+    return std::vector<std::string>{"192.168.1.16"}; // stale DNS: the old wired address
+  });
+  book.refreshNow(0.0);
+  std::vector<std::string> changes;
+  book.setChangedHandler([&changes](const std::string &peer) { changes.push_back(peer); });
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5"}));
+
+  // Learned (token-authenticated source) goes LAST: it never jumps ahead
+  // of configured addresses until it answers. Learning an existing
+  // candidate is a no-op (no reorder, no change event).
+  book.learn("mac", "192.168.1.143");
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5", "192.168.1.143"}));
+  QCOMPARE(changes, (std::vector<std::string>{"mac"}));
+  book.learn("mac", "100.64.0.5");
+  book.learn("mac", "192.168.1.143");
+  QCOMPARE(changes.size(), static_cast<size_t>(1));
+  // Bounded: the newest kMaxLearned survive.
+  book.learn("mac", "192.168.1.144");
+  book.learn("mac", "192.168.1.145");
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"192.168.1.16", "100.64.0.5", "192.168.1.145", "192.168.1.144"}));
+
+  // An answer promotes; evicting the answered/resolved address drops it
+  // from every tier, a configured literal is only reported.
+  book.noteAnswered("mac", "192.168.1.145");
+  QCOMPARE(book.candidates("mac").front(), std::string("192.168.1.145"));
+  book.evict("mac", "192.168.1.145");
+  book.evict("mac", "192.168.1.16");
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5", "192.168.1.144"}));
+  book.evict("mac", "100.64.0.5");
+  QCOMPARE(book.candidates("mac"), (std::vector<std::string>{"100.64.0.5", "192.168.1.144"}));
+  // Unknown peers and stop() are inert.
+  book.learn("ghost", "10.0.0.1");
+  book.stop();
+  book.learn("mac", "10.0.0.1");
+  QVERIFY(std::find(changes.begin(), changes.end(), "ghost") == changes.end());
+}
+
+void CoordinatorTests::addressBook_resolutionWakesTheLane()
+{
+  using deskflow::coordination::PeerAddressBook;
+  // The wiring the Coordinator uses: a lane whose candidates come from the
+  // book, woken by the book's change handler the moment a name resolves.
+  FakeClock clock;
+  FakeTransport transport;
+  transport.okFor = [](const std::string &) { return true; };
+  PeerAddressBook book(deskflow::coordination::parsePeerList("mac=mac.local"), [](const std::string &) {
+    return std::vector<std::string>{"192.168.1.143"};
+  });
+  PeerOutbox outbox("mac", [&book] { return book.candidates("mac"); }, transport.fn(), clock.fn());
+  outbox.setAddressSink([&book](const std::string &address, bool ok) {
+    if (ok) {
+      book.noteAnswered("mac", address);
+    }
+  });
+  book.setChangedHandler([&outbox](const std::string &) { outbox.wake(); });
+
+  outbox.post("hello");
+  outbox.pump(clock.now); // unresolved: window opens, nothing connected
+  QVERIFY(transport.hosts.empty());
+  QCOMPARE(outbox.nextAttemptAt(), 1.0);
+  outbox.post("hello");
+
+  book.refreshNow(clock.now); // resolution lands -> change -> wake()
+  QCOMPARE(outbox.nextAttemptAt(), 0.0);
+  outbox.pump(clock.now);
+  QCOMPARE(transport.hosts, (std::vector<std::string>{"192.168.1.143"}));
+  QCOMPARE(outbox.state(), PeerOutbox::State::Reachable);
+  QCOMPARE(book.candidates("mac").front(), std::string("192.168.1.143"));
+  book.stop();
+}
+
+void CoordinatorTests::mesh_sendToRefusesNames()
+{
+  // The transport never resolves: a name is refused immediately instead
+  // of blocking the lane thread inside getaddrinfo.
+  deskflow::coordination::CoordinationMesh mesh(0, "", [](const Message &, const std::function<void(const std::string &)> &) {});
+  const auto started = std::chrono::steady_clock::now();
+  QVERIFY(!mesh.sendTo("peer.local", "hello"));
+  QVERIFY(!mesh.probe("peer.local", 700));
+  QVERIFY(mesh.query("peer.local", "hello").empty());
+  QVERIFY(elapsedMs(started) < 200.0);
+}
+
+void CoordinatorTests::coordinator_learnsSourceAddressOnlyWithToken()
+{
+  // The transport stamps every line with its source address and (with a
+  // token configured) has already matched the token. Only then does a
+  // configured peer's line teach the book where that peer is now.
+  for (const bool withToken : {false, true}) {
+    CoordinatorConfig config;
+    config.selfName = "hackintosh";
+    config.meshPort = 0;
+    config.token = withToken ? "test-token" : "";
+    config.peers = deskflow::coordination::parsePeerList(std::string("macbookpro=") + kBlackholeA + ", hackintosh=10.0.0.1");
+    config.addressResolver = [](const std::string &) { return std::vector<std::string>{}; };
+    Coordinator coordinator(config);
+    const std::string hello =
+        protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "macbookpro", config.token, "abc");
+    std::string reply;
+    coordinator.onMessage(decodeFrom(hello, "192.168.1.143"), [&reply](const std::string &line) { reply = line; });
+    // Our own name and unknown names teach nothing.
+    coordinator.onMessage(decodeFrom(protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "hackintosh", config.token, "abc"), "10.0.0.2"), [](const std::string &) {});
+    coordinator.onMessage(decodeFrom(protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, "stranger", config.token, "abc"), "10.0.0.3"), [](const std::string &) {});
+    const auto candidates = coordinator.m_addressBook.candidates("macbookpro");
+    if (withToken) {
+      QCOMPARE(candidates, (std::vector<std::string>{kBlackholeA, "192.168.1.143"}));
+    } else {
+      QCOMPARE(candidates, (std::vector<std::string>{kBlackholeA}));
+    }
+    QVERIFY(coordinator.m_addressBook.candidates("hackintosh").size() <= 1);
+    QVERIFY(!reply.empty());
+  }
+}
+
+void CoordinatorTests::coordinator_evictsAddressAnsweringAsAnotherSeat()
+{
+  CoordinatorConfig config;
+  config.selfName = "tiny11";
+  config.meshPort = 0;
+  config.peers = deskflow::coordination::parsePeerList("hackintosh=240.0.0.1|hack.local");
+  config.addressResolver = [](const std::string &host) {
+    return host == "hack.local" ? std::vector<std::string>{"10.1.1.1"} : std::vector<std::string>{};
+  };
+  Coordinator coordinator(config);
+  coordinator.m_addressBook.refreshNow(0.0);
+  QCOMPARE(coordinator.m_addressBook.candidates("hackintosh"), (std::vector<std::string>{"10.1.1.1", "240.0.0.1"}));
+
+  const auto helloFrom = [](const char *name) {
+    return protocol::decode(protocol::encodeHello(deskflow::coordination::kMeshProtocolVersion, name, "", "abc"));
+  };
+  // Our own peer's hello (case-insensitive) keeps the address.
+  coordinator.noteHelloReply("hackintosh", "10.1.1.1", helloFrom("Hackintosh"));
+  QCOMPARE(coordinator.m_addressBook.candidates("hackintosh").size(), static_cast<size_t>(2));
+  // Another seat answering there: DHCP moved the address on -> evicted.
+  coordinator.noteHelloReply("hackintosh", "10.1.1.1", helloFrom("macbookpro"));
+  QCOMPARE(coordinator.m_addressBook.candidates("hackintosh"), (std::vector<std::string>{"240.0.0.1"}));
+  // A configured literal is the operator's word: reported, kept.
+  coordinator.noteHelloReply("hackintosh", "240.0.0.1", helloFrom("macbookpro"));
+  QCOMPARE(coordinator.m_addressBook.candidates("hackintosh"), (std::vector<std::string>{"240.0.0.1"}));
+  // Non-hello or nameless replies are ignored.
+  coordinator.noteHelloReply("hackintosh", "240.0.0.1", Message{});
+}
+
+void CoordinatorTests::keyLaneFailure_nameOnlyPeerWithStalledResolverFailsFast()
+{
+  // The incident shape: the peer is configured by a name whose resolution
+  // stalls for tens of seconds. The lane must not wait for it: the key
+  // stays local within the grace, the lane fails over to Backoff without
+  // a single connect, and the peer gets its resync when the name lands.
+  using deskflow::coordination::Role;
+  CoordinatorConfig config;
+  config.selfName = "hackintosh";
+  config.meshPort = 0;
+  config.token = "test-token";
+  config.peers = deskflow::coordination::parsePeerList("macbookpro=macbookpro.ts.net|macbookpro.local");
+  auto released = std::make_shared<std::atomic<bool>>(false);
+  config.addressResolver = [released](const std::string &) {
+    // Stalls like a 35 s mDNS lookup; the thread outlives the test on
+    // purpose (it owns only the book's shared state).
+    for (int i = 0; i < 400 && !released->load(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return std::vector<std::string>{};
+  };
+
+  EventQueue events;
+  Coordinator coordinator(config);
+  coordinator.setEventQueue(&events);
+  auto relay = std::make_unique<FakeKeyboardRelay>();
+  auto *relayPtr = relay.get();
+  coordinator.m_keyboardRelay = std::move(relay);
+  QVERIFY(coordinator.start());
+  {
+    std::scoped_lock lock{coordinator.m_mutex};
+    coordinator.m_election.becameClient("macbookpro.ts.net");
+    coordinator.m_fleetState.cursorHost = "macbookpro";
+  }
+  coordinator.setRunningRole(Role::Client);
+
+  const auto started = std::chrono::steady_clock::now();
+  QCOMPARE(
+      coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyTab, KeyModifierAlt, 1, "en"), KeyForwardResult::Local
+  );
+  QVERIFY(elapsedMs(started) < 300.0);
+  auto *lane = coordinator.outboxByName("macbookpro");
+  QVERIFY(lane != nullptr);
+  QVERIFY(waitFor([lane] { return lane->state() == PeerOutbox::State::Backoff; }, 1500));
+  QVERIFY(elapsedMs(started) < 1500.0); // no 700 ms connect was spent on a name
+  QVERIFY(lane->unresolvedAttempts() > 0);
+  QVERIFY(waitFor([relayPtr] { return relayPtr->resyncs.load() > 0; }, 1000));
+  QVERIFY(!lane->idle()); // the sticky KeyClearAll waits for an address
+  QCOMPARE(lane->preferredAddress(), std::string());
+
+  released->store(true);
+  coordinator.stop();
+  QVERIFY(elapsedMs(started) < 5000.0); // stop() never joins a stalled resolver
 }
 
 void CoordinatorTests::heartbeat_doesNotBlockOnUnreachablePeers()

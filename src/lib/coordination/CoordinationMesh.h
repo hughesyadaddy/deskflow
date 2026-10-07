@@ -120,11 +120,17 @@ private:
 Reachability is a small state machine. \c Unknown until the first attempt
 resolves, \c Reachable while sends succeed, \c Backoff after a failure with
 the retry delay doubling from 1 s to 30 s. In \c Backoff the lane makes one
-connect attempt per window, alternating the LAN and stable addresses, so a
-sleeping peer costs one connect timeout per window instead of two per
-heartbeat. The last address that answered is tried first. Queued lines are
-capped, and a failed attempt discards everything queued behind it: by then
-the lines are stale, and every periodic sender re-posts. Two job classes
+connect attempt per window, rotating through the peer's candidate
+addresses, so a sleeping peer costs one connect timeout per window instead
+of one per candidate per heartbeat. Addresses come from a Candidates
+callback (PeerAddressBook): NUMERIC only, in connect order, the one that
+most recently answered first; the lane itself never resolves a name, so a
+25 s mDNS stall can no longer hold a relayed key's Up behind it. With no
+candidate yet (a name still resolving at start-up) an attempt fails
+without consuming a connect timeout, and wake() -- called when candidates
+change -- reopens the backoff window at once. Queued lines are capped,
+and a failed attempt discards everything queued behind it: by then the
+lines are stale, and every periodic sender re-posts. Two job classes
 refine this: KEY lines (forward()) are never queued in backoff and expire
 kKeyDeadlineS after enqueue, so a key is never delivered late; STICKY
 lines (postSticky()) survive failed attempts, so a boundary resync always
@@ -149,6 +155,13 @@ public:
   using Transport = std::function<bool(const std::string &host, const std::string &line, std::string *reply)>;
   //! Monotonic seconds.
   using Clock = std::function<double()>;
+  //! Numeric addresses to try, in order (see PeerAddressBook::candidates).
+  //! Called on the lane thread before every attempt, never under the
+  //! lane's lock.
+  using Candidates = std::function<std::vector<std::string>()>;
+  //! A send to \p address completed (\p ok): the book promotes an address
+  //! that answered. Invoked on the lane thread, no lock held.
+  using AddressSink = std::function<void(const std::string &address, bool ok)>;
 
   static constexpr double kBackoffMinS = 1.0;
   static constexpr double kBackoffMaxS = 30.0;
@@ -167,7 +180,8 @@ public:
   //! resyncs (Coordinator: ledger release + sticky KeyClearAll).
   using FailureHandler = std::function<void()>;
 
-  PeerOutbox(std::string ip, std::string lan, Transport transport, Clock clock);
+  //! \p label names the peer in logs (never an address).
+  PeerOutbox(std::string label, Candidates candidates, Transport transport, Clock clock);
   PeerOutbox(const PeerOutbox &) = delete;
   PeerOutbox &operator=(const PeerOutbox &) = delete;
   ~PeerOutbox();
@@ -176,6 +190,12 @@ public:
   void stop();
 
   void setFailureHandler(FailureHandler handler);
+  void setAddressSink(AddressSink sink);
+
+  //! The candidate list changed (a name resolved, an address answered or
+  //! was learned): forget the current backoff window and attempt what is
+  //! queued now. Safe from any thread.
+  void wake();
 
   //! Queue \p line for delivery (kept across backoff; the oldest line is
   //! dropped past kMaxQueuedLines). \p onReply runs on the lane thread with
@@ -207,8 +227,13 @@ public:
   void discardKeys();
 
   State state() const;
-  //! Address tried first on the next attempt (last one that answered).
+  //! Address tried first on the next attempt (the candidates' head), or
+  //! empty while nothing has resolved.
   std::string preferredAddress() const;
+  //! Address the most recent successful send went to (empty if none).
+  std::string lastAnsweredAddress() const;
+  //! Attempts that found no numeric candidate (lane still unresolved).
+  uint64_t unresolvedAttempts() const;
   //! Monotonic time before which no connect attempt is made (0 = now).
   double nextAttemptAt() const;
   //! No queued lines and no attempt in flight.
@@ -237,19 +262,23 @@ private:
   uint64_t enqueueLocked(Job job);
   //! True while the job with \p ticket is queued or in flight.
   bool pendingLocked(uint64_t ticket) const;
-  std::string otherAddressLocked(const std::string &host) const;
 
-  const std::string m_ip;
-  const std::string m_lan;
+  const std::string m_label;
+  Candidates m_candidates;
   Transport m_transport;
   Clock m_clock;
+  AddressSink m_addressSink; //!< guarded by m_mutex (read into a copy)
 
   mutable std::mutex m_mutex;
   std::condition_variable m_wake;
   std::condition_variable m_jobDone;
   std::deque<Job> m_queue;
   State m_state = State::Unknown;
-  bool m_preferLan = true;
+  //! Which candidate the next backoff-window attempt starts at (rotates).
+  size_t m_rotation = 0;
+  std::string m_lastAnswered;
+  uint64_t m_unresolvedAttempts = 0;
+  bool m_loggedUnresolved = false;
   double m_backoffS = 0.0;
   double m_nextAttemptAt = 0.0;
   bool m_inFlight = false;

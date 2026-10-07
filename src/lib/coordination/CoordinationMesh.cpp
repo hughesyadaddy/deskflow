@@ -60,15 +60,23 @@ void setReceiveTimeout(int fd, int timeoutMs)
 #endif
 }
 
-//! Resolve + connect with a bounded timeout; returns fd or -1.
+//! Connect to a NUMERIC address with a bounded timeout; returns fd or -1.
+/*!
+Names are refused here on purpose: getaddrinfo on a name is unbounded (an
+mDNS lookup measured 25-35 s on this fleet) and this runs on a lane thread
+with relayed keys queued behind it. PeerAddressBook resolves names off
+the lane; callers hand numeric candidates only.
+*/
 int connectWithTimeout(const std::string &host, int port, int timeoutMs)
 {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
   addrinfo *results = nullptr;
   const std::string service = std::to_string(port);
   if (::getaddrinfo(host.c_str(), service.c_str(), &hints, &results) != 0 || results == nullptr) {
+    LOG_WARN("coordination: refusing to connect to non-numeric address \"%s\" (resolve it off the lane)", host.c_str());
     return -1;
   }
 
@@ -437,12 +445,11 @@ void CoordinationMesh::handleClient(int clientFd, const std::string &source)
 // PeerOutbox
 //
 
-PeerOutbox::PeerOutbox(std::string ip, std::string lan, Transport transport, Clock clock)
-    : m_ip(std::move(ip)),
-      m_lan(std::move(lan)),
+PeerOutbox::PeerOutbox(std::string label, Candidates candidates, Transport transport, Clock clock)
+    : m_label(std::move(label)),
+      m_candidates(std::move(candidates)),
       m_transport(std::move(transport)),
-      m_clock(std::move(clock)),
-      m_preferLan(!m_lan.empty())
+      m_clock(std::move(clock))
 {
   // do nothing
 }
@@ -481,6 +488,24 @@ void PeerOutbox::setFailureHandler(FailureHandler handler)
   m_onFailure = std::move(handler);
 }
 
+void PeerOutbox::setAddressSink(AddressSink sink)
+{
+  std::scoped_lock lock{m_mutex};
+  m_addressSink = std::move(sink);
+}
+
+void PeerOutbox::wake()
+{
+  {
+    std::scoped_lock lock{m_mutex};
+    // Only the schedule changes: the state stays Backoff (so forward()
+    // keeps refusing keys) until an attempt actually succeeds, but that
+    // attempt is made now instead of at the end of the window.
+    m_nextAttemptAt = 0.0;
+  }
+  m_wake.notify_all();
+}
+
 uint64_t PeerOutbox::enqueueLocked(Job job)
 {
   const uint64_t ticket = ++m_posted;
@@ -495,7 +520,7 @@ uint64_t PeerOutbox::enqueueLocked(Job job)
     }
     m_queue.erase(victim);
     m_jobDone.notify_all(); // a forward() waiting on the victim learns "not delivered" now
-    LOG_WARN("coordination: outbox to %s full (%zu queued); dropped the oldest line", m_ip.c_str(), kMaxQueuedLines);
+    LOG_WARN("coordination: outbox to %s full (%zu queued); dropped the oldest line", m_label.c_str(), kMaxQueuedLines);
   }
   return ticket;
 }
@@ -580,7 +605,7 @@ bool PeerOutbox::forward(std::string line, int graceMs)
   // fail, the lane's failure handler resyncs the peer (KeyClearAll), and a
   // lost key beats a doubled one.
   if (m_inFlightTicket == ticket) {
-    LOG_DEBUG("coordination: outbox to %s key in flight past the grace; treating as delivered", m_ip.c_str());
+    LOG_DEBUG("coordination: outbox to %s key in flight past the grace; treating as delivered", m_label.c_str());
     return true;
   }
   return false;
@@ -593,7 +618,7 @@ void PeerOutbox::discardKeys()
   const auto count = std::distance(removed, m_queue.end());
   m_queue.erase(removed, m_queue.end());
   if (count > 0) {
-    LOG_DEBUG("coordination: outbox to %s discarded %ld queued key line(s)", m_ip.c_str(), static_cast<long>(count));
+    LOG_DEBUG("coordination: outbox to %s discarded %ld queued key line(s)", m_label.c_str(), static_cast<long>(count));
   }
   m_jobDone.notify_all();
 }
@@ -606,8 +631,20 @@ PeerOutbox::State PeerOutbox::state() const
 
 std::string PeerOutbox::preferredAddress() const
 {
+  const auto candidates = m_candidates ? m_candidates() : std::vector<std::string>{};
+  return candidates.empty() ? std::string{} : candidates.front();
+}
+
+std::string PeerOutbox::lastAnsweredAddress() const
+{
   std::scoped_lock lock{m_mutex};
-  return (m_preferLan && !m_lan.empty()) ? m_lan : m_ip;
+  return m_lastAnswered;
+}
+
+uint64_t PeerOutbox::unresolvedAttempts() const
+{
+  std::scoped_lock lock{m_mutex};
+  return m_unresolvedAttempts;
 }
 
 double PeerOutbox::nextAttemptAt() const
@@ -628,20 +665,18 @@ uint64_t PeerOutbox::expiredKeys() const
   return m_expiredKeys;
 }
 
-std::string PeerOutbox::otherAddressLocked(const std::string &host) const
-{
-  if (m_lan.empty() || m_lan == m_ip) {
-    return {};
-  }
-  return host == m_lan ? m_ip : m_lan;
-}
-
 void PeerOutbox::pump(double now)
 {
   while (true) {
+    // Candidates are read before the lock: the book has its own lock and
+    // calls wake() (which takes ours) with it held, so ours must never be
+    // held while calling the book.
+    const std::vector<std::string> candidates = m_candidates ? m_candidates() : std::vector<std::string>{};
     Job job;
     std::string host;
+    std::string alternate;
     bool alternateOnFailure = false;
+    bool unresolved = false;
     {
       std::scoped_lock lock{m_mutex};
       // Expired keys are discarded before any connect: by now the hook has
@@ -653,7 +688,7 @@ void PeerOutbox::pump(double now)
         m_queue.pop_front();
         ++m_expiredKeys;
         expired = true;
-        LOG_DEBUG("coordination: outbox to %s discarded an expired key line", m_ip.c_str());
+        LOG_DEBUG("coordination: outbox to %s discarded an expired key line", m_label.c_str());
       }
       if (m_queue.empty() || now < m_nextAttemptAt || m_stop) {
         if (expired) {
@@ -663,10 +698,21 @@ void PeerOutbox::pump(double now)
       }
       job = std::move(m_queue.front());
       m_queue.pop_front();
-      host = (m_preferLan && !m_lan.empty()) ? m_lan : m_ip;
       // Only a peer we believed reachable (or never tried) earns a second
-      // address on the same attempt; in backoff it is one connect per window.
+      // address on the same attempt; in backoff it is one connect per
+      // window, rotating through the candidates.
       alternateOnFailure = m_state != State::Backoff;
+      if (candidates.empty()) {
+        unresolved = true;
+      } else if (m_state == State::Backoff) {
+        host = candidates[m_rotation % candidates.size()];
+        ++m_rotation;
+      } else {
+        host = candidates.front();
+        if (candidates.size() > 1) {
+          alternate = candidates[1];
+        }
+      }
       m_inFlight = true;
       m_inFlightTicket = job.ticket;
       if (expired) {
@@ -676,32 +722,39 @@ void PeerOutbox::pump(double now)
 
     std::string reply;
     std::string *replyOut = job.onReply ? &reply : nullptr;
-    bool ok = m_transport(host, job.line, replyOut);
-    if (!ok && alternateOnFailure) {
-      std::string other;
-      {
-        std::scoped_lock lock{m_mutex};
-        other = m_stop ? std::string{} : otherAddressLocked(host);
-      }
-      if (!other.empty()) {
-        reply.clear();
-        ok = m_transport(other, job.line, replyOut);
-        if (ok) {
-          host = other;
+    bool ok = false;
+    if (!unresolved) {
+      ok = m_transport(host, job.line, replyOut);
+      if (!ok && alternateOnFailure && !alternate.empty()) {
+        bool stopped = false;
+        {
+          std::scoped_lock lock{m_mutex};
+          stopped = m_stop;
+        }
+        if (!stopped) {
+          reply.clear();
+          ok = m_transport(alternate, job.line, replyOut);
+          if (ok) {
+            host = alternate;
+          }
         }
       }
     }
 
     FailureHandler onFailure;
+    AddressSink addressSink;
     {
       std::scoped_lock lock{m_mutex};
       m_inFlight = false;
       m_inFlightTicket = 0;
+      addressSink = m_addressSink;
       if (ok) {
         m_state = State::Reachable;
         m_backoffS = 0.0;
         m_nextAttemptAt = 0.0;
-        m_preferLan = !m_lan.empty() && host == m_lan;
+        m_rotation = 0;
+        m_lastAnswered = host;
+        m_loggedUnresolved = false;
         if (job.isKey) {
           if (m_deliveredKeys.size() > kMaxQueuedLines * 4) {
             m_deliveredKeys.clear(); // waiters that gave up never collect
@@ -712,8 +765,14 @@ void PeerOutbox::pump(double now)
         m_backoffS = m_backoffS <= 0.0 ? kBackoffMinS : (std::min)(m_backoffS * 2.0, kBackoffMaxS);
         m_state = State::Backoff;
         m_nextAttemptAt = m_clock() + m_backoffS;
-        if (!otherAddressLocked(host).empty()) {
-          m_preferLan = !m_preferLan; // alternate lan/ip across windows
+        if (unresolved) {
+          // No connect was attempted: the window still opens (nothing to
+          // try yet), and wake() closes it again the moment a name lands.
+          ++m_unresolvedAttempts;
+          if (!m_loggedUnresolved) {
+            m_loggedUnresolved = true;
+            LOG_WARN("coordination: peer %s has no numeric address yet (name still resolving)", m_label.c_str());
+          }
         }
         // Everything behind the failed line is stale by now (>= one
         // connect timeout old); periodic senders re-post. Sticky resync
@@ -730,10 +789,10 @@ void PeerOutbox::pump(double now)
             ++dropped;
           }
         }
-        if (dropped > 0) {
+        if (dropped > 0 && !unresolved) {
           LOG_WARN(
-              "coordination: peer %s unreachable; dropped %zu queued line(s) (retry in %.0f s)", host.c_str(), dropped,
-              m_backoffS
+              "coordination: peer %s unreachable at %s; dropped %zu queued line(s) (retry in %.0f s)", m_label.c_str(),
+              host.c_str(), dropped, m_backoffS
           );
         }
         m_queue = std::move(kept);
@@ -744,6 +803,9 @@ void PeerOutbox::pump(double now)
     }
     m_jobDone.notify_all();
 
+    if (!unresolved && addressSink) {
+      addressSink(host, ok);
+    }
     if (!ok) {
       if (onFailure) {
         onFailure();

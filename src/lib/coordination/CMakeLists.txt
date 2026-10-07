@@ -23,6 +23,8 @@ add_library(coordination STATIC
   Peer.h
   PeerAddressAllowlist.cpp
   PeerAddressAllowlist.h
+  PeerAddressBook.cpp
+  PeerAddressBook.h
   PreConnectHosts.cpp
   PreConnectHosts.h
   RelayKeyEvent.h

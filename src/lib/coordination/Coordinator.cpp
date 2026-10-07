@@ -72,7 +72,8 @@ RelayKeyEvent relayEventFromMessage(const Message &message)
 
 Coordinator::Coordinator(CoordinatorConfig config)
     : m_config(std::move(config)),
-      m_peerAllowlist(peerAddressEntries(m_config.peers)),
+      m_peerAllowlist(peerAddressEntries(m_config.peers), m_config.addressResolver),
+      m_addressBook(m_config.peers, m_config.addressResolver),
       m_election(m_config.selfName, m_config.tuning, monotonicSeconds),
       m_escSettleTimer([this] { settleEscBurst(); }),
       m_rescueWatchdog([this](int code, const std::string &reason) { exitProcess(code, reason); })
@@ -101,10 +102,28 @@ Coordinator::Coordinator(CoordinatorConfig config)
     if (namesEqual(peer.name, m_config.selfName) || m_outboxes.contains(peer.name)) {
       continue;
     }
-    auto outbox = std::make_unique<PeerOutbox>(peer.ip, peer.lan, transport, monotonicSeconds);
+    auto outbox = std::make_unique<PeerOutbox>(
+        peer.name, [book = &m_addressBook, name = peer.name] { return book->candidates(name); }, transport,
+        monotonicSeconds
+    );
     outbox->setFailureHandler([this, name = peer.name] { onPeerLaneFailed(name); });
+    outbox->setAddressSink([this, name = peer.name](const std::string &address, bool ok) {
+      if (ok) {
+        m_addressBook.noteAnswered(name, address);
+      } else {
+        m_addressBook.noteMiss(monotonicSeconds());
+      }
+    });
     m_outboxes.emplace(peer.name, std::move(outbox));
   }
+  // A name that resolves (or an address that answers / is learned) must
+  // not wait out a backoff window: wake the lane. Invoked with the book's
+  // lock held; outboxByName only reads the (immutable) lane map.
+  m_addressBook.setChangedHandler([this](const std::string &peerName) {
+    if (auto *lane = outboxByName(peerName); lane != nullptr) {
+      lane->wake();
+    }
+  });
   m_inputMonitor = createLocalInputMonitor();
   m_keyboardRelay = createKeyboardRelayMonitor();
   m_keyboardRelay->setForwardedReleaseSink([this](const std::vector<KeyButton> &buttons) {
@@ -152,6 +171,7 @@ bool Coordinator::start()
   m_inputMonitor->start([this] { onGenuineInput(); });
   m_startedAt = monotonicSeconds();
   m_peerAllowlist.start(m_startedAt);
+  m_addressBook.start(m_startedAt);
   m_workerStop = false;
   m_worker = std::thread([this] { workerLoop(); });
   // Settle every lane's reachability early so the first key forward does
@@ -189,6 +209,7 @@ void Coordinator::stop()
   }
   m_inputMonitor->stop();
   m_keyboardRelay->stop();
+  m_addressBook.stop(); // before the lanes: no more wake() into a dying lane
   for (auto &[name, outbox] : m_outboxes) {
     outbox->stop(); // before the mesh: lanes send through it
   }
@@ -623,6 +644,7 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
 void Coordinator::onMessage(const Message &message, const std::function<void(const std::string &)> &reply)
 {
   ++m_meshRx;
+  learnPeerAddress(message);
   switch (message.type) {
   case Message::Type::Claim: {
     ElectionState::ClaimAction action;
@@ -1155,6 +1177,36 @@ bool Coordinator::sourceAllowed(const Message &message, const char *kind)
   return false;
 }
 
+void Coordinator::learnPeerAddress(const Message &message)
+{
+  if (m_config.token.empty() || message.sourceAddress.empty() || message.name.empty()) {
+    return;
+  }
+  // tokenOk() already matched the configured token at the transport, so a
+  // configured peer's name on this line is authenticated by the shared
+  // secret, not by the name alone.
+  for (const auto &peer : m_config.peers) {
+    if (namesEqual(peer.name, message.name) && !namesEqual(peer.name, m_config.selfName)) {
+      m_addressBook.learn(peer.name, message.sourceAddress);
+      return;
+    }
+  }
+}
+
+void Coordinator::noteHelloReply(const std::string &peerName, const std::string &host, const Message &reply)
+{
+  if (reply.type != Message::Type::Hello || reply.name.empty() || host.empty() || namesEqual(reply.name, peerName)) {
+    return;
+  }
+  // Logged with the CONFIGURED name and the numeric host only: the wire
+  // name is untrusted input.
+  LOG_WARN(
+      "coordination: %s answered our hello for peer \"%s\" as a different seat -- dropping that address",
+      host.c_str(), peerName.c_str()
+  );
+  m_addressBook.evict(peerName, host);
+}
+
 std::vector<std::string> Coordinator::peerAddressEntries(const PeerList &peers)
 {
   std::vector<std::string> entries;
@@ -1239,10 +1291,15 @@ void Coordinator::followSender(const Message &claim)
   }
 
   // LAN-first: prefer the sender's LAN address when its coordination
-  // port answers there; otherwise use the stable address.
+  // port answers there; otherwise use the stable address. The probe goes
+  // to the book's numeric LAN candidate (the mesh refuses names); the
+  // election keeps the sender's configured strings untouched.
   std::string address = stable.empty() ? lan : stable;
-  if (!lan.empty() && lan != stable && m_mesh->probe(lan, kLanProbeTimeoutMs)) {
-    address = lan;
+  if (!lan.empty() && lan != stable) {
+    const std::string lanNumeric = m_addressBook.lanCandidate(claim.name);
+    if (!lanNumeric.empty() && m_mesh->probe(lanNumeric, kLanProbeTimeoutMs)) {
+      address = lan;
+    }
   }
   LOG_INFO("coordination: following \"%s\" at %s", claim.name.c_str(), address.c_str());
   decide(Role::Client, address);
@@ -1336,6 +1393,7 @@ void Coordinator::workerLoop()
     ++tick;
     const double now = monotonicSeconds();
     m_peerAllowlist.refreshIfDue(now);
+    m_addressBook.refreshIfDue(now);
     if (broadcastNow) {
       broadcastClaim();
       lastHeartbeatAt = now;
@@ -1449,8 +1507,11 @@ void Coordinator::probePeerMeshVersions()
   for (auto &[name, outbox] : m_outboxes) {
     // The reply handler runs on the lane thread; unreachable peers never
     // reply and keep whatever mismatch state they had.
-    outbox->post(hello, [this, peerName = name](const std::string &replyLine) {
+    outbox->post(hello, [this, peerName = name, lane = outbox.get()](const std::string &replyLine) {
       const Message reply = protocol::decode(replyLine);
+      // Same lane thread that just completed the send: this is the host
+      // that answered.
+      noteHelloReply(peerName, lane->lastAnsweredAddress(), reply);
       if (reply.type != Message::Type::Hello || reply.meshVersion < kMeshProtocolVersion) {
         noteVersionMismatch(peerName);
       } else {
