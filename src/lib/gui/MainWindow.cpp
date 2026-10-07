@@ -326,7 +326,10 @@ void MainWindow::connectSlots()
       }
   );
   connect(m_coordStatus, &deskflow::gui::CoordinationStatus::offline, this, &MainWindow::updateStatus);
-  m_coordStatus->start(static_cast<quint16>(Settings::value(Settings::Coordination::Port).toInt()));
+  m_coordStatus->start(
+      static_cast<quint16>(Settings::value(Settings::Coordination::Port).toInt()), 2500,
+      Settings::value(Settings::Coordination::Token).toString()
+  );
 
   connect(m_actionAbout, &QAction::triggered, this, &MainWindow::openAboutDialog);
   connect(m_actionClearSettings, &QAction::triggered, this, &MainWindow::clearSettings);

@@ -38,8 +38,13 @@ class CoordinationStatus : public QObject
 public:
   explicit CoordinationStatus(QObject *parent = nullptr);
 
-  void start(quint16 port, int intervalMs = 2500);
+  //! \p token: the fleet's shared `coordination/token`; with one configured
+  //! the core drops every untokened line, this poll included (observed as
+  //! "dropping message with bad token" every 2.5 s on every seat).
+  void start(quint16 port, int intervalMs = 2500, const QString &token = {});
   void stop();
+  //! The exact line poll() writes (tests).
+  QByteArray queryLine() const;
 
 Q_SIGNALS:
   //! \p role is "server" / "client" / "init"; \p serverName is the short
@@ -53,6 +58,7 @@ private:
   void poll();
 
   quint16 m_port = 24851;
+  QString m_token;
   QTimer *m_timer = nullptr;
 };
 

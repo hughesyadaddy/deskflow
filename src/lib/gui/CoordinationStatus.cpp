@@ -97,11 +97,22 @@ CoordinationStatus::CoordinationStatus(QObject *parent) : QObject(parent), m_tim
   connect(m_timer, &QTimer::timeout, this, &CoordinationStatus::poll);
 }
 
-void CoordinationStatus::start(quint16 port, int intervalMs)
+void CoordinationStatus::start(quint16 port, int intervalMs, const QString &token)
 {
   m_port = port;
+  m_token = token;
   m_timer->start(intervalMs);
   poll(); // immediate first reading
+}
+
+QByteArray CoordinationStatus::queryLine() const
+{
+  QJsonObject query;
+  query[QStringLiteral("t")] = QStringLiteral("status");
+  if (!m_token.isEmpty()) {
+    query[QStringLiteral("token")] = m_token;
+  }
+  return QJsonDocument(query).toJson(QJsonDocument::Compact) + "\n";
 }
 
 void CoordinationStatus::stop()
@@ -133,9 +144,7 @@ void CoordinationStatus::poll()
       Q_EMIT offline();
   };
 
-  connect(socket, &QTcpSocket::connected, this, [socket] {
-    socket->write("{\"t\":\"status\"}\n");
-  });
+  connect(socket, &QTcpSocket::connected, this, [socket, line = queryLine()] { socket->write(line); });
 
   connect(socket, &QTcpSocket::readyRead, this, [socket, finish] {
     const auto doc = QJsonDocument::fromJson(socket->readLine());

@@ -53,7 +53,12 @@ void CoordinationStatusTests::poll_emitsOnlineWithFleetGraph()
 
   CoordinationStatus status;
   QSignalSpy onlineSpy(&status, &CoordinationStatus::online);
-  status.start(port, 60000);
+  status.start(port, 60000, QStringLiteral("fleet-secret"));
+  // With a token configured the poll must carry it, or the core drops the
+  // line ("dropping message with bad token" every 2.5 s, 2026-10-07).
+  QCOMPARE(status.queryLine(), QByteArray("{\"t\":\"status\",\"token\":\"fleet-secret\"}\n"));
+  CoordinationStatus untokened;
+  QCOMPARE(untokened.queryLine(), QByteArray("{\"t\":\"status\"}\n"));
 
   QElapsedTimer timer;
   timer.start();
@@ -69,7 +74,7 @@ void CoordinationStatusTests::poll_emitsOnlineWithFleetGraph()
     QTest::qWait(20);
   }
   QVERIFY(client->bytesAvailable() > 0);
-  client->readAll();
+  QCOMPARE(client->readAll(), status.queryLine()); // the wire line is the tokened one
   client->write(reply);
   client->waitForBytesWritten(3000);
   client->disconnectFromHost();
