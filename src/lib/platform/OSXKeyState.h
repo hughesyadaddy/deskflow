@@ -96,6 +96,13 @@ public:
   void sanitizeInjectedKeys() override;
 
   CGEventFlags getModifierStateAsOSXFlags() const;
+  //! Flags for a posted pointer event (mouse move/button/scroll): only
+  //! modifiers that a key is actually holding -- ours (ledgered) or a
+  //! device-backed one on this machine's own keyboard. Never the bare
+  //! shadow: a shadow bit that no key holds, re-stamped on every mouse
+  //! move, is what kept a ghost modifier alive against its own release
+  //! (2026-10-08 18:09, Ctrl: "live after release" still held).
+  CGEventFlags pointerEventFlags() const;
   // Flags every posted key event carries: the shadow modifier state plus the
   // device-dependent bits. Public so tests can assert what an injected
   // letter would be composed against.

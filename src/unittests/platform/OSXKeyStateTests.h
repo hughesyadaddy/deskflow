@@ -52,6 +52,8 @@ private Q_SLOTS:
   void ghostReleaseClearsGenericOnlyModifier();
   void ghostReleaseLeavesDeviceBackedModifierAlone();
   void ghostReleaseExaminesOnlyCandidates();
+  void reseedIgnoresGhostBitsButKeepsLedgeredAndDeviceBacked();
+  void pointerEventFlagsCarryOnlyHeldModifiers();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);

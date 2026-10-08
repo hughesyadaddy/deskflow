@@ -38,8 +38,8 @@
 #include <AppKit/NSEvent.h>
 #include <AppKit/NSPasteboard.h>
 #include <AppKit/NSWorkspace.h>
-#include <Foundation/NSDistributedNotificationCenter.h>
 #include <AvailabilityMacros.h>
+#include <Foundation/NSDistributedNotificationCenter.h>
 #include <IOKit/hidsystem/event_status_driver.h>
 #include <dispatch/dispatch.h>
 #include <libproc.h>
@@ -185,12 +185,12 @@ public:
 
     NSDistributedNotificationCenter *dnc = [NSDistributedNotificationCenter defaultCenter];
     m_lockObserver = [[dnc addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil usingBlock:post] retain];
-    m_unlockObserver =
-        [[dnc addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil usingBlock:post] retain];
+    m_unlockObserver = [[dnc addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil
+                                     usingBlock:post] retain];
 
     NSNotificationCenter *wnc = [[NSWorkspace sharedWorkspace] notificationCenter];
-    m_wakeObserver =
-        [[wnc addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:nil usingBlock:post] retain];
+    m_wakeObserver = [[wnc addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:nil
+                                   usingBlock:post] retain];
   }
 
   ~OSXScreenImpl()
@@ -663,8 +663,9 @@ void OSXScreen::postMouseEvent(CGPoint &pos) const
   // Dragging events also need the click state
   CGEventSetIntegerValueField(event, kCGMouseEventClickState, m_clickState);
 
-  // Fix for sticky keys
-  CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
+  // Only modifiers a key is holding (ledgered or device-backed); the bare
+  // shadow re-stamped on every pointer event kept ghost modifiers alive.
+  CGEventFlags modifiers = m_keyState->pointerEventFlags();
   CGEventSetFlags(event, modifiers);
 
   // Set movement deltas to fix issues with certain 3D programs
@@ -747,8 +748,9 @@ void OSXScreen::fakeMouseButton(ButtonID id, bool press)
 
   CGEventSetIntegerValueField(event, kCGMouseEventClickState, m_clickState);
 
-  // Fix for sticky keys
-  CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
+  // Only modifiers a key is holding (ledgered or device-backed); the bare
+  // shadow re-stamped on every pointer event kept ghost modifiers alive.
+  CGEventFlags modifiers = m_keyState->pointerEventFlags();
   CGEventSetFlags(event, modifiers);
 
   m_buttonState.set(index, state);
@@ -849,8 +851,9 @@ void OSXScreen::fakeMouseWheel(ScrollDelta delta) const
   }
   CGEventRef scrollEvent = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, linesY, linesX);
 
-  // Fix for sticky keys
-  CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
+  // Only modifiers a key is holding (ledgered or device-backed); the bare
+  // shadow re-stamped on every pointer event kept ghost modifiers alive.
+  CGEventFlags modifiers = m_keyState->pointerEventFlags();
   CGEventSetFlags(scrollEvent, modifiers);
 
   deskflow::platform::markInjectedEvent(scrollEvent);
@@ -893,8 +896,9 @@ void OSXScreen::fakeMouseWheelEx(const WheelEx &in) const
     CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis2, fromFixed16(ex.xDelta));
   }
 
-  // Fix for sticky keys
-  CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
+  // Only modifiers a key is holding (ledgered or device-backed); the bare
+  // shadow re-stamped on every pointer event kept ghost modifiers alive.
+  CGEventFlags modifiers = m_keyState->pointerEventFlags();
   CGEventSetFlags(scrollEvent, modifiers);
   deskflow::platform::markInjectedEvent(scrollEvent);
 

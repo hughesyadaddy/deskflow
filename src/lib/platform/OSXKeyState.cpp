@@ -660,13 +660,57 @@ CGEventFlags OSXKeyState::osModifierFlags() const
 
 void OSXKeyState::reseedShadowFlagsFromOS()
 {
+  // A modifier enters the shadow only when a key is holding it: one we
+  // posted (ledgered) or one a device reports (its NX_DEVICE bit set). A
+  // generic bit with neither is a leftover of our own earlier post -- the
+  // OS adopts IOHIDPostEvent words asynchronously and every pointer event
+  // we post used to carry the shadow verbatim -- and adopting it here is
+  // precisely how a ghost became self-sustaining: reseed latched it, the
+  // next mouse move re-asserted it, the next reseed latched it again.
   const CGEventFlags os = osModifierFlags();
-  m_shiftPressed = (os & kCGEventFlagMaskShift) != 0;
-  m_controlPressed = (os & kCGEventFlagMaskControl) != 0;
-  m_altPressed = (os & kCGEventFlagMaskAlternate) != 0;
-  m_superPressed = (os & kCGEventFlagMaskCommand) != 0;
-  m_capsPressed = (os & kCGEventFlagMaskAlphaShift) != 0;
-  LOG_DEBUG("reseeded shadow modifier flags from os: 0x%llx", static_cast<unsigned long long>(os));
+  const auto held = [&](CGEventFlags generic, uint8_t vk) {
+    if ((os & generic) == 0) {
+      return false;
+    }
+    const CGEventFlags device = leftDeviceBitForVirtualKey(vk) | rightDeviceBitForVirtualKey(vk);
+    return (os & device) != 0 || m_injectedModifiers.contains(vk);
+  };
+  m_shiftPressed = held(kCGEventFlagMaskShift, s_shiftVK);
+  m_controlPressed = held(kCGEventFlagMaskControl, s_controlVK);
+  m_altPressed = held(kCGEventFlagMaskAlternate, s_altVK);
+  m_superPressed = held(kCGEventFlagMaskCommand, s_superVK);
+  m_capsPressed = (os & kCGEventFlagMaskAlphaShift) != 0; // lock state, not a held key
+  const CGEventFlags ignored =
+      os & (kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand) &
+      ~getModifierStateAsOSXFlags();
+  if (ignored != 0) {
+    LOG_DEBUG(
+        "reseeded shadow modifier flags from os: 0x%llx (ignored ghost bits 0x%llx: no device bit, not ledgered)",
+        static_cast<unsigned long long>(os), static_cast<unsigned long long>(ignored)
+    );
+  } else {
+    LOG_DEBUG("reseeded shadow modifier flags from os: 0x%llx", static_cast<unsigned long long>(os));
+  }
+}
+
+CGEventFlags OSXKeyState::pointerEventFlags() const
+{
+  const CGEventFlags os = osModifierFlags();
+  CGEventFlags flags = 0;
+  const auto include = [&](CGEventFlags generic, uint8_t vk) {
+    const CGEventFlags device = leftDeviceBitForVirtualKey(vk) | rightDeviceBitForVirtualKey(vk);
+    if (m_injectedModifiers.contains(vk) || ((os & generic) != 0 && (os & device) != 0)) {
+      flags |= generic;
+    }
+  };
+  include(kCGEventFlagMaskShift, s_shiftVK);
+  include(kCGEventFlagMaskControl, s_controlVK);
+  include(kCGEventFlagMaskAlternate, s_altVK);
+  include(kCGEventFlagMaskCommand, s_superVK);
+  if (m_capsPressed) {
+    flags |= kCGEventFlagMaskAlphaShift;
+  }
+  return flags;
 }
 
 void OSXKeyState::setShadowFlags(CGEventFlags flags)

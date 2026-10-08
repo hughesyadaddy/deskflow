@@ -263,7 +263,8 @@ void OSXKeyStateTests::shadowFlagsReseedFromOsOnUpdateKeyState()
 
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(0));
 
-  os.osFlags = kCGEventFlagMaskShift | kCGEventFlagMaskCommand;
+  // A physical press carries its device bit; that is what the reseed trusts.
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK;
   keyState.updateKeyState();
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift | kCGEventFlagMaskCommand));
 
@@ -670,6 +671,61 @@ void OSXKeyStateTests::ghostReleaseExaminesOnlyCandidates()
   QCOMPARE(os.posted.size(), size_t(1));
 }
 
+void OSXKeyStateTests::reseedIgnoresGhostBitsButKeepsLedgeredAndDeviceBacked()
+{
+  // 2026-10-08 18:09: the OS word 0x20040000 (generic Ctrl, no device bit,
+  // nothing ledgered) must NOT enter the shadow on a reseed -- that latch,
+  // plus the shadow stamped on every mouse move, is what kept the ghost
+  // alive against its own release. A ledgered modifier (ours, not yet
+  // adopted by a lagging OS) and a device-backed one (a real key) do.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl; // ghost
+  keyState.updateKeyState();
+  QVERIFY((keyState.getModifierStateAsOSXFlags() & kCGEventFlagMaskControl) == 0);
+
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl | NX_DEVICERCTLKEYMASK; // real key
+  keyState.updateKeyState();
+  QVERIFY((keyState.getModifierStateAsOSXFlags() & kCGEventFlagMaskControl) != 0);
+
+  keyState.fakeKey(stroke(kVK_Option, true));                            // ours, ledgered
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskAlternate; // OS dropped our device bit
+  keyState.updateKeyState();
+  QVERIFY((keyState.getModifierStateAsOSXFlags() & kCGEventFlagMaskAlternate) != 0);
+  QVERIFY((keyState.getModifierStateAsOSXFlags() & kCGEventFlagMaskControl) == 0);
+
+  // Caps is lock state and is taken as-is.
+  os.osFlags = kCGEventFlagMaskAlphaShift;
+  keyState.updateKeyState();
+  QVERIFY((keyState.getModifierStateAsOSXFlags() & kCGEventFlagMaskAlphaShift) != 0);
+}
+
+void OSXKeyStateTests::pointerEventFlagsCarryOnlyHeldModifiers()
+{
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  // Ghost Ctrl in the OS word: a posted mouse move must not carry it.
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl;
+  QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(0));
+  // A real local Shift (device bit) rides along for shift-click.
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | kCGEventFlagMaskControl;
+  QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(kCGEventFlagMaskShift));
+  // A relayed (ledgered) Cmd rides along even while the OS word lags.
+  keyState.fakeKey(stroke(kVK_Command, true));
+  os.osFlags = kCGEventFlagMaskNonCoalesced;
+  QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(kCGEventFlagMaskCommand));
+  keyState.fakeKey(stroke(kVK_Command, false));
+  QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(0));
+}
+
 void OSXKeyStateTests::releaseInjectedKeysLeavesPhysicallyHeldModifierAlone()
 {
   // Review finding: a held key emits ONE flagsChanged, so a user shift-
@@ -683,8 +739,8 @@ void OSXKeyStateTests::releaseInjectedKeysLeavesPhysicallyHeldModifierAlone()
   keyState.setHooks(os.hooks());
   QVERIFY(keyState.injectedModifiers().empty());
 
-  // Shift and Cmd held on this keyboard; the last flagsChanged is long past
-  os.osFlags = kCGEventFlagMaskShift | kCGEventFlagMaskCommand;
+  // Shift and Cmd held on this keyboard (device bits); the last flagsChanged is long past
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK;
   keyState.noteHardwareModifierFlags(kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK, os.now - 30.0);
   keyState.noteHardwareModifierFlags(kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK, os.now - 30.0);
 
@@ -738,7 +794,7 @@ void OSXKeyStateTests::fakeAllKeysUpReleasesLedgeredModifierOutsideSyntheticSet(
 
   keyState.fakeKey(stroke(kVK_Option, true)); // ledgered, not synthetic
   os.posted.clear();
-  os.osFlags = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift;
+  os.osFlags = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK; // the user's own Shift
 
   keyState.fakeAllKeysUp();
 
