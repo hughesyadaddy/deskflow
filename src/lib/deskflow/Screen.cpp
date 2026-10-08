@@ -581,7 +581,11 @@ void Screen::enterSecondary(KeyModifierMask mask)
   // m_osDisagreeModifiers must capture (the verifier's ghost candidates);
   // the filtered poll would never show it.
   const KeyModifierMask osMods = m_screen->pollReportedModifiers();
-  KeyModifierMask desired = osMods & ~IKeyState::s_lockModifierMask;
+  // The press mask, however, must describe what a key really holds (the
+  // filtered poll): seeding it with a reported ghost makes mapKey() flip
+  // that ghost around the reassert press -- a synthetic tap of the ghost
+  // modifier on every enter (review finding, 2026-10-08).
+  KeyModifierMask desired = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask;
   m_osDisagreeModifiers = 0;
   for (const auto &mod : kReassertedModifiers) {
     if ((mask & mod.bit) == 0) {
