@@ -299,6 +299,10 @@ public:
   {
     return osModifiers;
   }
+  KeyModifierMask pollReportedModifiers() const override
+  {
+    return osModifiers; // the scripted word is also what the OS "reports"
+  }
   int32_t pollActiveGroup() const override
   {
     return 0;
