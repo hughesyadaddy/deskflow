@@ -437,13 +437,43 @@ CGEventFlags OSXKeyState::getModifierStateAsOSXFlags() const
   return modifiers;
 }
 
+CGEventFlags OSXKeyState::heldModifierFlags() const
+{
+  // The OS flag word reduced to modifiers a key is actually holding: ours
+  // (ledgered) or device-backed (a real key, left or right). A generic bit
+  // with neither is a leftover of our own posts; adopting it anywhere --
+  // shadow, pointer events, or the base class's m_mask that mapKey()'s
+  // modifier restore acts on -- is what re-pressed a ghost on every key.
+  const CGEventFlags os = osModifierFlags();
+  CGEventFlags held =
+      os & ~(kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand);
+  const auto keep = [&](CGEventFlags generic, uint8_t vk) {
+    if ((os & generic) == 0) {
+      return;
+    }
+    const CGEventFlags device = leftDeviceBitForVirtualKey(vk) | rightDeviceBitForVirtualKey(vk);
+    if ((os & device) != 0 || m_injectedModifiers.contains(vk)) {
+      held |= generic;
+    }
+  };
+  keep(kCGEventFlagMaskShift, s_shiftVK);
+  keep(kCGEventFlagMaskControl, s_controlVK);
+  keep(kCGEventFlagMaskAlternate, s_altVK);
+  keep(kCGEventFlagMaskCommand, s_superVK);
+  return held;
+}
+
 KeyModifierMask OSXKeyState::pollActiveModifiers() const
 {
   if (m_hooks.osModifierFlags) {
     // Tests: the hooked flag word is the whole OS truth, so the base
     // class's mask (reseedModifierState) can be seeded and asserted.
-    return mapModifiersFromOSX(static_cast<uint32_t>(m_hooks.osModifierFlags()));
+    return mapModifiersFromOSX(static_cast<uint32_t>(heldModifierFlags()));
   }
+  // Production: the same held-or-ledgered rule on the HID system word.
+  // GetCurrentKeyModifiers() (below) carries no device bits, so it would
+  // hand a ghost straight into m_mask; its lock bits are still merged in.
+  const KeyModifierMask held = mapModifiersFromOSX(static_cast<uint32_t>(heldModifierFlags()));
   // falsely assumed that the mask returned by GetCurrentKeyModifiers()
   // was the same as a CGEventFlags (which is what mapModifiersFromOSX
   // expects). patch by Marc
@@ -470,6 +500,9 @@ KeyModifierMask OSXKeyState::pollActiveModifiers() const
   }
 
   LOG_VERBOSE("mask=%04x outMask=%04x", mask, outMask);
+  // Held modifiers come from the device-bit/ledger rule; GetCurrentKeyModifiers
+  // contributes only the lock state.
+  outMask = (outMask & ~(KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper)) | held;
   return outMask;
 }
 
@@ -668,17 +701,11 @@ void OSXKeyState::reseedShadowFlagsFromOS()
   // precisely how a ghost became self-sustaining: reseed latched it, the
   // next mouse move re-asserted it, the next reseed latched it again.
   const CGEventFlags os = osModifierFlags();
-  const auto held = [&](CGEventFlags generic, uint8_t vk) {
-    if ((os & generic) == 0) {
-      return false;
-    }
-    const CGEventFlags device = leftDeviceBitForVirtualKey(vk) | rightDeviceBitForVirtualKey(vk);
-    return (os & device) != 0 || m_injectedModifiers.contains(vk);
-  };
-  m_shiftPressed = held(kCGEventFlagMaskShift, s_shiftVK);
-  m_controlPressed = held(kCGEventFlagMaskControl, s_controlVK);
-  m_altPressed = held(kCGEventFlagMaskAlternate, s_altVK);
-  m_superPressed = held(kCGEventFlagMaskCommand, s_superVK);
+  const CGEventFlags held = heldModifierFlags();
+  m_shiftPressed = (held & kCGEventFlagMaskShift) != 0;
+  m_controlPressed = (held & kCGEventFlagMaskControl) != 0;
+  m_altPressed = (held & kCGEventFlagMaskAlternate) != 0;
+  m_superPressed = (held & kCGEventFlagMaskCommand) != 0;
   m_capsPressed = (os & kCGEventFlagMaskAlphaShift) != 0; // lock state, not a held key
   const CGEventFlags ignored =
       os & (kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand) &
@@ -695,18 +722,13 @@ void OSXKeyState::reseedShadowFlagsFromOS()
 
 CGEventFlags OSXKeyState::pointerEventFlags() const
 {
-  const CGEventFlags os = osModifierFlags();
-  CGEventFlags flags = 0;
-  const auto include = [&](CGEventFlags generic, uint8_t vk) {
-    const CGEventFlags device = leftDeviceBitForVirtualKey(vk) | rightDeviceBitForVirtualKey(vk);
-    if (m_injectedModifiers.contains(vk) || ((os & generic) != 0 && (os & device) != 0)) {
-      flags |= generic;
-    }
-  };
-  include(kCGEventFlagMaskShift, s_shiftVK);
-  include(kCGEventFlagMaskControl, s_controlVK);
-  include(kCGEventFlagMaskAlternate, s_altVK);
-  include(kCGEventFlagMaskCommand, s_superVK);
+  // Ledgered modifiers ride along even while a lagging OS word has not
+  // adopted our Down yet; device-backed ones are the user's own keys.
+  CGEventFlags flags = heldModifierFlags() & (kCGEventFlagMaskShift | kCGEventFlagMaskControl |
+                                              kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand);
+  for (const uint8_t vk : m_injectedModifiers) {
+    flags |= modifierFlagForVirtualKey(vk) & ~kCGEventFlagMaskAlphaShift;
+  }
   if (m_capsPressed) {
     flags |= kCGEventFlagMaskAlphaShift;
   }

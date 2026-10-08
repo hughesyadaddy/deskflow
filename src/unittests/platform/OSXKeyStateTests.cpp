@@ -591,12 +591,16 @@ void OSXKeyStateTests::ghostReleaseClearsGenericOnlyModifier()
   // restore Down for it -- re-pressing the ghost, now with a device bit.
   // Seed the mask the way leaveSecondary's fakeAllKeysUp() does (from the
   // OS, ghost included), then release, then check what mapKey() would see.
+  // With the held-or-ledgered rule a generic-only Cmd never enters the
+  // base mask in the first place (no restore-Down can re-press it), and
+  // the ghost release still clears the OS word.
   os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskCommand;
   keyState.updateKeyState();
-  QVERIFY((keyState.getActiveModifiers() & KeyModifierSuper) != 0);
+  QVERIFY((keyState.getActiveModifiers() & KeyModifierSuper) == 0);
   QCOMPARE(keyState.releaseGhostModifiers(KeyModifierSuper), KeyModifierMask(KeyModifierSuper));
   QVERIFY((keyState.getActiveModifiers() & KeyModifierSuper) == 0);
   QVERIFY((keyState.pollActiveModifiers() & KeyModifierSuper) == 0);
+  QVERIFY((os.osFlags & kCGEventFlagMaskCommand) == 0);
 
   // Round-2 review: the OS adopts the post asynchronously. With a LAGGING
   // OS (the posted word never lands before the next read) the reseed must
@@ -611,7 +615,7 @@ void OSXKeyStateTests::ghostReleaseClearsGenericOnlyModifier()
   lagged.setHooks(lagHooks);
   lagging.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskCommand;
   lagged.updateKeyState();
-  QVERIFY((lagged.getActiveModifiers() & KeyModifierSuper) != 0);
+  QVERIFY((lagged.getActiveModifiers() & KeyModifierSuper) == 0); // never latched
   QCOMPARE(lagged.releaseGhostModifiers(KeyModifierSuper), KeyModifierMask(KeyModifierSuper));
   QVERIFY((lagged.getActiveModifiers() & KeyModifierSuper) == 0);
   QVERIFY((lagged.getModifierStateAsOSXFlags() & kCGEventFlagMaskCommand) == 0);
@@ -687,6 +691,9 @@ void OSXKeyStateTests::reseedIgnoresGhostBitsButKeepsLedgeredAndDeviceBacked()
   os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl; // ghost
   keyState.updateKeyState();
   QVERIFY((keyState.getModifierStateAsOSXFlags() & kCGEventFlagMaskControl) == 0);
+  // ... nor the base class's active-modifier mask that mapKey() restores from.
+  QVERIFY((keyState.getActiveModifiers() & KeyModifierControl) == 0);
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierControl) == 0);
 
   os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl | NX_DEVICERCTLKEYMASK; // real key
   keyState.updateKeyState();

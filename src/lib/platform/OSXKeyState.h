@@ -103,6 +103,10 @@ public:
   //! move, is what kept a ghost modifier alive against its own release
   //! (2026-10-08 18:09, Ctrl: "live after release" still held).
   CGEventFlags pointerEventFlags() const;
+  //! The OS flag word reduced to modifiers a key is holding (ledgered or
+  //! device-backed); lock bits pass through. Every consumer of "what is
+  //! held" on this platform goes through it.
+  CGEventFlags heldModifierFlags() const;
   // Flags every posted key event carries: the shadow modifier state plus the
   // device-dependent bits. Public so tests can assert what an injected
   // letter would be composed against.
