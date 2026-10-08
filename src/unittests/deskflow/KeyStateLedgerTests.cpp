@@ -37,6 +37,7 @@ struct PlatformCall
     SetToggle,
     Sanitize,
     ReleaseInjected,
+    ReleaseGhost,
   };
   Kind kind;
   KeyID id = kKeyNone;
@@ -57,8 +58,11 @@ public:
   {
   }
 
-  // scripted OS truth
+  // scripted OS truth: what a key holds (the filtered poll) ...
   KeyModifierMask osModifiers = 0;
+  // ... plus bits the OS reports that no key holds (ghosts): only the
+  // unfiltered poll shows them, and releaseGhostModifiers() clears them.
+  KeyModifierMask osGhosts = 0;
   std::vector<PlatformCall> calls;
 
   // IScreen
@@ -176,6 +180,17 @@ public:
   void releaseInjectedKeys(KeyModifierMask keep = 0) override
   {
     calls.push_back({PlatformCall::Kind::ReleaseInjected, kKeyNone, 0, keep});
+  }
+  KeyModifierMask pollReportedModifiers() const override
+  {
+    return osModifiers | osGhosts;
+  }
+  KeyModifierMask releaseGhostModifiers(KeyModifierMask candidates) override
+  {
+    calls.push_back({PlatformCall::Kind::ReleaseGhost, kKeyNone, 0, candidates});
+    const KeyModifierMask released = candidates & osGhosts;
+    osGhosts &= ~released;
+    return released;
   }
 
   // IPlatformScreen
@@ -807,6 +822,47 @@ void KeyStateLedgerTests::primarySweep_neverReleasesPhysicallyCapturedKey()
   QVERIFY(ks.strokes[1].first == kShift && !ks.strokes[1].second);
 }
 
+void KeyStateLedgerTests::leaveSecondary_offersReportedGhostsForRelease()
+{
+  // 2026-10-08 18:09: the OS reported a Ctrl that no key held (a ghost). The
+  // filtered poll cannot show it by design, so leave must offer the
+  // REPORTED word's bits -- a review found the production path silently
+  // offering the filtered word and never releasing anything.
+  SecondaryFixture f;
+  f.platform->osModifiers = 0;
+  f.screen->enter(0);
+  f.platform->calls.clear();
+  f.platform->osGhosts = KeyModifierControl;
+  QVERIFY(f.screen->leave());
+  QCOMPARE(f.platform->count(PlatformCall::Kind::ReleaseGhost), 1);
+  const auto *ghost = f.platform->find(PlatformCall::Kind::ReleaseGhost);
+  QVERIFY(ghost != nullptr);
+  QVERIFY((ghost->mask & KeyModifierControl) != 0);
+  QCOMPARE(f.platform->osGhosts, KeyModifierMask(0)); // released
+}
+
+void KeyStateLedgerTests::postSwitchVerifier_offersDisownedReportedGhosts()
+{
+  // Same for the verifier: a ghost Cmd the server's enter mask disowned
+  // must reach releaseGhostModifiers() after the ledger release, from the
+  // REPORTED word; a reasserted (kept) modifier must not.
+  SecondaryFixture f;
+  f.platform->osModifiers = 0;
+  f.platform->osGhosts = KeyModifierSuper; // present at the crossing, server said not held
+  f.screen->enter(KeyModifierShift);       // Shift reasserted: kept
+  f.platform->calls.clear();
+  f.platform->osModifiers = KeyModifierShift;
+  pumpUntil(f.events, deskflow::Screen::kPostSwitchFirstCheckS + deskflow::Screen::kPostSwitchSecondCheckS + 3.0, [&] {
+    return f.platform->count(PlatformCall::Kind::ReleaseGhost) > 0;
+  });
+  QCOMPARE(f.platform->count(PlatformCall::Kind::ReleaseInjected), 1);
+  const auto *ghost = f.platform->find(PlatformCall::Kind::ReleaseGhost);
+  QVERIFY(ghost != nullptr);
+  QCOMPARE(ghost->mask, KeyModifierMask(KeyModifierSuper)); // not Shift
+  QCOMPARE(f.platform->osGhosts, KeyModifierMask(0));
+  QVERIFY(f.screen->leave());
+}
+
 void KeyStateLedgerTests::postSwitchVerifier_keepsReassertedModifiers()
 {
   // K4 audit MED-3: the user crosses with Shift held (re-asserted on enter)
@@ -830,7 +886,7 @@ void KeyStateLedgerTests::postSwitchVerifier_keepsReassertedModifiers()
   const auto *release = f.platform->find(PlatformCall::Kind::ReleaseInjected);
   QVERIFY(release != nullptr);
   QCOMPARE(release->mask, KeyModifierMask(KeyModifierShift)); // kept: the re-asserted Shift
-  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyUp), 0);   // Shift itself untouched
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyUp), 0);  // Shift itself untouched
 
   // ... and the re-asserted Shift still has its own release path
   f.platform->calls.clear();

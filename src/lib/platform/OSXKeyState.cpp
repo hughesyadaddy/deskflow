@@ -451,8 +451,13 @@ CGEventFlags OSXKeyState::heldModifierFlags() const
     if ((os & generic) == 0) {
       return;
     }
-    const CGEventFlags device = leftDeviceBitForVirtualKey(vk) | rightDeviceBitForVirtualKey(vk);
-    if ((os & device) != 0 || m_injectedModifiers.contains(vk)) {
+    const CGEventFlags left = leftDeviceBitForVirtualKey(vk);
+    const CGEventFlags right = rightDeviceBitForVirtualKey(vk);
+    // Our own Downs carry the LEFT device bit, so a left-only bit whose Up
+    // we have already posted (m_pendingReleases: the OS has not adopted it
+    // yet) is ours and stale, not a key; a RIGHT bit can only be a key.
+    const bool leftIsOurs = (os & left) != 0 && m_pendingReleases.contains(vk);
+    if ((os & right) != 0 || ((os & left) != 0 && !leftIsOurs) || m_injectedModifiers.contains(vk)) {
       held |= generic;
     }
   };
@@ -461,6 +466,12 @@ CGEventFlags OSXKeyState::heldModifierFlags() const
   keep(kCGEventFlagMaskAlternate, s_altVK);
   keep(kCGEventFlagMaskCommand, s_superVK);
   return held;
+}
+
+KeyModifierMask OSXKeyState::pollReportedModifiers() const
+{
+  // Unfiltered: what the OS says, ghosts included (the ghost paths' input).
+  return mapModifiersFromOSX(static_cast<uint32_t>(osModifierFlags()));
 }
 
 KeyModifierMask OSXKeyState::pollActiveModifiers() const
@@ -723,12 +734,25 @@ void OSXKeyState::reseedShadowFlagsFromOS()
 CGEventFlags OSXKeyState::pointerEventFlags() const
 {
   // Ledgered modifiers ride along even while a lagging OS word has not
-  // adopted our Down yet; device-backed ones are the user's own keys.
-  CGEventFlags flags = heldModifierFlags() & (kCGEventFlagMaskShift | kCGEventFlagMaskControl |
-                                              kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand);
-  for (const uint8_t vk : m_injectedModifiers) {
-    flags |= modifierFlagForVirtualKey(vk) & ~kCGEventFlagMaskAlphaShift;
-  }
+  // adopted our Down yet; device-backed ones are the user's own keys. Both
+  // carry their DEVICE bit: a pointer event with a generic-only modifier
+  // was the one place this process emitted the ghost signature itself.
+  const CGEventFlags os = osModifierFlags();
+  const CGEventFlags held = heldModifierFlags();
+  CGEventFlags flags = 0;
+  const auto add = [&](CGEventFlags generic, uint8_t vk) {
+    const CGEventFlags device = leftDeviceBitForVirtualKey(vk) | rightDeviceBitForVirtualKey(vk);
+    if ((held & generic) != 0) {
+      flags |= generic | (os & device);
+    }
+    if (m_injectedModifiers.contains(vk)) {
+      flags |= generic | leftDeviceBitForVirtualKey(vk);
+    }
+  };
+  add(kCGEventFlagMaskShift, s_shiftVK);
+  add(kCGEventFlagMaskControl, s_controlVK);
+  add(kCGEventFlagMaskAlternate, s_altVK);
+  add(kCGEventFlagMaskCommand, s_superVK);
   if (m_capsPressed) {
     flags |= kCGEventFlagMaskAlphaShift;
   }

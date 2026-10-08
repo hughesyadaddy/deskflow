@@ -577,7 +577,10 @@ void Screen::enterSecondary(KeyModifierMask mask)
   //    holds. Passing the whole enter mask (Win|Shift) as the desired state
   //    of the Shift press made mapKey() tap Super around it to "match" the
   //    mask -- a Start-menu flash on every Win+Shift crossing.
-  const KeyModifierMask osMods = m_screen->pollActiveModifiers();
+  // The REPORTED word: a bit the OS shows that no key holds is exactly what
+  // m_osDisagreeModifiers must capture (the verifier's ghost candidates);
+  // the filtered poll would never show it.
+  const KeyModifierMask osMods = m_screen->pollReportedModifiers();
   KeyModifierMask desired = osMods & ~IKeyState::s_lockModifierMask;
   m_osDisagreeModifiers = 0;
   for (const auto &mod : kReassertedModifiers) {
@@ -638,12 +641,14 @@ void Screen::leaveSecondary()
   // and stayed in the OS flags (generic bit, no device bit) for the next
   // three minutes until the following leave. A modifier held on this
   // machine's own keyboard carries its device bit and is left alone.
+  // Candidates come from the REPORTED word (the filtered poll hides ghosts
+  // by construction); releaseGhostModifiers() applies the device-bit test.
   const KeyModifierMask ghosts =
-      m_screen->releaseGhostModifiers(m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask);
+      m_screen->releaseGhostModifiers(m_screen->pollReportedModifiers() & ~IKeyState::s_lockModifierMask);
   if (ghosts != 0) {
     // Honest about the outcome: the release is a post, the poll is what the
     // OS actually did with it.
-    const KeyModifierMask remaining = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & ghosts;
+    const KeyModifierMask remaining = m_screen->pollReportedModifiers() & ~IKeyState::s_lockModifierMask & ghosts;
     LOG_INFO("[keys] leave released ghost modifiers 0x%04x (still reported held: 0x%04x)", ghosts, remaining);
   }
 }
@@ -709,7 +714,9 @@ void Screen::handlePostSwitchVerifier()
   // are tracked and have their own release path (the server's real key up
   // or leave), so they are not "stuck" however long the user holds them --
   // a shift-drag across the crossing must survive this.
-  KeyModifierMask held = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask;
+  // The verifier exists to find reported-but-not-held bits, so it reads the
+  // REPORTED word (the filtered poll would hide exactly those).
+  KeyModifierMask held = m_screen->pollReportedModifiers() & ~IKeyState::s_lockModifierMask;
   for (const auto &[bit, button] : m_reassertedModifiers) {
     held &= ~bit;
   }
@@ -764,7 +771,7 @@ void Screen::handlePostSwitchVerifier()
   // addition here. This poll only makes the log honest about what
   // releaseInjectedKeys() did and did not clear; nothing further is
   // attempted.
-  KeyModifierMask stillHeld = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & held;
+  KeyModifierMask stillHeld = m_screen->pollReportedModifiers() & ~IKeyState::s_lockModifierMask & held;
   if (stillHeld != 0) {
     // What the ledger could not close may still be OURS: a synthetic hold
     // whose release the OS dropped shows up as a generic modifier bit
@@ -778,7 +785,7 @@ void Screen::handlePostSwitchVerifier()
     const KeyModifierMask ghosts = m_screen->releaseGhostModifiers(stillHeld & m_osDisagreeModifiers & ~keep);
     if (ghosts != 0) {
       LOG_INFO("[keys] post-switch released ghost modifiers 0x%04x", ghosts);
-      stillHeld = m_screen->pollActiveModifiers() & ~IKeyState::s_lockModifierMask & held;
+      stillHeld = m_screen->pollReportedModifiers() & ~IKeyState::s_lockModifierMask & held;
     }
   }
   if (stillHeld != 0) {

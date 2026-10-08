@@ -722,15 +722,62 @@ void OSXKeyStateTests::pointerEventFlagsCarryOnlyHeldModifiers()
   // Ghost Ctrl in the OS word: a posted mouse move must not carry it.
   os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl;
   QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(0));
-  // A real local Shift (device bit) rides along for shift-click.
+  // A real local Shift (device bit) rides along for shift-click, WITH its
+  // device bit: this process must never emit a generic-only word.
   os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | kCGEventFlagMaskControl;
-  QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(kCGEventFlagMaskShift));
-  // A relayed (ledgered) Cmd rides along even while the OS word lags.
+  QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK));
+  // A relayed (ledgered) Cmd rides along even while the OS word lags, with
+  // the left device bit our own Down carries.
   keyState.fakeKey(stroke(kVK_Command, true));
   os.osFlags = kCGEventFlagMaskNonCoalesced;
-  QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(kCGEventFlagMaskCommand));
+  QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK));
   keyState.fakeKey(stroke(kVK_Command, false));
   QCOMPARE(keyState.pointerEventFlags(), CGEventFlags(0));
+}
+
+void OSXKeyStateTests::reportedPollShowsGhostsThatActivePollHides()
+{
+  // The ghost paths (leave, verifier) must be fed the REPORTED word.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl | kCGEventFlagMaskShift | NX_DEVICERSHIFTKEYMASK;
+  QCOMPARE(keyState.pollActiveModifiers() & (KeyModifierControl | KeyModifierShift), KeyModifierMask(KeyModifierShift));
+  QCOMPARE(
+      keyState.pollReportedModifiers() & (KeyModifierControl | KeyModifierShift),
+      KeyModifierMask(KeyModifierControl | KeyModifierShift)
+  );
+  // ... and the ghost release, fed the reported word, clears exactly the ghost.
+  QCOMPARE(keyState.releaseGhostModifiers(keyState.pollReportedModifiers()), KeyModifierMask(KeyModifierControl));
+  QVERIFY((os.osFlags & kCGEventFlagMaskShift) != 0);
+}
+
+void OSXKeyStateTests::pendingReleaseLeftBitIsNotHeld()
+{
+  // Our own Down carries the LEFT device bit. After we post its Up, a
+  // lagging OS word still shows generic+LEFT: that is ours and stale
+  // (m_pendingReleases), not a key -- the held rule must not latch it, or
+  // the lag window re-emits it. A RIGHT bit is always a key.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  OSXKeyState::Hooks hooks = os.hooks();
+  hooks.postHIDKey = [&os](uint8_t vk, bool down, CGEventFlags flags) {
+    os.posted.push_back({vk, down, flags});
+    return KERN_SUCCESS; // lagging OS: the word never follows our posts
+  };
+  keyState.setHooks(hooks);
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK; // as after our Down
+  keyState.fakeKey(stroke(kVK_Control, true));
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierControl) != 0); // ledgered
+  keyState.fakeKey(stroke(kVK_Control, false));                        // Up posted; OS still lags
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierControl) == 0);
+  QCOMPARE(keyState.pointerEventFlags() & kCGEventFlagMaskControl, CGEventFlags(0));
+  os.osFlags = kCGEventFlagMaskNonCoalesced | kCGEventFlagMaskControl | NX_DEVICERCTLKEYMASK; // a real right Ctrl
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierControl) != 0);
 }
 
 void OSXKeyStateTests::releaseInjectedKeysLeavesPhysicallyHeldModifierAlone()

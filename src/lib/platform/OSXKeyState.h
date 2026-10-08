@@ -92,6 +92,7 @@ public:
   void fakeAllKeysUp() override;
   void releaseInjectedKeys(KeyModifierMask keep = 0) override;
   KeyModifierMask releaseGhostModifiers(KeyModifierMask candidates) override;
+  KeyModifierMask pollReportedModifiers() const override;
   void setToggleState(KeyModifierMask bit, bool on) override;
   void sanitizeInjectedKeys() override;
 

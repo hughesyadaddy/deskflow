@@ -65,6 +65,7 @@ public:
   void sanitizeInjectedKeys() override;
   void releaseInjectedKeys(KeyModifierMask keep = 0) override;
   KeyModifierMask releaseGhostModifiers(KeyModifierMask candidates) override;
+  KeyModifierMask pollReportedModifiers() const override;
 
   // IPlatformScreen overrides
   void enable() override = 0;

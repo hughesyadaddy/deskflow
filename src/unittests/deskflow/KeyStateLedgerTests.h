@@ -36,6 +36,8 @@ private Q_SLOTS:
   void enable_sanitizesOnlyWhenNotEntered();
   void describeKey_printsCharacterWithItsCase();
   void primarySweep_neverReleasesPhysicallyCapturedKey();
+  void leaveSecondary_offersReportedGhostsForRelease();
+  void postSwitchVerifier_offersDisownedReportedGhosts();
   void postSwitchVerifier_keepsReassertedModifiers();
   void postSwitchVerifier_keepsNothingAfterShiftReleased();
 };

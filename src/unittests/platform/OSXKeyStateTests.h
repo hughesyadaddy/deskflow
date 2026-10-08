@@ -54,6 +54,8 @@ private Q_SLOTS:
   void ghostReleaseExaminesOnlyCandidates();
   void reseedIgnoresGhostBitsButKeepsLedgeredAndDeviceBacked();
   void pointerEventFlagsCarryOnlyHeldModifiers();
+  void reportedPollShowsGhostsThatActivePollHides();
+  void pendingReleaseLeftBitIsNotHeld();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);

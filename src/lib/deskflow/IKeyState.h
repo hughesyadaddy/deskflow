@@ -218,6 +218,20 @@ public:
     return 0;
   }
 
+  //! The modifier state the OS REPORTS, including bits no key is holding.
+  /*!
+  pollActiveModifiers() is the truth a platform trusts for composing keys
+  (on macOS: ledgered or device-backed only). This is the unfiltered word,
+  which is what the ghost paths must look at: a leftover bit is exactly a
+  reported-but-not-held modifier, so filtering it out before offering it
+  to releaseGhostModifiers() would hide every ghost (review finding,
+  2026-10-08). Default: the same as pollActiveModifiers().
+  */
+  virtual KeyModifierMask pollReportedModifiers() const
+  {
+    return pollActiveModifiers();
+  }
+
   //! Fake ctrl+alt+del
   /*!
   Synthesize a press of ctrl+alt+del.  Return true if processing is

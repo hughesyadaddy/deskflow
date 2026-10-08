@@ -108,6 +108,11 @@ KeyModifierMask PlatformScreen::releaseGhostModifiers(KeyModifierMask candidates
   return getKeyState()->releaseGhostModifiers(candidates);
 }
 
+KeyModifierMask PlatformScreen::pollReportedModifiers() const
+{
+  return getKeyState()->pollReportedModifiers();
+}
+
 std::string PlatformScreen::sidesMaskToString(uint32_t sides)
 {
   using enum DirectionMask;
