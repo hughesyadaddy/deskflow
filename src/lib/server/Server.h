@@ -398,15 +398,13 @@ private:
   //! Queue the active session's held out-mods for delivery on reconnect.
   void rememberUndeliveredChordModClear();
   void requestLocalCoreRestart();
-  //! 12x Esc: stop every Deskflow instance and service on every seat.
-  void requestLocalStopAll();
-  //! Settle poll for the Esc burst (one-shot timer on m_events; tests
-  //! inject the clock): decides and fires the burst's action.
+  //! Deadline poll for the Esc hold (one-shot timer on m_events; tests
+  //! inject the clock): fires the restart once the hold has lasted.
   void settleEscBurst(
-      deskflow::coordination::EscTapRescue::Clock::time_point now = deskflow::coordination::EscTapRescue::Clock::now()
+      deskflow::coordination::EscHoldRescue::Clock::time_point now = deskflow::coordination::EscHoldRescue::Clock::now()
   );
-  //! Release everything held on the active screen, then restart / stop.
-  void fireEscRescue(deskflow::coordination::RescueAction action);
+  //! Release everything held on the active screen, then restart.
+  void fireEscRescue();
   void armEscBurstTimer();
   void clearEscBurstTimer();
   void onMouseDown(ButtonID);
@@ -701,11 +699,13 @@ private:
   //! (every other chord comparison is CaselessCmp too).
   std::map<std::string, KeyModifierMask, deskflow::string::CaselessCmp> m_pendingChordModClears;
 
-  deskflow::coordination::EscTapRescue m_escTapRescue;
-  //! Fires settleEscBurst() once the burst has been silent for kSettleMs.
+  //! Esc hold rescue, fed by this seat's physical keys only.
+  deskflow::coordination::EscHoldRescue m_escHold;
+  //! Fires settleEscBurst() at the hold's deadline.
   EventQueueTimer *m_escBurstTimer = nullptr;
+  //! True while relayForwardedKey() replays a peer's key through
+  //! onKeyDown/onKeyUp: those never feed m_escHold.
+  bool m_relayingForwardedKey = false;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
   std::function<void()> m_localCoreRestartHook;
-  //! When set (unit tests), used instead of the fleet stop-all.
-  std::function<void()> m_localStopAllHook;
 };

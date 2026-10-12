@@ -622,8 +622,9 @@ void ServerKeyLedgerTests::forceLeave_sendsBestEffortReleases()
   }
 }
 
-void ServerKeyLedgerTests::escRescue_releasesLedger()
+void ServerKeyLedgerTests::escHold_releasesLedger()
 {
+  using deskflow::coordination::EscHoldRescue;
   Fixture f;
   f.init({"remote"});
   RecordingClient remote("remote");
@@ -634,24 +635,24 @@ void ServerKeyLedgerTests::escRescue_releasesLedger()
     int restarts = 0;
     server.m_localCoreRestartHook = [&restarts] { ++restarts; };
 
-    // a key is stuck down on the target; the user mashes Esc
+    // a key is stuck down on the target; the user holds Esc
     server.onKeyDown(kKeyA, 0, kButtonA, "en", nullptr);
-    for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
-      server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
-      server.onKeyUp(kKeyEscape, 0, 1, nullptr);
-    }
     remote.keys.clear();
     server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
-    // Nothing fires on the press; the ledger is released when the burst
-    // has ended (settle timer) and the restart is requested.
+    // The Esc rides to the target like any key; nothing fires on the press.
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyEscape), 1);
     QCOMPARE(restarts, 0);
     QVERIFY(!server.m_keysHeldOnActive.empty());
-    server.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
+    server.settleEscBurst(EscHoldRescue::Clock::now() + std::chrono::seconds(1));
+    QCOMPARE(restarts, 0); // still short of the hold
+    server.settleEscBurst(EscHoldRescue::Clock::now() + std::chrono::milliseconds(EscHoldRescue::kHoldMs + 500));
 
+    // Held long enough: everything on the ledger is released (A and the
+    // Esc itself) before the restart is requested.
     QCOMPARE(restarts, 1);
     QVERIFY(server.m_keysHeldOnActive.empty());
     QVERIFY(remote.findUp(kKeyA) != nullptr);
-    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyEscape), 0);
+    QVERIFY(remote.findUp(kKeyEscape) != nullptr);
 
     server.m_clients.erase("remote");
   }

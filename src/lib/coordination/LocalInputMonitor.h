@@ -38,10 +38,12 @@ class ILocalInputMonitor
 {
 public:
   using Callback = std::function<void()>;
-  //! A genuine key down (repeats excluded): the neutral KeyID (kKeyEscape
-  //! for Esc; other keys need not be mapped precisely) and the modifier
-  //! mask held at the time.
-  using KeyDownSink = std::function<void(KeyID id, KeyModifierMask mask)>;
+  //! A genuine PHYSICAL key transition (never injected or relayed input):
+  //! the neutral KeyID (kKeyEscape for Esc; other keys need not be mapped
+  //! precisely), the modifier mask held at the time, and whether this is a
+  //! Down (\p down; autorepeat Downs may or may not be delivered -- the
+  //! consumer treats a Down for a key already down as a repeat) or an Up.
+  using KeySink = std::function<void(KeyID id, KeyModifierMask mask, bool down)>;
 
   virtual ~ILocalInputMonitor() = default;
 
@@ -49,9 +51,9 @@ public:
   virtual bool start(Callback onGenuineInput) = 0;
   virtual void stop() = 0;
 
-  //! Install the key-down sink (set before start(); platforms without key
+  //! Install the key sink (set before start(); platforms without key
   //! monitoring keep the default no-op).
-  virtual void setKeyDownSink(KeyDownSink sink)
+  virtual void setKeySink(KeySink sink)
   {
     (void)sink;
   }

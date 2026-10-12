@@ -51,9 +51,9 @@ public:
     return true;
   }
 
-  void setKeyDownSink(KeyDownSink sink) override
+  void setKeySink(KeySink sink) override
   {
-    m_keyDownSink = std::move(sink);
+    m_keySink = std::move(sink);
   }
 
   void stop() override
@@ -92,14 +92,17 @@ private:
     if (sourcePid != 0 || deskflow::platform::isInjectedEvent(event)) {
       return event;
     }
-    if (type == kCGEventKeyDown) {
-      // Keys feed ONLY the Esc rescue counter (off the core event loop).
-      // They never count as genuine input for the election: a client
-      // seat's keyboard is relayed to the cursor host on purpose, and
-      // typing there must not promote that seat.
-      if (self->m_keyDownSink && CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) == 0) {
+    if (type == kCGEventKeyDown || type == kCGEventKeyUp) {
+      // Keys feed ONLY the Esc hold rescue (off the core event loop). They
+      // never count as genuine input for the election: a client seat's
+      // keyboard is relayed to the cursor host on purpose, and typing there
+      // must not promote that seat.
+      if (self->m_keySink && CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) == 0) {
         const auto keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-        self->m_keyDownSink(keycode == kEscapeKeycode ? kKeyEscape : kKeyNone, maskFromFlags(CGEventGetFlags(event)));
+        self->m_keySink(
+            keycode == kEscapeKeycode ? kKeyEscape : kKeyNone, maskFromFlags(CGEventGetFlags(event)),
+            type == kCGEventKeyDown
+        );
       }
       return event;
     }
@@ -137,7 +140,8 @@ private:
   {
     const CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDown) |
                              CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown) |
-                             CGEventMaskBit(kCGEventScrollWheel) | CGEventMaskBit(kCGEventKeyDown);
+                             CGEventMaskBit(kCGEventScrollWheel) | CGEventMaskBit(kCGEventKeyDown) |
+                             CGEventMaskBit(kCGEventKeyUp);
 
     m_tap = CGEventTapCreate(
         kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask, tapCallback, this
@@ -191,7 +195,7 @@ private:
   }
 
   Callback m_callback;
-  KeyDownSink m_keyDownSink;
+  KeySink m_keySink;
   std::thread m_thread;
   std::atomic<bool> m_running{false};
   std::atomic<bool> m_active{false}; //!< tap installed and pumping

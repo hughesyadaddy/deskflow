@@ -23,6 +23,5 @@ private Q_SLOTS:
   void macSequence_noStrays_skipsTheGrace();
   void requestLocalStopAll_runsExecutorOnceAndIgnoresRepeats();
   void requestLocalStopAll_withoutExecutor_doesNothingAndRearms();
-  void requestFleetStopAll_withoutMesh_fallsBackToLocal();
   void requestLocalCoreQuit_isNoopOnceCleared();
 };

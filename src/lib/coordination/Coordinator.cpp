@@ -149,12 +149,6 @@ void fleetRescueThunk()
     g_rescueCoordinator->requestFleetRescue();
   }
 }
-void fleetStopAllThunk()
-{
-  if (g_rescueCoordinator != nullptr) {
-    g_rescueCoordinator->requestFleetStopAll();
-  }
-}
 } // namespace
 
 bool Coordinator::start()
@@ -164,13 +158,12 @@ bool Coordinator::start()
   }
   g_rescueCoordinator = this;
   setFleetRescueHandler(&fleetRescueThunk);
-  setFleetStopAllHandler(&fleetStopAllThunk);
   for (auto &[name, outbox] : m_outboxes) {
     outbox->start();
   }
-  // The Esc rescue counter lives on the monitor's thread in every role:
-  // the core event loop may be the very thing that is wedged.
-  m_inputMonitor->setKeyDownSink([this](KeyID id, KeyModifierMask mask) { onLocalKeyDown(id, mask); });
+  // The Esc hold rescue lives on the monitor's thread in every role: the
+  // core event loop may be the very thing that is wedged.
+  m_inputMonitor->setKeySink([this](KeyID id, KeyModifierMask mask, bool down) { onLocalKey(id, mask, down); });
   m_inputMonitor->start([this] { onGenuineInput(); });
   m_startedAt = monotonicSeconds();
   m_peerAllowlist.start(m_startedAt);
@@ -191,7 +184,6 @@ void Coordinator::stop()
 {
   if (g_rescueCoordinator == this) {
     setFleetRescueHandler(nullptr);
-    setFleetStopAllHandler(nullptr);
     g_rescueCoordinator = nullptr;
   }
   m_escSettleTimer.cancel();
@@ -612,8 +604,8 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
       std::scoped_lock lock{m_mutex};
       m_loggedKeyForward = false;
       m_loggedKeyForwardReceive = false;
-      // Do not reset EscTapRescue here: the tick reconciler restarts a dead
-      // relay and must not wipe an in-progress 5× Esc sequence.
+      // Do not reset the Esc hold here: the tick reconciler restarts a dead
+      // relay and must not wipe an in-progress Esc hold.
       // Epoch restart does not call becameClient(); clear stale screen sync.
       m_election.resetCursorScreen();
       // Also drop the PREVIOUS epoch's cursor host. A fresh relay reads this
@@ -638,7 +630,7 @@ void Coordinator::updateKeyboardRelayForRole(Role role)
     std::scoped_lock lock{m_mutex};
     m_loggedKeyForward = false;
     m_loggedKeyForwardReceive = false;
-    m_escTapRescue.reset();
+    m_escHold.reset();
   }
   // Server epoch: keyboard uses Server::onKeyDown → m_active (not key relay).
   stopKeyboardRelay();
@@ -849,29 +841,14 @@ KeyForwardResult Coordinator::sendKeyForward(
 {
   // The RUNNING app decides, not the election: after a flip the election
   // says Client up to a dwell before the ServerApp actually stops, and
-  // Server::onKeyDown still owns the keyboard until then -- including the
-  // 5x Esc count, which is why the rescue check sits below this return
-  // (both counting the same taps fired the fleet rescue twice per burst).
+  // Server::onKeyDown still owns the keyboard until then.
   if (runningRole() != Role::Client) {
     return KeyForwardResult::Local;
   }
 
-  // The Esc burst is COUNTED by the local input monitor (onLocalKeyDown,
-  // every role, off the event loop), never here. This path only keeps a
-  // rescue in progress off the wire: from the 5th tap on, plain Esc downs
-  // are Swallowed = eaten WITHOUT recording them as held on a peer (their
-  // Ups then stay local).
-  if (phase == Message::KeyPhase::Down && id == kKeyEscape) {
-    constexpr KeyModifierMask chordMods = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
-    bool swallow = false;
-    if ((mask & chordMods) == 0) {
-      std::scoped_lock lock{m_mutex};
-      swallow = m_escTapRescue.swallowing();
-    }
-    if (swallow) {
-      return KeyForwardResult::Swallowed;
-    }
-  }
+  // The Esc hold rescue is observed by the local input monitor (onLocalKey,
+  // every role, off the event loop), never here: a held Esc rides the wire
+  // like any key, and the rescue itself releases what was forwarded.
 
   PeerOutbox *destination = nullptr;
   std::string line;
@@ -1022,8 +999,8 @@ void Coordinator::requestFleetRescue()
     }
     const double now = monotonicSeconds();
     if (now - m_lastFleetRescueAt < kFleetRescueDedupeS) {
-      // The off-loop monitor counter and the Server's on-loop counter both
-      // saw this burst; one fleet restart is enough.
+      // The off-loop monitor and the Server's on-loop observer both saw
+      // this hold; one fleet restart is enough.
       LOG_DEBUG("coordination: fleet rescue already requested %.1f s ago; ignoring repeat", now - m_lastFleetRescueAt);
       return;
     }
@@ -1041,66 +1018,33 @@ void Coordinator::requestFleetRescue()
   }
   m_keyboardRelay->releaseForwardedLocally();
   // Peers first: the lanes deliver to reachable peers within milliseconds,
-  // well before the local restart IPC lands, and this may run inside the
-  // keyboard hook (5x Esc) so nothing here may block.
+  // well before the local restart IPC lands, and this may run on the
+  // rescue timer thread so nothing here may block.
   sendLineToPeers(line);
   requestLocalCoreRestart();
 }
 
-void Coordinator::settleEscBurst(EscTapRescue::Clock::time_point now)
+void Coordinator::settleEscBurst(EscHoldRescue::Clock::time_point now)
 {
   RescueAction action = RescueAction::None;
   {
     std::scoped_lock lock{m_mutex};
-    action = m_escTapRescue.settle(now);
+    action = m_escHold.settle(now);
   }
   fireRescueAction(action);
 }
 
 void Coordinator::fireRescueAction(RescueAction action)
 {
-  switch (action) {
-  case RescueAction::Restart:
-    // Fleet-wide: this path is what sees the taps at a login screen (the
-    // elevated/secure-desktop core runs as a client epoch), and the wedged
-    // machine is usually a different one.
-    LOG_INFO("keyboard rescue: 5x Esc burst ended -- requesting a fleet restart");
-    requestFleetRescue();
-    armRescueAckWatchdog();
-    break;
-  case RescueAction::StopAll:
-    LOG_INFO("keyboard rescue: 12x Esc burst ended -- requesting a fleet stop-all");
-    requestFleetStopAll();
-    break;
-  default:
-    break;
+  if (action != RescueAction::Restart) {
+    return;
   }
-}
-
-void Coordinator::requestFleetStopAll()
-{
-  std::string line;
-  {
-    std::scoped_lock lock{m_mutex};
-    if (m_quit || m_stopAllTriggered) {
-      LOG_DEBUG("coordination: fleet stop-all already requested; ignoring repeat");
-      return;
-    }
-    m_stopAllTriggered = true;
-    line = protocol::encodeStopAll(m_config.token);
-  }
-  LOG_INFO("coordination: fleet stop-all -- stopping every Deskflow instance and service on every seat");
-  // Same boundary as the rescue: nothing forwarded before this is worth
-  // delivering after it, and every forwarded hold is re-labelled Local so
-  // its Up passes here (the peers' cores are going away).
-  for (auto &[name, outbox] : m_outboxes) {
-    outbox->discardKeys();
-  }
-  m_keyboardRelay->releaseForwardedLocally();
-  // Peers first (posted to the lanes, never blocking); the local executor
-  // runs on its own thread and takes far longer than a LAN delivery.
-  sendLineToPeers(line);
-  runLocalStopAll();
+  // Fleet-wide: this path is what sees the hold at a login screen (the
+  // elevated/secure-desktop core runs as a client epoch), and the wedged
+  // machine is usually a different one.
+  LOG_INFO("keyboard rescue: Esc held %lld ms -- requesting a fleet restart", static_cast<long long>(EscHoldRescue::kHoldMs));
+  requestFleetRescue();
+  armRescueAckWatchdog();
 }
 
 void Coordinator::requestLocalStopAll()
@@ -1125,31 +1069,29 @@ bool Coordinator::runLocalStopAll()
     started = deskflow::coordination::requestLocalStopAll(m_config.selfName);
   }
   if (!started) {
-    // Nothing could be started (no executor registered): a later 12x Esc
-    // must be allowed to try again rather than be swallowed forever.
+    // Nothing could be started (no executor registered): a later stopall
+    // line must be allowed to try again rather than be swallowed forever.
     std::scoped_lock lock{m_mutex};
     m_stopAllTriggered = false;
   }
   return started;
 }
 
-void Coordinator::onLocalKeyDown(KeyID id, KeyModifierMask mask)
+void Coordinator::onLocalKey(KeyID id, KeyModifierMask mask, bool down)
 {
-  RescueAction closed = RescueAction::None;
-  {
-    std::scoped_lock lock{m_mutex};
-    if (m_quit) {
-      return;
-    }
-    closed = m_escTapRescue.noteKeyDown(id, mask);
-    if (m_escTapRescue.pending()) {
-      // Also after a late press closed a stale burst: it opened a new one.
-      m_escSettleTimer.arm(m_escTapRescue.deadline());
-    }
+  std::scoped_lock lock{m_mutex};
+  if (m_quit) {
+    return;
   }
-  if (closed != RescueAction::None) {
-    // A stale burst the settle timer missed: its decision is still owed.
-    fireRescueAction(closed);
+  if (down) {
+    m_escHold.noteKeyDown(id, mask, EscHoldRescue::Clock::now());
+  } else {
+    m_escHold.noteKeyUp(id);
+  }
+  if (m_escHold.pending()) {
+    m_escSettleTimer.arm(m_escHold.deadline());
+  } else {
+    m_escSettleTimer.cancel();
   }
 }
 
@@ -1169,9 +1111,9 @@ void Coordinator::armRescueAckWatchdog()
   // loop is wedged would keep running as a dead server. The probe is
   // dispatched only by a live loop; a wedged one never gets to it, and
   // the process hard-exits non-zero so launchd KeepAlive / the daemon
-  // relaunch the core -- a hung server must always come back on 5x Esc.
+  // relaunch the core -- a hung server must always come back on an Esc hold.
   m_rescueWatchdog.arm(
-      m_rescueAckTimeout, s_exitFailed, "the core event loop did not acknowledge the 5x Esc rescue in time"
+      m_rescueAckTimeout, s_exitFailed, "the core event loop did not acknowledge the Esc-hold rescue in time"
   );
   events->addEvent(Event(EventTypes::CoordinationRescueProbe, events->getSystemTarget()));
 }

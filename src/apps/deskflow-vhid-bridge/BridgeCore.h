@@ -276,8 +276,13 @@ private:
   bool on_mouse_rel(const std::vector<uint8_t> &body);
   bool on_mouse_button(const std::vector<uint8_t> &body, bool down);
   bool on_mouse_wheel(const std::vector<uint8_t> &body);
-  // Returns true when the escape burst fired (the caller must stop).
-  bool note_escape_down();
+  // Relayed plain Esc held this long: stop (launchd restarts the bridge
+  // with a fresh virtual HID device). Shorter than the fleet's 3 s hold so
+  // the bridge resets before the server's own rescue releases the key.
+  static constexpr auto kEscapeHold = std::chrono::milliseconds(2500);
+  // A relayed Esc Down / Repeat / Up. Returns true when the hold fired
+  // (the caller must stop).
+  bool note_escape(uint16_t key_id, uint32_t mask, bool down);
   bool on_key_down(const std::vector<uint8_t> &body);
   void sync_caps_lock(uint16_t key_id, uint32_t mask);
   CapsTruth read_caps_truth();
@@ -318,8 +323,7 @@ private:
   int calibration_attempts_ = 0;
   bool closed_loop_disabled_ = false;
   int saturated_residuals_ = 0;
-  int escape_taps_ = 0;
-  Clock::time_point last_escape_{};
+  std::optional<Clock::time_point> escape_down_since_;
   // Session counters (reset per connection), printed by keys_summary().
   unsigned long letters_shifted_ = 0;
   unsigned long letters_unshifted_ = 0;

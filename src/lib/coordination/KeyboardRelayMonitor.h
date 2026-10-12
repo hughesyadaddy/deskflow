@@ -20,7 +20,6 @@ enum class KeyForwardResult
 {
   Local,     //!< not forwarded: the hook delivers the key to the local OS
   Forwarded, //!< sent to the peer: the hook swallows it and records the hold
-  Swallowed, //!< consumed here (5x Esc rescue): swallow, but NOT held remotely
 };
 
 //! Fleet keyboard relay: forward local keys when the cursor is on another peer.

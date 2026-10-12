@@ -32,10 +32,9 @@ private Q_SLOTS:
   void wakePeer_rateLimitsPerPeer();
   void wakePeer_refiresAfterRateLimitWindow();
   void wakePeer_ignoredForClientsAndPeersWithoutHints();
-  void fiveEsc_requestsLocalCoreRestart();
-  void fiveEsc_localPass_requestsLocalCoreRestart();
-  void fiveEsc_repeatPhase_doesNotRestart();
-  void stopAllTapsEsc_requestsFleetStopAllNotRestart();
+  void escHold_requestsLocalCoreRestart();
+  void escHold_localPass_requestsLocalCoreRestart();
+  void escHold_repeatPhase_doesNotRestart();
   void keyForward_gatingMatrix();
   void sendKeyForward_returnsFalseWithoutDestination();
   void sendKeyForward_returnsFalseWhenMeshUnreachable();

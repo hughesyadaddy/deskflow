@@ -92,12 +92,11 @@ private Q_SLOTS:
   void rescue_discardsQueuedKeysAndResyncsLedger();
   void rescue_duplicateDeliveryRestartsOnce();
   void stopAll_messageStopsLocallyOnce();
-  void stopAll_tenEscBurstBroadcastsAndStopsLocallyOnce();
   void fleetCommands_unknownSourceIsDropped();
   void fleetCommands_knownPeerSourceIsAccepted();
-  void offLoop_stopAllTapsEscWithBlockedEventLoop_stopsAll();
-  void offLoop_fiveEscWithBlockedEventLoop_exitsAfterAckTimeout();
-  void offLoop_fiveEscWithLiveEventLoop_noExit();
+  void offLoop_escHoldWithBlockedEventLoop_exitsAfterAckTimeout();
+  void offLoop_escHoldWithLiveEventLoop_noExit();
+  void offLoop_escHoldReleasedEarly_nothing();
   void claim_duplicateDeliveryEvaluatedOnce();
   void heartbeat_doesNotBlockOnUnreachablePeers();
   void keyForward_returnsWithinGraceWhenPeerUnreachable();
@@ -1665,21 +1664,17 @@ void CoordinatorTests::rescue_discardsQueuedKeysAndResyncsLedger()
 
   coordinator.m_exitProcessHook = [](int) {};
 
-  // The taps are COUNTED by the local input monitor (off the event loop);
-  // the relay only consults the count. Four Esc taps ride the lane (no
-  // lane thread: each is withdrawn after its grace and reported local).
-  for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
-    coordinator.onLocalKeyDown(kKeyEscape, 0);
-    QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Local);
-  }
-  // S6: the fifth is Swallowed -- consumed, NOT reported as forwarded, so
-  // the hook records it Local and its Up never chases a hold on the peer.
-  coordinator.onLocalKeyDown(kKeyEscape, 0);
-  QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Swallowed);
-  // Nothing fires on the press: the burst is decided once it has ended,
-  // and only then is every forwarded hold re-labelled Local for the restart.
+  // The hold is OBSERVED by the local input monitor (off the event loop);
+  // the relay never sees the gesture. The Esc Down rides the lane like any
+  // key (no lane thread: it is withdrawn after its grace and reported local).
+  using deskflow::coordination::EscHoldRescue;
+  coordinator.onLocalKey(kKeyEscape, 0, true);
+  QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), KeyForwardResult::Local);
+  // Nothing fires on the press, nor short of the hold.
+  coordinator.settleEscBurst(EscHoldRescue::Clock::now() + std::chrono::seconds(1));
   QCOMPARE(relayPtr->resyncs.load(), 0);
-  coordinator.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
+  // Held long enough: every forwarded hold is re-labelled Local for the restart.
+  coordinator.settleEscBurst(EscHoldRescue::Clock::now() + std::chrono::milliseconds(EscHoldRescue::kHoldMs + 500));
   QCOMPARE(relayPtr->resyncs.load(), 1);
 }
 
@@ -1708,69 +1703,6 @@ void CoordinatorTests::stopAll_messageStopsLocallyOnce()
   coordinator.m_lastRescueAt = -1.0e9;
   coordinator.onMessage(decodeFrom(line, kBlackholeA), reply);
   QCOMPARE(stops, 1);
-  // A stopping seat also ignores a burst of its own.
-  coordinator.requestFleetStopAll();
-  QCOMPARE(stops, 1);
-}
-
-void CoordinatorTests::stopAll_tenEscBurstBroadcastsAndStopsLocallyOnce()
-{
-  using deskflow::coordination::EscTapRescue;
-  using deskflow::coordination::RescueBurst;
-  using deskflow::coordination::Role;
-  CoordinatorConfig config;
-  config.selfName = "tiny11";
-  config.meshPort = 0;
-  config.token = "test-token";
-  config.peers = deskflow::coordination::parsePeerList(std::string("hackintosh=") + kBlackholeA);
-
-  EventQueue events;
-  Coordinator coordinator(config);
-  coordinator.setEventQueue(&events);
-  int restarts = 0;
-  int stops = 0;
-  coordinator.m_localCoreRestartHook = [&restarts] { ++restarts; };
-  coordinator.m_localStopAllHook = [&stops] { ++stops; };
-  auto relay = std::make_unique<FakeKeyboardRelay>();
-  auto *relayPtr = relay.get();
-  coordinator.m_keyboardRelay = std::move(relay);
-  {
-    std::scoped_lock lock{coordinator.m_mutex};
-    coordinator.m_election.becameClient(kBlackholeA);
-    coordinator.m_fleetState.cursorHost = "hackintosh";
-  }
-  coordinator.setRunningRole(Role::Client);
-
-  coordinator.m_exitProcessHook = [](int) {};
-
-  // Taps 1-4 ride the lane; from the 5th on the burst is a rescue in
-  // progress and every Esc is swallowed -- but NOTHING fires on the way
-  // to kStopAllTaps (no restart at five). The monitor counts, the relay consults.
-  for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
-    coordinator.onLocalKeyDown(kKeyEscape, 0);
-    const auto expected = i < RescueBurst::kRestartTaps - 1 ? KeyForwardResult::Local : KeyForwardResult::Swallowed;
-    QCOMPARE(coordinator.sendKeyForward(Message::KeyPhase::Down, kKeyEscape, 0, 53, "en"), expected);
-    QCOMPARE(restarts, 0);
-    QCOMPARE(stops, 0);
-  }
-  QCOMPARE(relayPtr->resyncs.load(), 0);
-
-  coordinator.settleEscBurst(EscTapRescue::Clock::now() + std::chrono::seconds(1));
-  QCOMPARE(stops, 1);
-  QCOMPARE(restarts, 0);
-  QCOMPARE(relayPtr->resyncs.load(), 1); // same boundary as the rescue
-  {
-    std::scoped_lock lock{coordinator.m_mutex};
-    QVERIFY(coordinator.m_stopAllTriggered);
-  }
-
-  // Already stopping: a second burst changes nothing.
-  for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
-    coordinator.onLocalKeyDown(kKeyEscape, 0);
-  }
-  coordinator.settleEscBurst(EscTapRescue::Clock::now() + std::chrono::seconds(2));
-  QCOMPARE(stops, 1);
-  QCOMPARE(restarts, 0);
 }
 
 void CoordinatorTests::fleetCommands_unknownSourceIsDropped()
@@ -1868,40 +1800,34 @@ struct CoordinatorTests::BlockedLoopSeat
     coordinator.setRunningRole(deskflow::coordination::Role::Server);
   }
 
-  void tap(int times)
+  void holdEsc()
   {
-    for (int i = 0; i < times; ++i) {
-      coordinator.onLocalKeyDown(kKeyEscape, 0);
-    }
+    coordinator.onLocalKey(kKeyEscape, 0, true);
   }
 
+  void releaseEsc()
+  {
+    coordinator.onLocalKey(kKeyEscape, 0, false);
+  }
+
+  //! Poll as if the hold deadline had passed.
   void settle()
   {
-    coordinator.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
+    using deskflow::coordination::EscHoldRescue;
+    coordinator.settleEscBurst(EscHoldRescue::Clock::now() + std::chrono::milliseconds(EscHoldRescue::kHoldMs + 500));
   }
 };
 
-void CoordinatorTests::offLoop_stopAllTapsEscWithBlockedEventLoop_stopsAll()
+void CoordinatorTests::offLoop_escHoldWithBlockedEventLoop_exitsAfterAckTimeout()
 {
   BlockedLoopSeat seat;
-  seat.tap(deskflow::coordination::RescueBurst::kStopAllTaps);
-  QCOMPARE(seat.stops, 0);
-  seat.settle();
-  // Reached StopAll from kStopAllTaps observed taps with the loop never serviced.
-  QCOMPARE(seat.stops, 1);
+  seat.holdEsc();
   QCOMPARE(seat.restarts, 0);
-  QCOMPARE(seat.relay->resyncs.load(), 1);
-  std::this_thread::sleep_for(std::chrono::milliseconds(150));
-  QCOMPARE(seat.exits.load(), 0); // stop-all never arms the ack watchdog
-}
-
-void CoordinatorTests::offLoop_fiveEscWithBlockedEventLoop_exitsAfterAckTimeout()
-{
-  BlockedLoopSeat seat;
-  seat.tap(deskflow::coordination::RescueBurst::kRestartTaps);
   seat.settle();
   // The restart request went out (peers + local IPC) without the loop...
   QCOMPARE(seat.restarts, 1);
+  QCOMPARE(seat.stops, 0); // no keyboard gesture stops the fleet any more
+  QCOMPARE(seat.relay->resyncs.load(), 1);
   QVERIFY(seat.coordinator.m_rescueWatchdog.armed());
   // ...and since the loop never dispatches the probe, the process is
   // hard-exited non-zero so the supervisor relaunches the core.
@@ -1909,10 +1835,10 @@ void CoordinatorTests::offLoop_fiveEscWithBlockedEventLoop_exitsAfterAckTimeout(
   QCOMPARE(seat.exitCode.load(), s_exitFailed);
 }
 
-void CoordinatorTests::offLoop_fiveEscWithLiveEventLoop_noExit()
+void CoordinatorTests::offLoop_escHoldWithLiveEventLoop_noExit()
 {
   BlockedLoopSeat seat;
-  seat.tap(deskflow::coordination::RescueBurst::kRestartTaps);
+  seat.holdEsc();
   seat.settle();
   QCOMPARE(seat.restarts, 1);
   QVERIFY(seat.coordinator.m_rescueWatchdog.armed());
@@ -1924,10 +1850,25 @@ void CoordinatorTests::offLoop_fiveEscWithLiveEventLoop_noExit()
   QCOMPARE(seat.exits.load(), 0);
 }
 
+void CoordinatorTests::offLoop_escHoldReleasedEarly_nothing()
+{
+  // The monitor reports the Up: the timer is disarmed and a late poll (the
+  // timer thread racing the Up) fires nothing.
+  BlockedLoopSeat seat;
+  seat.holdEsc();
+  QVERIFY(seat.coordinator.m_escSettleTimer.armed());
+  seat.releaseEsc();
+  QVERIFY(!seat.coordinator.m_escSettleTimer.armed());
+  seat.settle();
+  QCOMPARE(seat.restarts, 0);
+  QCOMPARE(seat.relay->resyncs.load(), 0);
+  QVERIFY(!seat.coordinator.m_rescueWatchdog.armed());
+}
+
 void CoordinatorTests::rescue_duplicateDeliveryRestartsOnce()
 {
-  // A-8: the server has two Esc counters and older peers send every line to
-  // both ip and lan, so the same rescue lands twice in the same millisecond.
+  // A-8: the server has two Esc observers and older peers send every line
+  // to both ip and lan, so the same rescue lands twice in the same millisecond.
   CoordinatorConfig config;
   config.selfName = "tiny11";
   config.meshPort = 0;

@@ -286,27 +286,17 @@ void Server::requestLocalCoreRestart()
     m_localCoreRestartHook();
     return;
   }
-  // Fleet-wide: 5x Esc means input is wedged SOMEWHERE, and the machine
-  // that saw the taps is usually not the broken one. Falls back to a local
+  // Fleet-wide: a held Esc means input is wedged SOMEWHERE, and the machine
+  // that saw the hold is usually not the broken one. Falls back to a local
   // restart when no mesh is running.
   deskflow::coordination::requestFleetRescue();
 }
 
-void Server::requestLocalStopAll()
-{
-  if (m_localStopAllHook) {
-    m_localStopAllHook();
-    return;
-  }
-  // Fleet-wide (falls back to this seat alone when no mesh is running).
-  deskflow::coordination::requestFleetStopAll();
-}
-
 void Server::armEscBurstTimer()
 {
-  using deskflow::coordination::RescueBurst;
+  using deskflow::coordination::EscHoldRescue;
   clearEscBurstTimer();
-  m_escBurstTimer = m_events->newOneShotTimer(static_cast<double>(RescueBurst::kSettleMs) / 1000.0, nullptr);
+  m_escBurstTimer = m_events->newOneShotTimer(static_cast<double>(EscHoldRescue::kHoldMs) / 1000.0, nullptr);
   m_events->addHandler(EventTypes::Timer, m_escBurstTimer, [this](const auto &) { settleEscBurst(); });
 }
 
@@ -320,31 +310,27 @@ void Server::clearEscBurstTimer()
   m_escBurstTimer = nullptr;
 }
 
-void Server::settleEscBurst(deskflow::coordination::EscTapRescue::Clock::time_point now)
+void Server::settleEscBurst(deskflow::coordination::EscHoldRescue::Clock::time_point now)
 {
   clearEscBurstTimer();
-  const auto action = m_escTapRescue.settle(now);
-  if (action == deskflow::coordination::RescueAction::None) {
+  if (m_escHold.settle(now) != deskflow::coordination::RescueAction::Restart) {
     return;
   }
-  fireEscRescue(action);
+  fireEscRescue();
 }
 
-void Server::fireEscRescue(deskflow::coordination::RescueAction action)
+void Server::fireEscRescue()
 {
-  using deskflow::coordination::RescueAction;
   // The rescue tears this core down: release what we hold on the active
   // screen first, or the restart strands it there (the one structural
   // boundary that used to skip the ledger).
   cancelChordRemapSession();
   releaseKeysHeldOnActive();
   releaseKeysHeldOnBroadcast(nullptr);
-  if (action == RescueAction::StopAll) {
-    LOG_INFO("keyboard rescue: 12x Esc burst ended -- requesting a fleet stop-all");
-    requestLocalStopAll();
-    return;
-  }
-  LOG_INFO("keyboard rescue: 5x Esc burst ended -- requesting a fleet restart");
+  LOG_INFO(
+      "keyboard rescue: Esc held %lld ms -- requesting a fleet restart",
+      static_cast<long long>(deskflow::coordination::EscHoldRescue::kHoldMs)
+  );
   requestLocalCoreRestart();
 }
 
@@ -486,7 +472,7 @@ Server::~Server()
 
   // Best-effort: release any chord-held mods while the client link is still
   // alive, so a role flip / epoch teardown doesn't strand a synthetic
-  // modifier on the target (five-Esc rescue of a server core lands here too).
+  // modifier on the target (an Esc-hold rescue of a server core lands here too).
   if (m_chordRemapSession.active) {
     cancelChordRemapSession();
   }
@@ -2261,35 +2247,22 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
   );
   assert(m_active != nullptr);
 
-  // Keyboard rescue: a burst of plain Esc downs, decided once it has ended
-  // (5..11 = restart every seat's core, 12+ = stop everything everywhere).
-  // Nothing fires on a press; the settle timer calls settleEscBurst().
-  // (In auto mode the coordinator's off-loop monitor counts the same taps;
-  // the coordinator dedupes the two requests. This on-loop counter keeps
-  // the ledger release and the swallowing, and is the only counter in
-  // plain --server mode.)
-  const auto closed = m_escTapRescue.noteKeyDown(id, mask);
-  if (m_escTapRescue.pending()) {
-    // Also when this press closed a stale burst: it opened the next one.
-    armEscBurstTimer();
-  }
-  if (closed != deskflow::coordination::RescueAction::None) {
-    // A stale burst the timer missed: its decision is still owed. If a
-    // timer from THIS now-closed burst is still armed (it fires only via
-    // settleEscBurst(), which we are bypassing here), cancel it -- an
-    // uncanceled one-shot timer firing later, after fireEscRescue() may
-    // have torn this Server down as part of a local core restart, is a
-    // callback into a dead object, not just a harmless no-op (found while
-    // testing the 2026-09-28 owed-decision fix: this exact path left
-    // m_escBurstTimer armed and non-null after an immediate fire).
-    clearEscBurstTimer();
-    fireEscRescue(closed);
-    return;
-  }
-  if (m_escTapRescue.pending() && m_escTapRescue.swallowing()) {
-    // From the 5th tap on this is a rescue in progress: the Esc that
-    // completes it and every later one in the burst stay off the wire.
-    return;
+  // Keyboard rescue: a plain Esc held for EscHoldRescue::kHoldMs restarts
+  // every seat's core. Nothing fires on the press; the one-shot timer calls
+  // settleEscBurst() at the deadline and the Up (or any other key) cancels
+  // it. Only PHYSICAL keys from this seat's own screen count: a key relayed
+  // here by a peer (relayForwardedKey) is that peer's hold, observed by
+  // that peer. (In auto mode the coordinator's off-loop monitor observes
+  // the same hold; the coordinator dedupes the two requests. This on-loop
+  // observer keeps the ledger release and is the only one in plain --server
+  // mode.) The Esc itself rides to the target like any key.
+  if (!m_relayingForwardedKey) {
+    m_escHold.noteKeyDown(id, mask, deskflow::coordination::EscHoldRescue::Clock::now());
+    if (m_escHold.pending()) {
+      armEscBurstTimer();
+    } else {
+      clearEscBurstTimer();
+    }
   }
 
   // Deferred Super (chord screens only): hold back the Super down until we
@@ -2382,6 +2355,13 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
 {
   LOG_DEBUG("onKeyUp id=%s mask=0x%04x button=0x%04x", IKeyState::describeKey(id).c_str(), mask, button);
   assert(m_active != nullptr);
+
+  if (!m_relayingForwardedKey) {
+    m_escHold.noteKeyUp(id);
+    if (!m_escHold.pending()) {
+      clearEscBurstTimer();
+    }
+  }
 
   // Resolve a deferred Super on its release: chord hold (nothing to send),
   // consumed momentary chord (nothing), emitted combo (send the up), or a
@@ -2554,6 +2534,9 @@ void Server::relayForwardedKey(const deskflow::coordination::RelayKeyEvent &even
     m_primaryClient->injectForwardedKey(event);
     return;
   }
+  // A relayed key is the SENDING seat's physical key: its Esc hold is that
+  // seat's rescue to observe, never this one's.
+  m_relayingForwardedKey = true;
   switch (event.phase) {
   case RelayKeyPhase::Up:
     if (const auto held = m_forwardedHeld.find(event.from); held != m_forwardedHeld.end()) {
@@ -2574,6 +2557,7 @@ void Server::relayForwardedKey(const deskflow::coordination::RelayKeyEvent &even
     onKeyDown(event.id, event.mask, event.button, event.lang, nullptr);
     break;
   }
+  m_relayingForwardedKey = false;
 }
 
 void Server::onMouseDown(ButtonID id)

@@ -745,7 +745,7 @@ void CoreProcess::reloadServerConfig()
 
 void CoreProcess::restart()
 {
-  // Rate-limit: settings churn, the 5x Esc rescue and reloadServerConfig can all fire
+  // Rate-limit: settings churn, the Esc-hold rescue and reloadServerConfig can all fire
   // restart() in quick succession; one restart per window is enough, later calls coalesce.
   if (m_lastRestart.isValid() && m_lastRestart.elapsed() < kRestartMinIntervalMs) {
     const auto remaining = static_cast<int>(kRestartMinIntervalMs - m_lastRestart.elapsed());
@@ -874,7 +874,7 @@ void CoreProcess::setProcessState(ProcessState state)
 void CoreProcess::onCoreIpcMessageReceived(const QString &command, const QString &args)
 {
   if (command == "restartCore") {
-    qInfo("core requested restart (keyboard rescue 5x Esc)");
+    qInfo("core requested restart (keyboard rescue: Esc held)");
     restart();
     return;
   }

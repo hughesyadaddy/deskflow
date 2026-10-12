@@ -14,35 +14,13 @@
 #include <string>
 #include <thread>
 
-using deskflow::coordination::EscTapRescue;
+using deskflow::coordination::EscHoldRescue;
 using deskflow::coordination::ExitWatchdog;
 using deskflow::coordination::RescueAction;
-using deskflow::coordination::RescueBurst;
 using deskflow::coordination::RescueSettleTimer;
-using Clock = EscTapRescue::Clock;
+using Clock = EscHoldRescue::Clock;
 
 namespace {
-
-constexpr int64_t kSpacingMs = 100;
-
-//! Tap Esc \p taps times, kSpacingMs apart from \p startMs. Every press
-//! must report None (nothing fires on a press); returns the last press time.
-int64_t tap(RescueBurst &burst, int taps, int64_t startMs = 0)
-{
-  int64_t at = startMs;
-  for (int i = 0; i < taps; ++i) {
-    at = startMs + i * kSpacingMs;
-    if (burst.observeEsc(at) != RescueAction::None) {
-      return -1;
-    }
-  }
-  return at;
-}
-
-RescueAction settleAfter(RescueBurst &burst, int64_t lastMs)
-{
-  return burst.decide(lastMs + RescueBurst::kSettleMs);
-}
 
 template <typename Condition> bool waitFor(Condition condition, int timeoutMs)
 {
@@ -58,239 +36,139 @@ template <typename Condition> bool waitFor(Condition condition, int timeoutMs)
 
 } // namespace
 
-void KeyboardRescueTests::burst_fourTaps_none()
-{
-  RescueBurst burst;
-  const auto last = tap(burst, 4);
-  QVERIFY(last >= 0);
-  QCOMPARE(burst.count(), 4);
-  QCOMPARE(settleAfter(burst, last), RescueAction::None);
-  QVERIFY(!burst.pending());
-}
+namespace {
+const auto kHold = std::chrono::milliseconds(EscHoldRescue::kHoldMs);
+const auto kJustShort = std::chrono::milliseconds(EscHoldRescue::kHoldMs - 1);
+} // namespace
 
-void KeyboardRescueTests::burst_fiveTaps_restart()
+void KeyboardRescueTests::hold_releasedBeforeDeadline_none()
 {
-  RescueBurst burst;
-  const auto last = tap(burst, 5);
-  QVERIFY(last >= 0);
-  QCOMPARE(settleAfter(burst, last), RescueAction::Restart);
-  QCOMPARE(burst.count(), 0);
-}
-
-void KeyboardRescueTests::burst_sevenTaps_restart()
-{
-  RescueBurst burst;
-  const auto last = tap(burst, 7);
-  QVERIFY(last >= 0);
-  QCOMPARE(settleAfter(burst, last), RescueAction::Restart);
-}
-
-void KeyboardRescueTests::burst_elevenTaps_restart()
-{
-  // One tap short of kStopAllTaps: still the Restart range, not StopAll.
-  RescueBurst burst;
-  const auto last = tap(burst, RescueBurst::kStopAllTaps - 1);
-  QVERIFY(last >= 0);
-  QCOMPARE(settleAfter(burst, last), RescueAction::Restart);
-  QCOMPARE(burst.count(), 0);
-}
-
-void KeyboardRescueTests::burst_twelveTaps_stop()
-{
-  RescueBurst burst;
-  const auto last = tap(burst, 12);
-  QVERIFY(last >= 0);
-  QCOMPARE(settleAfter(burst, last), RescueAction::StopAll);
-}
-
-void KeyboardRescueTests::burst_spacedBeyondGap_none()
-{
-  // Ten presses, each 900 ms after the previous: ten bursts of one.
-  RescueBurst burst;
-  int64_t at = 0;
-  for (int i = 0; i < 10; ++i) {
-    at = i * (RescueBurst::kSettleMs + 200);
-    QCOMPARE(burst.observeEsc(at), RescueAction::None);
-    QCOMPARE(burst.count(), 1);
-  }
-  QCOMPARE(settleAfter(burst, at), RescueAction::None);
-}
-
-void KeyboardRescueTests::burst_exactlyTwelveNeverYieldsRestart()
-{
-  // A user heading for kStopAllTaps must not be restarted on the way: no
-  // press and no early poll may ever answer Restart.
-  RescueBurst burst;
-  for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
-    const int64_t at = i * kSpacingMs;
-    QCOMPARE(burst.observeEsc(at), RescueAction::None);
-    QCOMPARE(burst.decide(at), RescueAction::None);
-    QCOMPARE(burst.decide(at + RescueBurst::kSettleMs - 1), RescueAction::None);
-  }
-  const int64_t last = (RescueBurst::kStopAllTaps - 1) * kSpacingMs;
-  QCOMPARE(burst.decide(last + RescueBurst::kSettleMs), RescueAction::StopAll);
-  QCOMPARE(burst.decide(last + RescueBurst::kSettleMs + 1000), RescueAction::None);
-}
-
-void KeyboardRescueTests::burst_pauseAtFiveThenContinue_restartThenFreshCount()
-{
-  RescueBurst burst;
-  const auto last = tap(burst, 5);
-  QVERIFY(last >= 0);
-  // Silence for kSettleMs: the settle poll decides the five.
-  QCOMPARE(burst.decide(last + RescueBurst::kSettleMs), RescueAction::Restart);
-  QVERIFY(!burst.pending());
-  // The user keeps going: a fresh burst, counted from one.
-  const int64_t resume = last + RescueBurst::kSettleMs + 50;
-  QCOMPARE(burst.observeEsc(resume), RescueAction::None);
-  QCOMPARE(burst.count(), 1);
-  QCOMPARE(burst.observeEsc(resume + kSpacingMs), RescueAction::None);
-  QCOMPARE(burst.count(), 2);
-  QCOMPARE(settleAfter(burst, resume + kSpacingMs), RescueAction::None);
-}
-
-void KeyboardRescueTests::burst_decideBeforeSettle_none()
-{
-  RescueBurst burst;
-  const auto last = tap(burst, 6);
-  QVERIFY(last >= 0);
-  QVERIFY(burst.pending());
-  QCOMPARE(burst.deadlineMs(), last + RescueBurst::kSettleMs);
-  QCOMPARE(burst.decide(last + RescueBurst::kSettleMs - 1), RescueAction::None);
-  QCOMPARE(burst.count(), 6); // still open
-  QCOMPARE(burst.decide(last + RescueBurst::kSettleMs), RescueAction::Restart);
-}
-
-void KeyboardRescueTests::burst_latePressClosesStaleBurst()
-{
-  // The settle poll never ran (late timer); the next press, beyond the
-  // gap, still owes the previous burst its decision and starts anew.
-  RescueBurst burst;
-  const auto last = tap(burst, RescueBurst::kStopAllTaps);
-  QVERIFY(last >= 0);
-  // The effective join gap is exactly kSettleMs, on the timer and on a
-  // late press alike: at kSettleMs the burst is over.
-  QCOMPARE(burst.observeEsc(last + RescueBurst::kSettleMs), RescueAction::StopAll);
-  QCOMPARE(burst.count(), 1);
-  // One ms inside the gap the press just joins the burst.
-  RescueBurst joined;
-  const auto joinedLast = tap(joined, 4);
-  QCOMPARE(joined.observeEsc(joinedLast + RescueBurst::kSettleMs - 1), RescueAction::None);
-  QCOMPARE(joined.count(), 5);
-}
-
-void KeyboardRescueTests::burst_breakAbandonsCount()
-{
-  RescueBurst burst;
-  const auto last = tap(burst, 7);
-  QVERIFY(last >= 0);
-  burst.breakBurst();
-  QVERIFY(!burst.pending());
-  QCOMPARE(settleAfter(burst, last), RescueAction::None);
-}
-
-void KeyboardRescueTests::escTap_modifiersDoNotCount()
-{
-  EscTapRescue rescue;
+  EscHoldRescue rescue;
   const auto t0 = Clock::now();
-  QCOMPARE(rescue.noteKeyDown(kKeyEscape, KeyModifierControl, t0), RescueAction::None);
-  QCOMPARE(rescue.count(), 0);
-  QCOMPARE(rescue.noteKeyDown(kKeyEscape, KeyModifierShift | KeyModifierAlt | KeyModifierControl, t0), RescueAction::None);
-  QCOMPARE(rescue.count(), 0);
-  QCOMPARE(rescue.noteKeyDown('a', 0, t0), RescueAction::None);
-  QCOMPARE(rescue.count(), 0);
-  QVERIFY(!rescue.pending());
-}
-
-void KeyboardRescueTests::escTap_capsLockIgnored_stillCounts()
-{
-  EscTapRescue rescue;
-  const auto t0 = Clock::now();
-  QCOMPARE(rescue.noteKeyDown(kKeyEscape, KeyModifierCapsLock, t0), RescueAction::None);
-  QCOMPARE(rescue.count(), 1);
+  rescue.noteKeyDown(kKeyEscape, 0, t0);
   QVERIFY(rescue.pending());
-  QVERIFY(rescue.deadline() == t0 + std::chrono::milliseconds(RescueBurst::kSettleMs));
+  QVERIFY(rescue.escDown());
+  QCOMPARE(rescue.settle(t0 + kJustShort), RescueAction::None);
+  rescue.noteKeyUp(kKeyEscape);
+  QVERIFY(!rescue.pending());
+  QVERIFY(!rescue.escDown());
+  // A late poll after the release never fires: the hold ended short.
+  QCOMPARE(rescue.settle(t0 + kHold * 4), RescueAction::None);
 }
 
-void KeyboardRescueTests::escTap_nonEscBreaksStreak()
+void KeyboardRescueTests::hold_heldPastDeadline_restartOnce()
 {
-  // Below kRestartTaps: a non-Esc key breaks the streak and owes nothing --
-  // there was never a completed decision to lose.
-  EscTapRescue rescue;
+  EscHoldRescue rescue;
   const auto t0 = Clock::now();
-  for (int i = 0; i < 4; ++i) {
-    QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(50 * i)), RescueAction::None);
-  }
-  QCOMPARE(rescue.count(), 4);
-  QCOMPARE(rescue.noteKeyDown('a', 0, t0 + std::chrono::milliseconds(300)), RescueAction::None);
-  QCOMPARE(rescue.count(), 0);
-  QCOMPARE(rescue.settle(t0 + std::chrono::seconds(5)), RescueAction::None);
-  // The streak restarts from one.
-  QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(350)), RescueAction::None);
-  QCOMPARE(rescue.count(), 1);
-}
-
-void KeyboardRescueTests::escTap_nonEscAfterThresholdFiresOwedDecision()
-{
-  // 2026-09-28 (hackintosh incident) regression: once a burst has ALREADY
-  // reached kRestartTaps, it is a completed, earned decision waiting out its
-  // 700 ms settle window -- ordinary typing landing inside that window must
-  // not discard it. A clean 5xEsc followed immediately by "hey" did exactly
-  // this live and the rescue never fired until a second, redundant burst.
-  EscTapRescue rescue;
-  const auto t0 = Clock::now();
-  for (int i = 0; i < 6; ++i) {
-    QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(50 * i)), RescueAction::None);
-  }
-  QCOMPARE(rescue.count(), 6);
+  rescue.noteKeyDown(kKeyEscape, 0, t0);
+  QVERIFY(rescue.deadline() == t0 + kHold);
+  QCOMPARE(rescue.settle(t0 + kJustShort), RescueAction::None);
   QVERIFY(rescue.pending());
-  // Six taps (5..11 range): a non-Esc key well inside the settle window must
-  // fire the owed Restart immediately, not silently drop it.
-  QCOMPARE(rescue.noteKeyDown('h', 0, t0 + std::chrono::milliseconds(300)), RescueAction::Restart);
-  QCOMPARE(rescue.count(), 0);
+  QCOMPARE(rescue.settle(t0 + kHold), RescueAction::Restart);
+  // Fired: no second decision while the key stays down, however long.
   QVERIFY(!rescue.pending());
-  // The burst is genuinely closed: no double-fire from the settle timer,
-  // and a fresh streak starts clean afterward.
-  QCOMPARE(rescue.settle(t0 + std::chrono::seconds(5)), RescueAction::None);
-  QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(350)), RescueAction::None);
-  QCOMPARE(rescue.count(), 1);
+  QVERIFY(rescue.escDown());
+  QCOMPARE(rescue.settle(t0 + kHold * 10), RescueAction::None);
+  // Release and hold again: a fresh rescue.
+  rescue.noteKeyUp(kKeyEscape);
+  const auto t1 = t0 + kHold * 20;
+  rescue.noteKeyDown(kKeyEscape, 0, t1);
+  QVERIFY(rescue.pending());
+  QCOMPARE(rescue.settle(t1 + kJustShort), RescueAction::None);
+  QCOMPARE(rescue.settle(t1 + kHold), RescueAction::Restart);
 }
 
-void KeyboardRescueTests::escTap_nonEscAfterStopAllThresholdFiresStopAll()
+void KeyboardRescueTests::hold_duplicateDownKeepsStart()
 {
-  // Same gap, StopAll range (kStopAllTaps+): must owe StopAll, never silently
-  // downgrade to nothing or to Restart.
-  EscTapRescue rescue;
+  // Autorepeat (or a feeder that delivers repeats) is more Downs while the
+  // key is down: they neither restart the clock nor count as taps.
+  EscHoldRescue rescue;
   const auto t0 = Clock::now();
-  int64_t lastTapMs = 0;
-  for (int i = 0; i < RescueBurst::kStopAllTaps; ++i) {
-    lastTapMs = 50 * i;
-    QCOMPARE(rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(lastTapMs)), RescueAction::None);
+  rescue.noteKeyDown(kKeyEscape, 0, t0);
+  for (int i = 1; i <= 50; ++i) {
+    rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(50 * i));
   }
-  QCOMPARE(rescue.count(), RescueBurst::kStopAllTaps);
-  // 100 ms after the last tap: well inside kSettleMs, so the burst is still
-  // pending when the non-Esc arrives.
-  QCOMPARE(
-      rescue.noteKeyDown('x', 0, t0 + std::chrono::milliseconds(lastTapMs + 100)), RescueAction::StopAll
-  );
-  QCOMPARE(rescue.count(), 0);
+  QVERIFY(rescue.deadline() == t0 + kHold);
+  QCOMPARE(rescue.settle(t0 + kHold), RescueAction::Restart);
 }
 
-void KeyboardRescueTests::escTap_swallowsFromFifthTap()
+void KeyboardRescueTests::hold_chordedEscDoesNotStart()
 {
-  EscTapRescue rescue;
+  EscHoldRescue rescue;
   const auto t0 = Clock::now();
-  for (int i = 0; i < RescueBurst::kRestartTaps - 1; ++i) {
-    rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(100 * i));
-    QVERIFY(!rescue.swallowing());
+  for (const KeyModifierMask mask :
+       {KeyModifierShift, KeyModifierControl, KeyModifierAlt, KeyModifierSuper,
+        static_cast<KeyModifierMask>(KeyModifierShift | KeyModifierControl)}) {
+    rescue.noteKeyDown(kKeyEscape, mask, t0);
+    QVERIFY(!rescue.pending());
+    QVERIFY(!rescue.escDown());
+    QCOMPARE(rescue.settle(t0 + kHold), RescueAction::None);
+    rescue.noteKeyUp(kKeyEscape);
   }
-  rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(400));
-  QVERIFY(rescue.swallowing());
-  rescue.noteKeyDown(kKeyEscape, 0, t0 + std::chrono::milliseconds(500));
-  QVERIFY(rescue.swallowing());
-  QCOMPARE(rescue.settle(t0 + std::chrono::milliseconds(500 + RescueBurst::kSettleMs)), RescueAction::Restart);
-  QVERIFY(!rescue.swallowing());
+}
+
+void KeyboardRescueTests::hold_lockModifiersStillStart()
+{
+  EscHoldRescue rescue;
+  const auto t0 = Clock::now();
+  rescue.noteKeyDown(kKeyEscape, KeyModifierCapsLock | KeyModifierNumLock, t0);
+  QVERIFY(rescue.pending());
+  QCOMPARE(rescue.settle(t0 + kHold), RescueAction::Restart);
+}
+
+void KeyboardRescueTests::hold_otherKeyCancels()
+{
+  EscHoldRescue rescue;
+  const auto t0 = Clock::now();
+  rescue.noteKeyDown(kKeyEscape, 0, t0);
+  rescue.noteKeyDown('a', 0, t0 + std::chrono::seconds(1));
   QVERIFY(!rescue.pending());
+  QVERIFY(rescue.escDown()); // still physically down, just not a rescue
+  QCOMPARE(rescue.settle(t0 + kHold), RescueAction::None);
+  // Cancelled stays cancelled until Esc is released...
+  rescue.noteKeyUp('a');
+  QCOMPARE(rescue.settle(t0 + kHold * 2), RescueAction::None);
+  // ...and the next hold starts clean.
+  rescue.noteKeyUp(kKeyEscape);
+  const auto t1 = t0 + kHold * 3;
+  rescue.noteKeyDown(kKeyEscape, 0, t1);
+  QVERIFY(rescue.pending());
+  QCOMPARE(rescue.settle(t1 + kHold), RescueAction::Restart);
+}
+
+void KeyboardRescueTests::hold_modifierJoiningCancels()
+{
+  // Shift pressed while Esc is held: the user is chording, not rescuing.
+  EscHoldRescue rescue;
+  const auto t0 = Clock::now();
+  rescue.noteKeyDown(kKeyEscape, 0, t0);
+  rescue.noteKeyDown(kKeyShift_L, KeyModifierShift, t0 + std::chrono::milliseconds(200));
+  QVERIFY(!rescue.pending());
+  QCOMPARE(rescue.settle(t0 + kHold), RescueAction::None);
+}
+
+void KeyboardRescueTests::hold_otherKeyUpIgnored()
+{
+  // The Up of a key pressed BEFORE the hold started (typing, then Esc) is
+  // not a cancellation.
+  EscHoldRescue rescue;
+  const auto t0 = Clock::now();
+  rescue.noteKeyDown(kKeyEscape, 0, t0);
+  rescue.noteKeyUp('a');
+  rescue.noteKeyUp(kKeyShift_L);
+  QVERIFY(rescue.pending());
+  QCOMPARE(rescue.settle(t0 + kHold), RescueAction::Restart);
+}
+
+void KeyboardRescueTests::hold_resetClears()
+{
+  EscHoldRescue rescue;
+  const auto t0 = Clock::now();
+  rescue.noteKeyDown(kKeyEscape, 0, t0);
+  rescue.reset();
+  QVERIFY(!rescue.pending());
+  QVERIFY(!rescue.escDown());
+  QCOMPARE(rescue.settle(t0 + kHold), RescueAction::None);
 }
 
 void KeyboardRescueTests::settleTimer_firesOnceAfterDeadline()

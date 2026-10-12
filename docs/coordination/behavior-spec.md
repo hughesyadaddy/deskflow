@@ -65,10 +65,12 @@ wire format but should add an optional shared token (documented in
 - **Windows**: Raw Input (`WM_INPUT`, `RIDEV_INPUTSINK`); genuine iff
   `RAWINPUTHEADER.hDevice != NULL` (SendInput-synthesized input has a
   null device).
-- The same monitors also report genuine, non-repeat key downs (macOS:
-  `kCGEventKeyDown` on the listen-only tap; Windows: keyboard Raw Input,
-  usage 0x06). That feed is the Esc-burst keyboard rescue counter in every
-  role -- it lives on the monitor thread, never on the core event loop.
+- The same monitors also report genuine physical key Downs and Ups (macOS:
+  `kCGEventKeyDown`/`kCGEventKeyUp` on the listen-only tap, autorepeats
+  dropped; Windows: keyboard Raw Input, usage 0x06, `RI_KEY_BREAK` = Up).
+  That feed is the Esc-hold keyboard rescue in every role -- it lives on
+  the monitor thread, never on the core event loop -- and it never includes
+  injected or relayed input, so Deskflow cannot rescue itself by accident.
 
 ### Debounce / anti-flap
 
@@ -273,26 +275,34 @@ The elected server is authoritative: each newer fragment replaces
 coordinator emits `CoordinationFleetStateChanged`; the first non-empty
 `links[]` also emits `CoordinationTopologyReady`.
 
-### `rescue` / `stopall` — keyboard rescue broadcasts
+### `rescue` / `stopall` — fleet command broadcasts
 
 ```json
 {"t": "rescue", "token": "<optional>"}
 {"t": "stopall", "token": "<optional>"}
 ```
 
-Sent by the seat whose keyboard saw a plain-Esc burst, to every configured
-peer, once the burst has ended (700 ms of silence; the same 700 ms is the
-join gap between taps).
-`rescue` (5–11 taps): the receiver restarts its local core (deduplicated for
-2 s: older peers send each line to both `ip` and `lan`). `stopall` (12+
-taps): the receiver logs `WARNING: [rescue] 12x Esc: stopping ALL Deskflow
-instances and services on <seat>` and stops every Deskflow instance and
-service it owns (macOS: quit-intent + launchd bootout of converge, GUI,
-strays, then the core; Windows: daemon `stopAll` IPC → every core/GUI under
-the install root, then a clean service stop). Never re-broadcast; a seat
-already stopping ignores repeats. `stopall` is a v2 extension without a
-version bump: a peer that predates it decodes the line as Invalid and the
-transport drops it silently (same path as any unknown `t`).
+`rescue` is sent by the seat whose PHYSICAL keyboard held a plain Esc (no
+Shift/Ctrl/Alt/Super) for 3 s, to every configured peer; the receiver
+restarts its local core (deduplicated for 2 s: older peers send each line
+to both `ip` and `lan`). The gesture is a hold, never a tap count: taps are
+just Esc, a chord joining the hold cancels it, autorepeat (duplicate Downs
+while down) does not restart the clock, and a hold fires exactly once per
+press. The held Esc rides to the target like any key; the rescue itself
+releases everything the sender holds on its peers before the restart. The
+on-loop Server observer feeds only its own screen's keys (a key relayed by
+a peer is that peer's hold), so one physical hold yields one fleet rescue.
+There is no keyboard gesture for `stopall` any more (a 12-tap burst used to
+stop the fleet; every 2026-10-08 outage was an accidental burst). The line
+is still honoured on receipt: the receiver logs `WARNING: [rescue]
+stop-all: stopping ALL Deskflow instances and services on <seat>` and stops
+every Deskflow instance and service it owns (macOS: quit-intent + launchd
+bootout of converge, GUI, strays, then the core; Windows: daemon `stopAll`
+IPC → every core/GUI under the install root, then a clean service stop).
+Never re-broadcast; a seat already stopping ignores repeats. `stopall` is a
+v2 extension without a version bump: a peer that predates it decodes the
+line as Invalid and the transport drops it silently (same path as any
+unknown `t`).
 
 Trust: the listener binds every interface and a fleet without a `token`
 accepts any line from anyone, so both commands are additionally gated on

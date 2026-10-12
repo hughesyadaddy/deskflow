@@ -134,7 +134,7 @@ void DaemonApp::clearWatchdogCommand()
 void DaemonApp::restartWatchdogProcess() const
 {
 #if defined(Q_OS_WIN)
-  // Keyboard rescue (5x Esc / fleet rescue) reached a core with no GUI to
+  // Keyboard rescue (Esc hold / fleet rescue) reached a core with no GUI to
   // restart it; the core asked us instead. MSWindowsWatchdog::requestRestart
   // queues StartPending, and startProcess() replaces the running core.
   m_pWatchdog->requestRestart();
@@ -155,7 +155,7 @@ void DaemonApp::stopAllProcesses()
     seat = QSysInfo::machineHostName();
   }
   // The WARNING line goes first, before anything is touched.
-  LOG_WARN("[rescue] 12x Esc: stopping ALL Deskflow instances and services on %s", qPrintable(seat));
+  LOG_WARN("[rescue] stop-all: stopping ALL Deskflow instances and services on %s", qPrintable(seat));
 
   // Clears the command (nothing is relaunched, daemon/configFile stays
   // persisted for the next `deskflow-ctl.ps1 start`), queues the stop of

@@ -44,9 +44,9 @@ public:
     return true;
   }
 
-  void setKeyDownSink(KeyDownSink sink) override
+  void setKeySink(KeySink sink) override
   {
-    m_keyDownSink = std::move(sink);
+    m_keySink = std::move(sink);
   }
 
   void stop() override
@@ -88,10 +88,10 @@ private:
       return;
     }
     if (header.dwType == RIM_TYPEKEYBOARD) {
-      // Keys feed ONLY the Esc rescue counter. They never count as genuine
+      // Keys feed ONLY the Esc hold rescue. They never count as genuine
       // input for the election: a client seat's keyboard is relayed to the
       // cursor host on purpose, and typing there must not promote that seat.
-      if (m_keyDownSink) {
+      if (m_keySink) {
         handleRawKeyboard(lParam);
       }
       return;
@@ -102,9 +102,9 @@ private:
     }
   }
 
-  //! A genuine key transition: feed non-repeat downs to the sink (the
-  //! Esc rescue counter). Raw Input carries no repeat flag; a down for a
-  //! key already recorded down is a repeat.
+  //! A genuine key transition, Down or Up, to the sink (the Esc hold
+  //! rescue). Raw Input carries no repeat flag: autorepeat arrives as more
+  //! Downs, which the consumer ignores while it already holds the key down.
   void handleRawKeyboard(LPARAM lParam)
   {
     RAWINPUT raw{};
@@ -116,19 +116,7 @@ private:
     const auto &keyboard = raw.data.keyboard;
     const bool keyUp = (keyboard.Flags & RI_KEY_BREAK) != 0;
     const bool isEscape = keyboard.VKey == VK_ESCAPE;
-    if (keyUp) {
-      if (isEscape) {
-        m_escapeDown = false;
-      }
-      return;
-    }
-    if (isEscape && m_escapeDown) {
-      return; // autorepeat
-    }
-    if (isEscape) {
-      m_escapeDown = true;
-    }
-    m_keyDownSink(isEscape ? kKeyEscape : kKeyNone, heldModifiers());
+    m_keySink(isEscape ? kKeyEscape : kKeyNone, heldModifiers(), !keyUp);
   }
 
   //! Shift/Ctrl/Alt/Win currently held (OS view; delivered after the key
@@ -219,8 +207,7 @@ private:
   }
 
   Callback m_callback;
-  KeyDownSink m_keyDownSink;
-  bool m_escapeDown = false;      //!< raw-input thread only (repeat detection)
+  KeySink m_keySink;
   std::set<HANDLE> m_seenDevices; //!< raw-input thread only
   std::thread m_thread;
   std::atomic<bool> m_running{false};

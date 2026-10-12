@@ -123,7 +123,6 @@ void RescueStopAllTests::cleanupTestCase()
 {
   deskflow::coordination::setLocalStopAllHandler({});
   deskflow::coordination::setLocalCoreQuitHandler({});
-  deskflow::coordination::setFleetStopAllHandler(nullptr);
   g_arch.reset();
 }
 
@@ -132,7 +131,6 @@ void RescueStopAllTests::init()
   deskflow::coordination::resetStopAllStateForTests();
   deskflow::coordination::setLocalStopAllHandler({});
   deskflow::coordination::setLocalCoreQuitHandler({});
-  deskflow::coordination::setFleetStopAllHandler(nullptr);
 }
 
 void RescueStopAllTests::macSequence_fallbackOrder_quitIntentConvergeGuiStraysCoreLast()
@@ -248,14 +246,6 @@ void RescueStopAllTests::requestLocalStopAll_withoutExecutor_doesNothingAndRearm
   // in-progress flag is released so a later registration can still act.
   QVERIFY(!deskflow::coordination::requestLocalStopAll("tiny11"));
   QVERIFY(!deskflow::coordination::stopAllInProgress());
-}
-
-void RescueStopAllTests::requestFleetStopAll_withoutMesh_fallsBackToLocal()
-{
-  std::atomic<int> runs{0};
-  deskflow::coordination::setLocalStopAllHandler([&runs](const std::string &) { ++runs; });
-  deskflow::coordination::requestFleetStopAll();
-  QVERIFY(waitFor([&runs] { return runs.load() == 1; }, 2000));
 }
 
 void RescueStopAllTests::requestLocalCoreQuit_isNoopOnceCleared()

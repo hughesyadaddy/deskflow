@@ -33,127 +33,64 @@ const char *rescueActionName(RescueAction action)
 }
 
 //
-// RescueBurst
+// EscHoldRescue
 //
 
-RescueAction RescueBurst::actionFor(int count)
-{
-  if (count >= kStopAllTaps) {
-    return RescueAction::StopAll;
-  }
-  if (count >= kRestartTaps) {
-    return RescueAction::Restart;
-  }
-  return RescueAction::None;
-}
-
-RescueAction RescueBurst::observeEsc(int64_t nowMs)
-{
-  RescueAction closed = RescueAction::None;
-  if (m_count > 0 && nowMs - m_lastMs >= kSettleMs) {
-    // The previous burst ended without a settle poll (late timer): its
-    // decision belongs to it, not to the press that starts the next one.
-    closed = actionFor(m_count);
-    m_count = 0;
-  }
-  ++m_count;
-  m_lastMs = nowMs;
-  return closed;
-}
-
-RescueAction RescueBurst::decide(int64_t nowMs)
-{
-  if (m_count == 0 || nowMs - m_lastMs < kSettleMs) {
-    return RescueAction::None;
-  }
-  const RescueAction action = actionFor(m_count);
-  m_count = 0;
-  return action;
-}
-
-void RescueBurst::breakBurst()
-{
-  m_count = 0;
-}
-
-int RescueBurst::count() const
-{
-  return m_count;
-}
-
-bool RescueBurst::pending() const
-{
-  return m_count > 0;
-}
-
-int64_t RescueBurst::deadlineMs() const
-{
-  return m_lastMs + kSettleMs;
-}
-
-//
-// EscTapRescue
-//
-
-int64_t EscTapRescue::toMs(Clock::time_point t)
-{
-  return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
-}
-
-RescueAction EscTapRescue::noteKeyDown(KeyID id, KeyModifierMask mask, Clock::time_point now)
+void EscHoldRescue::noteKeyDown(KeyID id, KeyModifierMask mask, Clock::time_point now)
 {
   constexpr KeyModifierMask chordMods = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
-  if (id != kKeyEscape || (mask & chordMods) != 0) {
-    // Non-Esc (or Esc with chord mods) breaks the streak; Caps/Num on plain Esc still count.
-    // A burst that had ALREADY reached the restart threshold is a completed,
-    // earned decision sitting out its settle window, not an aborted one --
-    // mirror observeEsc's stale-burst handling and fire it now instead of
-    // discarding it silently. 2026-09-28 (hackintosh incident): a clean,
-    // correctly-timed 5xEsc followed by ordinary typing before the 700ms
-    // settle elapsed was thrown away with zero effect and no log line; the
-    // user needed a second, redundant burst to actually trigger the rescue.
-    const RescueAction owed = RescueBurst::actionFor(m_burst.count());
-    m_burst.breakBurst();
-    return owed;
+  if (id == kKeyEscape && (mask & chordMods) == 0) {
+    if (m_escDown) {
+      return; // autorepeat / duplicate Down: the hold keeps its start time
+    }
+    m_escDown = true;
+    m_fired = false;
+    m_cancelled = false;
+    m_downAt = now;
+    return;
   }
-  if (!m_origin) {
-    m_origin = now;
-  }
-  return m_burst.observeEsc(toMs(now) - toMs(*m_origin));
+  // Any other key (a chord modifier included) joining the hold: not a rescue.
+  m_cancelled = true;
 }
 
-RescueAction EscTapRescue::settle(Clock::time_point now)
+void EscHoldRescue::noteKeyUp(KeyID id)
 {
-  if (!m_origin) {
+  if (id == kKeyEscape) {
+    m_escDown = false;
+    m_fired = false;
+    m_cancelled = false;
+  }
+}
+
+RescueAction EscHoldRescue::settle(Clock::time_point now)
+{
+  if (!pending() || now - m_downAt < std::chrono::milliseconds(kHoldMs)) {
     return RescueAction::None;
   }
-  return m_burst.decide(toMs(now) - toMs(*m_origin));
+  m_fired = true;
+  return RescueAction::Restart;
 }
 
-bool EscTapRescue::swallowing() const
+bool EscHoldRescue::pending() const
 {
-  return m_burst.count() >= RescueBurst::kRestartTaps;
+  return m_escDown && !m_fired && !m_cancelled;
 }
 
-bool EscTapRescue::pending() const
+EscHoldRescue::Clock::time_point EscHoldRescue::deadline() const
 {
-  return m_burst.pending();
+  return m_downAt + std::chrono::milliseconds(kHoldMs);
 }
 
-EscTapRescue::Clock::time_point EscTapRescue::deadline() const
+bool EscHoldRescue::escDown() const
 {
-  const auto origin = m_origin.value_or(Clock::time_point{});
-  return origin + std::chrono::milliseconds(m_burst.deadlineMs());
+  return m_escDown;
 }
 
-int EscTapRescue::count() const
+void EscHoldRescue::reset()
 {
-  return m_burst.count();
-}
-
-void EscTapRescue::reset()
-{
-  m_burst.breakBurst();
+  m_escDown = false;
+  m_fired = false;
+  m_cancelled = false;
 }
 
 //
@@ -361,7 +298,6 @@ namespace {
 
 LocalCoreRestartFn g_localCoreRestartHandler = nullptr;
 FleetRescueFn g_fleetRescueHandler = nullptr;
-FleetStopAllFn g_fleetStopAllHandler = nullptr;
 
 std::mutex g_stopAllMutex;
 LocalStopAllFn g_localStopAllHandler;
@@ -383,7 +319,7 @@ void requestLocalCoreRestart()
     g_localCoreRestartHandler();
     return;
   }
-  LOG_WARN("keyboard rescue: 5x Esc — no local core restart handler registered");
+  LOG_WARN("keyboard rescue: Esc held -- no local core restart handler registered");
 }
 
 void setFleetRescueHandler(FleetRescueFn fn)
@@ -400,21 +336,6 @@ void requestFleetRescue()
   // No mesh (server/client mode, or coordinator not started): the local
   // restart is still the best available rescue.
   requestLocalCoreRestart();
-}
-
-void setFleetStopAllHandler(FleetStopAllFn fn)
-{
-  g_fleetStopAllHandler = fn;
-}
-
-void requestFleetStopAll()
-{
-  if (g_fleetStopAllHandler != nullptr) {
-    g_fleetStopAllHandler();
-    return;
-  }
-  // No mesh: stop this seat alone (the gesture still means "make it stop").
-  requestLocalStopAll("this seat");
 }
 
 void setLocalStopAllHandler(LocalStopAllFn fn)
@@ -440,7 +361,7 @@ bool requestLocalStopAll(const std::string &seat)
     return true;
   }
   // The WARNING line goes first on every seat, before anything is touched.
-  LOG_WARN("[rescue] 12x Esc: stopping ALL Deskflow instances and services on %s", seat.c_str());
+  LOG_WARN("[rescue] stop-all: stopping ALL Deskflow instances and services on %s", seat.c_str());
   LocalStopAllFn handler;
   {
     std::scoped_lock lock{g_stopAllMutex};

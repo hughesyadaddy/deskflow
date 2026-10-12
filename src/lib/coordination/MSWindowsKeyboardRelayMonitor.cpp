@@ -203,13 +203,10 @@ private:
 
     // Fresh Down: destination is decided by where the cursor is NOW.
     const bool passLocal = self->m_passThrough ? self->m_passThrough() : true;
-    // When keys stay local, still deliver Downs to sendKeyForward so 5x Esc
-    // restart can observe taps (Swallowed = eat this key).
+    // The Esc hold rescue is observed by the local input monitor, not by
+    // this hook: a key that stays local never reaches the coordinator.
     if (passLocal) {
       self->m_ledger.downLocal(button);
-      if (mapped && self->send(phase, id, mask, button) == KeyForwardResult::Swallowed) {
-        return 1;
-      }
       return CallNextHookEx(nullptr, code, wParam, lParam);
     }
 
@@ -217,19 +214,10 @@ private:
     if (mapped) {
       result = self->send(phase, id, mask, button);
     }
-    switch (result) {
-    case KeyForwardResult::Forwarded:
+    if (result == KeyForwardResult::Forwarded) {
       self->m_ledger.downForwarded(button);
-      break;
-    case KeyForwardResult::Swallowed:
-      // Consumed by the rescue gesture: neither OS saw it, so its Up must
-      // not chase a hold on the peer. Local = the Up passes through here as
-      // a harmless no-op.
+    } else {
       self->m_ledger.downLocal(button);
-      return 1;
-    default:
-      self->m_ledger.downLocal(button);
-      break;
     }
 
     const KeyboardRelayHookContext ctx{passLocal, isInjected, mapped, result == KeyForwardResult::Forwarded};

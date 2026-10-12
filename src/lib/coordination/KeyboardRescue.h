@@ -19,109 +19,63 @@
 
 namespace deskflow::coordination {
 
-//! What an Esc burst asks for once it has ended.
+//! What the Esc hold asks for.
 enum class RescueAction
 {
   None,
-  //! 5..11 taps: every seat restarts its local core (the classic rescue).
+  //! Esc held for EscHoldRescue::kHoldMs: every seat restarts its local core.
   Restart,
-  //! 12+ taps: every seat stops every Deskflow instance and service.
+  //! Received over the mesh only (`stopall` line): stop every Deskflow
+  //! instance and service on this seat. No keyboard gesture produces it.
   StopAll
 };
 
 const char *rescueActionName(RescueAction action);
 
-//! Pure Esc-burst counter with an injected millisecond clock.
+//! Esc hold-to-rescue: a plain Esc held for kHoldMs asks for a fleet restart.
 /*!
-A burst is a run of plain Esc downs. It ENDS after kSettleMs of silence,
-and only then is it decided: fewer than kRestartTaps → nothing,
-kRestartTaps..kStopAllTaps-1 → Restart, kStopAllTaps or more → StopAll.
-Nothing fires at the 5th press any more, so a user heading for 12 never
-triggers a restart on the way.
+The gesture is ONE key held, not a tap count. Tap counting fired on every
+Esc-happy workflow (vim, dialogs, a held Esc autorepeating through a hook
+that lost the repeat flag) and the 2026-10-08 outages were all 5/12-tap
+bursts the user never meant as a rescue. A 3 s hold is deliberate, cannot
+be produced by autorepeat (repeats are duplicate Downs, ignored while the
+key is down) and cannot be produced by relayed input (the feeders only
+report physical local keys).
 
-There is ONE gap constant: a press that lands kSettleMs or later after the
-previous one belongs to a new burst, whether or not the settle poll ran in
-between (the poll may be late; the press then closes the stale burst and
-returns its decision so it is never lost). So the effective join gap is
-exactly kSettleMs (700 ms), on the timer and on a late press alike.
+State machine: a plain (no Shift/Ctrl/Alt/Super) Esc Down with Esc not
+already down starts the hold at that time. A duplicate Esc Down while down
+is ignored. Esc Up ends the hold. Any OTHER key Down (including a modifier)
+cancels it: a chord is not a rescue. settle(now) returns Restart exactly
+once per hold, once now - start >= kHoldMs; holding on past that returns
+None until the key is released and pressed again.
 
-A burst that has already reached kRestartTaps is a COMPLETED, earned
-decision merely waiting out its settle window to see if the user keeps
-going for kStopAllTaps -- it is not "still open" in the sense that
-anything can still abandon it for free. breakBurst() therefore does not
-discard it silently: any caller that reaches the threshold and then
-observes something other than the next Esc (see EscTapRescue::noteKeyDown)
-must fire actionFor(count()) itself before calling breakBurst(), exactly
-like the stale-burst path above, or an earned rescue the user is actively
-waiting on is lost with no log line (2026-09-28 hackintosh incident: a
-clean 5xEsc followed by ordinary typing before the settle timer fired was
-silently thrown away).
+Pure; the caller injects the clock and arms its own timer at deadline().
 */
-class RescueBurst
+class EscHoldRescue
 {
 public:
-  static constexpr int kRestartTaps = 5;
-  static constexpr int kStopAllTaps = 12;
-  //! Silence after the last press that ends a burst: decide() is due, and
-  //! a press this late starts a new burst.
-  static constexpr int64_t kSettleMs = 700;
-
-  //! A plain Esc down at \p nowMs. Returns the decision of a previous burst
-  //! this press found stale (usually None).
-  RescueAction observeEsc(int64_t nowMs);
-
-  //! Settle poll: the decision when the burst has ended, else None.
-  RescueAction decide(int64_t nowMs);
-
-  //! A non-Esc (or chord-modified Esc) press: the streak is abandoned.
-  void breakBurst();
-
-  //! Presses in the current (open) burst.
-  int count() const;
-  //! True while a burst is open and a decide() is still due.
-  bool pending() const;
-  //! When decide() becomes due (valid while pending()).
-  int64_t deadlineMs() const;
-
-  //! Mapping from burst length to action.
-  static RescueAction actionFor(int count);
-
-private:
-  int m_count = 0;
-  int64_t m_lastMs = 0;
-};
-
-//! Key-event adapter over RescueBurst (steady clock, modifier filtering).
-/*!
-Call only for KeyDown / KeyPhase::Down (not Repeat). Chord modifiers
-(Shift/Ctrl/Alt/Super) break the streak; Caps/NumLock are ignored.
-*/
-struct EscTapRescue
-{
   using Clock = std::chrono::steady_clock;
+  static constexpr int64_t kHoldMs = 3000;
 
-  //! Feed a key down; returns the decision of a stale burst this press
-  //! closed (usually None). The caller decides swallowing from count().
-  RescueAction noteKeyDown(KeyID id, KeyModifierMask mask, Clock::time_point now = Clock::now());
+  //! A key down. Esc (plain) starts the hold; anything else cancels it.
+  void noteKeyDown(KeyID id, KeyModifierMask mask, Clock::time_point now);
+  //! A key up. Esc ends the hold; other keys are ignored.
+  void noteKeyUp(KeyID id);
+  //! Poll: Restart once the hold has lasted kHoldMs, else None.
+  RescueAction settle(Clock::time_point now);
 
-  //! Settle poll (see RescueBurst::decide).
-  RescueAction settle(Clock::time_point now = Clock::now());
-
-  //! A burst of at least kRestartTaps is a rescue in progress: the Esc that
-  //! completes it and every later one in the burst are swallowed.
-  bool swallowing() const;
-
+  //! A hold is in progress and has not fired yet: a settle() is due at deadline().
   bool pending() const;
   Clock::time_point deadline() const;
-  int count() const;
+  //! Esc is currently down (fired or not).
+  bool escDown() const;
   void reset();
 
-  static int64_t toMs(Clock::time_point t);
-
 private:
-  RescueBurst m_burst;
-  //! Clock origin so the burst sees small non-negative ms values.
-  std::optional<Clock::time_point> m_origin;
+  bool m_escDown = false;
+  bool m_fired = false;
+  bool m_cancelled = false; //!< another key joined the hold
+  Clock::time_point m_downAt{};
 };
 
 //! Fires a callback once a (re-armable) deadline passes; one worker thread.
@@ -214,20 +168,13 @@ void setLocalCoreRestartHandler(LocalCoreRestartFn fn);
 void requestLocalCoreRestart();
 
 //! Process-wide FLEET rescue hook (set by the Coordinator, which owns the
-//! mesh). The 5-Esc gesture means "input is wedged somewhere in the fleet",
-//! and the machine that sees the taps is usually NOT the broken one -- so
-//! the rescue restarts every connected peer, not just this process.
+//! mesh). The Esc hold means "input is wedged somewhere in the fleet", and
+//! the machine that sees the hold is usually NOT the broken one -- so the
+//! rescue restarts every connected peer, not just this process.
 //! Falls back to a local-only restart when no mesh is running.
 using FleetRescueFn = void (*)();
 void setFleetRescueHandler(FleetRescueFn fn);
 void requestFleetRescue();
-
-//! Process-wide FLEET stop-all hook (Coordinator): 12x Esc stops every
-//! Deskflow instance and service on every seat. Falls back to a local-only
-//! stop when no mesh is running.
-using FleetStopAllFn = void (*)();
-void setFleetStopAllHandler(FleetStopAllFn fn);
-void requestFleetStopAll();
 
 //! Local stop-all executor (set by deskflow-core: the platform sequence
 //! that stops this seat's GUI, services and finally this core). Receives
@@ -236,8 +183,8 @@ void requestFleetStopAll();
 using LocalStopAllFn = std::function<void(const std::string &seat)>;
 void setLocalStopAllHandler(LocalStopAllFn fn);
 
-//! Stop everything on THIS seat. Logs the WARNING line first, then runs the
-//! registered executor once; repeats while a stop is in progress are
+//! Stop everything on THIS seat (mesh `stopall` line). Logs the WARNING
+//! line first, then runs the registered executor once; repeats while a stop is in progress are
 //! ignored (a seat that is already stopping never loops). Returns false
 //! when nothing could be started (no executor): the caller may retry on
 //! the next burst.

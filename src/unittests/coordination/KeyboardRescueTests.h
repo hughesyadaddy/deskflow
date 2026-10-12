@@ -12,25 +12,16 @@ class KeyboardRescueTests : public QObject
 {
   Q_OBJECT
 private Q_SLOTS:
-  // RescueBurst: pure, ms clock injected. Decided when the burst ENDS.
-  void burst_fourTaps_none();
-  void burst_fiveTaps_restart();
-  void burst_sevenTaps_restart();
-  void burst_elevenTaps_restart();
-  void burst_twelveTaps_stop();
-  void burst_spacedBeyondGap_none();
-  void burst_exactlyTwelveNeverYieldsRestart();
-  void burst_pauseAtFiveThenContinue_restartThenFreshCount();
-  void burst_decideBeforeSettle_none();
-  void burst_latePressClosesStaleBurst();
-  void burst_breakAbandonsCount();
-  // EscTapRescue: key filtering over the burst.
-  void escTap_modifiersDoNotCount();
-  void escTap_capsLockIgnored_stillCounts();
-  void escTap_nonEscBreaksStreak();
-  void escTap_nonEscAfterThresholdFiresOwedDecision();
-  void escTap_nonEscAfterStopAllThresholdFiresStopAll();
-  void escTap_swallowsFromFifthTap();
+  // EscHoldRescue: pure, clock injected. Fires once the hold has LASTED.
+  void hold_releasedBeforeDeadline_none();
+  void hold_heldPastDeadline_restartOnce();
+  void hold_duplicateDownKeepsStart();
+  void hold_chordedEscDoesNotStart();
+  void hold_lockModifiersStillStart();
+  void hold_otherKeyCancels();
+  void hold_modifierJoiningCancels();
+  void hold_otherKeyUpIgnored();
+  void hold_resetClears();
   // RescueSettleTimer: wakes once the deadline passes, re-arm replaces.
   void settleTimer_firesOnceAfterDeadline();
   void settleTimer_rearmReplacesDeadline();

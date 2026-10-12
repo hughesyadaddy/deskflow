@@ -12,6 +12,7 @@
 #include "base/EventQueue.h"
 #include "base/Log.h"
 #include "common/Settings.h"
+#include "coordination/RelayKeyEvent.h"
 #include "deskflow/AppUtil.h"
 #include "deskflow/PlatformScreen.h"
 #include "deskflow/Screen.h"
@@ -803,7 +804,21 @@ void ServerTests::requestWakePeer_refiresAfterThrottleWindow()
   }
 }
 
-void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
+namespace {
+using deskflow::coordination::EscHoldRescue;
+//! A poll time comfortably past the hold deadline of a press made "now".
+EscHoldRescue::Clock::time_point pastHold()
+{
+  return EscHoldRescue::Clock::now() + std::chrono::milliseconds(EscHoldRescue::kHoldMs + 500);
+}
+//! A poll time comfortably short of it.
+EscHoldRescue::Clock::time_point shortOfHold()
+{
+  return EscHoldRescue::Clock::now() + std::chrono::milliseconds(EscHoldRescue::kHoldMs / 2);
+}
+} // namespace
+
+void ServerTests::escHold_requestsLocalCoreRestartAndReleasesLedger()
 {
   LeakedServerFixture fixture;
   QVERIFY(fixture.config.addScreen("server"));
@@ -821,28 +836,24 @@ void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
 
-    for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps - 1; ++i) {
-      server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
-      QCOMPARE(restartCalls, 0);
-    }
-    QCOMPARE(remote.keys().size(), static_cast<size_t>(deskflow::coordination::RescueBurst::kRestartTaps - 1));
-    for (const auto &key : remote.keys()) {
-      QCOMPARE(key.kind, RecordedKeyEvent::Kind::Down);
-      QCOMPARE(key.id, kKeyEscape);
-    }
-    remote.clearKeys();
-    // The fifth Esc is swallowed and nothing fires yet: the burst is
-    // decided once it has ended (the settle timer), not at the 5th press.
+    // The Esc Down rides to the target like any key and arms the hold timer.
     server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
     QCOMPARE(restartCalls, 0);
-    QVERIFY(remote.keys().empty());
+    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys()[0].kind, RecordedKeyEvent::Kind::Down);
+    QCOMPARE(remote.keys()[0].id, kKeyEscape);
     QVERIFY(server.m_escBurstTimer != nullptr);
+    remote.clearKeys();
 
-    server.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
+    // Short of the hold: nothing.
+    server.settleEscBurst(shortOfHold());
+    QCOMPARE(restartCalls, 0);
+
+    // Past it: the ledger releases the Esc still held there, then the
+    // restart is requested.
+    server.settleEscBurst(pastHold());
     QCOMPARE(restartCalls, 1);
     QVERIFY(server.m_escBurstTimer == nullptr);
-    // The only traffic is the ledger releasing the Esc still held there
-    // (the rescue is a boundary like any other).
     QVERIFY(!remote.keys().empty());
     for (const auto &key : remote.keys()) {
       QCOMPARE(key.kind, RecordedKeyEvent::Kind::Up);
@@ -854,18 +865,8 @@ void ServerTests::fiveEsc_requestsLocalCoreRestartAndSwallows()
   }
 }
 
-void ServerTests::fiveEscThenOrdinaryKey_firesRestartImmediatelyAndEatsThatKey()
+void ServerTests::escHold_releasedBeforeDeadline_noRestart()
 {
-  // 2026-09-28 (hackintosh incident) regression, at the Server integration
-  // level rather than the pure EscTapRescue unit level: a burst that has
-  // ALREADY reached the restart threshold must fire the instant the next
-  // key arrives, without waiting for the settle timer -- and, per adversarial
-  // review, the interrupting key on this on-loop path is deliberately eaten
-  // (fireEscRescue already mutates chord/ledger state and returns before any
-  // relay would run; precedented by the existing late-Escape-closes-a-stale-
-  // burst path, which has always behaved the same way). This test locks that
-  // asymmetry in place so a future refactor can't silently flip it back to
-  // the discard bug without a test going red.
   LeakedServerFixture fixture;
   QVERIFY(fixture.config.addScreen("server"));
   QVERIFY(fixture.config.addScreen("remote"));
@@ -881,37 +882,23 @@ void ServerTests::fiveEscThenOrdinaryKey_firesRestartImmediatelyAndEatsThatKey()
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
 
-    for (int i = 0; i < deskflow::coordination::RescueBurst::kRestartTaps; ++i) {
+    // Any number of Esc taps is just Esc: Down and Up both relayed, the
+    // timer disarmed by each Up, and a late poll never fires.
+    for (int i = 0; i < 12; ++i) {
       server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+      QVERIFY(server.m_escBurstTimer != nullptr);
+      server.onKeyUp(kKeyEscape, 0, 1, nullptr);
+      QVERIFY(server.m_escBurstTimer == nullptr);
     }
-    QCOMPARE(restartCalls, 0); // not yet -- still inside the settle window
-    QVERIFY(server.m_escBurstTimer != nullptr);
-    remote.clearKeys();
-
-    // An ordinary key well inside the settle window must fire the owed
-    // restart RIGHT NOW, not silently drop it and not wait for the timer.
-    server.onKeyDown('h', 0, 1, "en", nullptr);
-    QCOMPARE(restartCalls, 1);
-    QVERIFY(server.m_escBurstTimer == nullptr);
-    // The triggering key itself is not relayed (only the ledger's Esc-up
-    // traffic, if any, may appear) -- confirm 'h' specifically never reached
-    // the remote client.
-    for (const auto &key : remote.keys()) {
-      QVERIFY(key.id != 'h');
-    }
-
-    // A fresh burst afterward is unaffected: ordinary Esc taps count from
-    // one, proving the fired burst was fully reset, not left half-open.
-    remote.clearKeys();
-    server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
-    QCOMPARE(remote.keys().size(), static_cast<size_t>(1));
-    QCOMPARE(remote.keys()[0].id, kKeyEscape);
+    QCOMPARE(remote.keys().size(), 24u);
+    server.settleEscBurst(pastHold());
+    QCOMPARE(restartCalls, 0);
 
     server.m_clients.erase("remote");
   }
 }
 
-void ServerTests::stopAllTapsEsc_requestsStopAllNotRestart()
+void ServerTests::escHold_otherKeyCancelsAndIsRelayed()
 {
   LeakedServerFixture fixture;
   QVERIFY(fixture.config.addScreen("server"));
@@ -926,27 +913,55 @@ void ServerTests::stopAllTapsEsc_requestsStopAllNotRestart()
     server.switchScreen(&remote, 50, 60, false);
 
     int restartCalls = 0;
-    int stopCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
-    server.m_localStopAllHook = [&stopCalls] { ++stopCalls; };
 
-    // Exactly kStopAllTaps: no restart on the way, taps 5..kStopAllTaps stay off the wire.
-    for (int i = 0; i < deskflow::coordination::RescueBurst::kStopAllTaps; ++i) {
-      server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
-      QCOMPARE(restartCalls, 0);
-      QCOMPARE(stopCalls, 0);
-    }
-    QCOMPARE(remote.keys().size(), static_cast<size_t>(deskflow::coordination::RescueBurst::kRestartTaps - 1));
+    server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+    QVERIFY(server.m_escBurstTimer != nullptr);
     remote.clearKeys();
-
-    server.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
-    QCOMPARE(stopCalls, 1);
+    // Another key joins: a chord, not a rescue. The key is relayed as
+    // usual (nothing is ever eaten by the gesture).
+    server.onKeyDown('h', 0, 2, "en", nullptr);
+    QVERIFY(server.m_escBurstTimer == nullptr);
+    QCOMPARE(remote.keys().size(), 1u);
+    QCOMPARE(remote.keys()[0].id, KeyID('h'));
+    server.settleEscBurst(pastHold());
     QCOMPARE(restartCalls, 0);
-    // Held keys are released before the seat goes down.
-    for (const auto &key : remote.keys()) {
-      QCOMPARE(key.kind, RecordedKeyEvent::Kind::Up);
-      QCOMPARE(key.id, kKeyEscape);
-    }
+
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::escHold_relayedKeyNeverCounts()
+{
+  // A peer's keyboard relayed through this server is THAT peer's Esc hold
+  // to observe. Counting it here fired two fleet rescues per hold and let a
+  // peer whose Esc Up was lost restart the fleet from this seat.
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    int restartCalls = 0;
+    server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+
+    deskflow::coordination::RelayKeyEvent event;
+    event.phase = deskflow::coordination::RelayKeyPhase::Down;
+    event.id = kKeyEscape;
+    event.button = 1;
+    event.lang = "en";
+    event.from = "tiny11";
+    server.relayForwardedKey(event);
+    QVERIFY(server.m_escBurstTimer == nullptr);
+    QCOMPARE(remote.keys().size(), 1u); // relayed to the target as usual
+    server.settleEscBurst(pastHold());
+    QCOMPARE(restartCalls, 0);
 
     server.m_clients.erase("remote");
   }
@@ -1054,7 +1069,7 @@ void ServerTests::chordRemapHoldThrough_tabRepeatKeepsAltMask()
   }
 }
 
-void ServerTests::chordRemapHoldThrough_fiveEscCancelsSession()
+void ServerTests::chordRemapHoldThrough_escHoldCancelsSession()
 {
   LeakedServerFixture fixture;
   loadConfigWithSuperTabRemap(fixture.config);
@@ -1072,18 +1087,15 @@ void ServerTests::chordRemapHoldThrough_fiveEscCancelsSession()
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
 
-    for (int i = 0; i < 4; ++i) {
-      server.onKeyDown(kKeyEscape, 0, 0, "en", nullptr);
-    }
-    remote.clearKeys();
     server.onKeyDown(kKeyEscape, 0, 0, "en", nullptr);
-    QCOMPARE(restartCalls, 0); // decided when the burst ends, not at the 5th press
+    remote.clearKeys();
+    QCOMPARE(restartCalls, 0); // decided when the hold has lasted, not on the press
     QVERIFY(server.m_chordRemapSession.active);
-    server.settleEscBurst(deskflow::coordination::EscTapRescue::Clock::now() + std::chrono::seconds(1));
+    server.settleEscBurst(pastHold());
 
     QCOMPARE(restartCalls, 1);
     QVERIFY(!server.m_chordRemapSession.active);
-    QCOMPARE(remote.keys().size(), 1u);
+    QVERIFY(!remote.keys().empty());
     QCOMPARE(remote.keys()[0].id, kKeyClearModifiers);
     QCOMPARE(remote.keys()[0].mask, KeyModifierAlt);
     QCOMPARE(server.m_active, &remote);

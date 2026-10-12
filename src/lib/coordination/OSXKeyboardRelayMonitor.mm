@@ -344,20 +344,9 @@ private:
     // Fresh Down: destination is decided by where the cursor is NOW.
     const bool passLocal = !isRepeat && (m_passThrough ? m_passThrough() : true);
     if (passLocal) {
+      // The Esc hold rescue is observed by the local input monitor, not by
+      // this hook: a key that stays local never reaches the coordinator.
       m_ledger.downLocal(button);
-      // Still hand the Down to the coordinator so 5x Esc rescue can observe
-      // taps while the cursor is local -- but WITHOUT the layout lookup:
-      // Esc (and every other rescue-relevant key) maps from the fixed
-      // table, and a glyph key only has to break the Esc streak, which a
-      // kKeyNone id does just as well.
-      Message::KeyPhase phase = Message::KeyPhase::Down;
-      KeyID id = kKeyNone;
-      KeyModifierMask mask = 0;
-      KeyButton mappedButton = 0;
-      mapRelayKeyFromCgEvent(event, phase, id, mask, mappedButton, false);
-      if (send(phase, id, mask, button) == KeyForwardResult::Swallowed) {
-        return nullptr;
-      }
       return event;
     }
 
@@ -377,19 +366,10 @@ private:
     if (mapped) {
       result = send(phase, id, mask, button);
     }
-    switch (result) {
-    case KeyForwardResult::Forwarded:
+    if (result == KeyForwardResult::Forwarded) {
       m_ledger.downForwarded(button);
-      break;
-    case KeyForwardResult::Swallowed:
-      // Consumed by the rescue gesture: never seen by either OS, so its Up
-      // must not chase a hold on the peer. Local = the Up passes through
-      // here as a harmless no-op.
+    } else {
       m_ledger.downLocal(button);
-      return nullptr;
-    default:
-      m_ledger.downLocal(button);
-      break;
     }
     return relaySwallowDecision(event, false, false, mapped, result == KeyForwardResult::Forwarded);
   }

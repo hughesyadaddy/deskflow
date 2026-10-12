@@ -43,7 +43,7 @@ namespace deskflow::coordination {
 //! version in their hello are rejected; there is no v1 compatibility mode.
 inline constexpr int kMeshProtocolVersion = 2;
 
-//! Grace for the core event loop to acknowledge an off-loop 5x Esc restart
+//! Grace for the core event loop to acknowledge an off-loop Esc-hold restart
 //! before the process hard-exits for a supervisor relaunch.
 inline constexpr std::chrono::milliseconds kRescueAckTimeout{3000};
 //! Two counters (off-loop monitor, on-loop Server) see the same taps: a
@@ -182,15 +182,10 @@ public:
   HealthStats healthStats() const;
 
   //! Fleet-wide keyboard rescue: restart the local core AND tell every peer
-  //! to restart theirs. The 5-Esc gesture means "the fleet's input is
-  //! wedged" -- restarting only the machine that happened to see the taps
-  //! left the actually-broken peer stuck.
+  //! to restart theirs. The Esc hold means "the fleet's input is wedged" --
+  //! restarting only the machine that happened to see the hold left the
+  //! actually-broken peer stuck.
   void requestFleetRescue();
-
-  //! Fleet-wide stop-all (12x Esc): tell every peer to stop every Deskflow
-  //! instance and service on its seat, then do the same here. Once per
-  //! process: a seat that is already stopping ignores repeats.
-  void requestFleetStopAll();
 
   //! Receiver side of the KeyClearAll boundary resync (mesh v2).
   /*!
@@ -244,19 +239,19 @@ public:
   void notifyServerLink(bool up);
 
 private:
-  //! Stop this seat (m_localStopAllHook in tests, else the process-wide
-  //! executor); guarded so it runs at most once per process. The guard is
-  //! released when no executor could be started, so a later burst retries.
+  //! Stop this seat on a mesh `stopall` line (m_localStopAllHook in tests,
+  //! else the process-wide executor); guarded so it runs at most once per
+  //! process. The guard is released when no executor could be started, so
+  //! a later line retries.
   void requestLocalStopAll();
   bool runLocalStopAll();
-  //! A genuine (non-repeat) key down seen by the local input monitor, on
-  //! its thread, in EVERY role: the one Esc-burst counter of this process.
-  //! Never touches the core event loop (a wedged loop is what the gesture
-  //! is for).
-  void onLocalKeyDown(KeyID id, KeyModifierMask mask);
-  //! Settle poll for the Esc burst (RescueSettleTimer thread, or tests
-  //! with an injected clock): decides and fires the burst's action.
-  void settleEscBurst(EscTapRescue::Clock::time_point now = EscTapRescue::Clock::now());
+  //! A genuine physical key transition seen by the local input monitor, on
+  //! its thread, in EVERY role: the Esc hold rescue of this process. Never
+  //! touches the core event loop (a wedged loop is what the gesture is for).
+  void onLocalKey(KeyID id, KeyModifierMask mask, bool down);
+  //! Deadline poll for the Esc hold (RescueSettleTimer thread, or tests
+  //! with an injected clock): fires the restart once the hold has lasted.
+  void settleEscBurst(EscHoldRescue::Clock::time_point now = EscHoldRescue::Clock::now());
   void fireRescueAction(RescueAction action);
   //! Off-loop restart: post a liveness probe to the core event loop and
   //! hard-exit (supervisor relaunch) unless it is dispatched in time.
@@ -344,22 +339,22 @@ private:
   //! When the last fleet rescue was accepted (guarded by m_mutex).
   double m_lastRescueAt = -1.0e9;
   //! When this seat last REQUESTED a fleet rescue (guarded by m_mutex):
-  //! the off-loop counter and the Server's on-loop counter see the same
-  //! taps, so the second request inside kFleetRescueDedupeS is dropped.
+  //! the off-loop monitor and the Server's on-loop observer see the same
+  //! hold, so the second request inside kFleetRescueDedupeS is dropped.
   double m_lastFleetRescueAt = -1.0e9;
   std::function<void(const std::string &)> m_keyClearAllHandler; //!< guarded by m_mutex
-  //! Esc burst counter (guarded by m_mutex; fed from the keyboard hook).
-  EscTapRescue m_escTapRescue;
+  //! Esc hold rescue (guarded by m_mutex; fed from the input monitor).
+  EscHoldRescue m_escHold;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
   std::function<void()> m_localCoreRestartHook;
   //! When set (unit tests), used instead of the process-wide stop-all.
   std::function<void()> m_localStopAllHook;
-  //! Set once a stop-all was requested or received (guarded by m_mutex).
+  //! Set once a stop-all line was received (guarded by m_mutex).
   bool m_stopAllTriggered = false;
-  //! Wakes settleEscBurst() once the burst has been silent for kSettleMs.
+  //! Wakes settleEscBurst() once the Esc hold reaches its deadline.
   RescueSettleTimer m_escSettleTimer;
   //! Hard-exits the process when the event loop never acknowledges an
-  //! off-loop 5x Esc restart (CoordinationRescueProbe).
+  //! off-loop Esc-hold restart (CoordinationRescueProbe).
   ExitWatchdog m_rescueWatchdog;
   //! How long the loop gets to dispatch the probe (tests shrink it).
   std::chrono::milliseconds m_rescueAckTimeout{kRescueAckTimeout};

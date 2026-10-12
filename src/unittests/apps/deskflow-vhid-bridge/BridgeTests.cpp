@@ -152,7 +152,8 @@ private Q_SLOTS:
   void shiftReleaseMidHoldDropsDerivedShift();
   void stuckKeyWarningCarriesNoButtonId();
   void keysSummaryHidesLetterCountsByDefault();
-  void escapeBurstReleasesBeforeStop();
+  void escapeHoldReleasesBeforeStop();
+  void escapeTapsAreJustEscape();
   void capsAssumptionHoldsUntilReaderAgrees();
   void capsAssumptionExpiresWithDisagreementLine();
   void cheapSpecialKeysAreMapped();
@@ -300,22 +301,32 @@ void BridgeTests::keysSummaryHidesLetterCountsByDefault()
   QVERIFY(log.any("case-applied=no"));
 }
 
-// A-4: the 4x Esc rescue must not exit the process before the release
+// A-4: the Esc-hold rescue must not exit the process before the release
 // report is posted. run() ends the connection, posts the empty keyboard
 // and pointing reports, and returns so main can unwind (sink destroyed
-// after the release was queued).
-void BridgeTests::escapeBurstReleasesBeforeStop()
+// after the release was queued). The hold is measured off the relayed
+// repeats: here the clock advances one second per reading.
+void BridgeTests::escapeHoldReleasesBeforeStop()
 {
+  LogCapture log;
   Fixture f;
+  f.bridge.now_ = [&f] {
+    f.now += std::chrono::seconds(1);
+    return f.now;
+  };
   int fds[2];
   QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-  // server hello + four Esc downs, all already in the buffer
+  // server hello + an Esc down and its autorepeats, all already in the buffer
   std::vector<uint8_t> hello(proto::kGreeting, proto::kGreeting + sizeof(proto::kGreeting));
   append_be16(hello, proto::kMajorVersion);
   append_be16(hello, proto::kMinorVersion);
   std::vector<uint8_t> stream = frame(hello);
-  for (int i = 0; i < 4; ++i) {
+  {
     const auto body = frame(key_body(proto::kKeyDown, kKeyIdEscape, 0, 53));
+    stream.insert(stream.end(), body.begin(), body.end());
+  }
+  for (int i = 0; i < 6; ++i) {
+    const auto body = frame(key_body(proto::kKeyRepeat, kKeyIdEscape, 0, 1)); // id, mask, count (button unused)
     stream.insert(stream.end(), body.begin(), body.end());
   }
   QCOMPARE(::write(fds[1], stream.data(), stream.size()), ssize_t(stream.size()));
@@ -325,7 +336,8 @@ void BridgeTests::escapeBurstReleasesBeforeStop()
   ::close(fds[1]);
 
   QVERIFY(g_stop.load());
-  // the 4th Esc down was posted, then the release (empty) report
+  QVERIFY(log.any("escape held"));
+  // the Esc down was posted, then the release (empty) report
   size_t escAt = f.sink.kb.size();
   for (size_t i = 0; i < f.sink.kb.size(); ++i) {
     if (f.sink.kb[i].keys.contains(kUsageEsc)) {
@@ -366,6 +378,45 @@ void BridgeTests::leaveFlushesAndUnconfirmedFlushWarns()
 // A-5: after an emitted caps edge the bridge assumes the state it set until
 // the OS reader agrees. A reader that stays stale for 80 ms yields exactly
 // one edge for the whole burst.
+// Taps are just Esc: however many, with a real clock between them, the
+// bridge keeps running and the keys ride through as Downs and Ups.
+void BridgeTests::escapeTapsAreJustEscape()
+{
+  LogCapture log;
+  Fixture f;
+  int fds[2];
+  QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  std::vector<uint8_t> hello(proto::kGreeting, proto::kGreeting + sizeof(proto::kGreeting));
+  append_be16(hello, proto::kMajorVersion);
+  append_be16(hello, proto::kMinorVersion);
+  std::vector<uint8_t> stream = frame(hello);
+  for (int i = 0; i < 12; ++i) {
+    const auto down = frame(key_body(proto::kKeyDown, kKeyIdEscape, 0, 53));
+    const auto up = frame(key_body(proto::kKeyUp, kKeyIdEscape, 0, 53));
+    stream.insert(stream.end(), down.begin(), down.end());
+    stream.insert(stream.end(), up.begin(), up.end());
+  }
+  QCOMPARE(::write(fds[1], stream.data(), stream.size()), ssize_t(stream.size()));
+  // Half-close: EOF after the taps ends run() normally, while the bridge's
+  // own handshake reply still has somewhere to go (no SIGPIPE).
+  QCOMPARE(::shutdown(fds[1], SHUT_WR), 0);
+
+  FramedSocket socket(fds[0]);
+  f.bridge.run(socket);
+  ::close(fds[1]);
+
+  QVERIFY(!g_stop.load());
+  QVERIFY(!log.any("escape held"));
+  int escDowns = 0;
+  for (const auto &report : f.sink.kb) {
+    if (report.keys.contains(kUsageEsc)) {
+      ++escDowns;
+    }
+  }
+  QCOMPARE(escDowns, 12);
+  QVERIFY(f.bridge.held_keys_.empty());
+}
+
 void BridgeTests::capsAssumptionHoldsUntilReaderAgrees()
 {
   Fixture f;

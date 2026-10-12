@@ -777,33 +777,52 @@ bool Bridge::on_mouse_wheel(const std::vector<uint8_t> &body)
   return true;
 }
 
-// 5x Esc keyboard rescue, bridge edition.
+// Esc-hold keyboard rescue, bridge edition.
 /*!
 At a login window the bridge is the ONLY Deskflow process on this machine,
-so the fleet rescue (which restarts cores) cannot fix a wedged bridge. Count
-relayed Esc presses and stop -- launchd's KeepAlive restarts us with a fresh
-virtual HID device and empty held-key state. The threshold is 4, not 5,
-because the server swallows the final tap of its own rescue gesture: the
-same five presses therefore rescue the cores AND the bridge.
+so the fleet rescue (which restarts cores) cannot replace a wedged virtual
+HID device. A relayed plain Esc held for kEscapeHold stops the bridge --
+launchd's KeepAlive restarts it with a fresh device and empty held-key
+state. The same physical hold rescues the cores (3 s) AND the bridge
+(2.5 s, so it fires off the relayed repeats before the server's rescue
+releases the key). Taps are just Esc; a chord never counts.
 
-Returns true when the burst fired. The caller ends the connection; run()
+Returns true when the hold fired. The caller ends the connection; run()
 then posts the release reports and main unwinds normally, so the sink is
 destroyed (and the dispatcher flushed) AFTER the empty report is queued.
 std::exit() here used to race that flush (A-4): the process could be gone
 before the daemon ever saw the release, leaving the last key held on a
 virtual keyboard nobody owned any more.
 */
-bool Bridge::note_escape_down()
+bool Bridge::note_escape(uint16_t key_id, uint32_t mask, bool down)
 {
-  const auto now = now_();
-  if (now - last_escape_ > std::chrono::seconds(2)) {
-    escape_taps_ = 0;
-  }
-  last_escape_ = now;
-  if (++escape_taps_ < 4) {
+  constexpr uint32_t kChordMods = 0x001F; // Shift | Control | Alt | Meta | Super
+  if (key_id != 0xEF1B) { // Escape
+    if (down) {
+      escape_down_since_.reset(); // another key joined: a chord, not a rescue
+    }
     return false;
   }
-  log_line("keyboard rescue: escape burst -- releasing input and stopping (launchd restarts the bridge)");
+  const auto now = now_();
+  if (down && !escape_down_since_) {
+    if ((mask & kChordMods) == 0) {
+      escape_down_since_ = now;
+    }
+    return false;
+  }
+  if (!escape_down_since_) {
+    return false;
+  }
+  // A Repeat (or the Up) while the hold has lasted long enough fires it.
+  const bool fired = now - *escape_down_since_ >= kEscapeHold;
+  if (!down) {
+    escape_down_since_.reset();
+  }
+  if (!fired) {
+    return false;
+  }
+  escape_down_since_.reset();
+  log_line("keyboard rescue: escape held -- releasing input and stopping (launchd restarts the bridge)");
   g_stop.store(true);
   wake();
   return true;
@@ -816,10 +835,8 @@ bool Bridge::on_key_down(const std::vector<uint8_t> &body)
     return true;
   const auto id16 = static_cast<uint16_t>(key_id);
   const auto mask32 = static_cast<uint32_t>(static_cast<uint16_t>(mask));
-  if (id16 == 0xEF1B) { // Escape
-    if (note_escape_down())
-      return false; // run() releases everything and returns
-  }
+  if (note_escape(id16, mask32, true))
+    return false; // run() releases everything and returns
   // Caps Lock is an EDGE, never a held key. A relayed Caps Down used to be
   // stored in held_keys_ with the mask's modifiers, so Shift held at caps
   // time latched onto it until Leave, and a second caps Down overwrote the
@@ -966,6 +983,8 @@ bool Bridge::on_key_up(const std::vector<uint8_t> &body)
   if (!parse_key(body, key_id, mask, button))
     return true;
   const auto id16 = static_cast<uint16_t>(key_id);
+  if (note_escape(id16, static_cast<uint32_t>(static_cast<uint16_t>(mask)), false))
+    return false; // run() releases everything and returns
   auto it = held_keys_.find(button);
   const bool was_held = it != held_keys_.end();
   if (was_held)
@@ -977,9 +996,16 @@ bool Bridge::on_key_up(const std::vector<uint8_t> &body)
   return true;
 }
 
-// Auto-repeat: the held key is already down, so no report change is required.
-bool Bridge::on_key_repeat(const std::vector<uint8_t> &)
+// Auto-repeat: the held key is already down, so no report change is
+// required -- but a repeating Esc is how the hold rescue measures time
+// without a timer of its own (one arrives every few tens of ms).
+bool Bridge::on_key_repeat(const std::vector<uint8_t> &body)
 {
+  int16_t key_id = 0, mask = 0, count = 0;
+  if (!parse_key(body, key_id, mask, count)) // DKRP: id, mask, count, button
+    return true;
+  if (note_escape(static_cast<uint16_t>(key_id), static_cast<uint32_t>(static_cast<uint16_t>(mask)), true))
+    return false;
   return true;
 }
 
