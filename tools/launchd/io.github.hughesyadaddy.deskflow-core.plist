@@ -42,7 +42,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>__APP__/Contents/MacOS/deskflow-core</string>
-    <string>auto</string>
+    <string>__CORE_MODE__</string>
   </array>
   <key>KeepAlive</key>
   <dict>

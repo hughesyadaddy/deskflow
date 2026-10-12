@@ -379,6 +379,17 @@ domain_services() {
   launchctl print "$DOMAIN" 2>/dev/null || true # fleet:allow unreadable domain = no runningboard evidence
 }
 
+core_mode() {
+  # Pinned role (fleet/pinned-roles): DESKFLOW_CORE_MODE, else core/coreMode in
+  # Deskflow.conf (1=client, 2=server). Anything else falls back to auto.
+  local m="${DESKFLOW_CORE_MODE:-}" n
+  if [[ -z "$m" ]]; then
+    n="$(sed -n 's/^coreMode=//p' "$HOME/Library/Deskflow/Deskflow.conf" 2>/dev/null | head -1)"
+    case "$n" in 1) m=client ;; 2) m=server ;; *) m=auto ;; esac
+  fi
+  echo "$m"
+}
+
 render_agent_to() {
   # $1 = label, $2 = output file. Renders <templates>/<label>.plist with the
   # bundle, home, launchd-safe ctl/dir and soak dir substituted. __CTL__ is
@@ -387,7 +398,7 @@ render_agent_to() {
   local src="${TEMPLATE_DIR:+$TEMPLATE_DIR/$1.plist}" hit
   [[ -n "$src" && -f "$src" ]] || die "missing template ${src:-$1.plist}: no launchd-safe copy at $SAFE_TEMPLATE_DIR and no checkout (run scripts/deskflow-ctl start from the checkout)"
   sed -e "s#__APP__#$APP#g" -e "s#__HOME__#$HOME#g" -e "s#__CTL__#$SAFE_CTL#g" \
-      -e "s#__CTL_DIR__#$SAFE_DIR#g" -e "s#__SOAK_DIR__#$SOAK_DIR#g" "$src" >"$2"
+      -e "s#__CTL_DIR__#$SAFE_DIR#g" -e "s#__SOAK_DIR__#$SOAK_DIR#g" -e "s#__CORE_MODE__#$(core_mode)#g" "$src" >"$2"
   if hit="$(grep -m1 -iE "$TCC_STRING_RE" "$2")"; then
     die "rendered $1.plist points launchd into $TCC_FOLDERS (EPERM, no prompt): $(echo "$hit" | sed 's/^[[:space:]]*//')"
   fi
