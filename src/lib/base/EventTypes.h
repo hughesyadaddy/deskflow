@@ -280,7 +280,7 @@ enum class EventTypes : uint32_t
   CoordinationTopologyReady,
 
   /** Keyboard rescue liveness probe: posted (system target) by the
-      coordinator right after an off-loop 5x Esc restart request. The
+      coordinator right after an off-loop Esc-hold restart request. The
       coordinator's own handler cancels the exit watchdog; a loop that
       never dispatches it is wedged and the process hard-exits so the
       supervisor relaunches the core. No event data.

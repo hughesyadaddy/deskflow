@@ -92,6 +92,20 @@ private:
     if (sourcePid != 0 || deskflow::platform::isInjectedEvent(event)) {
       return event;
     }
+    if (type == kCGEventFlagsChanged) {
+      // Modifiers are FlagsChanged, never KeyDown: a chord modifier going
+      // down while Esc is held must cancel the hold like any other key.
+      // Modifier releases are not reported (irrelevant to the hold); flags
+      // changes never count as genuine input for the election either.
+      if (self->m_keySink) {
+        constexpr KeyModifierMask chordMods = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
+        const KeyModifierMask mask = maskFromFlags(CGEventGetFlags(event));
+        if ((mask & chordMods) != 0) {
+          self->m_keySink(kKeyNone, mask, true);
+        }
+      }
+      return event;
+    }
     if (type == kCGEventKeyDown || type == kCGEventKeyUp) {
       // Keys feed ONLY the Esc hold rescue (off the core event loop). They
       // never count as genuine input for the election: a client seat's
@@ -141,7 +155,7 @@ private:
     const CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDown) |
                              CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown) |
                              CGEventMaskBit(kCGEventScrollWheel) | CGEventMaskBit(kCGEventKeyDown) |
-                             CGEventMaskBit(kCGEventKeyUp);
+                             CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(kCGEventFlagsChanged);
 
     m_tap = CGEventTapCreate(
         kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask, tapCallback, this
@@ -205,6 +219,12 @@ private:
 };
 
 } // namespace
+
+bool escapePhysicallyDown()
+{
+  // HID system state: the hardware keyboard's view, independent of taps.
+  return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, 53 /* Escape */);
+}
 
 std::unique_ptr<ILocalInputMonitor> createLocalInputMonitor()
 {

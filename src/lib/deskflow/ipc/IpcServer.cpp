@@ -265,7 +265,7 @@ void IpcServer::requestLocalCoreRestart()
   // Mutually exclusive on the owning thread: never queue restartCore when
   // empty (stale fire later), and never both broadcast and stop.
   if (hasClients()) {
-    LOG_INFO("keyboard rescue: 5x Esc — requesting core restart via GUI");
+    LOG_INFO("keyboard rescue: Esc held -- requesting core restart via GUI");
     broadcastCommandIfClients(QStringLiteral("restartCore"));
     return;
   }
@@ -279,7 +279,7 @@ void IpcServer::requestLocalCoreRestart()
   QLocalSocket daemon;
   daemon.connectToServer(QString::fromLatin1(kDaemonIpcName));
   if (daemon.waitForConnected(500)) {
-    LOG_INFO("keyboard rescue: 5x Esc — no GUI IPC client; asking the daemon to relaunch the core");
+    LOG_INFO("keyboard rescue: Esc held -- no GUI IPC client; asking the daemon to relaunch the core");
     daemon.write("restartCore\n");
     daemon.flush();
     daemon.waitForBytesWritten(500);
@@ -287,7 +287,7 @@ void IpcServer::requestLocalCoreRestart()
     return;
   }
   LOG_ERR(
-      "keyboard rescue: 5x Esc — no GUI IPC client and the daemon is unreachable (%s); ignoring",
+      "keyboard rescue: Esc held -- no GUI IPC client and the daemon is unreachable (%s); ignoring",
       daemon.errorString().toUtf8().constData()
   );
 #else
@@ -296,7 +296,7 @@ void IpcServer::requestLocalCoreRestart()
   // went dead and had to be restarted by hand. A rescue that cannot restart
   // must do nothing rather than destroy the thing it was meant to rescue.
   LOG_ERR(
-      "keyboard rescue: 5x Esc — no GUI IPC client to restart the core; "
+      "keyboard rescue: Esc held -- no GUI IPC client to restart the core; "
       "ignoring (stopping it here would leave this machine dead)"
   );
 #endif

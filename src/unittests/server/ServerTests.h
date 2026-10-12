@@ -24,6 +24,7 @@ private Q_SLOTS:
   void escHold_releasedBeforeDeadline_noRestart();
   void escHold_otherKeyCancelsAndIsRelayed();
   void escHold_relayedKeyNeverCounts();
+  void escHold_lostUp_probeSaysNotDown_noRestart();
   void chordRemapHoldThrough_superTabKeepsAltUntilSuperUp();
   void chordRemapHoldThrough_relaySuperUpClearsSession();
   void chordRemapHoldThrough_tabRepeatKeepsAltMask();

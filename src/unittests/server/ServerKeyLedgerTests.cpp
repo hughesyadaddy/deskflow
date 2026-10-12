@@ -634,6 +634,7 @@ void ServerKeyLedgerTests::escHold_releasesLedger()
     server.switchScreen(&remote, 50, 60, false);
     int restarts = 0;
     server.m_localCoreRestartHook = [&restarts] { ++restarts; };
+    server.m_escDownProbe = [] { return true; };
 
     // a key is stuck down on the target; the user holds Esc
     server.onKeyDown(kKeyA, 0, kButtonA, "en", nullptr);

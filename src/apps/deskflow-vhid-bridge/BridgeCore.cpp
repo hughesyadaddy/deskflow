@@ -576,6 +576,7 @@ bool Bridge::dispatch(FramedSocket &socket, const std::vector<uint8_t> &body)
   if (body_has_code(body, proto::kEnter))
     return on_enter(body);
   if (body_has_code(body, proto::kLeave)) {
+    escape_down_since_.reset(); // the server released everything on leave
     release_all(true);
     log_line("leave; " + keys_summary());
     return true;
@@ -1089,6 +1090,9 @@ void Bridge::release_all(bool flush)
 {
   held_keys_.clear();
   mouse_buttons_.clear();
+  // A hold whose Up never arrived (connection dropped mid-hold) must not
+  // make the next session's first Esc tap fire the rescue.
+  escape_down_since_.reset();
   have_last_abs_ = false;
   sink_.post_keyboard(0, {});
   sink_.post_pointing({}, 0, 0, 0, 0);

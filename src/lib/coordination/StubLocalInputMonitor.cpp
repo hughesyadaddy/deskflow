@@ -34,6 +34,11 @@ public:
 
 } // namespace
 
+bool escapePhysicallyDown()
+{
+  return true; // no probe on this platform: trust the feeder
+}
+
 std::unique_ptr<ILocalInputMonitor> createLocalInputMonitor()
 {
   return std::make_unique<StubLocalInputMonitor>();

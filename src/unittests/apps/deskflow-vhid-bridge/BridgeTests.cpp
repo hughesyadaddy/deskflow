@@ -154,6 +154,7 @@ private Q_SLOTS:
   void keysSummaryHidesLetterCountsByDefault();
   void escapeHoldReleasesBeforeStop();
   void escapeTapsAreJustEscape();
+  void escapeHoldForgottenOnRelease();
   void capsAssumptionHoldsUntilReaderAgrees();
   void capsAssumptionExpiresWithDisagreementLine();
   void cheapSpecialKeysAreMapped();
@@ -378,6 +379,22 @@ void BridgeTests::leaveFlushesAndUnconfirmedFlushWarns()
 // A-5: after an emitted caps edge the bridge assumes the state it set until
 // the OS reader agrees. A reader that stays stale for 80 ms yields exactly
 // one edge for the whole burst.
+// A hold whose Up never arrived (the connection dropped) must not make the
+// next session's first Esc tap fire the rescue.
+void BridgeTests::escapeHoldForgottenOnRelease()
+{
+  Fixture f;
+  QVERIFY(f.keyDown(kKeyIdEscape, 0, 53));
+  QVERIFY(f.bridge.escape_down_since_.has_value());
+  f.bridge.release_all(false);
+  QVERIFY(!f.bridge.escape_down_since_.has_value());
+  // Minutes later, a fresh tap: starts a new hold, fires nothing.
+  f.now += std::chrono::minutes(5);
+  QVERIFY(f.keyDown(kKeyIdEscape, 0, 53));
+  QVERIFY(f.keyUp(kKeyIdEscape, 0, 53));
+  QVERIFY(!g_stop.load());
+}
+
 // Taps are just Esc: however many, with a real clock between them, the
 // bridge keeps running and the keys ride through as Downs and Ups.
 void BridgeTests::escapeTapsAreJustEscape()

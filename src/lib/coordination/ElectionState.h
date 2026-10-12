@@ -161,6 +161,7 @@ private:
   //! starts disconnected and must connect within linkDownGraceS).
   bool m_serverLinkUp = false;
   double m_linkDownAt = -1.0e9;
+  double m_linkUpAt = -1.0e9;
   double m_lastSwitchAt = -1.0e9;    // long ago: no cooldown at boot
   int m_recentFlips = 0;             //!< role flips inside the flap window
   double m_flapWindowStart = -1.0e9; //!< start of the current flap window

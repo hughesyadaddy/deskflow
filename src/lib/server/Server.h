@@ -13,6 +13,7 @@
 #include "base/String.h"
 #include "common/NetworkProtocol.h"
 #include "coordination/KeyboardRescue.h"
+#include "coordination/LocalInputMonitor.h"
 #include "coordination/RelayKeyEvent.h"
 #include "deskflow/Clipboard.h"
 #include "deskflow/ClipboardTypes.h"
@@ -706,6 +707,8 @@ private:
   //! True while relayForwardedKey() replays a peer's key through
   //! onKeyDown/onKeyUp: those never feed m_escHold.
   bool m_relayingForwardedKey = false;
+  //! Confirms Esc is physically down at the hold deadline (tests inject).
+  std::function<bool()> m_escDownProbe = &deskflow::coordination::escapePhysicallyDown;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
   std::function<void()> m_localCoreRestartHook;
 };

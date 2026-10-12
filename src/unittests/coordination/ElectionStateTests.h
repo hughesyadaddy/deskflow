@@ -24,6 +24,7 @@ private Q_SLOTS:
   void cursorHereRaisesThreshold();
   void connectedClientNeverPromotesOnLocalInput();
   void freshClientEpochCountsAsLinkDown();
+  void flappingLinkDoesNotExtendGrace();
   void cursorToggleClearsBurst();
   void claimFromSelfIgnored();
   void claimDuringServerCooldownIgnored();

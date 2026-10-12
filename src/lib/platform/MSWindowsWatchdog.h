@@ -123,7 +123,7 @@ public:
   /**
    * @brief Relaunch the core with the current config (keyboard rescue).
    *
-   * Used when the 5x Esc rescue reaches a core that has no GUI IPC client to
+   * Used when the Esc-hold rescue reaches a core that has no GUI IPC client to
    * restart it. Queues a start with the existing command; startProcess()
    * shuts the running core down and launches a fresh one. A no-op (logged)
    * when no command is configured, so it can never act as a kill switch.
@@ -131,7 +131,7 @@ public:
   void requestRestart();
 
   /**
-   * @brief Stop-all (12x Esc): stop every Deskflow process under @p installRoot and never respawn.
+   * @brief Stop-all (mesh `stopall` line): stop every Deskflow process under @p installRoot and never respawn.
    *
    * Clears the command (nothing is relaunched; daemon/configFile stays
    * persisted for the next explicit start), queues the graceful stop of the

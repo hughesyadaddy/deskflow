@@ -62,4 +62,14 @@ public:
 //! Create the monitor for the current platform.
 std::unique_ptr<ILocalInputMonitor> createLocalInputMonitor();
 
+//! Best effort: does the OS report the Esc key physically down right now?
+/*!
+The Esc-hold rescue confirms this before firing: a monitor can miss the Up
+(secure event input swallows key events to every tap; a UAC/secure desktop
+withholds raw input; a tap disabled by timeout; a screen lock), and without
+this check a single Esc tap followed by such a gap would restart the fleet
+3 s later. Platforms without a probe return true.
+*/
+bool escapePhysicallyDown();
+
 } // namespace deskflow::coordination

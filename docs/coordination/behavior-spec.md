@@ -60,8 +60,12 @@ wire format but should add an optional shared token (documented in
 
 - **macOS**: listen-only CGEventTap; an event is genuine hardware iff its
   event-source unix PID is 0 (synthesized/injected events carry the
-  injecting process's PID). Requires Input Monitoring permission. The tap
-  must self-re-enable after timeout disables.
+  injecting process's PID -- verified 2026-10-12 on macOS 26: a key posted
+  through `IOHIDPostEvent` AND one posted through `CGEventPost` both show
+  the poster's pid in `kCGEventSourceUnixProcessID` at a listen-only
+  session tap, so Deskflow's own fake keys, including a peer's held Esc
+  replayed here, never reach the rescue). Requires Input Monitoring
+  permission. The tap must self-re-enable after timeout disables.
 - **Windows**: Raw Input (`WM_INPUT`, `RIDEV_INPUTSINK`); genuine iff
   `RAWINPUTHEADER.hDevice != NULL` (SendInput-synthesized input has a
   null device).
@@ -274,6 +278,25 @@ The elected server is authoritative: each newer fragment replaces
 `peers[]`, `links[]`, `screens[]`, and cursor fields. Post-merge, the
 coordinator emits `CoordinationFleetStateChanged`; the first non-empty
 `links[]` also emits `CoordinationTopologyReady`.
+
+### Lock keys (Caps/Num/Scroll) are owned by each seat's own keyboard
+
+No seat ever writes another seat's lock STATE: the server does not push
+lock state on enter or on a lock press, and a receiving KeyState ignores
+relayed lock keys outright (`ignored key …` at verbose). Pressing Caps with
+the cursor on a remote toggles the primary's Caps (the HID system toggles
+before any tap); the remote's own indicator never changes, and letters
+still type in the case the primary's Caps implies (KeyMap adds/removes
+Shift). The two seats' Caps indicators are simply independent. The enter
+mask still carries lock bits for wire compatibility; nothing acts on them.
+Background: 2026-10-12 Caps ping-pong -- the pushed state and a Shift+Caps
+at unlock re-latched each other until the Mac had Caps stuck for good.
+
+One deliberate exception: the macOS login-window vhid bridge drives that
+machine's Caps to the server's on enter (`sync_caps_lock`), because at a
+login window the bridge IS the only keyboard and the password field has no
+indicator to disagree with. It is one-directional; the server never reads
+it back.
 
 ### `rescue` / `stopall` — fleet command broadcasts
 

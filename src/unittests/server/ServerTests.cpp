@@ -835,6 +835,7 @@ void ServerTests::escHold_requestsLocalCoreRestartAndReleasesLedger()
 
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+    server.m_escDownProbe = [] { return true; };
 
     // The Esc Down rides to the target like any key and arms the hold timer.
     server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
@@ -881,6 +882,7 @@ void ServerTests::escHold_releasedBeforeDeadline_noRestart()
 
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+    server.m_escDownProbe = [] { return true; };
 
     // Any number of Esc taps is just Esc: Down and Up both relayed, the
     // timer disarmed by each Up, and a late poll never fires.
@@ -914,6 +916,7 @@ void ServerTests::escHold_otherKeyCancelsAndIsRelayed()
 
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+    server.m_escDownProbe = [] { return true; };
 
     server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
     QVERIFY(server.m_escBurstTimer != nullptr);
@@ -926,6 +929,41 @@ void ServerTests::escHold_otherKeyCancelsAndIsRelayed()
     QCOMPARE(remote.keys()[0].id, KeyID('h'));
     server.settleEscBurst(pastHold());
     QCOMPARE(restartCalls, 0);
+
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerTests::escHold_lostUp_probeSaysNotDown_noRestart()
+{
+  // Esc Down relayed, then the Up never reaches the server (secure input on
+  // the primary). The OS says Esc is not down at the deadline: no restart,
+  // and the hold is forgotten.
+  LeakedServerFixture fixture;
+  QVERIFY(fixture.config.addScreen("server"));
+  QVERIFY(fixture.config.addScreen("remote"));
+  QVERIFY(fixture.config.connect("server", Direction::Right, 0.0f, 1.0f, "remote", 0.0f, 1.0f));
+  fixture.init("server");
+  RecordingRemoteClient remote("remote");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+
+    int restartCalls = 0;
+    server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+    server.m_escDownProbe = [] { return false; };
+
+    server.onKeyDown(kKeyEscape, 0, 1, "en", nullptr);
+    QVERIFY(server.m_escBurstTimer != nullptr);
+    server.settleEscBurst(pastHold());
+    QCOMPARE(restartCalls, 0);
+    QVERIFY(server.m_escBurstTimer == nullptr);
+    QVERIFY(!server.m_escHold.pending());
+    // The relayed Esc is still held on the target (no rescue released it);
+    // its real Up, whenever it comes, releases it as usual.
+    QVERIFY(!server.m_keysHeldOnActive.empty());
 
     server.m_clients.erase("remote");
   }
@@ -950,6 +988,7 @@ void ServerTests::escHold_relayedKeyNeverCounts()
 
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+    server.m_escDownProbe = [] { return true; };
 
     deskflow::coordination::RelayKeyEvent event;
     event.phase = deskflow::coordination::RelayKeyPhase::Down;
@@ -1086,6 +1125,7 @@ void ServerTests::chordRemapHoldThrough_escHoldCancelsSession()
 
     int restartCalls = 0;
     server.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+    server.m_escDownProbe = [] { return true; };
 
     server.onKeyDown(kKeyEscape, 0, 0, "en", nullptr);
     remote.clearKeys();

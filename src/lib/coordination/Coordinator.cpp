@@ -677,6 +677,9 @@ void Coordinator::onMessage(const Message &message, const std::function<void(con
         break;
       }
       m_lastRescueAt = now;
+      // A received rescue also quiets our own originator for a while: this
+      // seat may be observing the very Esc the sender is holding.
+      m_lastFleetRescueAt = now;
     }
     // Never re-broadcast: the originator already fanned out to every peer,
     // so echoing would restart-storm the fleet.
@@ -998,10 +1001,12 @@ void Coordinator::requestFleetRescue()
       return;
     }
     const double now = monotonicSeconds();
-    if (now - m_lastFleetRescueAt < kFleetRescueDedupeS) {
+    if (now - m_lastFleetRescueAt < kFleetRescueDedupeS || now - m_lastRescueAt < kFleetRescueDedupeS) {
       // The off-loop monitor and the Server's on-loop observer both saw
-      // this hold; one fleet restart is enough.
-      LOG_DEBUG("coordination: fleet rescue already requested %.1f s ago; ignoring repeat", now - m_lastFleetRescueAt);
+      // this hold, or a peer's rescue line for the same hold just landed
+      // (our own injected copy of its Esc is what we are observing); one
+      // fleet restart is enough.
+      LOG_DEBUG("coordination: fleet rescue already requested/received recently; ignoring repeat");
       return;
     }
     m_lastFleetRescueAt = now;
@@ -1029,6 +1034,16 @@ void Coordinator::settleEscBurst(EscHoldRescue::Clock::time_point now)
   RescueAction action = RescueAction::None;
   {
     std::scoped_lock lock{m_mutex};
+    if (!m_escHold.pending()) {
+      return;
+    }
+    if (!m_escDownProbe()) {
+      // The monitor missed the Up (secure input, a disabled tap, a lock
+      // screen): the key is not held, so there is no rescue to fire.
+      LOG_DEBUG("keyboard rescue: Esc hold deadline reached but Esc is not down; ignoring");
+      m_escHold.reset();
+      return;
+    }
     action = m_escHold.settle(now);
   }
   fireRescueAction(action);

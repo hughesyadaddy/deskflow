@@ -216,6 +216,11 @@ private:
 
 } // namespace
 
+bool escapePhysicallyDown()
+{
+  return (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+}
+
 std::unique_ptr<ILocalInputMonitor> createLocalInputMonitor()
 {
   return std::make_unique<MSWindowsLocalInputMonitor>();

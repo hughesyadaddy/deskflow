@@ -46,7 +46,7 @@ inline constexpr int kMeshProtocolVersion = 2;
 //! Grace for the core event loop to acknowledge an off-loop Esc-hold restart
 //! before the process hard-exits for a supervisor relaunch.
 inline constexpr std::chrono::milliseconds kRescueAckTimeout{3000};
-//! Two counters (off-loop monitor, on-loop Server) see the same taps: a
+//! Two counters (off-loop monitor, on-loop Server) see the same hold: a
 //! second fleet rescue request inside this window is a duplicate.
 inline constexpr double kFleetRescueDedupeS = 5.0;
 
@@ -345,6 +345,8 @@ private:
   std::function<void(const std::string &)> m_keyClearAllHandler; //!< guarded by m_mutex
   //! Esc hold rescue (guarded by m_mutex; fed from the input monitor).
   EscHoldRescue m_escHold;
+  //! Confirms Esc is physically down at the hold deadline (tests inject).
+  std::function<bool()> m_escDownProbe = &escapePhysicallyDown;
   //! When set (unit tests), used instead of ipcRequestLocalCoreRestart().
   std::function<void()> m_localCoreRestartHook;
   //! When set (unit tests), used instead of the process-wide stop-all.

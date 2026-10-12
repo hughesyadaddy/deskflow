@@ -185,6 +185,36 @@ void ElectionStateTests::freshClientEpochCountsAsLinkDown()
   QVERIFY(g.feedInput(8, 0.05));
 }
 
+void ElectionStateTests::flappingLinkDoesNotExtendGrace()
+{
+  // A crash-looping server connects for a few seconds at a time. Only a
+  // link that was STABLE for the grace restarts the grace clock, so this
+  // seat becomes promotable 10 s after the first loss, not never.
+  Fixture f;
+  f.state.becameClient("10.0.0.2");
+  f.now += 1.0;
+  f.state.setServerLinkUp(true);
+  f.now += 3.0;
+  f.state.setServerLinkUp(false); // up for 3 s: a flap, not a stable link
+  f.now += 2.0;
+  f.state.setServerLinkUp(true);
+  f.now += 3.0;
+  f.state.setServerLinkUp(false);
+  f.now += 2.0; // 11 s after becameClient, link down
+  QVERIFY(f.feedInput(8, 0.05));
+
+  // A link that WAS stable restarts the clock on its loss.
+  Fixture g;
+  g.state.becameClient("10.0.0.2");
+  g.state.setServerLinkUp(true);
+  g.now += 60.0;
+  g.state.setServerLinkUp(false);
+  g.now += 5.0;
+  QVERIFY(!g.feedInput(8, 0.05));
+  g.now += 6.0;
+  QVERIFY(g.feedInput(8, 0.05));
+}
+
 void ElectionStateTests::cursorToggleClearsBurst()
 {
   Fixture f;

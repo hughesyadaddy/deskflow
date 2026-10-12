@@ -694,7 +694,7 @@ void KeyStateLedgerTests::fakeKeyDown_doesNotClickCapsAgainAfterSetToggleState()
   ks.osModifiers = 0;
   ks.updateKeyState(); // tracked mask = OS truth = no caps
 
-  // enter with caps on (Screen::applyToggleMask -> setToggleState)
+  // a direct lock write (the enter path no longer does this; see Screen.cpp)
   ks.setToggleState(KeyModifierCapsLock, true);
   QCOMPARE(ks.toggles.size(), 1u);
   QVERIFY((ks.getActiveModifiers() & KeyModifierCapsLock) != 0);

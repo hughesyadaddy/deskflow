@@ -38,7 +38,8 @@ const char *rescueActionName(RescueAction action)
 
 void EscHoldRescue::noteKeyDown(KeyID id, KeyModifierMask mask, Clock::time_point now)
 {
-  constexpr KeyModifierMask chordMods = KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierSuper;
+  constexpr KeyModifierMask chordMods =
+      KeyModifierShift | KeyModifierControl | KeyModifierAlt | KeyModifierMeta | KeyModifierSuper;
   if (id == kKeyEscape && (mask & chordMods) == 0) {
     if (m_escDown) {
       return; // autorepeat / duplicate Down: the hold keeps its start time

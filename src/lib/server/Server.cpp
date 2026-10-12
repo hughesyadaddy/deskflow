@@ -313,6 +313,15 @@ void Server::clearEscBurstTimer()
 void Server::settleEscBurst(deskflow::coordination::EscHoldRescue::Clock::time_point now)
 {
   clearEscBurstTimer();
+  if (!m_escHold.pending()) {
+    return;
+  }
+  if (!m_escDownProbe()) {
+    // The Up never reached us (secure input, lock screen): nothing is held.
+    LOG_DEBUG("keyboard rescue: Esc hold deadline reached but Esc is not down; ignoring");
+    m_escHold.reset();
+    return;
+  }
   if (m_escHold.settle(now) != deskflow::coordination::RescueAction::Restart) {
     return;
   }
@@ -2344,11 +2353,6 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
       }
     }
   }
-
-  // Lock keys are STATE: if this press flipped a lock on the primary, push
-  // the fresh state now rather than trusting the toggle to land in phase.
-  if (IKeyState::lockModifierForKey(id) != 0) {
-  }
 }
 
 void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const char *screens)
@@ -2450,10 +2454,6 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
     }
   }
 
-  // The lock state has certainly settled by the release (a hook may report
-  // the pre-toggle state on the down); re-check so nothing is missed.
-  if (IKeyState::lockModifierForKey(id) != 0) {
-  }
 }
 
 void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang)
@@ -2535,7 +2535,17 @@ void Server::relayForwardedKey(const deskflow::coordination::RelayKeyEvent &even
     return;
   }
   // A relayed key is the SENDING seat's physical key: its Esc hold is that
-  // seat's rescue to observe, never this one's.
+  // seat's rescue to observe, never this one's. Scope-guarded: a dead
+  // client stream throws out of keyDown, and a flag left true would
+  // silently retire this seat's own observer for the rest of the epoch.
+  struct RelayScope
+  {
+    bool &flag;
+    ~RelayScope()
+    {
+      flag = false;
+    }
+  } relayScope{m_relayingForwardedKey};
   m_relayingForwardedKey = true;
   switch (event.phase) {
   case RelayKeyPhase::Up:
@@ -2557,7 +2567,6 @@ void Server::relayForwardedKey(const deskflow::coordination::RelayKeyEvent &even
     onKeyDown(event.id, event.mask, event.button, event.lang, nullptr);
     break;
   }
-  m_relayingForwardedKey = false;
 }
 
 void Server::onMouseDown(ButtonID id)

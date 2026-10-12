@@ -157,8 +157,17 @@ void ElectionState::setServerLinkUp(bool up)
     return;
   }
   m_serverLinkUp = up;
-  if (!up) {
-    m_linkDownAt = m_clock();
+  const double now = m_clock();
+  if (up) {
+    m_linkUpAt = now;
+    return;
+  }
+  // Only a link that had been STABLE (up for at least the grace) restarts
+  // the grace clock. A server whose core crash-loops connects for a few
+  // seconds at a time; stamping every loss would keep this seat
+  // un-promotable for as long as the loop lasts.
+  if (now - m_linkUpAt >= m_tuning.linkDownGraceS) {
+    m_linkDownAt = now;
   }
 }
 

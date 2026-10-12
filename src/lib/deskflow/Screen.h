@@ -133,12 +133,6 @@ public:
   */
   void keyUp(KeyID id, KeyModifierMask, KeyButton);
 
-  //! Apply lock state
-  /*!
-  Drives Caps/Num/Scroll Lock to the states in \p toggleMask (lock keys are
-  STATE, not toggles). Only bits that disagree with the OS are touched.
-  */
-
   //! Notify of mouse press
   /*!
   Synthesize mouse events to generate a press of mouse button \c id.

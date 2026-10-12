@@ -97,6 +97,8 @@ private Q_SLOTS:
   void offLoop_escHoldWithBlockedEventLoop_exitsAfterAckTimeout();
   void offLoop_escHoldWithLiveEventLoop_noExit();
   void offLoop_escHoldReleasedEarly_nothing();
+  void offLoop_escHoldLostUp_probeSaysNotDown_nothing();
+  void rescue_receivedLineQuietsOwnOriginator();
   void claim_duplicateDeliveryEvaluatedOnce();
   void heartbeat_doesNotBlockOnUnreachablePeers();
   void keyForward_returnsWithinGraceWhenPeerUnreachable();
@@ -1652,6 +1654,7 @@ void CoordinatorTests::rescue_discardsQueuedKeysAndResyncsLedger()
   Coordinator coordinator(config);
   coordinator.setEventQueue(&events);
   coordinator.m_localCoreRestartHook = [] {};
+  coordinator.m_escDownProbe = [] { return true; };
   auto relay = std::make_unique<FakeKeyboardRelay>();
   auto *relayPtr = relay.get();
   coordinator.m_keyboardRelay = std::move(relay);
@@ -1770,6 +1773,7 @@ struct CoordinatorTests::BlockedLoopSeat
   Coordinator coordinator;
   int restarts = 0;
   int stops = 0;
+  bool escDown = true; //!< what the physical probe reports at the deadline
   std::atomic<int> exits{0};
   std::atomic<int> exitCode{-1};
   FakeKeyboardRelay *relay = nullptr;
@@ -1789,6 +1793,7 @@ struct CoordinatorTests::BlockedLoopSeat
     coordinator.setEventQueue(&events);
     coordinator.m_localCoreRestartHook = [this] { ++restarts; };
     coordinator.m_localStopAllHook = [this] { ++stops; };
+    coordinator.m_escDownProbe = [this] { return escDown; };
     coordinator.m_exitProcessHook = [this](int code) {
       exitCode = code;
       ++exits;
@@ -1863,6 +1868,44 @@ void CoordinatorTests::offLoop_escHoldReleasedEarly_nothing()
   QCOMPARE(seat.restarts, 0);
   QCOMPARE(seat.relay->resyncs.load(), 0);
   QVERIFY(!seat.coordinator.m_rescueWatchdog.armed());
+}
+
+void CoordinatorTests::offLoop_escHoldLostUp_probeSaysNotDown_nothing()
+{
+  // The monitor saw the Down but the Up never arrived (secure input, a
+  // tap disabled by timeout, a lock screen). At the deadline the OS says
+  // Esc is NOT down: no rescue, and the hold is forgotten so a later real
+  // hold starts from scratch.
+  BlockedLoopSeat seat;
+  seat.holdEsc();
+  seat.escDown = false;
+  seat.settle();
+  QCOMPARE(seat.restarts, 0);
+  QCOMPARE(seat.relay->resyncs.load(), 0);
+  {
+    std::scoped_lock lock{seat.coordinator.m_mutex};
+    QVERIFY(!seat.coordinator.m_escHold.pending());
+    QVERIFY(!seat.coordinator.m_escHold.escDown());
+  }
+  // A genuine hold afterwards still works.
+  seat.escDown = true;
+  seat.holdEsc();
+  seat.settle();
+  QCOMPARE(seat.restarts, 1);
+}
+
+void CoordinatorTests::rescue_receivedLineQuietsOwnOriginator()
+{
+  // The seat that received a peer's rescue line may be observing that very
+  // Esc (the peer's hold is injected here); its own hold must not originate
+  // a second fleet restart inside the dedupe window.
+  BlockedLoopSeat seat;
+  const auto reply = [](const std::string &) {};
+  seat.coordinator.onMessage(decodeFrom(protocol::encodeRescue("test-token"), kBlackholeA), reply);
+  QCOMPARE(seat.restarts, 1);
+  seat.holdEsc();
+  seat.settle();
+  QCOMPARE(seat.restarts, 1); // no second restart from our own hold
 }
 
 void CoordinatorTests::rescue_duplicateDeliveryRestartsOnce()

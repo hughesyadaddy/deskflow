@@ -440,6 +440,7 @@ void CoordinatorFleetPublishTests::escHold_requestsLocalCoreRestart()
 
   int restartCalls = 0;
   coordinator.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+  coordinator.m_escDownProbe = [] { return true; };
 
   FleetFragment inbound;
   inbound.server = "hackintosh";
@@ -478,6 +479,7 @@ void CoordinatorFleetPublishTests::escHold_localPass_requestsLocalCoreRestart()
 
   int restartCalls = 0;
   coordinator.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+  coordinator.m_escDownProbe = [] { return true; };
 
   FleetFragment inbound;
   inbound.server = "hackintosh";
@@ -512,6 +514,7 @@ void CoordinatorFleetPublishTests::escHold_repeatPhase_doesNotRestart()
 
   int restartCalls = 0;
   coordinator.m_localCoreRestartHook = [&restartCalls] { ++restartCalls; };
+  coordinator.m_escDownProbe = [] { return true; };
 
   FleetFragment inbound;
   inbound.server = "hackintosh";
