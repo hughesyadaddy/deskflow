@@ -370,6 +370,7 @@ private:
   // screen is still not entered (the platform declines under secure input).
   void armEnableSweep();
   void cancelEnableSweep();
+  void handleEnableSweep();
   EventQueueTimer *m_enableSweepTimer = nullptr;
   std::chrono::steady_clock::time_point m_enteredAt{};
   std::chrono::steady_clock::time_point m_lastKeyDownAt{};

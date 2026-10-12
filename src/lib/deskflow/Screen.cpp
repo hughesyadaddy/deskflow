@@ -658,14 +658,23 @@ void Screen::armEnableSweep()
   if (m_enableSweepTimer == nullptr) {
     return; // event queues without timers (test doubles)
   }
-  m_events->addHandler(EventTypes::Timer, m_enableSweepTimer, [this](const auto &) {
-    cancelEnableSweep();
-    if (m_entered) {
-      return;
-    }
-    LOG_DEBUG("[keys] delayed enable sweep");
-    m_screen->sanitizeInjectedKeys();
-  });
+  // Member function, not a lambda body: cancelEnableSweep() removes this very
+  // handler, and the lambda must read nothing of its own after that (the
+  // 2026-10-12 tiny11 crash reloaded the captured `this` from the removed
+  // closure; EventQueue::dispatchEvent now runs a copy, this is belt and
+  // braces and matches handlePostSwitchVerifier()).
+  m_events->addHandler(EventTypes::Timer, m_enableSweepTimer, [this](const auto &) { handleEnableSweep(); });
+}
+
+void Screen::handleEnableSweep()
+{
+  // one-shot: it has fired, drop it before anything else
+  cancelEnableSweep();
+  if (m_entered) {
+    return;
+  }
+  LOG_DEBUG("[keys] delayed enable sweep");
+  m_screen->sanitizeInjectedKeys();
 }
 
 void Screen::cancelEnableSweep()

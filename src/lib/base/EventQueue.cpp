@@ -169,12 +169,22 @@ bool EventQueue::getEvent(Event &event, double timeout)
 bool EventQueue::dispatchEvent(const Event &event)
 {
   void *target = event.getTarget();
-  if (const auto *type_handler = getHandler(event.getType(), target); type_handler) {
-    (*type_handler)(event);
+  // The handler runs from a COPY, never from the table node. Removing a
+  // handler erases its std::function -- closure included -- from the map,
+  // and a one-shot timer's handler removes itself as its first act, then
+  // reads its captures. 2026-10-12 tiny11: Screen::armEnableSweep's lambda
+  // reloaded the captured Screen* from the erased node after
+  // cancelEnableSweep(); the LOG allocation had reused that block, the
+  // pointer read back as 0 and deskflow-core.exe died at Screen+8
+  // (0xC0000005) on two of three client-epoch starts, every day since 10-05.
+  // The copy also closes the cross-thread remove-while-running race the bare
+  // pointer had.
+  if (EventHandler handler = getHandler(event.getType(), target); handler) {
+    handler(event);
     return true;
   }
-  if (const auto *any_handler = getHandler(EventTypes::Unknown, target); any_handler) {
-    (*any_handler)(event);
+  if (EventHandler handler = getHandler(EventTypes::Unknown, target); handler) {
+    handler(event);
     return true;
   }
   return false;
@@ -297,17 +307,17 @@ void EventQueue::removeHandlers(void *target)
   }
 }
 
-const EventQueue::EventHandler *EventQueue::getHandler(EventTypes type, void *target) const
+EventQueue::EventHandler EventQueue::getHandler(EventTypes type, void *target) const
 {
   std::scoped_lock lock{m_mutex};
   if (HandlerTable::const_iterator index = m_handlers.find(target); index != m_handlers.end()) {
     const TypeHandlerTable &typeHandlers = index->second;
     TypeHandlerTable::const_iterator index2 = typeHandlers.find(type);
     if (index2 != typeHandlers.end()) {
-      return &index2->second;
+      return index2->second;
     }
   }
-  return nullptr;
+  return {};
 }
 
 uint32_t EventQueue::saveEvent(Event &&event)

@@ -58,7 +58,11 @@ public:
   void waitForReady(double timeoutS) const;
 
 private:
-  const EventHandler *getHandler(EventTypes type, void *target) const;
+  //! The handler registered for (type, target), copied out of the table
+  //! under the lock; empty when there is none. A copy, not a pointer: the
+  //! caller runs it unlocked, and a handler that removes itself mid-call
+  //! (every one-shot timer does) erases the table node the original lives in.
+  EventHandler getHandler(EventTypes type, void *target) const;
   uint32_t saveEvent(Event &&event);
   Event removeEvent(uint32_t eventID);
   bool hasTimerExpired(Event &event);

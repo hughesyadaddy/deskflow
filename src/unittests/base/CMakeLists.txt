@@ -38,6 +38,16 @@ create_test(
 )
 
 
+# A handler runs from a copy and may remove itself mid-call (2026-10-12 tiny11
+# crash at the delayed enable sweep).
+create_test(
+  NAME EventQueueDispatchTests
+  DEPENDS base
+  LIBS arch mt
+  SOURCE EventQueueDispatchTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/base"
+)
+
 # K8: waitForReady() honours the ready flag (no thread deaths across epochs).
 create_test(
   NAME EventQueueReadyTests

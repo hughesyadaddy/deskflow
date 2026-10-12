@@ -71,7 +71,16 @@ $cmakeArgs = @(
   "-DCMAKE_PREFIX_PATH=$qt",
   "-DOPENSSL_ROOT_DIR=$ossl",
   '-DSKIP_BUILD_TESTS=ON',
-  '-DBUILD_TESTS=OFF'
+  '-DBUILD_TESTS=OFF',
+  # PDBs for the Release build: WER minidumps (%LOCALAPPDATA%\CrashDumps) are
+  # unreadable without them -- 2026-10-12 the tiny11 core crash took a day of
+  # guessing before the stack could be tied to Screen::armEnableSweep. The
+  # .pdb files land next to the exes and are copied into Program Files by
+  # install-windows.ps1 (the authenticode gate only looks at *.exe/*.dll).
+  '-DCMAKE_C_FLAGS_RELEASE="/O2 /Ob2 /DNDEBUG /Zi"',
+  '-DCMAKE_CXX_FLAGS_RELEASE="/O2 /Ob2 /DNDEBUG /Zi"',
+  '-DCMAKE_EXE_LINKER_FLAGS_RELEASE="/DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF"',
+  '-DCMAKE_SHARED_LINKER_FLAGS_RELEASE="/DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF"'
 )
 $buildTargets = 'deskflow-core;deskflow-daemon;deskflow;deskflow-vhid-bridge'
 # One cl.exe per parallel MSBuild project can use 1-3 GB on the heavier Qt/STL
