@@ -22,6 +22,8 @@ private Q_SLOTS:
   void selfCooldownBlocksPromotion();
   void serverNeverPromotesAgain();
   void cursorHereRaisesThreshold();
+  void connectedClientNeverPromotesOnLocalInput();
+  void freshClientEpochCountsAsLinkDown();
   void cursorToggleClearsBurst();
   void claimFromSelfIgnored();
   void claimDuringServerCooldownIgnored();

@@ -6,12 +6,12 @@
 
 #include "AutoModeRunner.h"
 
+#include "base/Event.h"
 #include "base/EventQueue.h"
 #include "base/Log.h"
 #include "common/ExitCodes.h"
 #include "common/FleetCursor.h"
 #include "common/Settings.h"
-#include "base/Event.h"
 #include "coordination/CoordinationEvents.h"
 #include "coordination/Coordinator.h"
 #include "coordination/FleetState.h"
@@ -387,6 +387,8 @@ int AutoModeRunner::runEpoch(Role role, const std::string &serverAddress)
   } else {
     auto clientApp = std::make_unique<ClientApp>(&m_events, m_processName);
     clientAppPtr = clientApp.get();
+    // Promotion on local input is gated on this link (ElectionTuning::linkDownGraceS).
+    clientApp->setConnectionStateCallback([this](bool up) { m_coordinator->notifyServerLink(up); });
     {
       topologyReadyHandler = [this, clientAppPtr, serverAddress, selfName](const Event &) {
         const auto fleet = m_coordinator->fleetSnapshot();

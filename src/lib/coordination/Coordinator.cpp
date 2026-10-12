@@ -1268,6 +1268,12 @@ bool Coordinator::relayPassThroughLocal()
   return routeKeyboard(input).route == KeyboardRoute::Local;
 }
 
+void Coordinator::notifyServerLink(bool up)
+{
+  std::scoped_lock lock{m_mutex};
+  m_election.setServerLinkUp(up);
+}
+
 void Coordinator::onGenuineInput()
 {
   bool promote = false;

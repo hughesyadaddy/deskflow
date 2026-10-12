@@ -50,6 +50,14 @@ struct ElectionTuning
   //! forwarded motion echoes can never promote a passive client.
   int burstCountCursorHere = 12;
   double burstWindowCursorHereS = 0.80;
+  //! A client promotes itself on local input ONLY while its link to the
+  //! server has been down for at least this long (or it never came up).
+  //! While the link is healthy, local input is just local input: using the
+  //! MacBook's trackpad or an Easy-Switched mouse there must not tear down
+  //! and rebuild every seat's epoch (7 flips/day on 2026-10-08, each one a
+  //! boundary that re-applied masks). Deliberate takeover while the link is
+  //! up is `kvmctl primary` / the GUI.
+  double linkDownGraceS = 10.0;
 };
 
 //! Pure last-touch-wins election logic.
@@ -84,6 +92,13 @@ public:
   within the self-cooldown of the last role change.
   */
   bool onLocalInput();
+  //! The client epoch's connection to the server came up / went down (from
+  //! ClientApp's connected / disconnected / connection-failed handlers).
+  void setServerLinkUp(bool up);
+  bool serverLinkUp() const
+  {
+    return m_serverLinkUp;
+  }
 
   //! Track whether the shared cursor is currently on this screen.
   void setCursorHere(bool here);
@@ -141,9 +156,14 @@ private:
   Clock m_clock;
   Role m_role = Role::Init;
   std::string m_serverAddress;
-  double m_lastSwitchAt = -1.0e9; // long ago: no cooldown at boot
-  int m_recentFlips = 0;               //!< role flips inside the flap window
-  double m_flapWindowStart = -1.0e9;   //!< start of the current flap window
+  //! Client only: whether the Deskflow connection to the server is up, and
+  //! when it was last seen down (becameClient() resets both: a fresh epoch
+  //! starts disconnected and must connect within linkDownGraceS).
+  bool m_serverLinkUp = false;
+  double m_linkDownAt = -1.0e9;
+  double m_lastSwitchAt = -1.0e9;    // long ago: no cooldown at boot
+  int m_recentFlips = 0;             //!< role flips inside the flap window
+  double m_flapWindowStart = -1.0e9; //!< start of the current flap window
   double effectiveSelfCooldownS() const;
   void noteRoleFlip(double now);
   int64_t m_seq = 0;

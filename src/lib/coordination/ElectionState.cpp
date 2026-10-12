@@ -40,6 +40,15 @@ bool ElectionState::onLocalInput()
   if (m_role == Role::Server) {
     return false; // already primary
   }
+  if (m_role == Role::Client) {
+    // A connected client never promotes on local input (see linkDownGraceS);
+    // one whose link is down may, once the grace has passed -- the server is
+    // genuinely gone, not merely reconnecting.
+    if (m_serverLinkUp || now - m_linkDownAt < m_tuning.linkDownGraceS) {
+      m_inputBurst.clear();
+      return false;
+    }
+  }
   if (now - m_lastSwitchAt < effectiveSelfCooldownS()) {
     return false; // anti-flap right after a role change; escalates with churn
   }
@@ -142,11 +151,24 @@ void ElectionState::becameServer()
   resetCursorScreen();
 }
 
+void ElectionState::setServerLinkUp(bool up)
+{
+  if (up == m_serverLinkUp) {
+    return;
+  }
+  m_serverLinkUp = up;
+  if (!up) {
+    m_linkDownAt = m_clock();
+  }
+}
+
 void ElectionState::becameClient(const std::string &serverAddress)
 {
   m_role = Role::Client;
   m_serverAddress = serverAddress;
   m_lastSwitchAt = m_clock();
+  m_serverLinkUp = false;
+  m_linkDownAt = m_lastSwitchAt;
   noteRoleFlip(m_lastSwitchAt);
   // Screen sync is reset when the client-epoch keyboard relay starts
   // (Coordinator::updateKeyboardRelayForRole).

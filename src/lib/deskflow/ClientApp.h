@@ -8,11 +8,13 @@
 
 #pragma once
 
-#include "deskflow/App.h"
 #include "coordination/RelayKeyEvent.h"
+#include "deskflow/App.h"
 #include "net/NetworkAddress.h"
 
 #include <QStringList>
+
+#include <functional>
 
 namespace deskflow {
 class Screen;
@@ -68,6 +70,12 @@ public:
   void stopClient();
   //! Mesh v2: add server addresses for fleet pre-connect (deduped).
   void appendPreConnectHosts(const QStringList &hosts);
+  //! Called with true when the connection to the server is established and
+  //! false when it drops or fails (the coordinator gates promotion on it).
+  void setConnectionStateCallback(std::function<void(bool up)> callback)
+  {
+    m_connectionStateCallback = std::move(callback);
+  }
   //! Inject a fleet-relayed key onto the local client screen (mesh v2 cursor host).
   void injectRelayedKey(const deskflow::coordination::RelayKeyEvent &event);
   void registerKeyForwardHandler();
@@ -95,6 +103,7 @@ public:
   double retryTime() const;
 
 private:
+  std::function<void(bool)> m_connectionStateCallback;
   ISocketFactory *getSocketFactory() const;
   NetworkAddress &getCurrentServerAddress();
   void tryNextServer();

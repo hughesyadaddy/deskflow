@@ -89,7 +89,7 @@ void ElectionStateTests::escalatingCooldownDampsFlapWar()
   Fixture f;
   // First flip: base cooldown applies.
   f.state.becameClient("10.0.0.2");
-  f.now += 3.0; // past base 2.5s
+  f.now += 11.0; // past base 2.5s cooldown AND the 10s link-down grace (link never came up)
   QVERIFY(f.feedInput(8, 0.05));
 
   // War: two more flips inside the 30s flap window.
@@ -121,8 +121,9 @@ void ElectionStateTests::selfCooldownBlocksPromotion()
   // Within the 2.5s self-cooldown nothing promotes, however fast.
   QVERIFY(!f.feedInput(20, 0.01));
 
-  // After the cooldown, a burst promotes again.
-  f.now += 3.0;
+  // After the cooldown (and, for a client whose link never came up, the
+  // 10s link-down grace) a burst promotes again.
+  f.now += 11.0;
   QVERIFY(f.feedInput(8, 0.05));
 }
 
@@ -138,13 +139,50 @@ void ElectionStateTests::cursorHereRaisesThreshold()
 {
   Fixture f;
   f.state.becameClient("10.0.0.2");
-  f.now += 3.0;
+  f.now += 11.0; // link never came up: past the link-down grace, input may promote
   f.state.setCursorHere(true);
 
   // The normal threshold (8) must not promote while the cursor is here.
   QVERIFY(!f.feedInput(8, 0.05));
   // But a sustained 12-within-0.80s burst must.
   QVERIFY(f.feedInput(12, 0.05));
+}
+
+void ElectionStateTests::connectedClientNeverPromotesOnLocalInput()
+{
+  // 2026-10-08: seven role flips a day from the MacBook's own trackpad and
+  // an Easy-Switched mouse while the hackintosh was serving fine. While the
+  // link to the server is up, local input is just local input.
+  Fixture f;
+  f.state.becameClient("10.0.0.2");
+  f.now += 1.0;
+  f.state.setServerLinkUp(true);
+  f.now += 60.0;
+  QVERIFY(!f.feedInput(8, 0.05));
+  QVERIFY(!f.feedInput(40, 0.01));
+  // The link drops: not yet -- the server may just be restarting.
+  f.state.setServerLinkUp(false);
+  f.now += 2.0;
+  QVERIFY(!f.feedInput(8, 0.05));
+  // Past the grace the server is genuinely gone: a sustained grab promotes.
+  f.now += ElectionTuning{}.linkDownGraceS;
+  QVERIFY(f.feedInput(8, 0.05));
+}
+
+void ElectionStateTests::freshClientEpochCountsAsLinkDown()
+{
+  // A client epoch starts disconnected; it has the grace to connect before
+  // local input may promote, and a connect inside the grace closes the door.
+  Fixture f;
+  f.state.becameClient("10.0.0.2");
+  f.now += 5.0;
+  QVERIFY(!f.feedInput(8, 0.05));
+  f.state.setServerLinkUp(true);
+  f.now += 30.0;
+  QVERIFY(!f.feedInput(8, 0.05));
+  // Init (first boot, nobody serving yet) is unaffected by the gate.
+  Fixture g;
+  QVERIFY(g.feedInput(8, 0.05));
 }
 
 void ElectionStateTests::cursorToggleClearsBurst()
@@ -282,7 +320,7 @@ void ElectionStateTests::resetCursorScreenClearsInputBurst()
 {
   Fixture f;
   f.state.becameClient("10.0.0.2");
-  f.now += 3.0;
+  f.now += 11.0; // past the link-down grace: input may count
   f.feedInput(7, 0.01);
   f.state.resetCursorScreen();
   f.now += 3.0;

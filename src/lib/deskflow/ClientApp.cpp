@@ -235,6 +235,9 @@ void ClientApp::handleClientConnected()
   // INFO, not DEBUG: external supervisors key link health off this line.
   LOG_INFO("connected to server");
   ipcSendConnectionState(deskflow::core::ConnectionState::Connected);
+  if (m_connectionStateCallback) {
+    m_connectionStateCallback(true);
+  }
   // Reset server index on successful connection
   m_currentServerIndex = 0;
   m_lastServerAddressIndex = 0;
@@ -242,6 +245,9 @@ void ClientApp::handleClientConnected()
 
 void ClientApp::handleClientFailed(const Event &e)
 {
+  if (m_connectionStateCallback) {
+    m_connectionStateCallback(false);
+  }
   if ((++m_lastServerAddressIndex) < m_client->getLastResolvedAddressesCount()) {
     // Try next resolved address for current hostname
     std::unique_ptr<Client::FailInfo> info(static_cast<Client::FailInfo *>(e.getData()));
@@ -290,6 +296,9 @@ void ClientApp::handleClientDisconnected()
   // INFO, not DEBUG: external supervisors key link health off this line.
   LOG_INFO("disconnected from server");
   ipcSendConnectionState(deskflow::core::ConnectionState::Disconnected);
+  if (m_connectionStateCallback) {
+    m_connectionStateCallback(false);
+  }
   if (!m_suspended) {
     scheduleClientRestart(retryTime());
   }
