@@ -9,8 +9,8 @@
 #pragma once
 
 #include "base/Event.h"
-#include "base/String.h"
 #include "base/Stopwatch.h"
+#include "base/String.h"
 #include "common/NetworkProtocol.h"
 #include "coordination/KeyboardRescue.h"
 #include "coordination/RelayKeyEvent.h"
@@ -18,8 +18,8 @@
 #include "deskflow/ClipboardTypes.h"
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
-#include "server/Config.h"
 #include "server/ChordRemapTypes.h"
+#include "server/Config.h"
 #include "server/TopologyLink.h"
 #include "server/VirtualHostTracker.h"
 
@@ -38,7 +38,7 @@ class InputFilter;
 namespace deskflow {
 class MouserLink;
 class Screen;
-}
+} // namespace deskflow
 class IEventQueue;
 class Thread;
 class ClientListener;
@@ -680,7 +680,6 @@ private:
   //! Lock-modifier bits last shipped to the active client (via CEnter or a
   //! lock-state update). Compared against the primary's OS truth on every
   //! lock-key event so a change is pushed as STATE, not left to a toggle.
-  KeyModifierMask m_toggleMaskSentToActive = 0;
 
   //! Record/forget a key the server injected on the active client.
   void noteKeySentToActive(KeyID id, KeyButton button);
@@ -694,7 +693,6 @@ private:
   void sendReleases(BaseClientProxy *client, HeldKeys &keys, const char *why);
   //! Push the primary's lock state to the active client if it changed
   //! since we last sent it (CEnter carries the initial state).
-  void syncToggleStateToActive();
   //! Clears we could not deliver because the session's client was already
   //! disconnecting (screen name -> held out-mods). Flushed to the fresh
   //! connection on reconnect-adoption so the target never keeps a synthetic

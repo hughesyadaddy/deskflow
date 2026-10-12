@@ -827,22 +827,11 @@ void KeyState::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton serverID, c
 
   // ignore certain keys
   if (isIgnoredKey(id, mask)) {
-    // A lock key never toggles here (I2: Caps Lock is STATE, not a toggle).
-    // The mask that rides with it is the primary's lock state after the
-    // press, so apply that absolutely when it disagrees with our OS truth.
-    // This is also the wire-compatible path: a server that only relays the
-    // physical Caps key as DKeyDown still drives the state correctly.
-    if (const KeyModifierMask lock = lockModifierForKey(id); lock != 0) {
-      const bool wanted = (mask & lock) != 0;
-      // Compare against the TRACKED mask, not a fresh OS poll: setToggleState()
-      // keeps m_mask in step with the OS, and m_mask is also what mapKey()
-      // consults when it decides whether a key needs the lock flipped. Judging
-      // by the poll while m_mask lagged made the next letter click Caps again.
-      if (((getActiveModifiersRValue() ^ mask) & lock) != 0) {
-        LOG_DEBUG("lock key 0x%04x: applying state %s from server mask", id, wanted ? "on" : "off");
-        setToggleState(lock, wanted);
-      }
-    }
+    // A relayed lock key (Caps/Num/Scroll) never toggles THIS seat's lock,
+    // and the lock bits in its mask are never applied as state: lock state
+    // is owned by each seat's own keyboard (2026-10-12). The primary's Caps
+    // already determines the KeyIDs it sends, and KeyMap never flips Caps
+    // to type a relayed key (KeyMap.cpp "don't try to change CapsLock").
     LOG_VERBOSE("ignored key %04x %04x", id, mask);
     return;
   }

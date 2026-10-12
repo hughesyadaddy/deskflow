@@ -732,11 +732,12 @@ void ServerKeyLedgerTests::broadcast_offReleasesHeldKeys()
   }
 }
 
-void ServerKeyLedgerTests::lockChange_pushesStateToActiveClient()
+void ServerKeyLedgerTests::lockChange_relaysOnlyThePhysicalKey()
 {
-  // I2: Caps is STATE. When the primary's lock state changes while a client
-  // is active, the fresh lock mask is pushed as a lock-key event carrying
-  // the mask (wire-compatible: old clients ignore the lock KeyID).
+  // Lock state is never pushed to a client (2026-10-12): a Caps tap on the
+  // primary is relayed once, as the physical key, with no synthetic
+  // "state update" (button 0) following it, and switching screens carries
+  // no lock bookkeeping.
   Fixture f;
   f.init({"remote"});
   RecordingClient remote("remote");
@@ -745,47 +746,23 @@ void ServerKeyLedgerTests::lockChange_pushesStateToActiveClient()
     QVERIFY(server.m_clients.emplace("remote", &remote).second);
     f.platform->osModifiers = 0;
     server.switchScreen(&remote, 50, 60, false);
-    QCOMPARE(server.m_toggleMaskSentToActive, static_cast<KeyModifierMask>(0));
     remote.keys.clear();
-
-    // user taps Caps on the primary: the OS flips it on
-    f.platform->osModifiers = KeyModifierCapsLock;
+    f.platform->osModifiers = KeyModifierCapsLock; // the OS flipped it on the primary
     server.onKeyDown(kKeyCapsLock, KeyModifierCapsLock, kButtonCaps, "en", nullptr);
-
-    QCOMPARE(server.m_toggleMaskSentToActive, KeyModifierCapsLock);
-    // the relayed physical key AND the state update both carry the mask
-    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyCapsLock), 2);
-    bool sawStateUpdate = false;
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyCapsLock), 1);
     for (const auto &k : remote.keys) {
-      if (k.kind == RecordedKey::Kind::Down && k.id == kKeyCapsLock && k.button == 0) {
-        sawStateUpdate = true;
-        QCOMPARE(k.mask, KeyModifierCapsLock);
+      if (k.kind == RecordedKey::Kind::Down && k.id == kKeyCapsLock) {
+        QVERIFY(k.button != 0); // the physical key, never a state update
       }
     }
-    QVERIFY(sawStateUpdate);
-    // the state update is never left in the ledger (button 0 is not held)
-    QVERIFY(!server.m_keysHeldOnActive.contains(0));
-    remote.keys.clear();
-
-    // the release settles nothing new: no second update
     server.onKeyUp(kKeyCapsLock, KeyModifierCapsLock, kButtonCaps, nullptr);
-    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyCapsLock), 0);
-
-    // a hook that reported the pre-toggle state on the down is caught on
-    // the up
     remote.keys.clear();
-    server.onKeyDown(kKeyCapsLock, KeyModifierCapsLock, kButtonCaps, "en", nullptr);
-    f.platform->osModifiers = 0;
-    server.onKeyUp(kKeyCapsLock, 0, kButtonCaps, nullptr);
-    QCOMPARE(server.m_toggleMaskSentToActive, static_cast<KeyModifierMask>(0));
-    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyCapsLock), 2); // relay + update
-
-    // re-entering re-baselines from the enter mask
+    // re-entering with a different lock state on the primary pushes nothing
     server.switchScreen(f.primary, 512, 384, false);
     f.platform->osModifiers = KeyModifierNumLock;
     server.switchScreen(&remote, 50, 60, false);
-    QCOMPARE(server.m_toggleMaskSentToActive, KeyModifierNumLock);
-
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyCapsLock), 0);
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyNumLock), 0);
     server.m_clients.erase("remote");
   }
 }
@@ -795,8 +772,7 @@ QTEST_MAIN(ServerKeyLedgerTests)
 namespace {
 
 deskflow::coordination::RelayKeyEvent relayed(
-    const char *from, deskflow::coordination::RelayKeyPhase phase, KeyID id, KeyButton button,
-    KeyModifierMask mask = 0
+    const char *from, deskflow::coordination::RelayKeyPhase phase, KeyID id, KeyButton button, KeyModifierMask mask = 0
 )
 {
   deskflow::coordination::RelayKeyEvent event;
@@ -1040,7 +1016,8 @@ struct ChordFixture
 
   void init()
   {
-    const std::string conf = std::string("section: screens\n\tserver:\n\t") + deskflow::server::kDefaultChordRemapScreen +
+    const std::string conf = std::string("section: screens\n\tserver:\n\t") +
+                             deskflow::server::kDefaultChordRemapScreen +
                              ":\nend\n\nsection: links\nend\n\nsection: options\nend\n\n";
     std::istringstream in(conf);
     deskflow::server::ConfigReadContext context(in);

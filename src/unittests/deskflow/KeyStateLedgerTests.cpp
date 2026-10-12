@@ -491,40 +491,23 @@ void KeyStateLedgerTests::enterSecondary_reassertsModifiersIncrementally()
   QVERIFY(f.screen->leave());
 }
 
-void KeyStateLedgerTests::enterSecondary_appliesCapsViaSetToggleState()
+void KeyStateLedgerTests::enterSecondary_neverTouchesLockState()
 {
-  // I2: Caps is STATE. Primary says Caps on, our OS says off -> apply on.
+  // Lock state is owned by each seat's own keyboard (2026-10-12). Whatever
+  // the primary's enter mask says about Caps, and whatever our OS says, the
+  // client never writes its lock state and never presses a lock key.
   SecondaryFixture f;
   f.platform->osModifiers = 0;
-
-  f.screen->enter(KeyModifierCapsLock);
-
-  const auto *toggle = f.platform->find(PlatformCall::Kind::SetToggle);
-  QVERIFY(toggle != nullptr);
-  QCOMPARE(toggle->mask, KeyModifierCapsLock);
-  QVERIFY(toggle->on);
-  // a lock bit is never re-asserted as a key press
+  f.screen->enter(KeyModifierCapsLock); // primary: Caps on, we: off
+  QCOMPARE(f.platform->count(PlatformCall::Kind::SetToggle), 0);
   QCOMPARE(f.platform->count(PlatformCall::Kind::KeyDown), 0);
-  QVERIFY(f.screen->leave());
-}
-
-void KeyStateLedgerTests::enterSecondary_clearsCapsWhenPrimaryHasItOff()
-{
-  // The reverse drift: our OS has Caps on, the primary does not. Apply off
-  // -- and when both agree, touch nothing.
-  SecondaryFixture f;
-  f.platform->osModifiers = KeyModifierCapsLock;
-
-  f.screen->enter(0);
-  const auto *toggle = f.platform->find(PlatformCall::Kind::SetToggle);
-  QVERIFY(toggle != nullptr);
-  QCOMPARE(toggle->mask, KeyModifierCapsLock);
-  QVERIFY(!toggle->on);
   QVERIFY(f.screen->leave());
 
   f.platform->calls.clear();
-  f.screen->enter(KeyModifierCapsLock);
+  f.platform->osModifiers = KeyModifierCapsLock;
+  f.screen->enter(0); // primary: Caps off, we: on
   QCOMPARE(f.platform->count(PlatformCall::Kind::SetToggle), 0);
+  QCOMPARE(f.platform->count(PlatformCall::Kind::KeyDown), 0);
   QVERIFY(f.screen->leave());
 }
 
@@ -678,32 +661,23 @@ void KeyStateLedgerTests::updateKeyState_releasesSyntheticKeysBeforeZeroing()
   QVERIFY(ks.strokes.empty());
 }
 
-void KeyStateLedgerTests::fakeKeyDown_capsKeyRoutesMaskBitToSetToggleState()
+void KeyStateLedgerTests::fakeKeyDown_relayedCapsKeyNeverTogglesLock()
 {
-  // The Caps KeyID stays ignored (never a toggle press on the target), but
-  // the mask bit riding with it is the primary's lock STATE and is applied
-  // absolutely when it disagrees with the OS.
+  // A relayed Caps KeyID is ignored outright: no toggle press, and the lock
+  // bit riding in its mask is not applied as state either, whatever the OS
+  // says (lock state is owned by this seat's own keyboard).
   EventQueue events;
   deskflow::KeyMap map;
   addOneKey(map, static_cast<KeyID>('a'), 0x1E);
   RecordingKeyState ks(&events, map);
   ks.osModifiers = 0;
-
   ks.fakeKeyDown(kKeyCapsLock, KeyModifierCapsLock, 0x3A, "en");
-  QCOMPARE(ks.toggles.size(), 1u);
-  QCOMPARE(ks.toggles[0].first, KeyModifierCapsLock);
-  QVERIFY(ks.toggles[0].second);
-  QVERIFY(ks.strokes.empty()); // no key press synthesized
-
-  // already in phase: nothing to apply
+  QVERIFY(ks.toggles.empty());
+  QVERIFY(ks.strokes.empty());
   ks.osModifiers = KeyModifierCapsLock;
-  ks.fakeKeyDown(kKeyCapsLock, KeyModifierCapsLock, 0x3A, "en");
-  QCOMPARE(ks.toggles.size(), 1u);
-
-  // primary turned it off
   ks.fakeKeyDown(kKeyCapsLock, 0, 0x3A, "en");
-  QCOMPARE(ks.toggles.size(), 2u);
-  QVERIFY(!ks.toggles[1].second);
+  QVERIFY(ks.toggles.empty());
+  QVERIFY(ks.strokes.empty());
 }
 
 void KeyStateLedgerTests::fakeKeyDown_doesNotClickCapsAgainAfterSetToggleState()

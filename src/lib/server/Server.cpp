@@ -23,13 +23,13 @@
 #include "deskflow/StreamChunker.h"
 #include "deskflow/ipc/CoreIpc.h"
 #include "net/TCPSocket.h"
+#include "server/ChordRemapTypes.h"
 #include "server/ClientListener.h"
 #include "server/ClientProxy.h"
 #include "server/ClientProxyUnknown.h"
 #include "server/MouserBridge.h"
 #include "server/PrimaryClient.h"
 #include "server/VirtualHostTracker.h"
-#include "server/ChordRemapTypes.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -222,35 +222,6 @@ void Server::releaseKeysHeldOnBroadcast(const BaseClientProxy *client)
     }
     it = m_keysHeldOnBroadcast.erase(it);
   }
-}
-
-void Server::syncToggleStateToActive()
-{
-  if (m_active == nullptr || m_active == m_primaryClient) {
-    return;
-  }
-  const KeyModifierMask now = m_primaryClient->getToggleMask() & IKeyState::s_lockModifierMask;
-  const KeyModifierMask changed = now ^ m_toggleMaskSentToActive;
-  if (changed == 0) {
-    return;
-  }
-  // Lock keys are STATE (I2): ship the fresh lock mask for each changed bit
-  // as a lock-key down/up carrying the mask. Wire-compatible: an old client
-  // drops the lock KeyID and ignores it; a new one applies the mask bit
-  // absolutely (KeyState::fakeKeyDown -> setToggleState).
-  for (const KeyModifierMask lock : {KeyModifierCapsLock, KeyModifierNumLock, KeyModifierScrollLock}) {
-    if ((changed & lock) == 0) {
-      continue;
-    }
-    const KeyID key = IKeyState::lockKeyForModifier(lock);
-    LOG_DEBUG(
-        "lock 0x%04x changed to %s on primary; updating \"%s\"", lock, (now & lock) ? "on" : "off",
-        getName(m_active).c_str()
-    );
-    m_active->keyDown(key, now, 0, std::string{});
-    m_active->keyUp(key, now, 0);
-  }
-  m_toggleMaskSentToActive = now;
 }
 
 void Server::cancelChordRemapSession()
@@ -892,9 +863,8 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     // increment enter sequence number
     ++m_seqNum;
 
-    // enter new screen (the enter mask IS the lock-state baseline)
+    // enter new screen (the mask still carries the primary's lock bits for wire compatibility; no client applies them)
     const KeyModifierMask toggleMask = m_primaryClient->getToggleMask();
-    m_toggleMaskSentToActive = toggleMask & IKeyState::s_lockModifierMask;
     m_active->enter(x, y, m_seqNum, toggleMask, forScreensaver);
 
     if (m_enableClipboard) {
@@ -2405,7 +2375,6 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
   // Lock keys are STATE: if this press flipped a lock on the primary, push
   // the fresh state now rather than trusting the toggle to land in phase.
   if (IKeyState::lockModifierForKey(id) != 0) {
-    syncToggleStateToActive();
   }
 }
 
@@ -2457,8 +2426,8 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
     // Super on the target, even if Super is not one of the session's source
     // modifiers. Otherwise the held Win outlives the keypress and every
     // subsequent letter becomes a Win shortcut.
-    const bool releasingHeldSuper = (id == kKeySuper_L || id == kKeySuper_R) &&
-                                    (m_chordRemapSession.heldOutMods & KeyModifierSuper) != 0;
+    const bool releasingHeldSuper =
+        (id == kKeySuper_L || id == kKeySuper_R) && (m_chordRemapSession.heldOutMods & KeyModifierSuper) != 0;
     if (isChordRemapSourceModifierKey(id, button) || releasingHeldSuper) {
       endChordRemapSession(std::string{});
     } else {
@@ -2471,8 +2440,7 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
     }
   } else {
     const bool remapped = applyChordRemapForActiveScreen(id, mask);
-    if (const KeyModifierMask stripped = maskWithoutWithheldSuper(mask, superWasWithheld, remapped);
-        stripped != mask) {
+    if (const KeyModifierMask stripped = maskWithoutWithheldSuper(mask, superWasWithheld, remapped); stripped != mask) {
       LOG_DEBUG(
           "withheld super stripped from key up id=%d mask=0x%04x -> 0x%04x for \"%s\"", id, mask, stripped,
           getName(m_active).c_str()
@@ -2505,7 +2473,6 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
   // The lock state has certainly settled by the release (a hook may report
   // the pre-toggle state on the down); re-check so nothing is missed.
   if (IKeyState::lockModifierForKey(id) != 0) {
-    syncToggleStateToActive();
   }
 }
 
@@ -2527,8 +2494,7 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
   } else {
     const bool remapped = applyChordRemapForActiveScreen(id, mask);
     // D5, as onKeyDown
-    if (const KeyModifierMask stripped = maskWithoutWithheldSuper(mask, superWithheld(), remapped);
-        stripped != mask) {
+    if (const KeyModifierMask stripped = maskWithoutWithheldSuper(mask, superWithheld(), remapped); stripped != mask) {
       LOG_DEBUG(
           "withheld super stripped from key repeat id=%d mask=0x%04x -> 0x%04x for \"%s\"", id, mask, stripped,
           getName(m_active).c_str()
@@ -2901,8 +2867,8 @@ void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
     // (and other OSes drive edge gestures) off a continued stream of pointer
     // events dwelling at the extreme row -- going silent after the first edge
     // event made bottom-edge Dock reveal fire only intermittently.
-    const bool pushingIntoEdge = (dx < 0 && m_x == ax) || (dx > 0 && m_x == ax + aw - 1) ||
-                                 (dy < 0 && m_y == ay) || (dy > 0 && m_y == ay + ah - 1);
+    const bool pushingIntoEdge = (dx < 0 && m_x == ax) || (dx > 0 && m_x == ax + aw - 1) || (dy < 0 && m_y == ay) ||
+                                 (dy > 0 && m_y == ay + ah - 1);
 
     // warp cursor if it moved or is being held against an edge.
     if (m_x != xOld || m_y != yOld || pushingIntoEdge) {
@@ -3118,7 +3084,6 @@ void Server::forceLeaveClient(const BaseClientProxy *client)
     } else {
       m_keysHeldOnActive.clear();
     }
-    m_toggleMaskSentToActive = 0;
     if (m_chordRemapSession.active) {
       // The active client is disconnecting: the clear below goes into a dead
       // socket, so queue it for the reconnect before cancelling.

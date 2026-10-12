@@ -138,7 +138,6 @@ public:
   Drives Caps/Num/Scroll Lock to the states in \p toggleMask (lock keys are
   STATE, not toggles). Only bits that disagree with the OS are touched.
   */
-  void applyToggleMask(KeyModifierMask toggleMask);
 
   //! Notify of mouse press
   /*!

@@ -24,7 +24,7 @@ private Q_SLOTS:
   void escRescue_releasesLedger();
   void broadcast_keysReleasedPerScreen();
   void broadcast_offReleasesHeldKeys();
-  void lockChange_pushesStateToActiveClient();
+  void lockChange_relaysOnlyThePhysicalKey();
   void clearAll_releasesOnlyThatSendersKeysOnTheActiveClient();
   void clearAll_withoutSenderReleasesEveryRelayedKey();
   void switch_releasesBeforeLeave();

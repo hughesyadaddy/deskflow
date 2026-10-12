@@ -332,19 +332,6 @@ void Screen::keyUp(KeyID id, KeyModifierMask, KeyButton button)
   m_reassertedModifiers.erase(it);
 }
 
-void Screen::applyToggleMask(KeyModifierMask toggleMask)
-{
-  const KeyModifierMask osMods = m_screen->pollActiveModifiers();
-  for (const KeyModifierMask lock : {KeyModifierCapsLock, KeyModifierNumLock, KeyModifierScrollLock}) {
-    if (((toggleMask ^ osMods) & lock) == 0) {
-      continue;
-    }
-    const bool on = (toggleMask & lock) != 0;
-    LOG_DEBUG("lock 0x%04x: server says %s, OS says %s; applying", lock, on ? "on" : "off", on ? "off" : "on");
-    m_screen->setToggleState(lock, on);
-  }
-}
-
 void Screen::mouseDown(ButtonID button)
 {
   m_screen->fakeMouseButton(button, true);
@@ -564,7 +551,14 @@ void Screen::enterSecondary(KeyModifierMask mask)
   //
   // 1. Lock state. Caps/Num/Scroll are STATE, never toggles (I2); apply the
   //    bits absolutely so a half-duplex Caps key cannot drift out of phase.
-  applyToggleMask(mask);
+  // Lock keys (Caps/Num/Scroll) are NOT synchronised between seats. Deskflow
+  // relays KeyIDs (characters), so the primary's Caps state already decides
+  // the case of what gets typed here; this seat's own lock state is owned
+  // by its own keyboard. Applying the primary's lock STATE on every enter
+  // (removed 2026-10-12) was the source of the Caps ping-pong: a state set
+  // here became this seat's exported truth after a role flip, and on this
+  // MacBook IOHIDSetModifierLockState(off) reports success without clearing
+  // the keyboard's state, so the drift was one-way and permanent.
 
   // 2. Physically held modifiers. The user crossed with Shift (or Ctrl...)
   //    held down; our OS has no such key down, so shift-click and
