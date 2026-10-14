@@ -22,7 +22,9 @@ inline void markInjectedEvent(CGEventRef event)
 
 inline bool isInjectedEvent(CGEventRef event)
 {
-  return CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kInjectedEventMarker;
+  // 'DSKR' (kModifierResyncMarker, OSXModifierResync.h) is ours too.
+  const int64_t tag = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
+  return tag == kInjectedEventMarker || tag == 0x44534B52;
 }
 
 } // namespace deskflow::platform

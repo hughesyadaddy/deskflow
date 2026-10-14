@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 
+#include "platform/OSXModifierResync.h"
 #include "coordination/LocalInputMonitor.h"
 
 #include "base/Log.h"
@@ -89,7 +90,11 @@ private:
     }
 
     const auto sourcePid = CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID);
-    if (sourcePid != 0 || deskflow::platform::isInjectedEvent(event)) {
+    if (sourcePid != 0 || deskflow::platform::isInjectedEvent(event) ||
+        (type == kCGEventFlagsChanged && deskflow::platform::ResyncEchoFilter::instance().matches(
+                                             static_cast<uint64_t>(CGEventGetFlags(event)),
+                                             deskflow::platform::ResyncEchoFilter::Clock::now()
+                                         ))) {
       return event;
     }
     if (type == kCGEventFlagsChanged) {

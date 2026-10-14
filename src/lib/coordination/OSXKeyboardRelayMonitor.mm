@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 
+#include "platform/OSXModifierResync.h"
 #include "coordination/KeyboardRelayMonitor.h"
 
 #include "coordination/KeyboardRelayHookPolicy.h"
@@ -27,7 +28,11 @@ namespace {
 bool relayEventIsInjected(CGEventRef event)
 {
   return CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid() ||
-         deskflow::platform::isInjectedEvent(event);
+         deskflow::platform::isInjectedEvent(event) ||
+         (CGEventGetType(event) == kCGEventFlagsChanged &&
+          deskflow::platform::ResyncEchoFilter::instance().matches(
+              static_cast<uint64_t>(CGEventGetFlags(event)), deskflow::platform::ResyncEchoFilter::Clock::now()
+          ));
 }
 
 CGEventRef relaySwallowDecision(CGEventRef event, bool passLocal, bool isInjected, bool mapped, bool forwarded)

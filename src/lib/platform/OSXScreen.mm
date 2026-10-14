@@ -1121,27 +1121,40 @@ void OSXScreen::resyncPrimaryModifiers() const
   // See primaryModifierResyncFlags(): the tap swallowed flagsChanged while
   // we were off screen, so the session's modifier word may disagree with
   // the hardware (Cmd held across the crossing, released on the client).
-  const uint64_t hid = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
-  const uint64_t session = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
-  const auto steps = deskflow::platform::primaryModifierResyncSteps(hid, session);
-  if (steps.empty()) {
-    return;
+  // Synchronous, re-sampled before every post (PrimaryModifierResync::run).
+  const uint64_t session0 = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+  const uint64_t hid0 = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+  deskflow::platform::PrimaryModifierResync resync;
+  resync.readHid = [] { return static_cast<uint64_t>(CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState)); };
+  resync.readSession = [] {
+    return static_cast<uint64_t>(CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState));
+  };
+  resync.postFlags = [this](uint16_t keycode, bool down, uint64_t flags) {
+    return m_keyState->postModifierResync(keycode, down, flags);
+  };
+  const auto posted = resync.run();
+  if (!posted.empty()) {
+    // Also clears session-only synthetic modifiers (e.g. a Keyboard Maestro
+    // macro holding Cmd at this instant): nothing physical holds them.
+    LOG_INFO(
+        "[keys] primary enter resynced %zu modifier(s): session 0x%llx -> hid 0x%llx "
+        "(session-only synthetic modifiers, e.g. Keyboard Maestro, are cleared too)",
+        posted.size(), static_cast<unsigned long long>(session0 & deskflow::platform::kHeldModifierFlags),
+        static_cast<unsigned long long>(hid0 & deskflow::platform::kHeldModifierFlags)
+    );
   }
-  for (const auto &step : steps) {
-    CGEventRef event = CGEventCreateKeyboardEvent(nullptr, static_cast<CGKeyCode>(step.keycode), false);
-    if (event == nullptr) {
-      continue;
-    }
-    CGEventSetType(event, kCGEventFlagsChanged);
-    CGEventSetFlags(event, static_cast<CGEventFlags>(step.flags));
-    CGEventSetIntegerValueField(event, kCGEventSourceUserData, deskflow::platform::kModifierResyncMarker);
-    CGEventPost(kCGHIDEventTap, event);
-    CFRelease(event);
+}
+
+bool OSXScreen::isOwnModifierResyncEvent(CGEventType type, CGEventRef event)
+{
+  if (type != kCGEventFlagsChanged) {
+    return false;
   }
-  LOG_INFO(
-      "[keys] primary enter resynced modifiers: session 0x%llx -> hid 0x%llx",
-      static_cast<unsigned long long>(session & deskflow::platform::kHeldModifierFlags),
-      static_cast<unsigned long long>(hid & deskflow::platform::kHeldModifierFlags)
+  if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == deskflow::platform::kModifierResyncMarker) {
+    return true;
+  }
+  return deskflow::platform::ResyncEchoFilter::instance().consume(
+      static_cast<uint64_t>(CGEventGetFlags(event)), deskflow::platform::ResyncEchoFilter::Clock::now()
   );
 }
 
@@ -2171,8 +2184,7 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
   OSXScreen *screen = (OSXScreen *)refcon;
 
   // our own primary-enter modifier resync: deliver to apps, never relay
-  if (type == kCGEventFlagsChanged &&
-      CGEventGetIntegerValueField(event, kCGEventSourceUserData) == deskflow::platform::kModifierResyncMarker) {
+  if (isOwnModifierResyncEvent(type, event)) {
     return event;
   }
 

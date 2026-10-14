@@ -1337,6 +1337,25 @@ kern_return_t OSXKeyState::postHIDVirtualKey(uint8_t virtualKey, bool postDown)
   return result;
 }
 
+bool OSXKeyState::postModifierResync(uint16_t keycode, bool keyDown, uint64_t flags)
+{
+  const auto modifierFlags = static_cast<CGEventFlags>(flags);
+  setShadowFlags(modifierFlags);
+  if (m_hooks.postHIDKey) {
+    return m_hooks.postHIDKey(static_cast<uint8_t>(keycode), keyDown, modifierFlags) == KERN_SUCCESS;
+  }
+  auto driver = getEventDriver();
+  if (!driver) {
+    return false;
+  }
+  NXEventData event;
+  bzero(&event, sizeof(NXEventData));
+  event.key.keyCode = keycode; // never 0 ('a') -- see postHIDVirtualKey
+  return IOHIDPostEvent(
+             driver, NX_FLAGSCHANGED, {0, 0}, &event, kNXEventDataVersion, modifierFlags, kIOHIDSetGlobalEventFlags
+         ) == KERN_SUCCESS;
+}
+
 void OSXKeyState::postKeyboardKey(CGKeyCode virtualKey, bool keyDown)
 {
   CGEventRef event = CGEventCreateKeyboardEvent(nullptr, virtualKey, keyDown);

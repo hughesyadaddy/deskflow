@@ -140,6 +140,11 @@ public:
     std::function<bool()> secureInputEnabled;
   };
   void setHooks(Hooks hooks);
+  //! Primary re-entry resync: post NX_FLAGSCHANGED via IOHIDPostEvent with
+  //! kIOHIDSetGlobalEventFlags and the ABSOLUTE flag word (same path as
+  //! postHIDVirtualKey's modifier posts), and adopt it as the shadow.
+  bool postModifierResync(uint16_t keycode, bool keyDown, uint64_t flags);
+
 
   //! Virtual keys of modifiers this process has injected and not yet released
   std::set<uint8_t> injectedModifiers() const;

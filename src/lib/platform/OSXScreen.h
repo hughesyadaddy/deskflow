@@ -156,6 +156,9 @@ public:
   void enter() override;
   //! primary re-entry: make the session modifier word match HID truth
   void resyncPrimaryModifiers() const;
+  //! primary tap: our own resync post (DSKR marker or IOHID echo) -> pass
+  //! to apps, never onKey / never relayed
+  static bool isOwnModifierResyncEvent(CGEventType type, CGEventRef event);
   bool canLeave() override;
   void leave() override;
   bool setClipboard(ClipboardID, const IClipboard *) override;
