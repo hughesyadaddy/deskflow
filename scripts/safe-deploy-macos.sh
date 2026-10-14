@@ -5,6 +5,7 @@
 #   --source: where to pull from (default: the repo's upstream). e.g. hackintosh:Desktop/deskflow
 #   Run on the target Mac itself (GUI login session; codesign needs the login keychain).
 set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 REPO="${DESKFLOW_REPO:-$HOME/Desktop/deskflow}"
 MOUSER_REPO="${MOUSER_REPO:-$HOME/Desktop/Mouser}"
 WORK="${DESKFLOW_DEPLOY_WORK:-$HOME/Library/Caches/deskflow-deploy}"
