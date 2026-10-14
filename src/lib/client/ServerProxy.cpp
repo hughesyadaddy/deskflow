@@ -384,6 +384,16 @@ void ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard *clipboard
   StreamChunker::sendClipboard(data, data.size(), id, m_seqNum, m_events, this);
 }
 
+void ServerProxy::sendKeyRelay(uint8_t phase, uint32_t id, uint16_t mask, uint16_t button, const std::string &lang)
+{
+  ProtocolUtil::writef(m_stream, kMsgDKeyRelay, phase, id, mask, button, &lang);
+}
+
+void ServerProxy::sendKeyRelayClear()
+{
+  ProtocolUtil::writef(m_stream, kMsgCKeyRelayClear);
+}
+
 void ServerProxy::flushCompressedMouse()
 {
   if (m_compressMouse) {

@@ -8,6 +8,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+
 #include "deskflow/IClient.h"
 
 #include "base/EventTypes.h"
@@ -37,6 +40,10 @@ class TCPSocket;
 /*!
 This class implements the top-level client algorithms for deskflow.
 */
+namespace deskflow::coordination {
+class IKeyboardRelayMonitor;
+}
+
 class Client : public IClient
 {
 public:
@@ -183,6 +190,16 @@ private:
   void handleResume();
   void sendClipboardThread(void *);
   void bindNetworkInterface(IDataSocket *socket) const;
+  void startKeyRelay();
+  void stopKeyRelay();
+  void handleKeyRelayEvent(const Event &event);
+
+public:
+  //! Esc x5 local dropout: release everything injected here, stop relaying,
+  //! disconnect. The caller then exits the process.
+  void dropout();
+
+private:
 
 private:
   std::string m_name;
@@ -194,6 +211,11 @@ private:
   ServerProxy *m_server = nullptr;
   bool m_ready = false;
   bool m_active = false;
+  //! keyboard follows the mouse: this machine's own keyboard is relayed to
+  //! the server while the cursor is NOT here (see startKeyRelay)
+  std::unique_ptr<deskflow::coordination::IKeyboardRelayMonitor> m_keyRelay;
+  std::atomic<bool> m_relayCursorHere{true};
+  std::atomic<bool> m_relayLive{false};
   bool m_suspended = false;
   bool m_connectOnResume = false;
   bool m_ownClipboard[kClipboardEnd];

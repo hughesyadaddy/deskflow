@@ -54,6 +54,10 @@ public:
   void onInfoChanged();
   bool onGrabClipboard(ClipboardID);
   void onClipboardChanged(ClipboardID, const IClipboard *);
+  //! keyboard relay: a key typed on THIS machine while the cursor is away
+  void sendKeyRelay(uint8_t phase, uint32_t id, uint16_t mask, uint16_t button, const std::string &lang);
+  //! keyboard relay: release everything this client relayed
+  void sendKeyRelayClear();
 
   //@}
 

@@ -9,6 +9,8 @@ add_library(coordination STATIC
   Coordinator.cpp
   Coordinator.h
   ElectionState.cpp
+  EscDropout.cpp
+  EscDropout.h
   ElectionState.h
   FleetState.h
   FleetStateMerge.cpp
@@ -41,6 +43,7 @@ if(APPLE)
     OSXLocalInputMonitor.mm
     OSXKeyboardRelayMonitor.mm
     OSXRescueStopAll.mm
+    OSXEscDropoutMonitor.mm
     KeyboardRelayMap.mm
   )
   # AppKit is needed for NSEvent (media-key decode); it re-exports Foundation.
@@ -54,6 +57,7 @@ elseif(WIN32)
   target_sources(coordination PRIVATE
     MSWindowsLocalInputMonitor.cpp
     MSWindowsKeyboardRelayMonitor.cpp
+    MSWindowsEscDropoutMonitor.cpp
     KeyboardRelayMap.cpp
   )
   target_link_libraries(coordination PUBLIC ws2_32)
@@ -61,6 +65,7 @@ else()
   target_sources(coordination PRIVATE
     StubLocalInputMonitor.cpp
     StubKeyboardRelayMonitor.cpp
+    StubEscDropoutMonitor.cpp
   )
 endif()
 

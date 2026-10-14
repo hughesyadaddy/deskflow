@@ -12,6 +12,8 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "client/ServerProxy.h"
+#include "coordination/CoordinationEvents.h"
+#include "coordination/KeyboardRelayMonitor.h"
 #include "common/NetworkProtocol.h"
 #include "common/Settings.h"
 #include "deskflow/Clipboard.h"
@@ -154,6 +156,7 @@ void Client::handshakeComplete()
 {
   m_ready = true;
   m_screen->enable();
+  startKeyRelay();
   if (m_relativeMouseMoves && !m_hasRelativeRestorePosition) {
     saveRelativeRestorePosition();
   }
@@ -198,6 +201,7 @@ void Client::getCursorPos(int32_t &x, int32_t &y) const
 void Client::enter(int32_t xAbs, int32_t yAbs, uint32_t, KeyModifierMask mask, bool)
 {
   m_active = true;
+  m_relayCursorHere = true;
   if (m_relativeMouseMoves && m_hasRelativeRestorePosition) {
     xAbs = m_relativeRestoreX;
     yAbs = m_relativeRestoreY;
@@ -216,6 +220,7 @@ bool Client::leave()
     saveRelativeRestorePosition();
   }
   m_active = false;
+  m_relayCursorHere = false;
 
   m_screen->leave();
   m_events->addEvent(Event(EventTypes::CoordinationScreenLeft, m_events->getSystemTarget()));
@@ -497,6 +502,7 @@ void Client::cleanupConnection()
 
 void Client::cleanupScreen()
 {
+  stopKeyRelay();
   if (m_server != nullptr) {
     if (m_ready) {
       m_screen->disable();
@@ -686,4 +692,115 @@ void Client::bindNetworkInterface(IDataSocket *socket) const
   bindAddress.resolve();
 
   socket->bind(bindAddress);
+}
+
+// ---------------------------------------------------------------- key relay
+//
+// Keyboard follows the mouse over the EXISTING server connection (no
+// coordination mesh, no promotion): while the cursor is on another screen,
+// keys typed on this machine's keyboard are swallowed here and sent to the
+// server (DKRL), which routes them exactly as if typed on its own keyboard.
+// The relay monitor's ledger keeps every key's Up/Repeat with its Down's
+// destination, so a key or modifier held across a crossing releases where
+// it was pressed. Disabled with DESKFLOW_KEY_RELAY=0.
+
+void Client::startKeyRelay()
+{
+  if (const char *env = std::getenv("DESKFLOW_KEY_RELAY"); env != nullptr && std::strcmp(env, "0") == 0) {
+    LOG_INFO("[relay] keyboard relay disabled (DESKFLOW_KEY_RELAY=0)");
+    return;
+  }
+  if (!m_keyRelay) {
+    m_keyRelay = deskflow::coordination::createKeyboardRelayMonitor();
+  }
+  m_relayCursorHere = m_active;
+  m_relayLive = true;
+  m_events->addHandler(EventTypes::CoordinationKeyForward, this, [this](const Event &e) { handleKeyRelayEvent(e); });
+  m_keyRelay->setForwardedReleaseSink([this](const std::vector<KeyButton> &buttons) {
+    // main thread (stop): release on the server what is still held there
+    if (m_server == nullptr) {
+      return;
+    }
+    try {
+      for (const KeyButton button : buttons) {
+        m_server->sendKeyRelay(1, kKeyNone, 0, button, std::string{});
+      }
+    } catch (const std::exception &e) { // NOSONAR: dead stream on disconnect
+      LOG_DEBUG("[relay] release not sent: %s", e.what());
+    }
+  });
+  using deskflow::coordination::KeyForwardResult;
+  m_keyRelay->start(
+      [this] { return m_relayCursorHere.load() || !m_relayLive.load(); },
+      [this](
+          deskflow::coordination::Message::KeyPhase phase, KeyID id, KeyModifierMask mask, KeyButton button,
+          const std::string &lang
+      ) {
+        // relay tap thread: never touch the stream here, hand it to the loop
+        if (!m_relayLive.load()) {
+          return KeyForwardResult::Local;
+        }
+        deskflow::coordination::RelayKeyEvent ev;
+        using P = deskflow::coordination::Message::KeyPhase;
+        ev.phase = phase == P::Up       ? deskflow::coordination::RelayKeyPhase::Up
+                   : phase == P::Repeat ? deskflow::coordination::RelayKeyPhase::Repeat
+                                        : deskflow::coordination::RelayKeyPhase::Down;
+        ev.id = id;
+        ev.mask = mask;
+        ev.button = button;
+        ev.lang = lang;
+        m_events->addEvent(
+            Event(EventTypes::CoordinationKeyForward, this, new CoordinationKeyForwardInfo(std::move(ev)))
+        );
+        return KeyForwardResult::Forwarded;
+      }
+  );
+  LOG_INFO("[relay] keyboard relay armed: this keyboard follows the cursor");
+}
+
+void Client::stopKeyRelay()
+{
+  if (!m_relayLive.exchange(false)) {
+    return;
+  }
+  if (m_keyRelay) {
+    m_keyRelay->stop(); // flushes forwarded holds through the release sink
+  }
+  if (m_server != nullptr) {
+    try {
+      m_server->sendKeyRelayClear();
+    } catch (const std::exception &e) { // NOSONAR: dead stream on disconnect
+      LOG_DEBUG("[relay] clear-all not sent: %s", e.what());
+    }
+  }
+  m_events->removeHandler(EventTypes::CoordinationKeyForward, this);
+  LOG_INFO("[relay] keyboard relay stopped");
+}
+
+void Client::handleKeyRelayEvent(const Event &event)
+{
+  const auto *info = dynamic_cast<const CoordinationKeyForwardInfo *>(event.getDataObject());
+  if (info == nullptr || m_server == nullptr || !m_relayLive.load()) {
+    return;
+  }
+  using deskflow::coordination::RelayKeyPhase;
+  const auto &ev = info->event;
+  const uint8_t phase = ev.phase == RelayKeyPhase::Up ? 1 : ev.phase == RelayKeyPhase::Repeat ? 2 : 0;
+  m_server->sendKeyRelay(
+      phase, static_cast<uint32_t>(ev.id), static_cast<uint16_t>(ev.mask), static_cast<uint16_t>(ev.button), ev.lang
+  );
+}
+
+void Client::dropout()
+{
+  LOG_INFO("[esc-dropout] client teardown: releasing local keys, stopping relay, disconnecting");
+  if (m_active) {
+    m_active = false;
+    m_relayCursorHere = true;
+    m_screen->leave(); // fakeAllKeysUp + ghost release of everything injected here
+  }
+  stopKeyRelay();
+  if (m_server != nullptr || isConnecting()) {
+    disconnect(nullptr);
+  }
 }

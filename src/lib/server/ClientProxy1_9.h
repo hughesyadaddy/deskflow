@@ -18,4 +18,10 @@ public:
 
   void mouseWheel(int32_t xDelta, int32_t yDelta) override;
   void mouseWheelEx(const WheelEx &ex) override;
+
+protected:
+  bool parseMessage(const uint8_t *code) override;
+
+private:
+  bool recvKeyRelay();
 };

@@ -269,6 +269,9 @@ enum class EventTypes : uint32_t
   /// Fleet keyboard relay: a peer forwarded a key event to the server epoch.
   CoordinationKeyForward,
 
+  /// Esc x5 on this machine's physical keyboard: drop out of Deskflow ~60 s.
+  LocalEscDropout,
+
   /// Fleet keyboard relay: the sender's lane failed; release every key relayed
   /// by that sender (data: CoordinationKeyClearAllInfo, coordination/CoordinationEvents.h).
   CoordinationKeyClearAll,

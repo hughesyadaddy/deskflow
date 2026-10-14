@@ -845,6 +845,99 @@ void ServerKeyLedgerTests::clearAll_releasesOnlyThatSendersKeysOnTheActiveClient
   }
 }
 
+void ServerKeyLedgerTests::clientRelay_keyGoesToActiveScreen()
+{
+  // Keyboard follows the mouse: a key typed on the MacBook keyboard (DKRL)
+  // while the cursor is on tiny11 reaches tiny11 like a server key.
+  using deskflow::coordination::RelayKeyPhase;
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    remote.keys.clear();
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Down, kKeyA, kButtonA));
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Up, kKeyA, kButtonA));
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyA), 1);
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyA), 1);
+    QVERIFY(!server.m_forwardedHeld.contains("macbookpro"));
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerKeyLedgerTests::clientRelay_modifierHeldAcrossSwitchIsReleasedOnLeave()
+{
+  // Shift held on the MacBook keyboard (relayed to tiny11), cursor then
+  // moves home: tiny11 must get the Shift Up at the crossing, and the late
+  // relayed Up must not re-press or strand anything.
+  using deskflow::coordination::RelayKeyPhase;
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Down, kKeyShift_L, kButtonShift, KeyModifierShift));
+    remote.keys.clear();
+    server.switchScreen(f.primary, 512, 384, false);
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyShift_L), 1);
+    QVERIFY(server.m_keysHeldOnActive.empty());
+    remote.keys.clear();
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Up, kKeyShift_L, kButtonShift));
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeyShift_L), 0);
+    QVERIFY(!server.m_forwardedHeld.contains("macbookpro"));
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerKeyLedgerTests::clientRelay_keyHeldOnPrimaryReleasedWhenCursorLeaves()
+{
+  // Cmd held on the MacBook keyboard while the cursor is home (injected into
+  // the Hackintosh), then the cursor leaves: the primary's injected hold is
+  // closed at the crossing (its Up would otherwise go to the new screen).
+  using deskflow::coordination::RelayKeyPhase;
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Down, kKeySuper_L, 0x37, KeyModifierSuper));
+    QCOMPARE(server.m_forwardedHeldOnPrimary.size(), 1u);
+    server.switchScreen(&remote, 50, 60, false);
+    QVERIFY(server.m_forwardedHeldOnPrimary.empty());
+    // the late Up goes to the active client and presses nothing
+    remote.keys.clear();
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Up, kKeySuper_L, 0x37));
+    QCOMPARE(remote.count(RecordedKey::Kind::Down, kKeySuper_L), 0);
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerKeyLedgerTests::escDropout_serverBringsCursorHomeAndReleasesEverything()
+{
+  using deskflow::coordination::RelayKeyPhase;
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Down, kKeyShift_L, kButtonShift, KeyModifierShift));
+    remote.keys.clear();
+    server.dropout();
+    QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(f.primary));
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyShift_L), 1);
+    QVERIFY(server.m_forwardedHeld.empty());
+    QVERIFY(server.m_keysHeldOnActive.empty());
+    server.m_clients.erase("remote");
+  }
+}
+
 void ServerKeyLedgerTests::clearAll_withoutSenderReleasesEveryRelayedKey()
 {
   // Legacy clear-all (no sender name): every relayed hold goes.

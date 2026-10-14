@@ -121,3 +121,11 @@ create_test(
   SOURCE WedgeDetectorTests.cpp
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
 )
+
+create_test(
+  NAME EscDropoutTests
+  DEPENDS coordination
+  SOURCE EscDropoutTests.cpp
+  LIBS base arch
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/coordination"
+)

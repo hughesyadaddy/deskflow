@@ -1289,6 +1289,7 @@ void OSXKeyState::setKeyboardModifiers(CGKeyCode virtualKey, bool keyDown)
 
 kern_return_t OSXKeyState::postHIDVirtualKey(uint8_t virtualKey, bool postDown)
 {
+  deskflow::platform::noteInjectedKey(virtualKey);
   // A modifier post carries the global flag word the OS will adopt
   // (kIOHIDSetGlobalEventFlags): derive it from the live flags so a
   // physical modifier the shadow never saw survives, then make the shadow
@@ -1358,6 +1359,7 @@ bool OSXKeyState::postModifierResync(uint16_t keycode, bool keyDown, uint64_t fl
 
 void OSXKeyState::postKeyboardKey(CGKeyCode virtualKey, bool keyDown)
 {
+  deskflow::platform::noteInjectedKey(virtualKey);
   CGEventRef event = CGEventCreateKeyboardEvent(nullptr, virtualKey, keyDown);
   if (event) {
     CGEventSetFlags(event, getKeyboardEventFlags());

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 
+#include "coordination/EscDropout.h"
 #include "coordination/KeyboardRelayMonitor.h"
 
 #include "coordination/KeyboardRelayHookPolicy.h"
@@ -126,6 +127,8 @@ private:
 
     const auto *info = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
     const bool keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+    // Esc x5 dropout sees every physical key BEFORE this hook may swallow it
+    escDropoutObserveWindowsKey(info->vkCode, !keyUp, (info->flags & LLKHF_INJECTED) != 0, info->time);
     const bool isRepeat = !keyUp && (info->flags & LLKHF_UP) == 0 && (GetAsyncKeyState(info->vkCode) & 0x8000);
     const auto vk = static_cast<int>(info->vkCode);
     const bool capsPress = vk == VK_CAPITAL && !keyUp && !isRepeat;

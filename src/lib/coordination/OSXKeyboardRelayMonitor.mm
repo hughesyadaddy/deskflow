@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <pthread.h>
 #include <thread>
 
 namespace deskflow::coordination {
@@ -65,7 +66,11 @@ public:
     // caps press relays as a change instead of being swallowed as a no-op.
     m_capsLockOn = (CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) & kCGEventFlagMaskAlphaShift) != 0;
     m_running = true;
-    m_thread = std::thread([this] { runLoop(); });
+    m_threadDone = false;
+    m_thread = std::thread([this] {
+      runLoop();
+      m_threadDone = true;
+    });
     return true;
   }
 
@@ -83,6 +88,14 @@ public:
       }
     }
     if (m_thread.joinable()) {
+      // The tap thread may be inside runOnMainQueue (dispatch_sync, layout
+      // lookup) right now: joining from the main thread without draining
+      // the main queue would deadlock both. Pump it until the thread ends.
+      if (pthread_main_np() != 0) {
+        while (!m_threadDone.load()) {
+          CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
+        }
+      }
       m_thread.join();
     }
     releaseRunLoop();
@@ -434,6 +447,7 @@ private:
     }
   }
 
+  std::atomic<bool> m_threadDone{true};
   RelayPassThroughQuery m_passThrough;
   KeyForwardSend m_send;
   ForwardedReleaseSink m_releaseSink;

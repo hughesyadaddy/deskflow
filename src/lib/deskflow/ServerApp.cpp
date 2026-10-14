@@ -7,6 +7,7 @@
  */
 
 #include "deskflow/ServerApp.h"
+#include "deskflow/EscDropoutGuard.h"
 
 #include "arch/Arch.h"
 #include "base/DirectionTypes.h"
@@ -629,6 +630,15 @@ NetworkAddress ServerApp::getAddress(const NetworkAddress &address) const
 
 int ServerApp::mainLoop()
 {
+  // Esc x5 dropout: sit out a pending one BEFORE serving anything
+  EscDropoutGuard escDropout(getEvents(), "server", [this] {
+    if (m_server != nullptr) {
+      m_server->dropout();
+    }
+  });
+  escDropout.gateStartup();
+  escDropout.arm();
+
   // create socket multiplexer.  this must happen after daemonization
   // on unix because threads evaporate across a fork().
   setSocketMultiplexer(std::make_unique<SocketMultiplexer>());

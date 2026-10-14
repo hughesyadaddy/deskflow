@@ -506,6 +506,20 @@ extern const char *const kMsgCInfoAck;
  */
 extern const char *const kMsgCKeepAlive;
 
+/**
+ * @brief Fleet: client keyboard relay (client -> server)
+ * A key typed on the CLIENT's physical keyboard while the cursor is NOT on
+ * that client: phase (0 down, 1 up, 2 repeat), KeyID, modifier mask,
+ * client-local button, layout. The server routes it as if typed on its own
+ * keyboard (to the active screen; injected locally when that is the server).
+ */
+extern const char *const kMsgDKeyRelay;
+
+/**
+ * @brief Fleet: release every key this client relayed (client -> server)
+ */
+extern const char *const kMsgCKeyRelayClear;
+
 /** @} */ // end of protocol_commands group
 
 /**

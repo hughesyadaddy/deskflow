@@ -827,6 +827,13 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     }
     if (m_active == m_primaryClient) {
       releaseKeysHeldOnActive();
+      // keys a client relayed here (injected into this OS) while home: their
+      // Ups will now route to the new active screen, so close them here
+      if (!m_forwardedHeldOnPrimary.empty()) {
+        LOG_INFO("[relay] leaving primary: releasing %zu relayed key(s) held here", m_forwardedHeldOnPrimary.size());
+        m_forwardedHeldOnPrimary.clear();
+        m_primaryClient->releaseForwardedKeys();
+      }
     }
 
     // update the primary client's clipboards if we're leaving the
@@ -1926,6 +1933,10 @@ void Server::handleClientDisconnected(BaseClientProxy *client)
   // never leave a dangling virtual-device host pointer behind
   m_mouserVirtualHostTracker.clearHostIf(client);
 
+  // whatever this client relayed from its own keyboard must not outlive it
+  // (held on the active screen or injected on the primary)
+  releaseForwardedKeys(getName(client));
+
   // client has disconnected.  it might be an old client or an
   // active client.  we don't care so just handle it both ways.
   removeActiveClient(client);
@@ -2527,10 +2538,30 @@ void Server::releaseForwardedKeys(const std::string &sender)
   }
 }
 
+void Server::dropout()
+{
+  LOG_INFO("[esc-dropout] server teardown: cursor home, releasing every held/relayed key, stopping serving");
+  if (m_active != nullptr && m_active != m_primaryClient && m_primaryClient != nullptr) {
+    // leave() on the client releases what it injected; entering the primary
+    // runs the 7625 modifier resync so this keyboard is clean locally
+    jumpToScreen(m_primaryClient);
+  }
+  releaseForwardedKeys();
+  m_forwardedHeldOnPrimary.clear();
+  if (m_primaryClient != nullptr) {
+    m_primaryClient->releaseForwardedKeys();
+  }
+}
+
 void Server::relayForwardedKey(const deskflow::coordination::RelayKeyEvent &event)
 {
   using deskflow::coordination::RelayKeyPhase;
   if (m_active == m_primaryClient) {
+    if (event.phase == deskflow::coordination::RelayKeyPhase::Up) {
+      m_forwardedHeldOnPrimary.erase(event.button);
+    } else if (event.phase == deskflow::coordination::RelayKeyPhase::Down && event.button != 0) {
+      m_forwardedHeldOnPrimary.insert(event.button);
+    }
     m_primaryClient->injectForwardedKey(event);
     return;
   }

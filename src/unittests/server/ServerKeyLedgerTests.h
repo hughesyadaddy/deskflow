@@ -27,6 +27,10 @@ private Q_SLOTS:
   void lockChange_relaysOnlyThePhysicalKey();
   void clearAll_releasesOnlyThatSendersKeysOnTheActiveClient();
   void clearAll_withoutSenderReleasesEveryRelayedKey();
+  void clientRelay_keyGoesToActiveScreen();
+  void clientRelay_modifierHeldAcrossSwitchIsReleasedOnLeave();
+  void escDropout_serverBringsCursorHomeAndReleasesEverything();
+  void clientRelay_keyHeldOnPrimaryReleasedWhenCursorLeaves();
   void switch_releasesBeforeLeave();
   void enterPrimary_releasesOnlyInjectedLedger();
   void enterSecondary_logsStuckReleaseWhenModifierPersists();

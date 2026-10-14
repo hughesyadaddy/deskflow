@@ -7,6 +7,7 @@
  */
 
 #include "deskflow/ClientApp.h"
+#include "deskflow/EscDropoutGuard.h"
 
 #include "arch/Arch.h"
 #include "base/Event.h"
@@ -551,6 +552,15 @@ void ClientApp::appendPreConnectHosts(const QStringList &hosts)
 
 int ClientApp::mainLoop()
 {
+  // Esc x5 dropout: sit out a pending one BEFORE connecting
+  EscDropoutGuard escDropout(getEvents(), "client", [this] {
+    if (m_client != nullptr) {
+      m_client->dropout();
+    }
+  });
+  escDropout.gateStartup();
+  escDropout.arm();
+
   // create socket multiplexer.  this must happen after daemonization
   // on unix because threads evaporate across a fork().
   setSocketMultiplexer(std::make_unique<SocketMultiplexer>());

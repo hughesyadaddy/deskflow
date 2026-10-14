@@ -231,6 +231,10 @@ public:
   //! \p sender releases everything (legacy clear-all without a name).
   void releaseForwardedKeys(const std::string &sender = {});
 
+  //! Esc x5 local dropout: bring the cursor home, release every key held
+  //! on any screen (relayed included). The caller then exits the core.
+  void dropout();
+
   //@}
 
 private:
@@ -669,6 +673,9 @@ private:
   */
   std::map<std::string, HeldKeys> m_keysHeldOnBroadcast;
 
+  //! Buttons relayed DOWN while the cursor was home (injected into the
+  //! primary's OS); released when the cursor leaves the primary.
+  std::set<KeyButton> m_forwardedHeldOnPrimary;
   //! Buttons each fleet peer relayed DOWN through relayForwardedKey() while
   //! the cursor was on a secondary (so they are held on the active client),
   //! keyed by sender name. A KeyClearAll from that sender releases exactly
