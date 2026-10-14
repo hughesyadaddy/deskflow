@@ -63,7 +63,7 @@ NEW="$STAGE/Deskflow.app"
 QT=$(ls "$NEW/Contents/Frameworks" 2>/dev/null | grep -c '^Qt') ; [ "$QT" -ge 10 ] || die "only $QT Qt frameworks"
 MB=$(du -sm "$NEW" | cut -f1); [ "$MB" -ge 80 ] || die "bundle only ${MB} MB"
 codesign --verify --deep --strict "$NEW" || die "codesign verify failed"
-codesign -dv "$NEW" 2>&1 | grep -q "TeamIdentifier=$TEAM" || die "wrong team"
+SIGINFO=$(codesign -dv "$NEW" 2>&1 || true); [[ "$SIGINFO" == *"TeamIdentifier=$TEAM"* ]] || die "wrong team"
 [ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$NEW/Contents/Info.plist")" = "$BUNDLE_ID" ] || die "wrong bundle id"
 VER=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$NEW/Contents/Info.plist")
 log "verified $VER: ${MB} MB, $QT Qt frameworks, team $TEAM, $BUNDLE_ID"
