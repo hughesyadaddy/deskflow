@@ -23,7 +23,9 @@ SETTINGS=( "$HOME/Library/Deskflow" "$HOME/Library/Application Support/Mouser"
            "$HOME/Library/Preferences/$BUNDLE_ID.plist" "$HOME/Library/LaunchAgents" )
 snap(){ for p in "${SETTINGS[@]}"; do [ -e "$p" ] || continue
   find "$p" -type f \( -name '*.conf' -o -name '*.plist' -o -name '*.json' -o -name '*.ini' -o -name '*.token' -o -name '*.pem' \) \
-    -not -path '*/deploy-backups/*' -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null; done; }
+    -not -path '*/deploy-backups/*' -print0 2>/dev/null | sort -z | while IFS= read -r -d '' f; do
+      # the GUI rewrites lastVersion= on every new build; that is bookkeeping, not a setting
+      printf '%s  %s\n' "$(grep -v '^lastVersion=' "$f" | shasum -a 256 | cut -c1-64)" "$f"; done; done; }
 snap > "$BK/settings.sha256"
 for p in "${SETTINGS[@]}"; do [ -e "$p" ] && rsync -a --exclude deploy-backups --exclude '*.log' "$p" "$BK/" ; done
 log "settings backed up to $BK ($(wc -l < "$BK/settings.sha256") files hashed)"
