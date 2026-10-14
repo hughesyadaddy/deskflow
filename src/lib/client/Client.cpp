@@ -785,6 +785,10 @@ void Client::handleKeyRelayEvent(const Event &event)
   }
   using deskflow::coordination::RelayKeyPhase;
   const auto &ev = info->event;
+  static int diagSent = 0;
+  if (diagSent < 12) {
+    LOG_INFO("[relay-diag] sending DKRL #%d phase=%d", diagSent++, static_cast<int>(ev.phase));
+  }
   const uint8_t phase = ev.phase == RelayKeyPhase::Up ? 1 : ev.phase == RelayKeyPhase::Repeat ? 2 : 0;
   m_server->sendKeyRelay(
       phase, static_cast<uint32_t>(ev.id), static_cast<uint16_t>(ev.mask), static_cast<uint16_t>(ev.button), ev.lang

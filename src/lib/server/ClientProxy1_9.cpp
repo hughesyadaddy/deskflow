@@ -71,6 +71,10 @@ bool ClientProxy1_9::recvKeyRelay()
   event.button = static_cast<KeyButton>(button);
   event.lang = lang;
   event.from = getName();
+  static int diagRecv = 0;
+  if (diagRecv < 12) {
+    LOG_INFO("[relay-diag] DKRL #%d phase=%d from \"%s\"", diagRecv++, static_cast<int>(phase), getName().c_str());
+  }
   LOG_DEBUG("[relay] key %d from \"%s\" button=0x%04x", static_cast<int>(phase), getName().c_str(), button);
   if (getServer() != nullptr) {
     getServer()->relayForwardedKey(event);

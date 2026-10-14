@@ -162,6 +162,13 @@ private:
     }
 
     const bool isInjected = relayEventIsInjected(event);
+    {
+      static std::atomic<int> diagCount{0};
+      if (const int n = diagCount.fetch_add(1); n < 12) {
+        LOG_INFO("[relay-diag] tap event #%d type=%d injected=%d passLocal=%d", n, static_cast<int>(type), isInjected ? 1 : 0,
+                 (self->m_passThrough ? self->m_passThrough() : true) ? 1 : 0);
+      }
+    }
     self->applyPendingResync();
 
     // Consumer/media keys (volume, brightness, play/pause, ...) arrive as
@@ -420,7 +427,7 @@ private:
     CFRunLoopAddSource(runLoop, source, kCFRunLoopCommonModes);
     CGEventTapEnable(m_tap, true);
     m_active = true;
-    LOG_DEBUG("coordination: keyboard relay monitor started");
+    LOG_INFO("[relay-diag] tap thread running (session tap enabled=%d)", CGEventTapIsEnabled(m_tap) ? 1 : 0);
 
     while (m_running) {
       CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, true);
