@@ -6,6 +6,9 @@
 #   Run on the target Mac itself (GUI login session; codesign needs the login keychain).
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# whole body in a function: bash parses it fully first, so the git pull below can
+# safely rewrite this file while it runs
+main() {
 REPO="${DESKFLOW_REPO:-$HOME/Desktop/deskflow}"
 MOUSER_REPO="${MOUSER_REPO:-$HOME/Desktop/Mouser}"
 WORK="${DESKFLOW_DEPLOY_WORK:-$HOME/Library/Caches/deskflow-deploy}"
@@ -89,3 +92,5 @@ if launchctl list | grep -Eq 'deskflow-(converge|prio)'; then die "converge/prio
 awk -F= '/^\[/{sec=tolower($0)} sec=="[coordination]" && $1=="enabled" && $2=="true"{f=1} END{exit !f}' "$HOME/Library/Deskflow/Deskflow.conf" 2>/dev/null && die "coordination enabled in Deskflow.conf"
 pgrep -fl 'MacOS/deskflow-core' | cut -c1-90 || die "core not running"
 log "OK: settings unchanged, converge/prio absent, $VER running"
+}
+main "$@"
