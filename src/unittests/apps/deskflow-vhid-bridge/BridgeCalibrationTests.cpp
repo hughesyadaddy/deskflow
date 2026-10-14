@@ -62,6 +62,7 @@ private Q_SLOTS:
   void countsPerPointRejectsTinyOrWrongSign();
   void countsPerPointRejectsAbsurdScale();
   void combineAxes();
+  void probeAxisRejectsClampedOrUnparked();
   void pointsToCountsRounds();
 
   // -- residual carry ------------------------------------------------------
@@ -69,6 +70,17 @@ private Q_SLOTS:
   void residualRejectsHuge();
   void residualZeroWhenOnTarget();
 };
+
+void BridgeCalibrationTests::probeAxisRejectsClampedOrUnparked()
+{
+  using bridge_logic::probe_axis_usable;
+  QVERIFY(probe_axis_usable(0.0, 50.0, 1555));     // parked, travelled freely
+  QVERIFY(probe_axis_usable(1.0, 1500.0, 1555));   // slack at the origin
+  QVERIFY(!probe_axis_usable(1352.0, 1554.0, 1555)); // slam failed AND clamped (MacBook log)
+  QVERIFY(!probe_axis_usable(0.0, 1554.0, 1555));  // probe ended on the far edge
+  QVERIFY(!probe_axis_usable(40.0, 90.0, 1555));   // slam did not park the cursor
+  QVERIFY(probe_axis_usable(0.0, 5000.0, 0));      // unknown extent: start check only
+}
 
 void BridgeCalibrationTests::maskToModifierBits_data()
 {

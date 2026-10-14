@@ -5,6 +5,8 @@
 #   default: fast-forward ~/Desktop/deskflow and ~/Desktop/Mouser to the FORK's main on GitHub
 #            (hughesyadaddy/*; never upstream), then build/sign/verify/install.
 #   --dry-run: fetch and show what would be pulled; change nothing.
+#   --with-mouser: also rebuild+install Mouser (its own signed installer) when the installed
+#                  Mouser commit != ~/Desktop/Mouser HEAD. Mouser config is never touched.
 #   --source/--branch: pull Deskflow from somewhere else (e.g. hackintosh:Desktop/deskflow fleet/x)
 #   Run on the target Mac itself (GUI login session; codesign needs the login keychain).
 set -euo pipefail
@@ -19,9 +21,9 @@ TEAM=J5KPG8ZR5C; BUNDLE_ID=io.github.hughesyadaddy.deskflow
 APP=/Applications/Deskflow.app
 DESKFLOW_FORK="${DESKFLOW_FORK:-https://github.com/hughesyadaddy/deskflow.git}"
 MOUSER_FORK="${MOUSER_FORK:-https://github.com/hughesyadaddy/Mouser.git}"
-SOURCE="$DESKFLOW_FORK"; BRANCH=""; PULL=1; DRY=0
+SOURCE="$DESKFLOW_FORK"; BRANCH=""; PULL=1; DRY=0; WITH_MOUSER=0
 while [ $# -gt 0 ]; do case "$1" in
-  --source) SOURCE="$2"; shift 2;; --branch) BRANCH="$2"; shift 2;; --no-pull) PULL=0; shift;; --dry-run) DRY=1; shift;;
+  --source) SOURCE="$2"; shift 2;; --branch) BRANCH="$2"; shift 2;; --no-pull) PULL=0; shift;; --dry-run) DRY=1; shift;; --with-mouser) WITH_MOUSER=1; shift;;
   *) echo "unknown arg $1"; exit 2;; esac; done
 [ -n "$BRANCH" ] || { if [ "$PULL" = 1 ]; then BRANCH=main; else BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD); fi; }
 log(){ printf '[safe-deploy] %s\n' "$*"; }
@@ -96,6 +98,23 @@ U="gui/$(id -u)"
 for l in io.github.hughesyadaddy.deskflow-core io.github.hughesyadaddy.deskflow; do
   launchctl kickstart -k "$U/$l" 2>/dev/null || log "note: $l not loaded"; done
 log "installed $VER (rollback: $RB -> mv back to $APP)"
+
+# ---- 4b. optional Mouser (only when the installed build is not repo HEAD) --
+if [ "$WITH_MOUSER" = 1 ] && [ -d "$MOUSER_REPO/.git" ]; then
+  MAPP=/Applications/Mouser.app
+  HAVE=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["commit"])' "$MAPP/Contents/Resources/mouser_build_info.json" 2>/dev/null || echo none)
+  WANT=$(git -C "$MOUSER_REPO" rev-parse HEAD)
+  if [ "$HAVE" = "$WANT" ]; then log "Mouser already at ${WANT:0:7}; not rebuilt"
+  else
+    MRB="/tmp/Mouser.app.prev-${HAVE:0:7}"; rm -rf "$MRB"; [ -d "$MAPP" ] && ditto "$MAPP" "$MRB"
+    log "building Mouser ${WANT:0:7} (installed ${HAVE:0:7}; rollback copy $MRB)"
+    (cd "$MOUSER_REPO" && zsh scripts/build_and_install_macos_app.sh) >"$WORK/mouser-build.log" 2>&1 \
+      || { tail -20 "$WORK/mouser-build.log"; die "Mouser build/install failed (rollback: $MRB)"; }
+    codesign --verify --deep --strict "$MAPP" || die "Mouser signature invalid (rollback: $MRB)"
+    MSIG=$(codesign -dv "$MAPP" 2>&1 || true); [[ "$MSIG" == *"TeamIdentifier=$TEAM"* ]] || die "Mouser wrong team"
+    log "Mouser ${WANT:0:7} installed"
+  fi
+fi
 
 # ---- 5. guards: settings unchanged, converge/prio/coordination off --------
 sleep 8

@@ -456,8 +456,14 @@ bool Bridge::calibrate()
     log_line("calibrate: cursor unreadable after probe — keeping seed scale");
     return false;
   }
-  const auto sx = bridge_logic::counts_per_point(kProbeX, p1->x - p0->x);
-  const auto sy = bridge_logic::counts_per_point(kProbeY, p1->y - p0->y);
+  // An axis whose start was not parked at the origin, or whose probe ended
+  // clamped at the far edge, measures a clamped travel: drop it.
+  const auto sx = bridge_logic::probe_axis_usable(p0->x, p1->x, screen_w_)
+                      ? bridge_logic::counts_per_point(kProbeX, p1->x - p0->x)
+                      : std::nullopt;
+  const auto sy = bridge_logic::probe_axis_usable(p0->y, p1->y, screen_h_)
+                      ? bridge_logic::counts_per_point(kProbeY, p1->y - p0->y)
+                      : std::nullopt;
   const auto scale = bridge_logic::combine_axis_scales(sx, sy);
   log_line(
       "calibrate: probe +" + std::to_string(kProbeX) + "," + std::to_string(kProbeY) + " counts moved cursor from (" +

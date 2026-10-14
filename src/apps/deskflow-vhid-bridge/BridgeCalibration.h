@@ -462,6 +462,25 @@ inline std::optional<double> counts_per_point(int emitted_counts, double observe
 }
 
 // Combines the two axis measurements (either may be unusable).
+/*!
+A calibration probe axis is usable only if the slam really parked the cursor at
+the origin edge (start within kEdgeSlackPoints of 0) and the probe did NOT end
+pinned against the far edge (extent - 1). Otherwise the observed travel is
+clamped and the scale comes out too small (MacBook log: 1352 -> 1554 of 1555
+gave 1.97 counts/point instead of ~8, so every move undershot and the closed
+loop caught up in jumps). extent <= 0 means unknown: only the start is checked.
+*/
+constexpr double kEdgeSlackPoints = 2.0;
+
+inline bool probe_axis_usable(double start, double end, int extent)
+{
+  if (std::fabs(start) > kEdgeSlackPoints)
+    return false;
+  if (extent > 0 && end >= static_cast<double>(extent - 1) - kEdgeSlackPoints)
+    return false;
+  return true;
+}
+
 inline std::optional<double> combine_axis_scales(std::optional<double> sx, std::optional<double> sy)
 {
   if (sx && sy)
