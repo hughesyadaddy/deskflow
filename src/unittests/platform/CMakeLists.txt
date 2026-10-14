@@ -56,6 +56,13 @@ if (WIN32)
   )
 elseif(APPLE)
   create_test(
+    NAME OSXModifierResyncTests
+    DEPENDS platform
+    LIBS base arch
+    SOURCE OSXModifierResyncTests.cpp
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
+  )
+  create_test(
     NAME OSXClipboardTests
     DEPENDS platform
     LIBS base arch

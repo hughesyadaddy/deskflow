@@ -28,6 +28,7 @@
 #include "mt/Thread.h"
 #include "platform/DisplayWaitPolicy.h"
 #include "platform/OSXClipboard.h"
+#include "platform/OSXModifierResync.h"
 #include "platform/OSXEventQueueBuffer.h"
 #include "platform/OSXInjectedEvent.h"
 #include "platform/OSXKeyState.h"
@@ -1089,6 +1090,7 @@ void OSXScreen::enter()
 
   if (m_isPrimary) {
     setZeroSuppressionInterval();
+    resyncPrimaryModifiers();
   } else {
     // reset buttons
     m_buttonState.reset();
@@ -1112,6 +1114,35 @@ void OSXScreen::enter()
 
     avoidSupression();
   }
+}
+
+void OSXScreen::resyncPrimaryModifiers() const
+{
+  // See primaryModifierResyncFlags(): the tap swallowed flagsChanged while
+  // we were off screen, so the session's modifier word may disagree with
+  // the hardware (Cmd held across the crossing, released on the client).
+  const uint64_t hid = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+  const uint64_t session = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+  const auto steps = deskflow::platform::primaryModifierResyncSteps(hid, session);
+  if (steps.empty()) {
+    return;
+  }
+  for (const auto &step : steps) {
+    CGEventRef event = CGEventCreateKeyboardEvent(nullptr, static_cast<CGKeyCode>(step.keycode), false);
+    if (event == nullptr) {
+      continue;
+    }
+    CGEventSetType(event, kCGEventFlagsChanged);
+    CGEventSetFlags(event, static_cast<CGEventFlags>(step.flags));
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, deskflow::platform::kModifierResyncMarker);
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+  }
+  LOG_INFO(
+      "[keys] primary enter resynced modifiers: session 0x%llx -> hid 0x%llx",
+      static_cast<unsigned long long>(session & deskflow::platform::kHeldModifierFlags),
+      static_cast<unsigned long long>(hid & deskflow::platform::kHeldModifierFlags)
+  );
 }
 
 bool OSXScreen::canLeave()
@@ -2138,6 +2169,12 @@ OSXScreen::handleCGInputEventSecondary(CGEventTapProxy proxy, CGEventType type, 
 CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
   OSXScreen *screen = (OSXScreen *)refcon;
+
+  // our own primary-enter modifier resync: deliver to apps, never relay
+  if (type == kCGEventFlagsChanged &&
+      CGEventGetIntegerValueField(event, kCGEventSourceUserData) == deskflow::platform::kModifierResyncMarker) {
+    return event;
+  }
 
   switch (type) {
   case kCGEventLeftMouseDown:

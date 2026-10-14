@@ -154,6 +154,8 @@ public:
   void enable() override;
   void disable() override;
   void enter() override;
+  //! primary re-entry: make the session modifier word match HID truth
+  void resyncPrimaryModifiers() const;
   bool canLeave() override;
   void leave() override;
   bool setClipboard(ClipboardID, const IClipboard *) override;
