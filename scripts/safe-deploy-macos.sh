@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # safe-deploy-macos.sh -- pull, build (VS Code task recipe), sign, verify, install Deskflow.
 # NEVER touches Deskflow/Mouser settings, never re-enables converge/prio/coordination.
-# Usage: scripts/safe-deploy-macos.sh [--source <git-url-or-path>] [--branch <b>] [--no-pull]
-#   --source: where to pull from (default: the repo's upstream). e.g. hackintosh:Desktop/deskflow
+# Usage: scripts/safe-deploy-macos.sh [--dry-run] [--no-pull] [--source <git-url-or-path>] [--branch <b>]
+#   default: fast-forward ~/Desktop/deskflow and ~/Desktop/Mouser to the FORK's main on GitHub
+#            (hughesyadaddy/*; never upstream), then build/sign/verify/install.
+#   --dry-run: fetch and show what would be pulled; change nothing.
+#   --source/--branch: pull Deskflow from somewhere else (e.g. hackintosh:Desktop/deskflow fleet/x)
 #   Run on the target Mac itself (GUI login session; codesign needs the login keychain).
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -14,10 +17,13 @@ MOUSER_REPO="${MOUSER_REPO:-$HOME/Desktop/Mouser}"
 WORK="${DESKFLOW_DEPLOY_WORK:-$HOME/Library/Caches/deskflow-deploy}"
 TEAM=J5KPG8ZR5C; BUNDLE_ID=io.github.hughesyadaddy.deskflow
 APP=/Applications/Deskflow.app
-SOURCE=""; BRANCH=""; PULL=1
+DESKFLOW_FORK="${DESKFLOW_FORK:-https://github.com/hughesyadaddy/deskflow.git}"
+MOUSER_FORK="${MOUSER_FORK:-https://github.com/hughesyadaddy/Mouser.git}"
+SOURCE="$DESKFLOW_FORK"; BRANCH=""; PULL=1; DRY=0
 while [ $# -gt 0 ]; do case "$1" in
-  --source) SOURCE="$2"; shift 2;; --branch) BRANCH="$2"; shift 2;; --no-pull) PULL=0; shift;;
+  --source) SOURCE="$2"; shift 2;; --branch) BRANCH="$2"; shift 2;; --no-pull) PULL=0; shift;; --dry-run) DRY=1; shift;;
   *) echo "unknown arg $1"; exit 2;; esac; done
+[ -n "$BRANCH" ] || { if [ "$PULL" = 1 ]; then BRANCH=main; else BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD); fi; }
 log(){ printf '[safe-deploy] %s\n' "$*"; }
 die(){ printf '[safe-deploy] FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -34,15 +40,24 @@ snap > "$BK/settings.sha256"
 for p in "${SETTINGS[@]}"; do [ -e "$p" ] && rsync -a --exclude deploy-backups --exclude '*.log' "$p" "$BK/" ; done
 log "settings backed up to $BK ($(wc -l < "$BK/settings.sha256") files hashed)"
 
-# ---- 1. pull ---------------------------------------------------------------
-cd "$REPO"; BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
+# ---- 1. pull (fast-forward only, from the fork) ---------------------------
+ffpull(){ # repo url branch
+  local repo="$1" url="$2" br="$3"
+  cd "$repo"
+  [ "$(git rev-parse --abbrev-ref HEAD)" = "$br" ] || die "$repo is on $(git rev-parse --abbrev-ref HEAD), expected $br (git switch $br)"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || die "$repo has uncommitted changes"
+  git fetch -q --no-tags "$url" "$br" || die "fetch $url $br failed"
+  local behind ahead; read -r ahead behind < <(git rev-list --left-right --count HEAD...FETCH_HEAD)
+  log "$(basename "$repo"): $behind new commit(s) on $url $br, $ahead local-only"
+  [ "$ahead" = 0 ] || die "$repo has local commits not on $url $br -- push them first (no merge/rewrite here)"
+  if [ "$DRY" = 1 ]; then git log --oneline HEAD..FETCH_HEAD | head -20; else git merge --ff-only -q FETCH_HEAD; fi
+}
 if [ "$PULL" = 1 ]; then
-  [ -z "$(git status --porcelain --untracked-files=no)" ] || die "$REPO has uncommitted changes"
-  if [ -n "$SOURCE" ]; then git fetch -q --no-tags "$SOURCE" "$BRANCH" && git merge --ff-only -q FETCH_HEAD
-  else git pull --ff-only -q --no-tags; fi
-  if [ -d "$MOUSER_REPO/.git" ]; then (cd "$MOUSER_REPO" && [ -z "$(git status --porcelain --untracked-files=no)" ] \
-      && git pull --ff-only -q 2>/dev/null && log "Mouser repo pulled") || log "Mouser repo not pulled (dirty/no upstream) -- left as is"; fi
+  ffpull "$REPO" "$SOURCE" "$BRANCH"
+  if [ -d "$MOUSER_REPO/.git" ]; then ffpull "$MOUSER_REPO" "$MOUSER_FORK" main; fi
 fi
+if [ "$DRY" = 1 ]; then log "dry run: nothing built or installed"; exit 0; fi
+cd "$REPO"
 log "deskflow $BRANCH @ $(git log --oneline -1 | cut -c1-70)"
 
 # ---- 2. build: tag-free clone so the build number = commit count ----------
