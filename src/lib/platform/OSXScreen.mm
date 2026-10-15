@@ -422,7 +422,15 @@ void *OSXScreen::getEventTarget() const
 
 bool OSXScreen::getClipboard(ClipboardID, IClipboard *dst) const
 {
-  Clipboard::copy(dst, &m_pasteboard);
+  // reading the pasteboard converts and copies every flavour synchronously on
+  // this (event) thread; the server asks on every leave, once per clipboard
+  // id, so serve an unchanged pasteboard from the last read.  The key is the
+  // changeCount seen by the last poll, which is also when m_pasteboard's
+  // Carbon reference was PasteboardSynchronize'd: Carbon reads return that
+  // snapshot until the next sync, so keying on the live changeCount could
+  // cache a pre-sync (stale) read under the new count and keep serving it.
+  const bool cached = m_pasteboardReadCache.read(dst, m_pasteboard, [this] { return m_lastPasteboardChangeCount; });
+  LOG_DEBUG("read clipboard%s", cached ? " (unchanged, from cache)" : "");
   return true;
 }
 
@@ -1173,6 +1181,13 @@ void OSXScreen::leave()
     warpCursor(m_xCenter, m_yCenter);
   }
 
+  // a copy made since the last poll (up to 1 s ago) would otherwise only be
+  // noticed after the cursor left; check now (a cheap changeCount read) so
+  // the server's deferred clipboard sync picks it up
+  if (m_isPrimary && m_clipboardTimer != nullptr) {
+    clipboardPollTick();
+  }
+
   // now off screen
   m_isOnScreen = false;
   if (m_clipboardTimer != nullptr) {
@@ -1182,6 +1197,8 @@ void OSXScreen::leave()
 
 bool OSXScreen::setClipboard(ClipboardID, const IClipboard *src)
 {
+  // our own write changes the pasteboard; drop the cached read (and its memory)
+  m_pasteboardReadCache.invalidate();
   if (src != nullptr) {
     LOG_DEBUG("setting clipboard");
     Clipboard::copy(&m_pasteboard, src);

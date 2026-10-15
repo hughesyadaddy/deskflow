@@ -52,6 +52,16 @@ public:
     return false;
   }
 
+  //! Finish any paced clipboard transfer now
+  /*!
+  Writes the rest of a clipboard still being sent in paced chunks, so the
+  message written next (a key press or click, which may be a paste) arrives
+  after it.  No-op for screens that do not pace (the primary, old peers).
+  */
+  virtual void finishClipboardTransfers()
+  {
+  }
+
   //@}
 
   // IScreen

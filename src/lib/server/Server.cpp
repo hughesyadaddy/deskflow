@@ -38,9 +38,7 @@
 #if defined(__APPLE__)
 #include <Carbon/Carbon.h>
 #endif
-#ifdef _WIN32
 #include <algorithm>
-#endif
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -478,6 +476,7 @@ Server::~Server()
   m_events->removeHandler(Timer, this);
   stopSwitch();
   clearEscBurstTimer();
+  cancelClipboardSyncTimer();
 
   // Best-effort: release any chord-held mods while the client link is still
   // alive, so a role flip / epoch teardown doesn't strand a synthetic
@@ -836,15 +835,12 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
       }
     }
 
-    // update the primary client's clipboards if we're leaving the
-    // primary screen.
+    // leaving the primary: its clipboard must be re-read, but NOT here.  The
+    // read (every pasteboard format, synchronously) and the send used to run
+    // on this path and froze the cursor at the edge for a large or slow copy;
+    // syncClipboards() does it once the mouse rests or before a key/click.
     if (m_active == m_primaryClient && m_enableClipboard) {
-      for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-        const ClipboardInfo &clipboard = m_clipboards[id];
-        if (clipboard.m_clipboardOwner == getName(m_primaryClient)) {
-          onClipboardChanged(m_primaryClient, id, clipboard.m_clipboardSeqNum);
-        }
-      }
+      std::fill(std::begin(m_primaryClipboardStale), std::end(m_primaryClipboardStale), true);
     }
 
 #if defined(__APPLE__)
@@ -870,14 +866,16 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     m_active->enter(x, y, m_seqNum, toggleMask, forScreensaver);
 
     if (m_enableClipboard) {
-      // send the clipboard data to new active screen
-      for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-        // size check uses the cached fingerprint; a screen switch must not
-        // re-marshal (and so copy) every clipboard just to measure it.
-        if (m_clipboards[id].m_fingerprint.m_size > (m_maximumClipboardSize * 1024)) {
-          continue;
-        }
-        m_active->setClipboard(id, &m_clipboards[id].m_clipboard);
+      if (m_active == m_primaryClient) {
+        // home: nothing to read (the primary owns what it last copied, and a
+        // stale read stays pending for the next leave) and the write is a
+        // local pasteboard update of data already received, which must land
+        // before a paste key the OS delivers itself -- so do it now.
+        cancelClipboardSyncTimer();
+        const bool noneSent[kClipboardEnd] = {};
+        sendClipboardsToActive(noneSent);
+      } else {
+        syncClipboardsWhenMouseIdle();
       }
     }
 
@@ -1844,8 +1842,11 @@ void Server::handleClipboardGrabbed(const Event &event, BaseClientProxy *grabber
   }
 
   if (grabber == m_primaryClient && m_active != m_primaryClient) {
+    // the copy was noticed after we left (e.g. made just before crossing):
+    // read and send it once the mouse rests, not in the middle of a motion
     LOG_DEBUG("clipboard grabbed while active screen was changed, resending clipboard data");
-    onClipboardChanged(m_primaryClient, info->m_id, clipboard.m_clipboardSeqNum);
+    m_primaryClipboardStale[info->m_id] = true;
+    syncClipboardsWhenMouseIdle();
   }
 }
 
@@ -2152,14 +2153,14 @@ void Server::clearClipboard(ClipboardInfo &clipboard)
   clipboard.m_fingerprint = fingerprintClipboard(clipboard.m_clipboard);
 }
 
-void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum)
+bool Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum)
 {
   ClipboardInfo &clipboard = m_clipboards[id];
 
   // ignore update if sequence number is old
   if (seqNum < clipboard.m_clipboardSeqNum) {
     LOG_INFO("ignored screen \"%s\" update of clipboard %d (mis-sequenced)", getName(sender).c_str(), id);
-    return;
+    return false;
   }
 
   // should be the expected client
@@ -2174,13 +2175,13 @@ void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, u
 
   if (clipboard.m_fingerprint.m_size > m_maximumClipboardSize * 1024) {
     LOG_WARN("not sending clipboard data, exceeds limit: %i KB", m_maximumClipboardSize);
-    return;
+    return false;
   }
 
   // ignore if data hasn't changed
   if (clipboard.m_fingerprint == previous) {
     LOG_DEBUG("ignored screen \"%s\" update of clipboard %d (unchanged)", clipboard.m_clipboardOwner.c_str(), id);
-    return;
+    return false;
   }
 
   // got new data
@@ -2194,6 +2195,114 @@ void Server::onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, u
 
   // send the new clipboard to the active screen
   m_active->setClipboard(id, &clipboard.m_clipboard);
+  return true;
+}
+
+void Server::noteMouseActivity()
+{
+  m_lastMouseActivity = std::chrono::steady_clock::now();
+}
+
+int64_t Server::msUntilMouseIdle() const
+{
+  if (m_lastMouseActivity == std::chrono::steady_clock::time_point{}) {
+    return 0;
+  }
+  const auto sinceMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastMouseActivity)
+          .count();
+  return std::max<int64_t>(kMouseIdleMs - static_cast<int64_t>(sinceMs), 0);
+}
+
+void Server::syncClipboardsWhenMouseIdle()
+{
+  if (m_clipboardSyncTimer != nullptr) {
+    return; // already waiting for the mouse to rest
+  }
+
+  // reading and sending a large clipboard stalls this loop, so only start
+  // once the mouse rests.  (EventQueue timers tick at whole-second
+  // granularity on this branch, so the timer is a "check again soon"; the
+  // idle test itself uses steady_clock.)
+  if (const auto waitMs = msUntilMouseIdle(); waitMs > 0) {
+    m_clipboardSyncTimer = m_events->newOneShotTimer(static_cast<double>(waitMs) / 1000.0, nullptr);
+    if (m_clipboardSyncTimer != nullptr) {
+      m_events->addHandler(EventTypes::Timer, m_clipboardSyncTimer, [this](const auto &) {
+        handleClipboardSyncTimer();
+      });
+      return;
+    }
+    // event queue without timers (test doubles): fall back to syncing now
+  }
+  LOG_DEBUG("mouse at rest, syncing clipboards with screen \"%s\"", getName(m_active).c_str());
+  syncClipboards();
+}
+
+void Server::handleClipboardSyncTimer()
+{
+  cancelClipboardSyncTimer();
+  syncClipboardsWhenMouseIdle();
+}
+
+void Server::cancelClipboardSyncTimer()
+{
+  if (m_clipboardSyncTimer == nullptr) {
+    return;
+  }
+  m_events->removeHandler(EventTypes::Timer, m_clipboardSyncTimer);
+  m_events->deleteTimer(m_clipboardSyncTimer);
+  m_clipboardSyncTimer = nullptr;
+}
+
+void Server::syncClipboardsBeforeInput()
+{
+  if (!m_enableClipboard || m_active == m_primaryClient) {
+    return;
+  }
+  // a key or click may be a paste, so the clipboard has to reach the screen first
+  if (m_clipboardSyncTimer != nullptr) {
+    cancelClipboardSyncTimer();
+    LOG_DEBUG("input before the mouse rested, syncing clipboards with screen \"%s\"", getName(m_active).c_str());
+    syncClipboards();
+  }
+  m_active->finishClipboardTransfers();
+}
+
+void Server::syncClipboards()
+{
+  if (!m_enableClipboard) {
+    return;
+  }
+  bool sent[kClipboardEnd] = {};
+  // a 0 size limit disables sharing: nothing would be sent, so don't read
+  if (m_active != m_primaryClient && m_maximumClipboardSize != 0) {
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+      if (!m_primaryClipboardStale[id]) {
+        continue;
+      }
+      m_primaryClipboardStale[id] = false;
+      const ClipboardInfo &clipboard = m_clipboards[id];
+      if (clipboard.m_clipboardOwner == getName(m_primaryClient)) {
+        sent[id] = onClipboardChanged(m_primaryClient, id, clipboard.m_clipboardSeqNum);
+      }
+    }
+  }
+  sendClipboardsToActive(sent);
+}
+
+void Server::sendClipboardsToActive(const bool (&alreadySent)[kClipboardEnd])
+{
+  for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+    if (alreadySent[id]) {
+      continue; // onClipboardChanged() just pushed it
+    }
+    // size check uses the cached fingerprint; a screen switch must not
+    // re-marshal (and so copy) every clipboard just to measure it.
+    if (m_clipboards[id].m_fingerprint.m_size > (m_maximumClipboardSize * 1024)) {
+      continue;
+    }
+    m_active->setClipboard(id, &m_clipboards[id].m_clipboard);
+  }
 }
 
 void Server::onScreensaver(bool activated)
@@ -2266,6 +2375,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
       lang.c_str()
   );
   assert(m_active != nullptr);
+  syncClipboardsBeforeInput();
 
   // Keyboard rescue: a plain Esc held for EscHoldRescue::kHoldMs restarts
   // every seat's core. Nothing fires on the press; the one-shot timer calls
@@ -2604,6 +2714,8 @@ void Server::onMouseDown(ButtonID id)
 {
   LOG_VERBOSE("onMouseDown id=%d", id);
   assert(m_active != nullptr);
+  noteMouseActivity();
+  syncClipboardsBeforeInput();
 
   // relay
   m_active->mouseDown(id);
@@ -2613,6 +2725,7 @@ void Server::onMouseUp(ButtonID id)
 {
   LOG_VERBOSE("onMouseUp id=%d", id);
   assert(m_active != nullptr);
+  noteMouseActivity();
 
   // relay
   m_active->mouseUp(id);
@@ -2621,6 +2734,7 @@ void Server::onMouseUp(ButtonID id)
 bool Server::onMouseMovePrimary(int32_t x, int32_t y)
 {
   LOG_VERBOSE("onMouseMovePrimary %d,%d", x, y);
+  noteMouseActivity();
 
   // mouse move on primary (server's) screen
   if (m_active != m_primaryClient) {
@@ -2725,6 +2839,7 @@ bool Server::onMouseMovePrimary(int32_t x, int32_t y)
 void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
 {
   LOG_VERBOSE("mouse move on secondary: %+d,%+d", dx, dy);
+  noteMouseActivity();
 
   // Fork: env-var mouse multiplier; move to Settings when upstream accepts a setting.
   const static auto adjustEnv = "DESKFLOW_MOUSE_ADJUSTMENT";
@@ -2905,6 +3020,7 @@ void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
 void Server::onMouseWheel(int32_t xDelta, int32_t yDelta)
 {
   LOG_VERBOSE("onMouseWheel %+d,%+d", xDelta, yDelta);
+  noteMouseActivity();
   assert(m_active != nullptr);
 
   // relay
@@ -2918,6 +3034,7 @@ void Server::onMouseWheelEx(const WheelEx &ex)
       static_cast<int>(ex.phase), static_cast<int>(ex.momentum)
   );
   assert(m_active != nullptr);
+  noteMouseActivity();
 
   if (ex.phase != ScrollPhase::None) {
     m_wheelPhaseOpen = ex.phase == ScrollPhase::Began || ex.phase == ScrollPhase::Changed;
@@ -3134,7 +3251,8 @@ void Server::forceLeaveClient(const BaseClientProxy *client)
          m_x, m_y)
     );
 
-    // cut over
+    // cut over (a clipboard sync pending for the lost screen is moot)
+    cancelClipboardSyncTimer();
     m_active = m_primaryClient;
     m_wheelPhaseOpen = false;
     m_wheelMomentumOpen = false;

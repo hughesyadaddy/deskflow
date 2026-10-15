@@ -21,13 +21,23 @@
 
 OSXClipboard::OSXClipboard() : m_time(0), m_pboard(nullptr)
 {
+  init(kPasteboardClipboard);
+}
+
+OSXClipboard::OSXClipboard(CFStringRef pasteboardName) : m_time(0), m_pboard(nullptr)
+{
+  init(pasteboardName);
+}
+
+void OSXClipboard::init(CFStringRef pasteboardName)
+{
   m_converters.push_back(new OSXClipboardHTMLConverter);
   m_converters.push_back(new OSXClipboardBMPConverter);
   m_converters.push_back(new OSXClipboardUTF8Converter);
   m_converters.push_back(new OSXClipboardUTF16Converter);
   m_converters.push_back(new OSXClipboardTextConverter);
 
-  OSStatus createErr = PasteboardCreate(kPasteboardClipboard, &m_pboard);
+  OSStatus createErr = PasteboardCreate(pasteboardName, &m_pboard);
   if (createErr != noErr) {
     LOG_WARN("failed to create clipboard reference: error %i", createErr);
     LOG_ERR("unable to connect to pasteboard, clipboard sharing disabled", createErr);
@@ -43,7 +53,44 @@ OSXClipboard::OSXClipboard() : m_time(0), m_pboard(nullptr)
 
 OSXClipboard::~OSXClipboard()
 {
+  resetFlavors();
   clearConverters();
+}
+
+void OSXClipboard::resetFlavors() const
+{
+  if (m_flavors != nullptr) {
+    CFRelease(m_flavors);
+    m_flavors = nullptr;
+  }
+}
+
+bool OSXClipboard::itemHasFlavor(PasteboardItemID item, CFStringRef type) const
+{
+  // while open, list the item's flavours once and answer every has()/get()
+  // from that list; outside open/close nothing bounds the cache's lifetime,
+  // so list afresh
+  CFArrayRef flavors = m_open ? m_flavors : nullptr;
+  CFArrayRef fresh = nullptr;
+  if (flavors == nullptr) {
+    ++m_flavorListCount;
+    if (PasteboardCopyItemFlavors(m_pboard, item, &fresh) != noErr) {
+      LOG_DEBUG("failed to list clipboard flavours");
+      fresh = nullptr;
+    }
+    flavors = fresh;
+    if (m_open && fresh != nullptr) {
+      m_flavors = fresh; // owned by the cache now
+      fresh = nullptr;
+    }
+  }
+
+  const bool found =
+      flavors != nullptr && CFArrayContainsValue(flavors, CFRangeMake(0, CFArrayGetCount(flavors)), type);
+  if (fresh != nullptr) {
+    CFRelease(fresh);
+  }
+  return found;
 }
 
 bool OSXClipboard::empty()
@@ -51,6 +98,8 @@ bool OSXClipboard::empty()
   LOG_DEBUG("emptying clipboard");
   if (m_pboard == nullptr)
     return false;
+
+  resetFlavors();
 
   OSStatus err = PasteboardClear(m_pboard);
   if (err != noErr) {
@@ -79,6 +128,8 @@ void OSXClipboard::add(Format format, const std::string &data)
 {
   if (m_pboard == nullptr)
     return;
+
+  resetFlavors();
 
   LOG_DEBUG("add %d bytes to clipboard format: %d", data.size(), format);
   if (format == IClipboard::Format::Text) {
@@ -117,13 +168,16 @@ bool OSXClipboard::open(Time time) const
 
   LOG_DEBUG("opening clipboard");
   m_time = time;
+  resetFlavors();
+  m_open = true;
   return true;
 }
 
 void OSXClipboard::close() const
 {
   LOG_DEBUG("closing clipboard");
-  /* not needed */
+  m_open = false;
+  resetFlavors();
 }
 
 IClipboard::Time OSXClipboard::getTime() const
@@ -141,15 +195,8 @@ bool OSXClipboard::has(Format format) const
 
   for (ConverterList::const_iterator index = m_converters.begin(); index != m_converters.end(); ++index) {
     IOSXClipboardConverter *converter = *index;
-    if (converter->getFormat() == format) {
-      PasteboardFlavorFlags flags;
-      CFStringRef type = converter->getOSXFormat();
-
-      OSStatus res;
-
-      if ((res = PasteboardGetItemFlavorFlags(m_pboard, item, type, &flags)) == noErr) {
-        return true;
-      }
+    if (converter->getFormat() == format && itemHasFlavor(item, converter->getOSXFormat())) {
+      return true;
     }
   }
 
@@ -172,10 +219,9 @@ std::string OSXClipboard::get(Format format) const
   for (ConverterList::const_iterator index = m_converters.begin(); index != m_converters.end(); ++index) {
     converter = *index;
 
-    PasteboardFlavorFlags flags;
     type = converter->getOSXFormat();
 
-    if (converter->getFormat() == format && PasteboardGetItemFlavorFlags(m_pboard, item, type, &flags) == noErr) {
+    if (converter->getFormat() == format && itemHasFlavor(item, type)) {
       break;
     }
     converter = nullptr;

@@ -15,6 +15,8 @@ private Q_SLOTS:
   void open();
   void singleFormat();
   void formatConvert_UTF8();
+  // uses a private named pasteboard, never the user's general pasteboard
+  void privatePasteboard_listsFlavorsOncePerOpen();
 
 private:
   Log m_log;

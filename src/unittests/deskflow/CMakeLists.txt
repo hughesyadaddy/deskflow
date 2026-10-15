@@ -22,6 +22,22 @@ create_test(
 )
 
 create_test(
+  NAME ClipboardSenderTests
+  DEPENDS app
+  LIBS arch base io ${extra_libs}
+  SOURCE ClipboardSenderTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/deskflow"
+)
+
+create_test(
+  NAME ClipboardReadCacheTests
+  DEPENDS app
+  LIBS arch base io ${extra_libs}
+  SOURCE ClipboardReadCacheTests.cpp
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/deskflow"
+)
+
+create_test(
   NAME IKeyStateTests
   DEPENDS app
   LIBS arch base ${extra_libs}

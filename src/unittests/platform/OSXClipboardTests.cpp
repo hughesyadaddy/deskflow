@@ -40,3 +40,34 @@ void OSXClipboardTests::formatConvert_UTF8()
 }
 
 QTEST_MAIN(OSXClipboardTests)
+
+void OSXClipboardTests::privatePasteboard_listsFlavorsOncePerOpen()
+{
+  using enum IClipboard::Format;
+
+  OSXClipboard clipboard(CFSTR("org.deskflow.unittest.flavors"));
+  QVERIFY(clipboard.open(0));
+  QVERIFY(clipboard.empty());
+  clipboard.add(Text, m_testString);
+  clipboard.close();
+
+  // a whole read (has() for every format, get() for the present one) lists
+  // the item's flavours once, instead of querying the owner per flavour
+  QVERIFY(clipboard.open(0));
+  const int before = clipboard.flavorListCountForTests();
+  QVERIFY(clipboard.has(Text));
+  QVERIFY(!clipboard.has(HTML));
+  QVERIFY(!clipboard.has(Bitmap));
+  QCOMPARE(clipboard.get(Text), m_testString);
+  QCOMPARE(clipboard.get(HTML), std::string());
+  QCOMPARE(clipboard.flavorListCountForTests(), before + 1);
+  clipboard.close();
+
+  // the list does not outlive the read: the next open lists again
+  QVERIFY(clipboard.open(0));
+  QVERIFY(clipboard.has(Text));
+  QCOMPARE(clipboard.flavorListCountForTests(), before + 2);
+  QVERIFY(clipboard.empty());
+  QVERIFY(!clipboard.has(Text)); // emptied: stale list dropped
+  clipboard.close();
+}
