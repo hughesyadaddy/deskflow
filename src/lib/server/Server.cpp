@@ -1837,6 +1837,11 @@ void Server::handleClipboardGrabbed(const Event &event, BaseClientProxy *grabber
   );
   clipboard.m_clipboardOwner = getName(grabber);
   clipboard.m_clipboardSeqNum = info->m_sequenceNumber;
+  if (grabber != m_primaryClient) {
+    // another screen owns it now: a pending re-read of the primary is moot,
+    // and must not hold this copy back from the primary on the way home
+    m_primaryClipboardStale[info->m_id] = false;
+  }
 
   // a copy noticed on the primary after we left is read later (deferred), so
   // keep the last data until that read replaces it; otherwise it isn't known
@@ -2312,7 +2317,7 @@ void Server::sendClipboardsToActive(const bool (&alreadySent)[kClipboardEnd])
     if (alreadySent[id]) {
       continue; // onClipboardChanged() just pushed it
     }
-    if (m_primaryClipboardStale[id]) {
+    if (m_primaryClipboardStale[id] && m_clipboards[id].m_clipboardOwner == getName(m_primaryClient)) {
       continue; // superseded by a primary copy not read yet; sent once read
     }
     // size check uses the cached fingerprint; a screen switch must not

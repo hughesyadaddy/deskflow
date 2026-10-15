@@ -508,6 +508,7 @@ private Q_SLOTS:
   void inputBeforeMouseRests_syncsClipboardFirst();
   void returningHome_cancelsDeferredSync();
   void grabWhileAway_isDeferredUntilMouseRests();
+  void remoteCopyWhileDeferred_clearsPrimaryStale();
 
 private:
   std::unique_ptr<Arch> m_arch;
@@ -859,6 +860,37 @@ void ServerClipboardTests::grabWhileAway_isDeferredUntilMouseRests()
     QCOMPARE(fixture.platform->m_reads, reads + 1);
     QCOMPARE(remoteA.m_setClipboard[kClipboardClipboard], sentBefore + 1);
 
+  }
+}
+
+// A copy on a secondary while the primary re-read is still pending: the
+// primary no longer owns the clipboard, so nothing may hold the new copy back.
+void ServerClipboardTests::remoteCopyWhileDeferred_clearsPrimaryStale()
+{
+  Fixture fixture;
+  fixture.platform->setText(kClipboardClipboard, makePayload(4096, 'r'));
+  RecordingProxy remoteA("remoteA");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remoteA", &remoteA).second);
+    server.m_clientSet.insert(&remoteA);
+    const auto unregister = qScopeGuard([&] {
+      server.m_clientSet.erase(&remoteA);
+      server.m_clients.erase("remoteA");
+    });
+
+    server.noteMouseActivity();
+    server.switchScreen(&remoteA, 50, 60, false);
+    QVERIFY(server.m_clipboardSyncTimer != nullptr);
+    QVERIFY(server.m_primaryClipboardStale[kClipboardClipboard]);
+
+    IScreen::ClipboardInfo info{kClipboardClipboard, 7};
+    server.handleClipboardGrabbed(
+        Event(EventTypes::ClipboardGrabbed, remoteA.getEventTarget(), &info, Event::EventFlags::DontFreeData), &remoteA
+    );
+    QVERIFY(!server.m_primaryClipboardStale[kClipboardClipboard]);
+    QCOMPARE(server.m_clipboards[kClipboardClipboard].m_clipboardOwner, std::string("remoteA"));
   }
 }
 
