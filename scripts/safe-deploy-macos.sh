@@ -98,6 +98,9 @@ U="gui/$(id -u)"
 for l in io.github.hughesyadaddy.deskflow-core io.github.hughesyadaddy.deskflow; do
   launchctl kickstart -k "$U/$l" 2>/dev/null || log "note: $l not loaded"; done
 log "installed $VER (rollback: $RB -> mv back to $APP)"
+# keep only the newest rollback copy (disks have run full on both Macs)
+ls -dt /tmp/Deskflow.app.prev* 2>/dev/null | tail -n +2 | while IFS= read -r d; do rm -rf "$d"; done
+rm -rf "$STAGE"
 
 # ---- 4b. optional Mouser (only when the installed build is not repo HEAD) --
 if [ "$WITH_MOUSER" = 1 ] && [ -d "$MOUSER_REPO/.git" ]; then
