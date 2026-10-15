@@ -938,6 +938,82 @@ void ServerKeyLedgerTests::escDropout_serverBringsCursorHomeAndReleasesEverythin
   }
 }
 
+void ServerKeyLedgerTests::reclaim_displaySleepBringsCursorHomeAndReleasesKeys()
+{
+  // Oct 15 02:10-03:57 ET: cursor parked on a sleeping client; display sleep
+  // on the server must bring it home and release everything held there.
+  using deskflow::coordination::RelayKeyPhase;
+  Fixture f;
+  f.init({"remote"});
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    server.relayForwardedKey(relayed("macbookpro", RelayKeyPhase::Down, kKeyShift_L, kButtonShift, KeyModifierShift));
+    remote.keys.clear();
+    server.reclaimPrimary("test");
+    QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(f.primary));
+    QCOMPARE(remote.count(RecordedKey::Kind::Up, kKeyShift_L), 1);
+    QVERIFY(server.m_forwardedHeld.empty());
+    QVERIFY(server.m_keysHeldOnActive.empty());
+    // already home: a second reclaim is a no-op
+    server.reclaimPrimary("test");
+    QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(f.primary));
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerKeyLedgerTests::reclaim_remoteDesktopInputHoldsEdgeCrossing()
+{
+  // A remote-desktop cursor touching the edge must not cross (03:57:20 ET
+  // bouncing); remote input while on a client brings the cursor home.
+  Fixture f;
+  f.init({"remote"});
+  QVERIFY(f.config.connect("server", Direction::Left, 0.0F, 1.0F, "remote", 0.0F, 1.0F));
+  QVERIFY(f.config.connect("remote", Direction::Right, 0.0F, 1.0F, "server", 0.0F, 1.0F));
+  RecordingClient remote("remote");
+  {
+    Server server(f.config, f.primary, f.screen, &f.events);
+    QVERIFY(server.m_clients.emplace("remote", &remote).second);
+    server.switchScreen(&remote, 50, 60, false);
+    server.noteRemoteDesktopInput();
+    QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(f.primary));
+    QVERIFY(server.m_remoteHold.active(deskflow::reclaim::Clock::now()));
+    int32_t ax, ay, aw, ah;
+    f.primary->getShape(ax, ay, aw, ah);
+    server.onMouseMovePrimary(ax + aw / 2, ay + ah / 2);
+    QVERIFY(!server.onMouseMovePrimary(ax, ay + ah / 2)); // edge, but held
+    QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(f.primary));
+    // physical input after the hold expires crosses again (wake path intact)
+    server.m_remoteHold = deskflow::reclaim::RemoteInputHold{};
+    server.onMouseMovePrimary(ax + aw / 2, ay + ah / 2);
+    server.onMouseMovePrimary(ax, ay + ah / 2);
+    QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(&remote));
+    server.m_clients.erase("remote");
+  }
+}
+
+void ServerKeyLedgerTests::reclaim_remoteDesktopProcessPaths()
+{
+  using deskflow::reclaim::isRemoteDesktopProcessPath;
+  QVERIFY(isRemoteDesktopProcessPath("/Applications/RustDesk.app/Contents/MacOS/service"));
+  QVERIFY(isRemoteDesktopProcessPath("/Applications/TeamViewer.app/Contents/MacOS/TeamViewer_Desktop"));
+  QVERIFY(isRemoteDesktopProcessPath("/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/x"));
+  QVERIFY(isRemoteDesktopProcessPath("/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent"));
+  QVERIFY(isRemoteDesktopProcessPath("/Library/Google/Chrome Remote Desktop/remoting_me2me_host"));
+  QVERIFY(!isRemoteDesktopProcessPath("/Applications/Mouser.app/Contents/MacOS/Mouser"));
+  QVERIFY(!isRemoteDesktopProcessPath("/Applications/Deskflow.app/Contents/MacOS/deskflow-core"));
+  QVERIFY(!isRemoteDesktopProcessPath("/System/Library/CoreServices/System Events.app/Contents/MacOS/System Events"));
+  QVERIFY(!isRemoteDesktopProcessPath(""));
+  deskflow::reclaim::RemoteInputHold hold;
+  const auto t0 = deskflow::reclaim::Clock::now();
+  QVERIFY(!hold.active(t0));
+  hold.note(t0);
+  QVERIFY(hold.active(t0 + std::chrono::seconds(9)));
+  QVERIFY(!hold.active(t0 + std::chrono::seconds(11)));
+}
+
 void ServerKeyLedgerTests::clearAll_withoutSenderReleasesEveryRelayedKey()
 {
   // Legacy clear-all (no sender name): every relayed hold goes.

@@ -404,6 +404,12 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
       EventTypes::PrimaryScreenSaverDeactivated, m_primaryClient->getEventTarget(),
       [this](const auto &) { onScreensaver(false); }
   );
+  m_events->addHandler(EventTypes::PrimaryScreenReclaim, m_primaryClient->getEventTarget(), [this](const auto &) {
+    reclaimPrimary("display sleep / screen lock");
+  });
+  m_events->addHandler(EventTypes::PrimaryRemoteDesktopInput, m_primaryClient->getEventTarget(), [this](const auto &) {
+    noteRemoteDesktopInput();
+  });
   m_events->addHandler(EventTypes::ServerSwitchToScreen, m_inputFilter, [this](const auto &e) {
     handleSwitchToScreenEvent(e);
   });
@@ -2538,6 +2544,28 @@ void Server::releaseForwardedKeys(const std::string &sender)
   }
 }
 
+void Server::reclaimPrimary(const char *why)
+{
+  if (m_active == nullptr || m_primaryClient == nullptr || m_active == m_primaryClient) {
+    return;
+  }
+  LOG_INFO("[reclaim] %s: cursor home from \"%s\", keys released", why, getName(m_active).c_str());
+  jumpToScreen(m_primaryClient); // client leave() releases everything it injected
+  releaseForwardedKeys();
+  m_forwardedHeldOnPrimary.clear();
+}
+
+void Server::noteRemoteDesktopInput()
+{
+  const auto now = deskflow::reclaim::Clock::now();
+  const bool wasActive = m_remoteHold.active(now);
+  m_remoteHold.note(now);
+  if (!wasActive) {
+    LOG_INFO("[reclaim] remote-desktop input on this machine: edge crossing paused while it is active");
+  }
+  reclaimPrimary("remote-desktop input");
+}
+
 void Server::dropout()
 {
   LOG_INFO("[esc-dropout] server teardown: cursor home, releasing every held/relayed key, stopping serving");
@@ -2639,6 +2667,12 @@ bool Server::onMouseMovePrimary(int32_t x, int32_t y)
   // save position
   m_x = x;
   m_y = y;
+
+  // A remote-desktop session is driving this machine: its cursor touching an
+  // edge must never cross onto (and get captured by) a client.
+  if (m_remoteHold.active(deskflow::reclaim::Clock::now())) {
+    return false;
+  }
 
   // get screen shape
   int32_t ax;

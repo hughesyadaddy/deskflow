@@ -77,7 +77,7 @@ private:
     }
     // physical keys only: nothing this process (or any process) posted
     if (deskflow::platform::isInjectedEvent(event) ||
-        CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid()) {
+        CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0) { // hardware only: no remote-desktop Esc
       return event;
     }
     const auto vk = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);

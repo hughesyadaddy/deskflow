@@ -706,8 +706,11 @@ void Client::bindNetworkInterface(IDataSocket *socket) const
 
 void Client::startKeyRelay()
 {
-  if (const char *env = std::getenv("DESKFLOW_KEY_RELAY"); env != nullptr && std::strcmp(env, "0") == 0) {
-    LOG_INFO("[relay] keyboard relay disabled (DESKFLOW_KEY_RELAY=0)");
+  // Opt-in (DESKFLOW_KEY_RELAY=1) since 2026-10-15: with the relay tap off
+  // this client never filters its own keyboard, so server->client forwarding
+  // and local / remote-desktop input are exactly core Deskflow.
+  if (const char *env = std::getenv("DESKFLOW_KEY_RELAY"); env == nullptr || std::strcmp(env, "1") != 0) {
+    LOG_INFO("[relay] keyboard relay off (opt in with DESKFLOW_KEY_RELAY=1)");
     return;
   }
   if (!m_keyRelay) {

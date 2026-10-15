@@ -272,6 +272,12 @@ enum class EventTypes : uint32_t
   /// Esc x5 on this machine's physical keyboard: drop out of Deskflow ~60 s.
   LocalEscDropout,
 
+  /// Primary display slept or the session locked: bring the cursor home, release keys.
+  PrimaryScreenReclaim,
+
+  /// A remote-desktop tool injected input on the primary: cursor home + hold crossings.
+  PrimaryRemoteDesktopInput,
+
   /// Fleet keyboard relay: the sender's lane failed; release every key relayed
   /// by that sender (data: CoordinationKeyClearAllInfo, coordination/CoordinationEvents.h).
   CoordinationKeyClearAll,

@@ -28,7 +28,10 @@ namespace {
 
 bool relayEventIsInjected(CGEventRef event)
 {
-  return CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid() ||
+  // Any synthetic event (non-zero source pid: remote desktop, accessibility
+  // tools, our own injection) passes locally untouched -- only hardware
+  // keystrokes (pid 0) ever follow the cursor.
+  return CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0 ||
          deskflow::platform::isInjectedEvent(event) ||
          (CGEventGetType(event) == kCGEventFlagsChanged &&
           deskflow::platform::ResyncEchoFilter::instance().matches(

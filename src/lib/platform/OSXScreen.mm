@@ -38,6 +38,12 @@
 
 #include <AppKit/NSEvent.h>
 #include <AppKit/NSPasteboard.h>
+#include "deskflow/InputReclaimPolicy.h"
+#include <libproc.h>
+#include <map>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 #include <AppKit/NSWorkspace.h>
 #include <AvailabilityMacros.h>
 #include <Foundation/NSDistributedNotificationCenter.h>
@@ -192,6 +198,18 @@ public:
     NSNotificationCenter *wnc = [[NSWorkspace sharedWorkspace] notificationCenter];
     m_wakeObserver = [[wnc addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:nil
                                    usingBlock:post] retain];
+
+    // Display sleep / screen lock: never leave the cursor (and every local or
+    // remote-desktop event) captured on a client nobody can see. Only the
+    // server listens for this; crossing again (which wakes the client) works.
+    auto reclaim = ^(NSNotification *note) {
+      LOG_DEBUG("session notification %s, queueing primary reclaim", [[note name] UTF8String]);
+      events->addEvent(Event(EventTypes::PrimaryScreenReclaim, target));
+    };
+    m_sleepObserver = [[wnc addObserverForName:NSWorkspaceScreensDidSleepNotification object:nil queue:nil
+                                    usingBlock:reclaim] retain];
+    m_lockReclaimObserver = [[dnc addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil
+                                          usingBlock:reclaim] retain];
   }
 
   ~OSXScreenImpl()
@@ -205,13 +223,46 @@ public:
     NSNotificationCenter *wnc = [[NSWorkspace sharedWorkspace] notificationCenter];
     [wnc removeObserver:m_wakeObserver];
     [m_wakeObserver release];
+    [wnc removeObserver:m_sleepObserver];
+    [m_sleepObserver release];
+    [dnc removeObserver:m_lockReclaimObserver];
+    [m_lockReclaimObserver release];
   }
 
 private:
   id m_lockObserver = nil;
   id m_unlockObserver = nil;
   id m_wakeObserver = nil;
+  id m_sleepObserver = nil;
+  id m_lockReclaimObserver = nil;
 };
+
+// Remote-desktop tools (RustDesk, TeamViewer, Screen Sharing, ...) post
+// synthetic events carrying their pid. Cached per pid: proc_pidpath is cheap
+// but this runs on every captured event.
+static bool isRemoteDesktopEvent(CGEventRef event)
+{
+  const auto pid = static_cast<pid_t>(CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID));
+  if (pid <= 0 || pid == getpid()) {
+    return false; // hardware (pid 0) or our own injection
+  }
+  static std::mutex mutex;
+  static std::map<pid_t, bool> cache;
+  std::scoped_lock lock(mutex);
+  if (const auto it = cache.find(pid); it != cache.end()) {
+    return it->second;
+  }
+  char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+  const bool remote = proc_pidpath(pid, path, sizeof(path)) > 0 && deskflow::reclaim::isRemoteDesktopProcessPath(path);
+  if (cache.size() > 256) {
+    cache.clear();
+  }
+  cache[pid] = remote;
+  if (remote) {
+    LOG_INFO("[reclaim] input from remote-desktop process %d (%s) passes through untouched", pid, path);
+  }
+  return remote;
+}
 
 //
 // OSXScreen
@@ -2186,6 +2237,25 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
   // our own primary-enter modifier resync: deliver to apps, never relay
   if (isOwnModifierResyncEvent(type, event)) {
     return event;
+  }
+
+  // Remote-desktop input is never captured or swallowed: the server brings
+  // its cursor home (and pauses edge crossing while the session is active),
+  // and the event reaches this machine exactly as the tool posted it.
+  if (screen->m_isPrimary && type != kCGEventTapDisabledByTimeout && type != kCGEventTapDisabledByUserInput &&
+      isRemoteDesktopEvent(event)) {
+    static std::atomic<int64_t> lastPostMs{0};
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()
+    )
+                              .count();
+    if (nowMs - lastPostMs.load() > 250) {
+      lastPostMs = nowMs;
+      screen->getEvents()->addEvent(Event(EventTypes::PrimaryRemoteDesktopInput, screen->getEventTarget()));
+    }
+    if (!screen->m_isOnScreen) {
+      return event;
+    }
   }
 
   switch (type) {

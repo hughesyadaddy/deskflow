@@ -28,6 +28,8 @@
 #include <climits>
 #include <functional>
 #include <map>
+#include "deskflow/InputReclaimPolicy.h"
+
 #include <memory>
 #include <set>
 #include <vector>
@@ -676,6 +678,14 @@ private:
   //! Buttons relayed DOWN while the cursor was home (injected into the
   //! primary's OS); released when the cursor leaves the primary.
   std::set<KeyButton> m_forwardedHeldOnPrimary;
+  deskflow::reclaim::RemoteInputHold m_remoteHold;
+
+public:
+  //! display sleep / lock / remote-desktop input: cursor home, keys released
+  void reclaimPrimary(const char *why);
+  void noteRemoteDesktopInput();
+
+private:
   //! Buttons each fleet peer relayed DOWN through relayForwardedKey() while
   //! the cursor was on a secondary (so they are held on the active client),
   //! keyed by sender name. A KeyClearAll from that sender releases exactly

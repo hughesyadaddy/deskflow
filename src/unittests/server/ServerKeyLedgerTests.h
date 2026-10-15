@@ -30,6 +30,9 @@ private Q_SLOTS:
   void clientRelay_keyGoesToActiveScreen();
   void clientRelay_modifierHeldAcrossSwitchIsReleasedOnLeave();
   void escDropout_serverBringsCursorHomeAndReleasesEverything();
+  void reclaim_displaySleepBringsCursorHomeAndReleasesKeys();
+  void reclaim_remoteDesktopInputHoldsEdgeCrossing();
+  void reclaim_remoteDesktopProcessPaths();
   void clientRelay_keyHeldOnPrimaryReleasedWhenCursorLeaves();
   void switch_releasesBeforeLeave();
   void enterPrimary_releasesOnlyInjectedLedger();
