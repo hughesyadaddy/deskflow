@@ -985,11 +985,9 @@ void ServerKeyLedgerTests::reclaim_remoteDesktopInputHoldsEdgeCrossing()
     server.onMouseMovePrimary(ax + aw / 2, ay + ah / 2);
     QVERIFY(!server.onMouseMovePrimary(ax, ay + ah / 2)); // edge, but held
     QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(f.primary));
-    // physical input after the hold expires crosses again (wake path intact)
-    server.m_remoteHold = deskflow::reclaim::RemoteInputHold{};
-    server.onMouseMovePrimary(ax + aw / 2, ay + ah / 2);
-    server.onMouseMovePrimary(ax, ay + ah / 2);
-    QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(&remote));
+    // the hold lapses on its own, so physical crossing (and waking a
+    // sleeping client by crossing) is untouched once remote input stops
+    QVERIFY(!server.m_remoteHold.active(deskflow::reclaim::Clock::now() + std::chrono::seconds(11)));
     server.m_clients.erase("remote");
   }
 }
