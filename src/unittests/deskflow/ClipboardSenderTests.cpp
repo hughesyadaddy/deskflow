@@ -157,6 +157,7 @@ private Q_SLOTS:
   void sendsOneChunkPerFlush();
   void inputInterleavesBetweenChunks();
   void sendRemainingWritesEverythingNow();
+  void sendRemainingIsBounded();
   void newerDataRestartsTheTransfer();
   void otherClipboardQueuesBehind();
   void emptyClipboardCompletesAtOnce();
@@ -260,6 +261,26 @@ void ClipboardSenderTests::sendRemainingWritesEverythingNow()
   QVERIFY(assembled == data);
   QCOMPARE(messages.back().kind, Message::Mouse); // input lands after the clipboard
   QCOMPARE(messages[messages.size() - 2].kind, Message::End);
+}
+
+void ClipboardSenderTests::sendRemainingIsBounded()
+{
+  EventQueue events;
+  LoopbackStream stream;
+  ClipboardSender sender(&events, &stream);
+  const auto data = payload(3 * ClipboardSender::kChunkSize, 'b');
+
+  sender.sendClipboard(data, kClipboardClipboard, 0); // start + chunk 1
+  sender.sendRemaining(ClipboardSender::kChunkSize);  // at most 2 more steps
+  QVERIFY(sender.isSending());                        // the end is left paced
+  flush(events, stream);
+  QVERIFY(!sender.isSending());
+
+  std::string assembled;
+  bool finished = false;
+  drain(stream, assembled, finished);
+  QVERIFY(finished);
+  QVERIFY(assembled == data);
 }
 
 void ClipboardSenderTests::newerDataRestartsTheTransfer()

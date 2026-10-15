@@ -429,7 +429,16 @@ bool OSXScreen::getClipboard(ClipboardID, IClipboard *dst) const
   // Carbon reference was PasteboardSynchronize'd: Carbon reads return that
   // snapshot until the next sync, so keying on the live changeCount could
   // cache a pre-sync (stale) read under the new count and keep serving it.
-  const bool cached = m_pasteboardReadCache.read(dst, m_pasteboard, [this] { return m_lastPasteboardChangeCount; });
+  // The live NSPasteboard changeCount guards the read itself: a copy made
+  // during (or since the poll before) this read is not cached.
+  const bool cached = m_pasteboardReadCache.read(
+      dst, m_pasteboard, [this] { return m_lastPasteboardChangeCount; },
+      [] {
+        @autoreleasepool {
+          return static_cast<long>([[NSPasteboard generalPasteboard] changeCount]);
+        }
+      }
+  );
   LOG_DEBUG("read clipboard%s", cached ? " (unchanged, from cache)" : "");
   return true;
 }

@@ -45,13 +45,23 @@ void ClipboardSender::sendClipboard(std::string data, ClipboardID id, uint32_t s
   beginTransfer(id, Transfer{std::move(data), sequence});
 }
 
-void ClipboardSender::sendRemaining()
+void ClipboardSender::sendRemaining(size_t budgetBytes)
 {
-  if (m_sending) {
-    LOG_DEBUG("sending the rest of clipboard %d ahead of input", m_currentId);
+  if (!m_sending) {
+    return;
   }
-  while (m_sending) {
+  // data chunks within the budget, plus the end chunk; a queued transfer
+  // started by the end chunk shares the same budget
+  size_t steps = budgetBytes / kChunkSize + 1;
+  LOG_DEBUG("sending up to %zu bytes of clipboard %d ahead of input", budgetBytes, m_currentId);
+  while (m_sending && steps-- > 0) {
     sendNextChunk();
+  }
+  if (m_sending) {
+    LOG_DEBUG(
+        "clipboard %d: %zu of %zu bytes left, continuing paced", m_currentId, m_current.data.size() - m_sent,
+        m_current.data.size()
+    );
   }
 }
 

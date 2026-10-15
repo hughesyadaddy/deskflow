@@ -13,7 +13,8 @@
 
 void OSXClipboardTests::open()
 {
-  OSXClipboard clipboard;
+  // a private named pasteboard: tests must never touch the user's clipboard
+  OSXClipboard clipboard(CFSTR("org.deskflow.unittest.open"));
   QVERIFY(clipboard.open(0));
   QVERIFY(clipboard.empty());
   clipboard.close();
@@ -23,7 +24,7 @@ void OSXClipboardTests::singleFormat()
 {
   using enum IClipboard::Format;
 
-  OSXClipboard clipboard;
+  OSXClipboard clipboard(CFSTR("org.deskflow.unittest.single"));
   QVERIFY(clipboard.empty());
   clipboard.add(Text, m_testString);
   QVERIFY(clipboard.has(Text));

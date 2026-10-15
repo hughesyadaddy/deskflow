@@ -8,6 +8,8 @@
 
 #include "server/Server.h"
 
+#include "deskflow/PasteChord.h"
+
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "common/Settings.h"
@@ -875,6 +877,9 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
         const bool noneSent[kClipboardEnd] = {};
         sendClipboardsToActive(noneSent);
       } else {
+        // re-arm for this screen: a deferral pending from the previous hop
+        // (secondary -> secondary) must not be left keyed to that hop
+        cancelClipboardSyncTimer();
         syncClipboardsWhenMouseIdle();
       }
     }
@@ -1827,8 +1832,13 @@ void Server::handleClipboardGrabbed(const Event &event, BaseClientProxy *grabber
   clipboard.m_clipboardOwner = getName(grabber);
   clipboard.m_clipboardSeqNum = info->m_sequenceNumber;
 
-  // clear the clipboard data (since it's not known at this point)
-  clearClipboard(clipboard);
+  // a copy noticed on the primary after we left is read later (deferred), so
+  // keep the last data until that read replaces it; otherwise it isn't known
+  // at this point
+  const bool deferRead = grabber == m_primaryClient && m_active != m_primaryClient && m_enableClipboard;
+  if (!deferRead) {
+    clearClipboard(clipboard);
+  }
 
   // tell all other screens to take ownership of clipboard.  tell the
   // grabber that it's clipboard isn't dirty.
@@ -1841,7 +1851,7 @@ void Server::handleClipboardGrabbed(const Event &event, BaseClientProxy *grabber
     }
   }
 
-  if (grabber == m_primaryClient && m_active != m_primaryClient) {
+  if (deferRead) {
     // the copy was noticed after we left (e.g. made just before crossing):
     // read and send it once the mouse rests, not in the middle of a motion
     LOG_DEBUG("clipboard grabbed while active screen was changed, resending clipboard data");
@@ -2296,6 +2306,9 @@ void Server::sendClipboardsToActive(const bool (&alreadySent)[kClipboardEnd])
     if (alreadySent[id]) {
       continue; // onClipboardChanged() just pushed it
     }
+    if (m_primaryClipboardStale[id]) {
+      continue; // superseded by a primary copy not read yet; sent once read
+    }
     // size check uses the cached fingerprint; a screen switch must not
     // re-marshal (and so copy) every clipboard just to measure it.
     if (m_clipboards[id].m_fingerprint.m_size > (m_maximumClipboardSize * 1024)) {
@@ -2375,7 +2388,10 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
       lang.c_str()
   );
   assert(m_active != nullptr);
-  syncClipboardsBeforeInput();
+  // only a paste needs the clipboard first; typing and modifiers never read it
+  if (deskflow::isPasteChord(id, mask)) {
+    syncClipboardsBeforeInput();
+  }
 
   // Keyboard rescue: a plain Esc held for EscHoldRescue::kHoldMs restarts
   // every seat's core. Nothing fires on the press; the one-shot timer calls

@@ -8,6 +8,8 @@
 
 #include "deskflow/Clipboard.h"
 
+#include <chrono>
+#include <cstddef>
 #include <functional>
 #include <memory>
 
@@ -26,12 +28,34 @@ class ClipboardReadCache
 public:
   using ChangeCount = std::function<long()>;
 
+  //! Bounds on one read of the platform clipboard
+  struct Limits
+  {
+    //! A format bigger than this is dropped (0 = no cap)
+    size_t maxFormatBytes = 8 * 1024 * 1024;
+    //! Past this, formats after text are skipped (0 = no budget)
+    std::chrono::milliseconds budget{250};
+  };
+
   //! Copy \p source into \p dst, from the cache while \p changeCount is unchanged
   /*!
-  Returns true when served from the cache.  A read during which the counter
-  moved is not cached.
+  Returns true when served from the cache.  \p changeCount keys the cache (the
+  count the source snapshot belongs to); \p liveCount, when given, is the
+  platform's live counter: a read during which it moved, or that started with
+  it ahead of the key, is not cached.  Without it \p changeCount is used for
+  both.
   */
-  bool read(IClipboard *dst, const IClipboard &source, const ChangeCount &changeCount);
+  bool read(
+      IClipboard *dst, const IClipboard &source, const ChangeCount &changeCount, const ChangeCount &liveCount = {}
+  );
+
+  //! Copy \p src into \p dst within \p limits (text first; see Limits)
+  static bool copyBounded(IClipboard *dst, const IClipboard *src, const Limits &limits);
+
+  void setLimits(const Limits &limits)
+  {
+    m_limits = limits;
+  }
 
   //! Drop the cached copy (call before writing the platform clipboard)
   void invalidate();
@@ -46,4 +70,5 @@ private:
   std::unique_ptr<Clipboard> m_cache;
   bool m_valid = false;
   long m_changeCount = 0;
+  Limits m_limits;
 };

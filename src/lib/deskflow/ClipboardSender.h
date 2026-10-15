@@ -50,11 +50,13 @@ public:
   //! Start (or queue) sending marshalled clipboard \p data
   void sendClipboard(std::string data, ClipboardID id, uint32_t sequence);
 
-  //! Write everything still pending now, so the next message follows it
+  //! Write up to \p budgetBytes of what is still pending now, ahead of input
   /*!
-  Used before a key press or click, which may be a paste.
+  Used before a paste chord or click.  Bounded so a huge clipboard can't stall
+  the event loop (and every key behind it): a transfer that fits the budget
+  completes before the input; the rest stays paced, one chunk per flush.
   */
-  void sendRemaining();
+  void sendRemaining(size_t budgetBytes = kFlushBudget);
 
   //! True while a transfer is in flight or queued
   bool isSending() const
@@ -64,6 +66,9 @@ public:
 
   //! Data chunk size (one per flush)
   static constexpr size_t kChunkSize = 64 * 1024;
+
+  //! Most data sendRemaining() writes in one call by default
+  static constexpr size_t kFlushBudget = 1024 * 1024;
 
 private:
   struct Transfer

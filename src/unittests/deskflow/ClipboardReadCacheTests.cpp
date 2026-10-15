@@ -14,8 +14,12 @@
 
 #include <QTest>
 
+#include "deskflow/PasteChord.h"
+
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -37,6 +41,33 @@ public:
   mutable int m_gets = 0;
 };
 
+class SlowClipboard : public CountingClipboard
+{
+public:
+  std::string get(Format format) const override
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    return CountingClipboard::get(format);
+  }
+};
+
+void fill(IClipboard &clipboard, const std::string &text, const std::string &html)
+{
+  clipboard.open(0);
+  clipboard.empty();
+  clipboard.add(IClipboard::Format::Text, text);
+  clipboard.add(IClipboard::Format::HTML, html);
+  clipboard.close();
+}
+
+bool hasFormat(const IClipboard &clipboard, IClipboard::Format format)
+{
+  clipboard.open(0);
+  const bool has = clipboard.has(format);
+  clipboard.close();
+  return has;
+}
+
 std::string textOf(const IClipboard &clipboard)
 {
   clipboard.open(0);
@@ -56,6 +87,11 @@ private Q_SLOTS:
   void changedCountRereads();
   void changeDuringReadIsNotCached();
   void invalidateForcesReread();
+  void liveCountMovingIsNotCached();
+  void liveAheadOfKeyIsNotCached();
+  void oversizedFormatIsSkipped();
+  void overBudgetSendsTextOnly();
+  void onlyPasteChordsFlush();
 
 private:
   std::unique_ptr<Arch> m_arch;
@@ -133,6 +169,77 @@ void ClipboardReadCacheTests::invalidateForcesReread()
   Clipboard dst2;
   QVERIFY(!cache.read(&dst2, source, fixed));
   QVERIFY(source.m_gets > before);
+}
+
+void ClipboardReadCacheTests::liveCountMovingIsNotCached()
+{
+  CountingClipboard source;
+  source.setText("racy");
+  ClipboardReadCache cache;
+  long live = 5;
+  Clipboard dst;
+  QVERIFY(!cache.read(&dst, source, [] { return 5L; }, [&] { return live++; }));
+  QCOMPARE(textOf(dst), std::string("racy"));
+  QVERIFY(!cache.isValid());
+}
+
+void ClipboardReadCacheTests::liveAheadOfKeyIsNotCached()
+{
+  CountingClipboard source;
+  source.setText("snapshot");
+  ClipboardReadCache cache;
+  Clipboard dst;
+  // a copy landed after the last poll: the snapshot read must not be cached
+  QVERIFY(!cache.read(&dst, source, [] { return 5L; }, [] { return 6L; }));
+  QVERIFY(!cache.isValid());
+  Clipboard dst2;
+  QVERIFY(!cache.read(&dst2, source, [] { return 6L; }, [] { return 6L; }));
+  QVERIFY(cache.isValid());
+}
+
+void ClipboardReadCacheTests::oversizedFormatIsSkipped()
+{
+  Clipboard source;
+  fill(source, "text", std::string(200, 'h'));
+  ClipboardReadCache::Limits limits;
+  limits.maxFormatBytes = 100;
+  Clipboard dst;
+  QVERIFY(ClipboardReadCache::copyBounded(&dst, &source, limits));
+  QCOMPARE(textOf(dst), std::string("text"));
+  QVERIFY(!hasFormat(dst, IClipboard::Format::HTML));
+}
+
+void ClipboardReadCacheTests::overBudgetSendsTextOnly()
+{
+  SlowClipboard source;
+  fill(source, "text", "<b>html</b>");
+  ClipboardReadCache::Limits limits;
+  limits.budget = std::chrono::milliseconds(1);
+  Clipboard dst;
+  QVERIFY(ClipboardReadCache::copyBounded(&dst, &source, limits));
+  QCOMPARE(textOf(dst), std::string("text"));
+  QVERIFY(!hasFormat(dst, IClipboard::Format::HTML));
+
+  // within budget every format is copied
+  limits.budget = std::chrono::milliseconds(0);
+  Clipboard all;
+  QVERIFY(ClipboardReadCache::copyBounded(&all, &source, limits));
+  QVERIFY(hasFormat(all, IClipboard::Format::HTML));
+}
+
+void ClipboardReadCacheTests::onlyPasteChordsFlush()
+{
+  using deskflow::isPasteChord;
+  QVERIFY(isPasteChord('v', KeyModifierSuper));
+  QVERIFY(isPasteChord('v', KeyModifierControl));
+  QVERIFY(isPasteChord('V', KeyModifierControl | KeyModifierShift));
+  QVERIFY(isPasteChord(kKeyInsert, KeyModifierShift));
+  QVERIFY(!isPasteChord('v', 0));
+  QVERIFY(!isPasteChord('v', KeyModifierShift));
+  QVERIFY(!isPasteChord('a', KeyModifierSuper));
+  QVERIFY(!isPasteChord(kKeySuper_L, KeyModifierSuper));
+  QVERIFY(!isPasteChord(kKeyShift_L, KeyModifierShift));
+  QVERIFY(!isPasteChord(kKeyInsert, 0));
 }
 
 QTEST_APPLESS_MAIN(ClipboardReadCacheTests)
