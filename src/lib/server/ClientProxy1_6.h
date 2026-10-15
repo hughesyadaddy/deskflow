@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "deskflow/ClipboardSender.h"
 #include "server/ClientProxy1_5.h"
 
 class Server;
@@ -16,11 +17,14 @@ class ClientProxy1_6 : public ClientProxy1_5
 {
 public:
   ClientProxy1_6(const std::string &name, deskflow::IStream *adoptedStream, Server *server, IEventQueue *events);
-  ~ClientProxy1_6() override;
+  ~ClientProxy1_6() override = default;
 
   void setClipboard(ClipboardID id, const IClipboard *clipboard) override;
+  void finishClipboardTransfers() override;
   bool recvClipboard() override;
 
 private:
   IEventQueue *m_events;
+  // paced: one chunk per output flush, so input is never stuck behind a clipboard
+  ClipboardSender m_clipboardSender;
 };

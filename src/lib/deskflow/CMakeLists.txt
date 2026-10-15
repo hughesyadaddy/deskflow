@@ -79,6 +79,10 @@ add_library(${lib_name} STATIC ${PLATFORM_CODE}
   ServerApp.h
   StreamChunker.cpp
   StreamChunker.h
+  ClipboardSender.cpp
+  ClipboardSender.h
+  ClipboardReadCache.cpp
+  ClipboardReadCache.h
   KeyboardLayoutManager.cpp
   KeyboardLayoutManager.h
   ipc/IpcServer.cpp

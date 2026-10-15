@@ -24,6 +24,7 @@
 #include "server/Server.h"
 
 #include <QCoreApplication>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -201,8 +202,12 @@ public:
 
   bool getClipboard(ClipboardID id, IClipboard *dst) const override
   {
+    ++m_reads;
     return Clipboard::copy(dst, &m_clipboards[id]);
   }
+
+  // platform clipboard reads (the slow NSPasteboard path on macOS)
+  mutable int m_reads = 0;
 
   void getShape(int32_t &x, int32_t &y, int32_t &width, int32_t &height) const override
   {
@@ -372,6 +377,10 @@ public:
   {
     ++m_setClipboard[id];
   }
+  void finishClipboardTransfers() override
+  {
+    ++m_finishTransfers;
+  }
   void grabClipboard(ClipboardID id) override
   {
     ++m_grabClipboard[id];
@@ -436,6 +445,7 @@ public:
   int m_setClipboard[kClipboardEnd] = {0, 0};
   int m_grabClipboard[kClipboardEnd] = {0, 0};
   int m_markedDirty[kClipboardEnd] = {0, 0};
+  int m_finishTransfers = 0;
 
 private:
   NullTestStream m_stream;
@@ -494,6 +504,10 @@ private Q_SLOTS:
   void switchScreen_doesNotMarshalOrCopyClipboard();
   void unchangedClipboard_isNotRebroadcast();
   void oversizedClipboard_isNotSentOnSwitch();
+  void switchWhileMouseMoving_defersClipboardReadAndSend();
+  void inputBeforeMouseRests_syncsClipboardFirst();
+  void returningHome_cancelsDeferredSync();
+  void grabWhileAway_isDeferredUntilMouseRests();
 
 private:
   std::unique_ptr<Arch> m_arch;
@@ -676,6 +690,165 @@ void ServerClipboardTests::oversizedClipboard_isNotSentOnSwitch()
     QCOMPARE(remoteA.m_setClipboard[kClipboardSelection], 1);
 
     server.m_clients.erase("remoteA");
+  }
+}
+
+// The switch itself must not read or send the clipboard while the mouse is
+// moving: that read (every pasteboard flavour) and send froze the cursor.
+void ServerClipboardTests::switchWhileMouseMoving_defersClipboardReadAndSend()
+{
+  Fixture fixture;
+  fixture.platform->setText(kClipboardClipboard, makePayload(kPayloadBytes, 'm'));
+  RecordingProxy remoteA("remoteA");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remoteA", &remoteA).second);
+    // a failed QVERIFY returns early: never leave the stack proxy registered
+    const auto unregister = qScopeGuard([&] { server.m_clients.erase("remoteA"); });
+    server.m_clipboards[kClipboardClipboard].m_clipboardOwner = "server";
+
+    server.noteMouseActivity(); // the crossing motion
+    const auto readsBefore = fixture.platform->m_reads;
+    server.switchScreen(&remoteA, 50, 60, false);
+
+    QCOMPARE(fixture.platform->m_reads, readsBefore);
+    QCOMPARE(remoteA.m_setClipboard[kClipboardClipboard], 0);
+    QVERIFY(server.m_clipboardSyncTimer != nullptr);
+    QVERIFY(server.m_primaryClipboardStale[kClipboardClipboard]);
+
+    // still moving when the timer fires: keep waiting, still no read
+    server.noteMouseActivity();
+    server.handleClipboardSyncTimer();
+    QCOMPARE(fixture.platform->m_reads, readsBefore);
+    QVERIFY(server.m_clipboardSyncTimer != nullptr);
+
+    // mouse at rest: read once and send
+    server.m_lastMouseActivity = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    server.handleClipboardSyncTimer();
+    QCOMPARE(fixture.platform->m_reads, readsBefore + kClipboardEnd);
+    QCOMPARE(remoteA.m_setClipboard[kClipboardClipboard], 1);
+    QVERIFY(server.m_clipboardSyncTimer == nullptr);
+    QVERIFY(!server.m_primaryClipboardStale[kClipboardClipboard]);
+
+  }
+}
+
+// A key press or click may be a paste: the clipboard must reach the screen
+// before it, and a paced transfer must be finished ahead of it.
+void ServerClipboardTests::inputBeforeMouseRests_syncsClipboardFirst()
+{
+  Fixture fixture;
+  fixture.platform->setText(kClipboardClipboard, makePayload(4096, 'k'));
+  RecordingProxy remoteA("remoteA");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remoteA", &remoteA).second);
+    // a failed QVERIFY returns early: never leave the stack proxy registered
+    const auto unregister = qScopeGuard([&] { server.m_clients.erase("remoteA"); });
+    server.m_clipboards[kClipboardClipboard].m_clipboardOwner = "server";
+
+    server.noteMouseActivity();
+    server.switchScreen(&remoteA, 50, 60, false);
+    QCOMPARE(remoteA.m_setClipboard[kClipboardClipboard], 0);
+
+    server.onMouseDown(kButtonLeft);
+    QCOMPARE(remoteA.m_setClipboard[kClipboardClipboard], 1);
+    QCOMPARE(remoteA.m_finishTransfers, 1);
+    QVERIFY(server.m_clipboardSyncTimer == nullptr);
+
+    // later input only finishes transfers; nothing is re-read
+    const auto reads = fixture.platform->m_reads;
+    server.onMouseDown(kButtonLeft);
+    QCOMPARE(remoteA.m_finishTransfers, 2);
+    QCOMPARE(fixture.platform->m_reads, reads);
+
+    // a key press takes the same path
+    server.noteMouseActivity();
+    server.switchScreen(server.m_primaryClient, 10, 10, false);
+    server.noteMouseActivity();
+    server.switchScreen(&remoteA, 50, 60, false);
+    QVERIFY(server.m_clipboardSyncTimer != nullptr);
+    server.onKeyDown('v', 0, 9, "", nullptr);
+    QVERIFY(server.m_clipboardSyncTimer == nullptr);
+    QCOMPARE(remoteA.m_finishTransfers, 3);
+
+  }
+}
+
+// Back on the primary there is nothing to read; a pending sync is dropped and
+// the stale flag waits for the next leave.
+void ServerClipboardTests::returningHome_cancelsDeferredSync()
+{
+  Fixture fixture;
+  fixture.platform->setText(kClipboardClipboard, makePayload(4096, 'h'));
+  RecordingProxy remoteA("remoteA");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remoteA", &remoteA).second);
+    // a failed QVERIFY returns early: never leave the stack proxy registered
+    const auto unregister = qScopeGuard([&] { server.m_clients.erase("remoteA"); });
+    server.m_clipboards[kClipboardClipboard].m_clipboardOwner = "server";
+
+    server.noteMouseActivity();
+    server.switchScreen(&remoteA, 50, 60, false);
+    QVERIFY(server.m_clipboardSyncTimer != nullptr);
+
+    const auto reads = fixture.platform->m_reads;
+    server.noteMouseActivity();
+    server.switchScreen(server.m_primaryClient, 10, 10, false);
+    QVERIFY(server.m_clipboardSyncTimer == nullptr);
+    QCOMPARE(fixture.platform->m_reads, reads);
+    QVERIFY(server.m_primaryClipboardStale[kClipboardClipboard]);
+
+    // next trip out reads it once the mouse rests
+    server.noteMouseActivity();
+    server.switchScreen(&remoteA, 50, 60, false);
+    server.m_lastMouseActivity = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    server.handleClipboardSyncTimer();
+    QCOMPARE(fixture.platform->m_reads, reads + kClipboardEnd);
+    QCOMPARE(remoteA.m_setClipboard[kClipboardClipboard], 1);
+
+  }
+}
+
+// A copy noticed after leaving (the 1 s poll) used to be read and sent at
+// once, mid-motion on the client; it now waits for the mouse to rest too.
+void ServerClipboardTests::grabWhileAway_isDeferredUntilMouseRests()
+{
+  Fixture fixture;
+  fixture.platform->setText(kClipboardClipboard, makePayload(4096, 'g'));
+  RecordingProxy remoteA("remoteA");
+
+  {
+    Server server(fixture.config, fixture.primary, fixture.screen, &fixture.events);
+    QVERIFY(server.m_clients.emplace("remoteA", &remoteA).second);
+    // a failed QVERIFY returns early: never leave the stack proxy registered
+    const auto unregister = qScopeGuard([&] { server.m_clients.erase("remoteA"); });
+    server.m_clientSet.insert(fixture.primary);
+    server.switchScreen(&remoteA, 50, 60, false); // mouse idle: synced at once
+    QVERIFY(server.m_clipboardSyncTimer == nullptr);
+
+    fixture.platform->setText(kClipboardClipboard, makePayload(8192, 'G'));
+    IScreen::ClipboardInfo info{kClipboardClipboard, 1};
+    const auto reads = fixture.platform->m_reads;
+    server.noteMouseActivity();
+    server.handleClipboardGrabbed(
+        Event(EventTypes::ClipboardGrabbed, fixture.primary->getEventTarget(), &info, Event::EventFlags::DontFreeData),
+        fixture.primary
+    );
+    QCOMPARE(fixture.platform->m_reads, reads);
+    QVERIFY(server.m_clipboardSyncTimer != nullptr);
+    QVERIFY(server.m_primaryClipboardStale[kClipboardClipboard]);
+
+    const auto sentBefore = remoteA.m_setClipboard[kClipboardClipboard];
+    server.m_lastMouseActivity = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    server.handleClipboardSyncTimer();
+    QCOMPARE(fixture.platform->m_reads, reads + 1);
+    QCOMPARE(remoteA.m_setClipboard[kClipboardClipboard], sentBefore + 1);
+
   }
 }
 

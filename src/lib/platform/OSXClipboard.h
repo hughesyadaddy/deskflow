@@ -20,6 +20,8 @@ class OSXClipboard : public IClipboard
 {
 public:
   OSXClipboard();
+  //! Use a named pasteboard instead of the general one (tests)
+  explicit OSXClipboard(CFStringRef pasteboardName);
   virtual ~OSXClipboard();
 
   //! Test if clipboard is owned by deskflow
@@ -36,8 +38,17 @@ public:
 
   bool synchronize();
 
+  //! Test hook: PasteboardCopyItemFlavors calls made so far
+  int flavorListCountForTests() const
+  {
+    return m_flavorListCount;
+  }
+
 private:
+  void init(CFStringRef pasteboardName);
   void clearConverters();
+  bool itemHasFlavor(PasteboardItemID item, CFStringRef type) const;
+  void resetFlavors() const;
 
 private:
   using ConverterList = std::vector<IOSXClipboardConverter *>;
@@ -45,6 +56,12 @@ private:
   mutable Time m_time;
   ConverterList m_converters;
   PasteboardRef m_pboard;
+  // the item's flavour list, fetched once per open()/close(): every
+  // per-flavour query can make the copying app serve its data again (Synergy
+  // 7c95affa "list clipboard flavours once per read": a url list hung there)
+  mutable CFArrayRef m_flavors = nullptr;
+  mutable bool m_open = false;
+  mutable int m_flavorListCount = 0;
 };
 
 //! Clipboard format converter interface

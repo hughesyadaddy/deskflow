@@ -388,7 +388,23 @@ private:
   void handleLockCursorToScreenEvent(const Event &event);
 
   // event processing
-  void onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum);
+  //! Returns true when it pushed the clipboard to the active screen
+  bool onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum);
+
+  // Clipboard sync is kept OFF the screen-switch path: reading the primary's
+  // pasteboard (every format, synchronously) and queueing the whole clipboard
+  // on the socket used to happen inside switchScreen(), so a large or slow
+  // copy froze the cursor at the edge.  The read/send now runs once the mouse
+  // has rested (kMouseIdleMs), or at once before a key press or click (which
+  // may be a paste).  Same approach as Synergy 1.22 / deskflow PR #10201.
+  void noteMouseActivity();
+  void syncClipboardsWhenMouseIdle();
+  void syncClipboardsBeforeInput();
+  void syncClipboards();
+  void sendClipboardsToActive(const bool (&alreadySent)[kClipboardEnd]);
+  void handleClipboardSyncTimer();
+  void cancelClipboardSyncTimer();
+  int64_t msUntilMouseIdle() const;
   void onScreensaver(bool activated);
   void onKeyDown(KeyID, KeyModifierMask, KeyButton, const std::string &, const char *screens);
   void onKeyUp(KeyID, KeyModifierMask, KeyButton, const char *screens);
@@ -609,6 +625,14 @@ private:
   bool m_defaultLockToScreenState = false;
   bool m_disableLockToScreen = false;
   bool m_enableClipboard = true;
+
+  // deferred clipboard sync (see syncClipboardsWhenMouseIdle)
+  // per clipboard id: the primary's copy must be re-read before it is sent
+  bool m_primaryClipboardStale[kClipboardEnd] = {};
+  EventQueueTimer *m_clipboardSyncTimer = nullptr;
+  // default-constructed (epoch) means no mouse activity seen yet: idle
+  std::chrono::steady_clock::time_point m_lastMouseActivity{};
+  static constexpr int64_t kMouseIdleMs = 50;
 
   struct ChordRemapSession
   {
