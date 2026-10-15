@@ -40,6 +40,7 @@
 #include <AppKit/NSPasteboard.h>
 #include "deskflow/InputReclaimPolicy.h"
 #include <libproc.h>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <atomic>
@@ -202,14 +203,39 @@ public:
     // Display sleep / screen lock: never leave the cursor (and every local or
     // remote-desktop event) captured on a client nobody can see. Only the
     // server listens for this; crossing again (which wakes the client) works.
+    // Debounced + coalesced: sleep and lock share one generation counter; a
+    // wake/unlock (or another sleep/lock) inside kReclaimSettleSec cancels the
+    // pending reclaim, so a flapping display never yanks the cursor home.
+    std::shared_ptr<std::atomic<uint64_t>> gen = m_reclaimGen;
     auto reclaim = ^(NSNotification *note) {
-      LOG_DEBUG("session notification %s, queueing primary reclaim", [[note name] UTF8String]);
-      events->addEvent(Event(EventTypes::PrimaryScreenReclaim, target));
+      const uint64_t mine = ++(*gen);
+      const bool locked = [[note name] isEqualToString:@"com.apple.screenIsLocked"];
+      LOG_DEBUG("session notification %s: primary reclaim in %.1fs unless it reverses", [[note name] UTF8String],
+                kReclaimSettleSec);
+      dispatch_after(
+          dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(kReclaimSettleSec * NSEC_PER_SEC)),
+          dispatch_get_main_queue(), ^{
+            if (gen->load() != mine) {
+              return; // reversed (wake/unlock) or superseded by a newer sleep/lock
+            }
+            if (!locked && !CGDisplayIsAsleep(CGMainDisplayID())) {
+              return; // display already back
+            }
+            events->addEvent(Event(EventTypes::PrimaryScreenReclaim, target));
+          }
+      );
+    };
+    auto cancel = ^(NSNotification *) {
+      ++(*gen);
     };
     m_sleepObserver = [[wnc addObserverForName:NSWorkspaceScreensDidSleepNotification object:nil queue:nil
                                     usingBlock:reclaim] retain];
+    m_screensWakeObserver = [[wnc addObserverForName:NSWorkspaceScreensDidWakeNotification object:nil queue:nil
+                                          usingBlock:cancel] retain];
     m_lockReclaimObserver = [[dnc addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil
                                           usingBlock:reclaim] retain];
+    m_unlockReclaimObserver = [[dnc addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil
+                                            usingBlock:cancel] retain];
   }
 
   ~OSXScreenImpl()
@@ -223,10 +249,15 @@ public:
     NSNotificationCenter *wnc = [[NSWorkspace sharedWorkspace] notificationCenter];
     [wnc removeObserver:m_wakeObserver];
     [m_wakeObserver release];
+    ++(*m_reclaimGen); // cancel anything still pending
     [wnc removeObserver:m_sleepObserver];
     [m_sleepObserver release];
+    [wnc removeObserver:m_screensWakeObserver];
+    [m_screensWakeObserver release];
     [dnc removeObserver:m_lockReclaimObserver];
     [m_lockReclaimObserver release];
+    [dnc removeObserver:m_unlockReclaimObserver];
+    [m_unlockReclaimObserver release];
   }
 
 private:
@@ -234,7 +265,11 @@ private:
   id m_unlockObserver = nil;
   id m_wakeObserver = nil;
   id m_sleepObserver = nil;
+  id m_screensWakeObserver = nil;
   id m_lockReclaimObserver = nil;
+  id m_unlockReclaimObserver = nil;
+  static constexpr double kReclaimSettleSec = 2.5;
+  std::shared_ptr<std::atomic<uint64_t>> m_reclaimGen = std::make_shared<std::atomic<uint64_t>>(0);
 };
 
 // Remote-desktop tools (RustDesk, TeamViewer, Screen Sharing, ...) post
@@ -246,18 +281,27 @@ static bool isRemoteDesktopEvent(CGEventRef event)
   if (pid <= 0 || pid == getpid()) {
     return false; // hardware (pid 0) or our own injection
   }
+  // keyed by pid + process start time, so a recycled pid is re-checked
+  struct proc_bsdinfo info{};
+  if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != static_cast<int>(sizeof(info))) {
+    return false; // process gone or unreadable: not cached
+  }
+  const uint64_t startUs = info.pbi_start_tvsec * 1000000ULL + info.pbi_start_tvusec;
   static std::mutex mutex;
-  static std::map<pid_t, bool> cache;
+  static std::map<pid_t, std::pair<uint64_t, bool>> cache;
   std::scoped_lock lock(mutex);
-  if (const auto it = cache.find(pid); it != cache.end()) {
-    return it->second;
+  if (const auto it = cache.find(pid); it != cache.end() && it->second.first == startUs) {
+    return it->second.second;
   }
   char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-  const bool remote = proc_pidpath(pid, path, sizeof(path)) > 0 && deskflow::reclaim::isRemoteDesktopProcessPath(path);
+  if (proc_pidpath(pid, path, sizeof(path)) <= 0) {
+    return false; // failure is never cached
+  }
+  const bool remote = deskflow::reclaim::isRemoteDesktopProcessPath(path);
   if (cache.size() > 256) {
     cache.clear();
   }
-  cache[pid] = remote;
+  cache[pid] = {startUs, remote};
   if (remote) {
     LOG_INFO("[reclaim] input from remote-desktop process %d (%s) passes through untouched", pid, path);
   }
@@ -2249,13 +2293,14 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
                               std::chrono::steady_clock::now().time_since_epoch()
     )
                               .count();
+    // arm the crossing hold NOW (not via the queue), so no motion processed
+    // after this point can cross; the queued event only reclaims + logs
+    deskflow::reclaim::sharedRemoteHold().note(deskflow::reclaim::Clock::now());
     if (nowMs - lastPostMs.load() > 250) {
       lastPostMs = nowMs;
       screen->getEvents()->addEvent(Event(EventTypes::PrimaryRemoteDesktopInput, screen->getEventTarget()));
     }
-    if (!screen->m_isOnScreen) {
-      return event;
-    }
+    return event; // untouched: never reaches onMouseMove/onKey/onMouseButton
   }
 
   switch (type) {

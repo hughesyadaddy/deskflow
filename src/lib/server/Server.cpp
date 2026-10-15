@@ -2549,10 +2549,13 @@ void Server::reclaimPrimary(const char *why)
   if (m_active == nullptr || m_primaryClient == nullptr || m_active == m_primaryClient) {
     return;
   }
-  LOG_INFO("[reclaim] %s: cursor home from \"%s\", keys released", why, getName(m_active).c_str());
-  jumpToScreen(m_primaryClient); // client leave() releases everything it injected
+  LOG_INFO("[reclaim] %s: releasing keys, cursor home from \"%s\"", why, getName(m_active).c_str());
+  // release first (relayed holds on the client, relayed keys injected here),
+  // then leave the client, whose leave() releases everything it injected
   releaseForwardedKeys();
+  m_primaryClient->releaseForwardedKeys();
   m_forwardedHeldOnPrimary.clear();
+  jumpToScreen(m_primaryClient);
 }
 
 void Server::noteRemoteDesktopInput()

@@ -985,9 +985,13 @@ void ServerKeyLedgerTests::reclaim_remoteDesktopInputHoldsEdgeCrossing()
     server.onMouseMovePrimary(ax + aw / 2, ay + ah / 2);
     QVERIFY(!server.onMouseMovePrimary(ax, ay + ah / 2)); // edge, but held
     QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(f.primary));
-    // the hold lapses on its own, so physical crossing (and waking a
-    // sleeping client by crossing) is untouched once remote input stops
+    // the hold lapses on its own: physical crossing (which is how a sleeping
+    // client gets woken) works again once remote input stops
     QVERIFY(!server.m_remoteHold.active(deskflow::reclaim::Clock::now() + std::chrono::seconds(11)));
+    server.m_remoteHold.reset();
+    server.onMouseMovePrimary(ax + aw / 2, ay + ah / 2);
+    server.onMouseMovePrimary(ax - 1, ay + ah / 2);
+    QCOMPARE(server.m_active, static_cast<BaseClientProxy *>(&remote));
     server.m_clients.erase("remote");
   }
 }
@@ -1004,6 +1008,11 @@ void ServerKeyLedgerTests::reclaim_remoteDesktopProcessPaths()
   QVERIFY(!isRemoteDesktopProcessPath("/Applications/Deskflow.app/Contents/MacOS/deskflow-core"));
   QVERIFY(!isRemoteDesktopProcessPath("/System/Library/CoreServices/System Events.app/Contents/MacOS/System Events"));
   QVERIFY(!isRemoteDesktopProcessPath(""));
+  QVERIFY(isRemoteDesktopProcessPath("/Applications/Microsoft Remote Desktop.app/Contents/MacOS/Microsoft Remote Desktop"));
+  QVERIFY(isRemoteDesktopProcessPath("/Applications/Windows App.app/Contents/MacOS/Windows App"));
+  QVERIFY(isRemoteDesktopProcessPath("/Applications/VNC Viewer.app/Contents/MacOS/vncviewer"));
+  QVERIFY(!isRemoteDesktopProcessPath("/usr/local/bin/svncli"));
+  QVERIFY(!isRemoteDesktopProcessPath("/Applications/Envnc.app/Contents/MacOS/Envnc"));
   deskflow::reclaim::RemoteInputHold hold;
   const auto t0 = deskflow::reclaim::Clock::now();
   QVERIFY(!hold.active(t0));

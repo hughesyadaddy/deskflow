@@ -702,7 +702,7 @@ void Client::bindNetworkInterface(IDataSocket *socket) const
 // server (DKRL), which routes them exactly as if typed on its own keyboard.
 // The relay monitor's ledger keeps every key's Up/Repeat with its Down's
 // destination, so a key or modifier held across a crossing releases where
-// it was pressed. Disabled with DESKFLOW_KEY_RELAY=0.
+// it was pressed. Off by default; opt in with DESKFLOW_KEY_RELAY=1.
 
 void Client::startKeyRelay()
 {

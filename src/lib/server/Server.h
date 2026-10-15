@@ -678,7 +678,7 @@ private:
   //! Buttons relayed DOWN while the cursor was home (injected into the
   //! primary's OS); released when the cursor leaves the primary.
   std::set<KeyButton> m_forwardedHeldOnPrimary;
-  deskflow::reclaim::RemoteInputHold m_remoteHold;
+  deskflow::reclaim::RemoteInputHold &m_remoteHold = deskflow::reclaim::sharedRemoteHold();
 
 public:
   //! display sleep / lock / remote-desktop input: cursor home, keys released
