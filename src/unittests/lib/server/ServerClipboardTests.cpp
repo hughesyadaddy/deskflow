@@ -770,7 +770,13 @@ void ServerClipboardTests::inputBeforeMouseRests_syncsClipboardFirst()
     server.noteMouseActivity();
     server.switchScreen(&remoteA, 50, 60, false);
     QVERIFY(server.m_clipboardSyncTimer != nullptr);
+    // plain typing never reads or flushes the clipboard
     server.onKeyDown('v', 0, 9, "", nullptr);
+    server.onKeyDown(kKeyShift_L, KeyModifierShift, 0x38, "", nullptr);
+    QVERIFY(server.m_clipboardSyncTimer != nullptr);
+    QCOMPARE(remoteA.m_finishTransfers, 2);
+    // a paste chord does
+    server.onKeyDown('v', KeyModifierSuper, 9, "", nullptr);
     QVERIFY(server.m_clipboardSyncTimer == nullptr);
     QCOMPARE(remoteA.m_finishTransfers, 3);
 
@@ -834,6 +840,8 @@ void ServerClipboardTests::grabWhileAway_isDeferredUntilMouseRests()
     fixture.platform->setText(kClipboardClipboard, makePayload(8192, 'G'));
     IScreen::ClipboardInfo info{kClipboardClipboard, 1};
     const auto reads = fixture.platform->m_reads;
+    const auto sizeBefore = server.m_clipboards[kClipboardClipboard].m_fingerprint.m_size;
+    QVERIFY(sizeBefore > 0);
     server.noteMouseActivity();
     server.handleClipboardGrabbed(
         Event(EventTypes::ClipboardGrabbed, fixture.primary->getEventTarget(), &info, Event::EventFlags::DontFreeData),
@@ -842,6 +850,8 @@ void ServerClipboardTests::grabWhileAway_isDeferredUntilMouseRests()
     QCOMPARE(fixture.platform->m_reads, reads);
     QVERIFY(server.m_clipboardSyncTimer != nullptr);
     QVERIFY(server.m_primaryClipboardStale[kClipboardClipboard]);
+    // the last data is kept until the deferred read replaces it
+    QCOMPARE(server.m_clipboards[kClipboardClipboard].m_fingerprint.m_size, sizeBefore);
 
     const auto sentBefore = remoteA.m_setClipboard[kClipboardClipboard];
     server.m_lastMouseActivity = std::chrono::steady_clock::now() - std::chrono::seconds(1);
