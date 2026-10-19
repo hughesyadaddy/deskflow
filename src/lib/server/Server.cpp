@@ -347,6 +347,21 @@ void Server::fireEscRescue()
 // Server
 //
 
+namespace {
+// [cmd-diag] temporary — Super/Cmd forwarded to active client (logging only).
+void cmdDiagLogSuper(const char *phase, KeyID id, KeyModifierMask mask, KeyButton button, const char *screen)
+{
+  if (id != kKeySuper_L && id != kKeySuper_R) {
+    return;
+  }
+  LOG_INFO(
+      "[cmd-diag] server-%s id=%s mask=0x%04x button=0x%04x to=\"%s\"", phase,
+      IKeyState::describeKey(id).c_str(), mask, button, screen != nullptr ? screen : "?"
+  );
+}
+} // namespace
+
+
 Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Screen *screen, IEventQueue *events)
     : m_primaryClient(primaryClient),
       m_active(primaryClient),
@@ -2442,6 +2457,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
     } else {
       // Real Win combo: deliver the withheld Super down, then the key.
       noteKeySentToActive(m_deferredSuper.id, m_deferredSuper.button);
+      cmdDiagLogSuper("down", m_deferredSuper.id, mask, m_deferredSuper.button, getName(m_active).c_str());
       m_active->keyDown(m_deferredSuper.id, mask, m_deferredSuper.button, lang);
       m_deferredSuper.emitted = true;
       LOG_DEBUG("emitting deferred super down (non-chord key) for \"%s\"", getName(m_active).c_str());
@@ -2484,6 +2500,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
     noteKeySentToActive(id, button);
+    cmdDiagLogSuper("down", id, mask, button, getName(m_active).c_str());
     m_active->keyDown(id, mask, button, lang);
   } else {
     if (!screens && m_keyboardBroadcasting) {
@@ -2497,6 +2514,7 @@ void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const s
         if (index->second != m_primaryClient && button != 0) {
           m_keysHeldOnBroadcast[index->first][button] = id;
         }
+        cmdDiagLogSuper("down", id, mask, button, index->first.c_str());
         index->second->keyDown(id, mask, button, lang);
       }
     }
@@ -2542,10 +2560,13 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
       }
       if (deferred.emitted) {
         forgetKeySentToActive(button);
+        cmdDiagLogSuper("up", id, mask, button, getName(m_active).c_str());
         m_active->keyUp(id, mask, button);
         return;
       }
+      cmdDiagLogSuper("down", deferred.id, mask, deferred.button, getName(m_active).c_str());
       m_active->keyDown(deferred.id, mask, deferred.button, std::string{});
+      cmdDiagLogSuper("up", deferred.id, mask, deferred.button, getName(m_active).c_str());
       m_active->keyUp(deferred.id, mask, deferred.button);
       forgetKeySentToActive(deferred.button);
       LOG_DEBUG("deferred super resolved as lone tap for \"%s\"", getName(m_active).c_str());
@@ -2584,6 +2605,7 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
   // relay
   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
     forgetKeySentToActive(button);
+    cmdDiagLogSuper("up", id, mask, button, getName(m_active).c_str());
     m_active->keyUp(id, mask, button);
   } else {
     if (!screens && m_keyboardBroadcasting) {
@@ -2597,6 +2619,7 @@ void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const cha
         if (const auto held = m_keysHeldOnBroadcast.find(index->first); held != m_keysHeldOnBroadcast.end()) {
           held->second.erase(button);
         }
+        cmdDiagLogSuper("up", id, mask, button, index->first.c_str());
         index->second->keyUp(id, mask, button);
       }
     }
@@ -2663,6 +2686,7 @@ void Server::releaseForwardedKeys(const std::string &sender)
       const KeyID id = held != m_keysHeldOnActive.end() ? held->second : kKeyNone;
       forgetKeySentToActive(button);
       try {
+        cmdDiagLogSuper("up", id, 0, button, getName(m_active).c_str());
         m_active->keyUp(id, 0, button);
       } catch (const std::exception &e) { // NOSONAR
         LOG_WARN("could not release relayed button 0x%04x on \"%s\": %s", button, getName(m_active).c_str(), e.what());

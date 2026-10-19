@@ -32,6 +32,7 @@
 #include "platform/OSXEventQueueBuffer.h"
 #include "platform/OSXInjectedEvent.h"
 #include "platform/OSXKeyState.h"
+#include "platform/OSXCmdDiag.h"
 #include "platform/OSXMediaKeySupport.h"
 #include "platform/OSXPasteboardPeeker.h"
 #include "platform/OSXScreenSaver.h"
@@ -1195,6 +1196,8 @@ void OSXScreen::disable()
 void OSXScreen::enter()
 {
   m_isOnScreen = true;
+  m_lastEnterAt = std::chrono::steady_clock::now();
+  deskflow::platform::cmd_diag::noteEnter(m_isPrimary);
   showCursor();
   if (m_clipboardTimer != nullptr) {
     armClipboardTimer(); // back to the active 1 s cadence
@@ -1216,9 +1219,7 @@ void OSXScreen::enter()
       IOObjectRelease(entry);
     }
 
-    // [scroll-diag] see logWheelPostGapIfIdle(): timestamp this so the first
-    // wheel event afterward can log how long it waited on nothing.
-    m_lastEnterAt = std::chrono::steady_clock::now();
+    // [scroll-diag] see logWheelPostGapIfIdle(): m_lastEnterAt set at top of enter().
     LOG_INFO(
         "[scroll-diag] enter(): requested display wake (wrangler entry %s)",
         entry != MACH_PORT_NULL ? "found" : "MISSING"
@@ -1277,6 +1278,8 @@ bool OSXScreen::canLeave()
 
 void OSXScreen::leave()
 {
+  m_lastLeaveAt = std::chrono::steady_clock::now();
+  deskflow::platform::cmd_diag::noteLeave();
   hideCursor();
 
   if (m_isPrimary) {
@@ -2278,7 +2281,19 @@ OSXScreen::handleCGInputEventSecondary(CGEventTapProxy proxy, CGEventType type, 
   {
     OSXScreen *screen = (OSXScreen *)refcon;
     if (type == kCGEventFlagsChanged) {
-      screen->m_keyState->noteHardwareModifierFlags(CGEventGetFlags(event), OSXKeyState::monotonicSeconds());
+      const CGEventFlags macMask = CGEventGetFlags(event);
+      screen->m_keyState->noteHardwareModifierFlags(macMask, OSXKeyState::monotonicSeconds());
+      // [cmd-diag] logging only — observe local modifier edges on the client
+      // (unstick via Ctrl/Option/Cmd+Tab shows up here). Rate-limited.
+      if (deskflow::platform::cmd_diag::allowFlagsChangedLog()) {
+        using namespace deskflow::platform::cmd_diag;
+        const bool shadowCmd = (screen->m_keyState->getModifierStateAsOSXFlags() & kCommand) != 0;
+        const bool ledgerCmd =
+            screen->m_keyState->injectedModifiers().contains(static_cast<uint8_t>(kVK_Command));
+        logEvent(
+            "flagsChanged", shadowCmd, ledgerCmd, readHid(), readSession(), macMask, "vk=flags"
+        );
+      }
     }
   }
 
@@ -2303,6 +2318,11 @@ OSXScreen::handleCGInputEventSecondary(CGEventTapProxy proxy, CGEventType type, 
 CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
   OSXScreen *screen = (OSXScreen *)refcon;
+
+  // [cmd-diag] alive-stamp for tap-timeout dead-duration (ignore disable notices)
+  if (type != kCGEventTapDisabledByTimeout && type != kCGEventTapDisabledByUserInput) {
+    screen->m_lastTapEventAt = std::chrono::steady_clock::now();
+  }
 
   // our own primary-enter modifier resync: deliver to apps, never relay
   if (isOwnModifierResyncEvent(type, event)) {
@@ -2377,10 +2397,29 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
     if (AXIsProcessTrusted()) {
       if (screen->m_eventTapPort != nullptr) {
         // the tap was dead for an unknown stretch: restart the observation window
+        const auto now = std::chrono::steady_clock::now();
+        const auto deadMs = screen->m_lastTapEventAt.time_since_epoch().count() == 0
+                                ? static_cast<long long>(-1)
+                                : std::chrono::duration_cast<std::chrono::milliseconds>(now - screen->m_lastTapEventAt)
+                                      .count();
+        const CGEventFlags hid = deskflow::platform::cmd_diag::readHid();
+        const CGEventFlags sess = deskflow::platform::cmd_diag::readSession();
+        const bool shadowCmd =
+            (screen->m_keyState->getModifierStateAsOSXFlags() & kCGEventFlagMaskCommand) != 0;
+        const bool anyMod =
+            (hid & (kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate |
+                    kCGEventFlagMaskCommand)) != 0;
         screen->m_keyState->noteHardwareObservation(false, OSXKeyState::monotonicSeconds());
         CGEventTapEnable(screen->m_eventTapPort, true);
         screen->m_keyState->noteHardwareObservation(true, OSXKeyState::monotonicSeconds());
         LOG_INFO("quartz event tap was disabled by timeout, re-enabling");
+        LOG_INFO(
+            "[cmd-diag] tap-timeout re-enable dead_ms=%lld modifier_down=%d shadow_cmd=%d "
+            "os_hid_cmd=%d os_sess_cmd=%d os_hid=0x%llx os_sess=0x%llx",
+            deadMs, anyMod ? 1 : 0, shadowCmd ? 1 : 0,
+            deskflow::platform::cmd_diag::cmdOn(hid) ? 1 : 0, deskflow::platform::cmd_diag::cmdOn(sess) ? 1 : 0,
+            static_cast<unsigned long long>(hid), static_cast<unsigned long long>(sess)
+        );
       }
     } else {
       LOG_CRIT("process is not trusted anymore, quitting");

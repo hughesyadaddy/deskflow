@@ -12,11 +12,13 @@
 #include "platform/OSXMainQueue.h"
 #include "platform/OSXMediaKeySupport.h"
 #include "platform/OSXUchrKeyResource.h"
+#include "platform/OSXCmdDiag.h"
 
 #include <Carbon/Carbon.h>
 #include <IOKit/hidsystem/IOHIDLib.h>
 #include <IOKit/hidsystem/IOHIDParameter.h>
 #include <chrono>
+#include <cstdio>
 #include <pthread.h>
 
 #pragma clang diagnostic push
@@ -1386,6 +1388,13 @@ void OSXKeyState::fakeKey(const Keystroke &keystroke)
     );
 
     setKeyboardModifiers(virtualKey, keyDown);
+
+    // [cmd-diag] compute stamped flags the post will carry (logging only).
+    const bool isMod =
+        virtualKey <= 0xff && modifierFlagForVirtualKey(static_cast<uint8_t>(virtualKey)) != 0;
+    const CGEventFlags stamped =
+        isMod ? modifierEventFlags(static_cast<uint8_t>(virtualKey), keyDown) : getKeyboardEventFlags();
+
     if (postHIDVirtualKey(virtualKey, keyDown) != KERN_SUCCESS) {
       LOG_WARN("fail to post hid event");
       postKeyboardKey(virtualKey, keyDown);
@@ -1393,11 +1402,33 @@ void OSXKeyState::fakeKey(const Keystroke &keystroke)
 
     // remember which modifiers we hold down so sanitizeInjectedKeys() can
     // release exactly those and nothing the user is physically holding.
-    if (virtualKey <= 0xff && modifierFlagForVirtualKey(static_cast<uint8_t>(virtualKey)) != 0) {
+    if (isMod) {
       if (keyDown) {
         m_injectedModifiers.insert(static_cast<uint8_t>(virtualKey));
       } else {
         m_injectedModifiers.erase(static_cast<uint8_t>(virtualKey));
+      }
+    }
+
+    // [cmd-diag] temporary: modifier injects always; non-mod only when Cmd
+    // shadow/ledger is set and disagrees with OS (skip OS reads when both clear).
+    {
+      using namespace deskflow::platform::cmd_diag;
+      const bool shadowCmd = m_superPressed;
+      const bool ledgerCmd = m_injectedModifiers.contains(static_cast<uint8_t>(s_superVK));
+      if (isMod) {
+        const CGEventFlags hid = readHid();
+        const CGEventFlags sess = readSession();
+        char lab[40];
+        std::snprintf(lab, sizeof(lab), "vk=0x%02x/%s", static_cast<unsigned>(virtualKey), keyDown ? "down" : "up");
+        logEvent(keyDown ? "inject-mod-down" : "inject-mod-up", shadowCmd, ledgerCmd, hid, sess, stamped, lab);
+      } else if (shadowCmd || ledgerCmd) {
+        const CGEventFlags hid = readHid();
+        const CGEventFlags sess = readSession();
+        const bool disagree = (shadowCmd != cmdOn(hid)) || (shadowCmd != cmdOn(sess)) || (ledgerCmd != cmdOn(hid));
+        if (disagree && allowDisagreeLog()) {
+          logEvent("inject-key-disagree", shadowCmd, ledgerCmd, hid, sess, stamped, "key");
+        }
       }
     }
 

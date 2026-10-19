@@ -338,6 +338,9 @@ private:
   //! Logs the gap once per idle-then-resume transition. Remove once the
   //! root cause is confirmed or ruled out.
   std::chrono::steady_clock::time_point m_lastEnterAt{};
+  std::chrono::steady_clock::time_point m_lastLeaveAt{};
+  // [cmd-diag] last event seen by the primary quartz tap (approx. tap-alive stamp)
+  std::chrono::steady_clock::time_point m_lastTapEventAt{};
   mutable std::chrono::steady_clock::time_point m_lastWheelPostAt{};
   void logWheelPostGapIfIdle() const;
 
