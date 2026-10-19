@@ -1198,6 +1198,12 @@ void OSXScreen::enter()
   m_isOnScreen = true;
   m_lastEnterAt = std::chrono::steady_clock::now();
   deskflow::platform::cmd_diag::noteEnter(m_isPrimary);
+  {
+    using namespace deskflow::platform::cmd_diag;
+    const bool shadowCmd = (m_keyState->getModifierStateAsOSXFlags() & kCommand) != 0;
+    const bool ledgerCmd = m_keyState->injectedModifiers().contains(static_cast<uint8_t>(kVK_Command));
+    logBoundary("enter", shadowCmd, ledgerCmd);
+  }
   showCursor();
   if (m_clipboardTimer != nullptr) {
     armClipboardTimer(); // back to the active 1 s cadence
@@ -1279,6 +1285,12 @@ bool OSXScreen::canLeave()
 void OSXScreen::leave()
 {
   m_lastLeaveAt = std::chrono::steady_clock::now();
+  {
+    using namespace deskflow::platform::cmd_diag;
+    const bool shadowCmd = (m_keyState->getModifierStateAsOSXFlags() & kCommand) != 0;
+    const bool ledgerCmd = m_keyState->injectedModifiers().contains(static_cast<uint8_t>(kVK_Command));
+    logBoundary("leave", shadowCmd, ledgerCmd);
+  }
   deskflow::platform::cmd_diag::noteLeave();
   hideCursor();
 

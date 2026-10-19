@@ -115,6 +115,14 @@ Log one [cmd-diag] line. \p keyLabel is a modifier vk hex ("vk=0x37") or "key"
 for non-modifiers — never a character. \p stamped is flags on the posted event
 (or the flagsChanged event's flags).
 */
+/*! Snapshot at enter/leave — correlates thrash with Cmd shadow/OS bits. */
+inline void logBoundary(const char *kind, bool shadowCmd, bool ledgerCmd)
+{
+  const CGEventFlags hid = readHid();
+  const CGEventFlags sess = readSession();
+  logEvent(kind, shadowCmd, ledgerCmd, hid, sess, 0, "vk=boundary");
+}
+
 inline void logEvent(
     const char *kind, bool shadowCmd, bool ledgerCmd, CGEventFlags osHid, CGEventFlags osSession, CGEventFlags stamped,
     const char *keyLabel

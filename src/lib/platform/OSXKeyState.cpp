@@ -1220,10 +1220,18 @@ void OSXKeyState::sanitizeInjectedKeys()
   const double at = now();
   if (secureInputEnabled()) {
     LOG_INFO("[keys] stale-modifier sweep skipped: a password field owns input (hardware presses invisible)");
+    {
+      using namespace deskflow::platform::cmd_diag;
+      logBoundary("sweep-skip-secure", m_superPressed, m_injectedModifiers.contains(static_cast<uint8_t>(s_superVK)));
+    }
     return;
   }
   if (!hardwareObservableFor(kHardwareModifierFreshS, at)) {
     LOG_INFO("[keys] stale-modifier sweep skipped: hardware not observable for %.0f s", kHardwareModifierFreshS);
+    {
+      using namespace deskflow::platform::cmd_diag;
+      logBoundary("sweep-skip-unobs", m_superPressed, m_injectedModifiers.contains(static_cast<uint8_t>(s_superVK)));
+    }
     return;
   }
   for (uint32_t virtualKey : {s_shiftVK, s_controlVK, s_altVK, s_superVK}) {
