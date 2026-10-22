@@ -1328,4 +1328,125 @@ void OSXKeyStateTests::midSessionDialogDismissReleasesOnlyLedgeredModifier()
   QCOMPARE(keyState.getModifierStateAsOSXFlags(), CGEventFlags(kCGEventFlagMaskShift));
 }
 
+// -- stuck-Fn (2026-10-21) ---------------------------------------------------
+
+void OSXKeyStateTests::modifierPostStripsStrayFnAndNumericPad()
+{
+  // The live OS word carries SecondaryFn + NumericPad macOS left set, with no
+  // function/keypad key held by us. A modifier post must not re-publish them
+  // (that is what kept Fn stuck for 34 s): the posted word drops both.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+  keyState.fakeKey(stroke(kVK_Shift, true));
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskSecondaryFn) == 0);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskNumericPad) == 0);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskShift) != 0);
+}
+
+void OSXKeyStateTests::modifierPostKeepsFnAndNumericPadWhileArrowHeld()
+{
+  // Ctrl held + arrow injected (Mission Control): the arrow legitimately
+  // carries Fn and NumericPad while down, so a modifier post made meanwhile
+  // must keep both -- the hotkey would break otherwise.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+
+  os.osFlags = 0;
+  keyState.fakeKey(stroke(kVK_LeftArrow, true)); // non-modifier: held in our set
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad; // macOS set them
+  os.posted.clear();
+  keyState.fakeKey(stroke(kVK_Control, true));
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskSecondaryFn) != 0);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskNumericPad) != 0);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskControl) != 0);
+}
+
+void OSXKeyStateTests::modifierReleasePostsStrayFnResync()
+{
+  // On the secondary, releasing a modifier while the OS word still shows a
+  // stray Fn that nothing explains posts a clean kVK_Function up carrying the
+  // Fn-less word. A lagging (non-adopting) OS keeps the Fn visible to
+  // clearStrayFnFlag(), modelling the async kIOHIDSetGlobalEventFlags adoption.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  OSXKeyState::Hooks hooks = os.hooks();
+  hooks.postHIDKey = [&](uint8_t vk, bool down, CGEventFlags flags) {
+    os.posted.push_back({vk, down, flags}); // lagging OS: osFlags stays put
+    return KERN_SUCCESS;
+  };
+  keyState.setHooks(hooks);
+  keyState.setSecondaryScreen(true);
+
+  os.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | kCGEventFlagMaskSecondaryFn;
+  keyState.fakeKey(stroke(kVK_Shift, true));
+  os.posted.clear();
+  keyState.fakeKey(stroke(kVK_Shift, false)); // release -> stray-Fn clear
+
+  QVERIFY(!os.posted.empty());
+  const PostedKey &last = os.posted.back();
+  QCOMPARE(last.virtualKey, uint8_t{0x3F}); // kVK_Function
+  QVERIFY(!last.down);
+  QVERIFY((last.flags & kCGEventFlagMaskSecondaryFn) == 0);
+
+  // and nothing is posted on the primary (role gate)
+  deskflow::KeyMap keyMap2;
+  EventQueue eventQueue2;
+  InjectingKeyState primary(&eventQueue2, keyMap2, {"en"}, true);
+  HookedState os2;
+  OSXKeyState::Hooks hooks2 = os2.hooks();
+  hooks2.postHIDKey = [&](uint8_t vk, bool down, CGEventFlags flags) {
+    os2.posted.push_back({vk, down, flags});
+    return KERN_SUCCESS;
+  };
+  primary.setHooks(hooks2); // setSecondaryScreen never called -> primary
+  os2.osFlags = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | kCGEventFlagMaskSecondaryFn;
+  primary.fakeKey(stroke(kVK_Shift, true));
+  os2.posted.clear();
+  primary.fakeKey(stroke(kVK_Shift, false));
+  for (const PostedKey &p : os2.posted) {
+    QVERIFY(p.virtualKey != 0x3F); // no stray-Fn resync on the primary
+  }
+}
+
+void OSXKeyStateTests::fakeAllKeysUpClearsFunctionKeySet()
+{
+  // The held-key set is cleared at leave (fakeAllKeysUp): afterwards a
+  // modifier post strips Fn/NumericPad again, because no key holds them.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  os.osFlags = 0;
+  keyState.fakeKey(stroke(kVK_LeftArrow, true)); // held: Fn/NumericPad carrier
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+  os.posted.clear();
+  keyState.fakeKey(stroke(kVK_Control, true));
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) != 0); // kept while held
+
+  keyState.fakeAllKeysUp(); // leave: releases keys and clears the tracked set
+
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+  os.posted.clear();
+  keyState.fakeKey(stroke(kVK_Command, true));
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskNumericPad) == 0);
+}
+
 QTEST_MAIN(OSXKeyStateTests)

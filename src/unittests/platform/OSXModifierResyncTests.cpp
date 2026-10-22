@@ -272,4 +272,89 @@ void OSXModifierResyncTests::tap_hardwareFlagsChangedIsNotOwn()
   CFRelease(e);
 }
 
+// -- stuck-Fn (2026-10-21): pure stray-modifier decision helpers -------------
+
+void OSXModifierResyncTests::stray_eachWatchedBitUnexplainedIsStray()
+{
+  // nothing explained -> each watched bit present in the OS word is stray
+  QCOMPARE(strayModifierBits(kFlagSecondaryFn, 0), kFlagSecondaryFn);
+  QCOMPARE(strayModifierBits(kFlagControl, 0), kFlagControl);
+  QCOMPARE(strayModifierBits(kFlagAlternate, 0), kFlagAlternate);
+  QCOMPARE(strayModifierBits(kFlagShift, 0), kFlagShift);
+  QCOMPARE(strayModifierBits(kFlagCommand, 0), kFlagCommand);
+  // explained -> nothing stray
+  QCOMPARE(strayModifierBits(kFlagCommand, kFlagCommand), uint64_t{0});
+  // NumericPad on its own is not watched (it only rides with a cleared bit)
+  QCOMPARE(strayModifierBits(kFlagNumericPad, 0), uint64_t{0});
+}
+
+void OSXModifierResyncTests::stray_deviceBackedModifierIsNotStray()
+{
+  // heldModifierFlags() returns the generic bit for a device-backed modifier
+  // (a real key, this machine's own); the caller passes that as "explained".
+  const uint64_t os = kFlagCommand | 0x0008 /* LCmd device */;
+  QCOMPARE(strayModifierBits(os, kFlagCommand), uint64_t{0});
+  // but the same generic bit with nothing explaining it is a ghost -> stray
+  QCOMPARE(strayModifierBits(kFlagCommand, 0), kFlagCommand);
+}
+
+void OSXModifierResyncTests::stray_fnExplainedByHeldFunctionKeyOrPhysicalFn()
+{
+  // classifiers: function keys, the navigation cluster and the arrows carry Fn
+  QVERIFY(isFnCarryingKey(0x7A));  // F1
+  QVERIFY(isFnCarryingKey(0x5A));  // F20
+  QVERIFY(isFnCarryingKey(0x72));  // Help / Insert
+  QVERIFY(isFnCarryingKey(0x7B));  // Left arrow
+  QVERIFY(!isFnCarryingKey(0x00)); // 'a'
+  QVERIFY(!isFnCarryingKey(0x52)); // keypad 0: NumericPad, not Fn
+  // a held Fn key (or the physical fn) is folded into "explained" by the
+  // caller; then Fn is not stray even though the word carries it.
+  const uint64_t os = kFlagSecondaryFn | kFlagNumericPad;
+  QCOMPARE(strayModifierBits(os, kFlagSecondaryFn), uint64_t{0});
+  QCOMPARE(strayModifierBits(os, 0), kFlagSecondaryFn);
+}
+
+void OSXModifierResyncTests::stray_capsLockIsNeverStray()
+{
+  QCOMPARE(strayModifierBits(kFlagAlphaShift, 0), uint64_t{0});
+  QCOMPARE(strayModifierBits(kFlagAlphaShift | kFlagCommand, 0), kFlagCommand);
+}
+
+void OSXModifierResyncTests::stray_numericPadCleaning()
+{
+  const uint64_t os = kFlagSecondaryFn | kFlagNumericPad | 0x100 /* NonCoalesced */;
+  // no keypad key held -> Fn and NumericPad both cleared, the rest kept
+  QCOMPARE(cleanedModifierWord(os, kFlagSecondaryFn, false), uint64_t{0x100});
+  // a keypad key held -> NumericPad rides along, only Fn is cleared
+  QCOMPARE(cleanedModifierWord(os, kFlagSecondaryFn, true), uint64_t{kFlagNumericPad | 0x100});
+  // keypad digits and the arrows are NumericPad keys; the F-keys are not
+  QVERIFY(isNumericPadKey(0x52)); // keypad 0
+  QVERIFY(isNumericPadKey(0x51)); // keypad equals
+  QVERIFY(isNumericPadKey(0x7E)); // Up arrow
+  QVERIFY(!isNumericPadKey(0x7A)); // F1
+}
+
+void OSXModifierResyncTests::stray_resyncKeycodePrefersFn()
+{
+  QCOMPARE(strayResyncKeycode(kFlagSecondaryFn), uint16_t{0x3F});
+  QCOMPARE(strayResyncKeycode(kFlagSecondaryFn | kFlagCommand), uint16_t{0x3F});
+  QCOMPARE(strayResyncKeycode(kFlagCommand), uint16_t{55});
+  QCOMPARE(strayResyncKeycode(kFlagShift), uint16_t{56});
+  QCOMPARE(strayResyncKeycode(kFlagAlternate), uint16_t{58});
+  QCOMPARE(strayResyncKeycode(kFlagControl), uint16_t{59});
+}
+
+void OSXModifierResyncTests::stray_dwellRequiresSameSetTwice()
+{
+  StrayDwell d;
+  QVERIFY(!d.sample(kFlagSecondaryFn)); // once is not enough
+  QVERIFY(d.sample(kFlagSecondaryFn));  // same set twice -> trigger
+  // a different set restarts the dwell
+  QVERIFY(!d.sample(kFlagCommand));
+  QVERIFY(d.sample(kFlagCommand));
+  // a clean sample (nothing stray) resets it
+  QVERIFY(!d.sample(0));
+  QVERIFY(!d.sample(kFlagCommand)); // back to needing two in a row
+}
+
 QTEST_MAIN(OSXModifierResyncTests)

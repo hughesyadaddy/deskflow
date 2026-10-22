@@ -32,6 +32,14 @@ private Q_SLOTS:
   void tap_echoOfOwnPostIsRecognisedOnce();
   void tap_dskrMarkerIsOwnAndInjected();
   void tap_hardwareFlagsChangedIsNotOwn();
+  // stuck-Fn (2026-10-21): pure stray-modifier decision helpers
+  void stray_eachWatchedBitUnexplainedIsStray();
+  void stray_deviceBackedModifierIsNotStray();
+  void stray_fnExplainedByHeldFunctionKeyOrPhysicalFn();
+  void stray_capsLockIsNeverStray();
+  void stray_numericPadCleaning();
+  void stray_resyncKeycodePrefersFn();
+  void stray_dwellRequiresSameSetTwice();
 
 private:
   Arch m_arch;

@@ -56,6 +56,11 @@ private Q_SLOTS:
   void pointerEventFlagsCarryOnlyHeldModifiers();
   void reportedPollShowsGhostsThatActivePollHides();
   void pendingReleaseLeftBitIsNotHeld();
+  // stuck-Fn (2026-10-21)
+  void modifierPostStripsStrayFnAndNumericPad();
+  void modifierPostKeepsFnAndNumericPadWhileArrowHeld();
+  void modifierReleasePostsStrayFnResync();
+  void fakeAllKeysUpClearsFunctionKeySet();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);
