@@ -247,11 +247,33 @@ public:
   using Clock = std::chrono::steady_clock;
   static constexpr std::chrono::milliseconds kWindow{500};
 
+  //! primary resync posts: match on the ordinary-modifier bits only (an IOHID
+  //! echo may differ in lock/device noise). Unchanged semantics.
   void expect(uint64_t flags, Clock::time_point now)
   {
+    add(flags, kHeldModifierFlags, now);
+  }
+
+  //! secondary Fn cleanup/resync posts: match on the FULL word, SecondaryFn
+  //! and NumericPad included, so a physical fn edge (Fn set) within the window
+  //! is not swallowed as our echo (our cleaned word has Fn cleared).
+  void expectFull(uint64_t flags, Clock::time_point now)
+  {
+    add(flags, ~uint64_t(0), now);
+  }
+
+  //! drop one still-live expectation matching \p flags (rollback when the post
+  //! that was announced failed to go out)
+  void cancel(uint64_t flags, Clock::time_point now)
+  {
     std::scoped_lock lock(m_mutex);
-    m_pending.push_back({flags & kHeldModifierFlags, now});
-    m_any.store(true, std::memory_order_release);
+    for (auto it = m_pending.begin(); it != m_pending.end(); ++it) {
+      if (now - it->at <= kWindow && (flags & it->mask) == it->flags) {
+        m_pending.erase(it);
+        break;
+      }
+    }
+    m_any.store(!m_pending.empty(), std::memory_order_release);
   }
 
   //! true (and consumed) if a flagsChanged with these flags is our own echo
@@ -265,7 +287,7 @@ public:
     for (auto it = m_pending.begin(); it != m_pending.end();) {
       if (now - it->at > kWindow) {
         it = m_pending.erase(it);
-      } else if (!hit && it->flags == (flags & kHeldModifierFlags)) {
+      } else if (!hit && (flags & it->mask) == it->flags) {
         it = m_pending.erase(it);
         hit = true;
       } else {
@@ -284,7 +306,7 @@ public:
     }
     std::scoped_lock lock(m_mutex);
     for (const auto &p : m_pending) {
-      if (now - p.at <= kWindow && p.flags == (flags & kHeldModifierFlags)) {
+      if (now - p.at <= kWindow && (flags & p.mask) == p.flags) {
         return true;
       }
     }
@@ -300,9 +322,16 @@ public:
 private:
   struct Pending
   {
-    uint64_t flags;
+    uint64_t flags; //!< expected word already reduced to \c mask
+    uint64_t mask;  //!< bits compared against an observed word
     Clock::time_point at;
   };
+  void add(uint64_t flags, uint64_t mask, Clock::time_point now)
+  {
+    std::scoped_lock lock(m_mutex);
+    m_pending.push_back({flags & mask, mask, now});
+    m_any.store(true, std::memory_order_release);
+  }
   std::mutex m_mutex;
   std::vector<Pending> m_pending;
   std::atomic<bool> m_any{false};

@@ -1574,11 +1574,11 @@ void OSXKeyStateTests::cleanupSkippedUnderSecureInput()
   QCOMPARE(os.posted.size(), size_t(0));
 }
 
-void OSXKeyStateTests::samplerAgesOutStaleInjectedCarrier()
+void OSXKeyStateTests::samplerKeepsFnDuringLongHoldThenClearsOnUp()
 {
-  // Item 7: an injected arrow whose key-up was lost keeps "explaining" Fn only
-  // for kCarrierFreshSec; after that the sampler clears Fn even though the OS
-  // key map (GetKeys) still shows the arrow down. A fresh carrier does not.
+  // Item A: the freshness rule is gone. An injected arrow held for a long time
+  // with no repeat (repeat disabled / long delay) still explains Fn, so the
+  // sampler never strips it; its UP then clears the stray Fn.
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -1588,22 +1588,76 @@ void OSXKeyStateTests::samplerAgesOutStaleInjectedCarrier()
 
   os.now = 100.0;
   keyState.fakeKey(stroke(kVK_LeftArrow, true)); // injected down, no later repeat
-  os.physical.insert(buttonFor(kVK_LeftArrow));  // lost key-up: GetKeys still shows it
   os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
   os.posted.clear();
 
-  // refreshed 1 s ago -> still fresh -> explains Fn -> no post
-  os.now = 101.0;
+  // 30 s later, still held: Fn stays explained, no resync posted
+  os.now = 130.0;
   QVERIFY(!keyState.sampleStrayModifiers());
-  os.now = 101.3;
+  os.now = 130.3;
   QVERIFY(!keyState.sampleStrayModifiers());
   QCOMPARE(os.posted.size(), size_t(0));
 
-  // 4 s since the last down, no repeat -> stale -> excluded from the physical
-  // scan too (it is ours) -> Fn unexplained -> cleared after the dwell
-  os.now = 104.0;
+  // the arrow's UP (last Fn carrier) clears the stray Fn now
+  os.posted.clear();
+  keyState.fakeKey(stroke(kVK_LeftArrow, false));
+  QVERIFY(!os.posted.empty());
+  QCOMPARE(os.posted.back().virtualKey, uint8_t{0x3F});
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);
+}
+
+void OSXKeyStateTests::cleanupRollbackOnFailedPost()
+{
+  // Item B: a cleanup whose post fails must leave no echo expectation, so a
+  // later physical fn edge is not mistaken for our echo.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  OSXKeyState::Hooks hooks = os.hooks();
+  hooks.postHIDKey = [&](uint8_t vk, bool down, CGEventFlags flags) {
+    os.posted.push_back({vk, down, flags});
+    return KERN_FAILURE; // the post fails
+  };
+  keyState.setHooks(hooks);
+  keyState.setSecondaryScreen(true);
+
+  // os carries Fn plus a physical Ctrl (device bit) that survives cleaning, so
+  // the announced word is distinctive and unlikely to collide with other tests
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK;
+  const uint64_t cleaned = kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK; // Fn stripped
+  const auto nowTp = deskflow::platform::ResyncEchoFilter::Clock::now();
+
+  QVERIFY(!keyState.clearStrayFnFlag()); // post failed
+  // the announced expectation was rolled back
+  QVERIFY(!deskflow::platform::ResyncEchoFilter::instance().matches(cleaned, nowTp));
+}
+
+void OSXKeyStateTests::physicalFnLatchResetAllowsClear()
+{
+  // Item C: a latched physical-fn atomic explains Fn (no post). Resetting it
+  // (as secure-input off / secondary enter() do) lets the sampler clear the
+  // stray Fn after the dwell.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  keyState.notePhysicalFnKey(true); // latched true
+  os.osFlags = kCGEventFlagMaskSecondaryFn;
+  os.now = 100.0;
   QVERIFY(!keyState.sampleStrayModifiers());
-  os.now = 104.3;
+  os.now = 100.3;
+  QVERIFY(!keyState.sampleStrayModifiers()); // explained by the latch -> no post
+  QCOMPARE(os.posted.size(), size_t(0));
+
+  keyState.notePhysicalFnKey(false); // the reset point (enter / secure-input off)
+  os.posted.clear();
+  os.now = 101.0;
+  QVERIFY(!keyState.sampleStrayModifiers());
+  os.now = 101.3;
   QVERIFY(keyState.sampleStrayModifiers());
   QCOMPARE(os.posted.back().virtualKey, uint8_t{0x3F});
   QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);

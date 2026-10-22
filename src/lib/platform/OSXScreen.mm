@@ -1222,6 +1222,10 @@ void OSXScreen::enter()
     // reset buttons
     m_buttonState.reset();
 
+    // Item C: a physical fn release can be missed while off screen (or while
+    // secure input blinded the tap), latching m_physicalFnHeld true; reset it
+    // at the boundary so a stale latch cannot explain a stray Fn forever.
+    m_keyState->notePhysicalFnKey(false);
     // Fn that macOS left set while the cursor was away (a function key still
     // "down" in the word) would ride onto the first modifier post here; clear
     // it now, then watch for a stray modifier flag while we hold the screen.
@@ -1446,6 +1450,9 @@ void OSXScreen::secureInputPollTick()
     // the reverse) must never be judged by the freshness sweep -- the user
     // may be mid-gesture at this very keyboard.
     m_keyState->releaseInjectedKeys();
+    // Item C: a physical fn release during the blind window would not have
+    // reached the tap; drop any stale latch so it cannot explain a stray Fn.
+    m_keyState->notePhysicalFnKey(false);
     break;
   case SecureInputTransition::None:
     break;

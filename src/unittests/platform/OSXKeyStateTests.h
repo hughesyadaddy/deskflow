@@ -67,7 +67,10 @@ private Q_SLOTS:
   void samplerClearsUnexplainedFnAfterDwell();               // item 1
   void samplerKeepsFnWhileCarrierHeldOrSecureInput();        // items 1/3/4
   void cleanupSkippedUnderSecureInput();                     // item 4
-  void samplerAgesOutStaleInjectedCarrier();                 // item 7
+  // round-2 reviewer follow-ups
+  void samplerKeepsFnDuringLongHoldThenClearsOnUp(); // A (freshness removed)
+  void cleanupRollbackOnFailedPost();                // B
+  void physicalFnLatchResetAllowsClear();            // C
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);

@@ -177,12 +177,6 @@ public:
   //! incarnation) and sanitizeInjectedKeys() releases it.
   static constexpr double kHardwareModifierFreshS = 2.0;
 
-  //! An injected function-class / keypad key stops "explaining" its Fn /
-  //! NumericPad bit this many seconds after its last down/repeat: in the
-  //! incident the Fn was held by an injected key whose key-up never arrived,
-  //! so a stale carrier must not pin the flag on until the next leave.
-  static constexpr double kCarrierFreshSec = 3.0;
-
   //! Monotonic seconds (steady clock); the clock noteHardwareModifierFlags()
   //! stamps are expected in.
   static double monotonicSeconds();
@@ -341,17 +335,17 @@ private:
   // item 5): one that no key -- injected (and still fresh) or physically down
   // -- legitimately holds.
   void stripStrayFnNumericPad(CGEventFlags &flags) const;
-  // Which carrier bits a key currently holds: an injected carrier counted only
-  // while fresh (a lost key-up must not explain Fn forever), plus the
-  // MacBook's own physical carrier / fn key (GetKeys), excluding keys we
-  // injected ourselves.
+  // Which carrier bits a key currently holds: any injected carrier still in
+  // m_injectedKeys (until its up / fakeAllKeysUp at leave), plus the MacBook's
+  // own physical carrier / fn key (GetKeys), excluding keys we injected.
   void carriersHeld(bool &fnHeld, bool &numpadHeld) const;
-  // An injected carrier counts as held only within kCarrierFreshSec of its
-  // last down/repeat.
-  bool carrierFresh(uint8_t vk) const;
   // True iff an injected (still-held) non-modifier key is Fn-carrying; decides
   // whether a release was the last injected Fn carrier.
   bool holdingFnCarryingKey() const;
+  // Diagnostics only (count, no key id): log once per hold if an injected
+  // function-class key has been held past the long-hold threshold with no
+  // repeat. Called from the sampler tick.
+  void logLongHeldFunctionKeys();
 
 private:
   // OS X uses a physical key if 0 for the 'A' key.  deskflow reserves
@@ -398,8 +392,10 @@ private:
   // Event-thread only (fakeKey / the stray timer tick).
   std::set<uint8_t> m_injectedKeys;
   // monotonic time each injected non-modifier key was last posted Down (or
-  // repeated); carrierFresh() ages a lost-key-up carrier out. Event-thread only.
+  // repeated) and the function-class keys already long-hold-logged this hold;
+  // used ONLY by the long-hold diagnostic, not to explain Fn. Event-thread only.
   std::map<uint8_t, double> m_injectedKeyAt;
+  std::set<uint8_t> m_longHoldLogged;
   // the MacBook's own physical fn/Globe key, tracked from the secondary tap
   // thread; read when composing/resyncing flags.
   std::atomic<bool> m_physicalFnHeld{false};

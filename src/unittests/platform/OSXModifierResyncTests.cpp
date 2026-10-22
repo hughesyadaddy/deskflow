@@ -375,4 +375,28 @@ void OSXModifierResyncTests::tap_ownFnCleanupEchoIsNotHardwareFn()
   CFRelease(e);
 }
 
+void OSXModifierResyncTests::echo_fullWordMatchExcludesPhysicalFnAndCancels()
+{
+  // Item B: a secondary cleanup announces the FULL cleaned word (Fn cleared).
+  // A physical fn PRESS (Fn set) differs in the SecondaryFn bit, so it is not
+  // swallowed as our echo; and cancel() rolls the expectation back.
+  ResyncEchoFilter echo;
+  const auto t = ResyncEchoFilter::Clock::now();
+  const uint64_t cleaned = kNC | kLCmd; // Fn already cleared in a cleanup word
+  echo.expectFull(cleaned, t);
+
+  // a physical fn edge over the same base word (Fn set) must NOT match
+  QVERIFY(!echo.matches(cleaned | kFlagSecondaryFn, t));
+  // the exact announced word still matches (would be consumed as our echo)
+  QVERIFY(echo.matches(cleaned, t));
+
+  // cancel removes the expectation
+  echo.cancel(cleaned, t);
+  QVERIFY(!echo.matches(cleaned, t));
+
+  // a primary-style (masked) expectation still ignores Fn/device noise
+  echo.expect(kNC | kRShift, t);
+  QVERIFY(echo.matches(kNC | kRShift | kFlagSecondaryFn, t));
+}
+
 QTEST_MAIN(OSXModifierResyncTests)
