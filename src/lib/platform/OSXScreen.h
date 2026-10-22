@@ -117,6 +117,11 @@ public:
   */
   static constexpr double kSecureInputPollSec = 1.0;
 
+  //! Poll cadence (seconds) for the secondary stray-modifier sweep. ~250 ms
+  //! is frequent enough to unstick a stray Fn within a few samples yet cheap
+  //! (one HID-word read per tick).
+  static constexpr double kStrayModifierPollSec = 0.25;
+
   OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync = false);
 
   virtual ~OSXScreen();
@@ -250,6 +255,13 @@ private:
   void secureInputPollTick();
   void armSecureInputTimer();
   void cancelSecureInputTimer();
+
+  // Secondary-only stray-modifier (stuck-Fn) sweep. Armed in enter(),
+  // cancelled in leave() and disable(); each tick asks the key state to
+  // resync a modifier flag the OS word carries but no key holds.
+  void strayModifierPollTick();
+  void armStrayModifierTimer();
+  void cancelStrayModifierTimer();
 
   // global hotkey operating mode
   static bool isGlobalHotKeyOperatingModeAvailable();
@@ -387,6 +399,10 @@ private:
   // disable(); the tick itself only acts while m_isOnScreen (see
   // secureInputWatchTick()).
   EventQueueTimer *m_secureInputTimer = nullptr;
+
+  // Secondary stray-modifier sweep timer. Armed in enter(), cancelled in
+  // leave()/disable(); only a secondary ever arms it.
+  EventQueueTimer *m_strayModifierTimer = nullptr;
 
   // window object that gets user input events when the server
   // has focus.

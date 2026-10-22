@@ -21,6 +21,7 @@
 namespace deskflow::platform::cmd_diag {
 
 inline constexpr CGEventFlags kCommand = kCGEventFlagMaskCommand;
+inline constexpr CGEventFlags kSecondaryFn = kCGEventFlagMaskSecondaryFn;
 
 // Shared boundary clocks (OSXScreen enter/leave). Steady ms; 0 = never.
 struct Boundaries {
@@ -60,6 +61,11 @@ inline void noteLeave()
 inline bool cmdOn(CGEventFlags flags)
 {
   return (flags & kCommand) != 0;
+}
+
+inline bool fnOn(CGEventFlags flags)
+{
+  return (flags & kSecondaryFn) != 0;
 }
 
 inline CGEventFlags readHid()
@@ -124,10 +130,10 @@ inline void logEvent(
   appendBoundary(boundary, sizeof(boundary));
   LOG_INFO(
       "[cmd-diag] %s %s shadow_cmd=%d ledger_cmd=%d os_hid_cmd=%d os_sess_cmd=%d "
-      "stamped_cmd=%d os_hid=0x%llx os_sess=0x%llx stamped=0x%llx %s",
+      "os_hid_fn=%d os_sess_fn=%d stamped_cmd=%d os_hid=0x%llx os_sess=0x%llx stamped=0x%llx %s",
       kind, keyLabel, shadowCmd ? 1 : 0, ledgerCmd ? 1 : 0, cmdOn(osHid) ? 1 : 0, cmdOn(osSession) ? 1 : 0,
-      cmdOn(stamped) ? 1 : 0, static_cast<unsigned long long>(osHid), static_cast<unsigned long long>(osSession),
-      static_cast<unsigned long long>(stamped), boundary
+      fnOn(osHid) ? 1 : 0, fnOn(osSession) ? 1 : 0, cmdOn(stamped) ? 1 : 0, static_cast<unsigned long long>(osHid),
+      static_cast<unsigned long long>(osSession), static_cast<unsigned long long>(stamped), boundary
   );
 }
 

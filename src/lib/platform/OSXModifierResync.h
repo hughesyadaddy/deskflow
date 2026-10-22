@@ -26,13 +26,131 @@ inline constexpr uint64_t kFlagShift = 0x00020000;
 inline constexpr uint64_t kFlagControl = 0x00040000;
 inline constexpr uint64_t kFlagAlternate = 0x00080000;
 inline constexpr uint64_t kFlagCommand = 0x00100000;
-inline constexpr uint64_t kFlagSecondaryFn = 0x00800000; // Fn: NOT resynced (like Caps)
+inline constexpr uint64_t kFlagSecondaryFn = 0x00800000; // Fn: resynced only on the secondary
+inline constexpr uint64_t kFlagNumericPad = 0x00200000;  // NumericPad: rides with Fn on arrows/keypad
 inline constexpr uint64_t kFlagAlphaShift = 0x00010000;  // Caps Lock: state, never touched
 // NX_DEVICE* bits: LCtl 0x1, LShift 0x2, RShift 0x4, LCmd 0x8, RCmd 0x10,
 // LAlt 0x20, RAlt 0x40, RCtl 0x2000.
 inline constexpr uint64_t kDeviceModifierBits = 0x207F;
 inline constexpr uint64_t kHeldModifierFlags =
     kFlagShift | kFlagControl | kFlagAlternate | kFlagCommand | kDeviceModifierBits;
+
+// ---------------------------------------------------------------------------
+// Stray-modifier (stuck-Fn) decision logic, used only on the secondary. Pure
+// and numeric so it stays testable; the stuck-Fn incident (2026-10-21) had
+// macOS carry SecondaryFn in the HID/session word for 34 s while Deskflow
+// held no such key, because every modifier post copied the live Fn bit
+// through and re-published it (kIOHIDSetGlobalEventFlags).
+// ---------------------------------------------------------------------------
+
+//! kVK_* (numeric) for keys macOS flags with SecondaryFn while they are down:
+//! the function keys F1..F20 and the navigation cluster, plus the arrows.
+inline bool isFnCarryingKey(uint16_t vk)
+{
+  switch (vk) {
+  // F1..F20 (kVK_F*). The codes are scattered, so listed explicitly.
+  case 0x7A: case 0x78: case 0x63: case 0x76: case 0x60: case 0x61: case 0x62:
+  case 0x64: case 0x65: case 0x6D: case 0x67: case 0x6F: case 0x69: case 0x6B:
+  case 0x71: case 0x6A: case 0x40: case 0x4F: case 0x50: case 0x5A:
+  // navigation cluster: Help 0x72, Home 0x73, PageUp 0x74, ForwardDelete
+  // 0x75, End 0x77, PageDown 0x79.
+  case 0x72: case 0x73: case 0x74: case 0x75: case 0x77: case 0x79:
+  // arrows: Left 0x7B, Right 0x7C, Down 0x7D, Up 0x7E.
+  case 0x7B: case 0x7C: case 0x7D: case 0x7E:
+    return true;
+  default:
+    return false;
+  }
+}
+
+//! kVK_* (numeric) for keys macOS flags with NumericPad while they are down:
+//! the arrows and the keypad keys (kVK_ANSI_Keypad*).
+inline bool isNumericPadKey(uint16_t vk)
+{
+  switch (vk) {
+  // arrows (as above).
+  case 0x7B: case 0x7C: case 0x7D: case 0x7E:
+  // keypad digits 0..9 and operators (kVK_ANSI_Keypad*).
+  case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58:
+  case 0x59: case 0x5B: case 0x5C: case 0x41: case 0x43: case 0x45: case 0x47:
+  case 0x4B: case 0x4C: case 0x4E: case 0x51:
+    return true;
+  default:
+    return false;
+  }
+}
+
+//! Modifier bits a stray-modifier scan watches. Caps Lock (0x10000) is
+//! deliberately absent: its flag is lock state, never a held key.
+inline constexpr uint64_t kStrayWatchBits =
+    kFlagSecondaryFn | kFlagControl | kFlagAlternate | kFlagShift | kFlagCommand;
+
+//! Watched bits set in \p osFlags that Deskflow cannot explain. \p explained
+//! carries the bits a key is known to hold: heldModifierFlags() for
+//! Shift/Ctrl/Opt/Cmd, plus Fn when an Fn-carrying key or the physical fn is
+//! held. Caps Lock can never be stray (not in kStrayWatchBits).
+inline uint64_t strayModifierBits(uint64_t osFlags, uint64_t explained)
+{
+  return (osFlags & kStrayWatchBits) & ~explained;
+}
+
+//! \p osFlags with the stray bits cleared; NumericPad is additionally cleared
+//! unless a NumericPad key is held (it rides with the stray Fn on an arrow).
+inline uint64_t cleanedModifierWord(uint64_t osFlags, uint64_t strayBits, bool numericPadKeyHeld)
+{
+  uint64_t cleaned = osFlags & ~strayBits;
+  if (!numericPadKeyHeld) {
+    cleaned &= ~kFlagNumericPad;
+  }
+  return cleaned;
+}
+
+//! Keycode to stamp on a stray-modifier resync post. Cosmetic -- the post
+//! carries the absolute cleaned word -- but prefers Fn (kVK_Function) and
+//! otherwise names a left modifier keycode for whichever stray bit is set.
+inline uint16_t strayResyncKeycode(uint64_t strayBits)
+{
+  if ((strayBits & kFlagSecondaryFn) != 0) {
+    return 0x3F; // kVK_Function
+  }
+  if ((strayBits & kFlagCommand) != 0) {
+    return 55; // kVK_Command
+  }
+  if ((strayBits & kFlagShift) != 0) {
+    return 56; // kVK_Shift
+  }
+  if ((strayBits & kFlagAlternate) != 0) {
+    return 58; // kVK_Option
+  }
+  if ((strayBits & kFlagControl) != 0) {
+    return 59; // kVK_Control
+  }
+  return 0x3F;
+}
+
+//! Two-sample dwell for the stray-modifier resync: an unexplained set must
+//! survive one full sample unchanged before we act, so a single transient
+//! sample (a chord mid-press) never triggers. A different set, or a return to
+//! nothing stray, restarts the dwell.
+struct StrayDwell
+{
+  uint64_t lastStray = 0;
+  bool armed = false; //!< a non-zero set has been seen at least once
+
+  //! feed a new sample; returns true iff it should trigger a resync now
+  bool sample(uint64_t stray)
+  {
+    if (stray == 0) {
+      armed = false;
+      lastStray = 0;
+      return false;
+    }
+    const bool same = armed && stray == lastStray;
+    lastStray = stray;
+    armed = true;
+    return same;
+  }
+};
 
 //! Primary re-entry reconcile target. While the cursor was on another screen
 //! the primary's tap swallowed every flagsChanged, so the session (what apps

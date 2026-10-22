@@ -11,6 +11,7 @@
 #include "platform/OSXInjectedEvent.h"
 #include "platform/OSXMainQueue.h"
 #include "platform/OSXMediaKeySupport.h"
+#include "platform/OSXModifierResync.h"
 #include "platform/OSXUchrKeyResource.h"
 #include "platform/OSXCmdDiag.h"
 
@@ -840,7 +841,128 @@ CGEventFlags OSXKeyState::modifierEventFlags(uint8_t virtualKey, bool down) cons
   }
   // ... and the key being posted takes its new state last
   force(virtualKey, down);
+
+  // SecondaryFn and NumericPad in the live OS word are transient flags macOS
+  // sets while a function-class / keypad key is down; they are never
+  // modifiers this process holds. Copying them onto a modifier post
+  // re-publishes them globally (kIOHIDSetGlobalEventFlags), and every later
+  // post re-asserts them -- the 34 s stuck-Fn incident (2026-10-21). Strip
+  // them unless a key we injected legitimately carries them, or (Fn) the
+  // MacBook's own physical fn/Globe key is held. Caps and the device bits are
+  // untouched. (The primary never injects an Fn-carrying key, so this only
+  // ever matters on the secondary.)
+  if (!holdingFnCarryingKey() && !m_physicalFnHeld.load(std::memory_order_relaxed)) {
+    flags &= ~kCGEventFlagMaskSecondaryFn;
+  }
+  if (!holdingNumericPadKey()) {
+    flags &= ~kCGEventFlagMaskNumericPad;
+  }
   return flags;
+}
+
+bool OSXKeyState::holdingFnCarryingKey() const
+{
+  for (const uint8_t vk : m_injectedKeys) {
+    if (deskflow::platform::isFnCarryingKey(vk)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool OSXKeyState::holdingNumericPadKey() const
+{
+  for (const uint8_t vk : m_injectedKeys) {
+    if (deskflow::platform::isNumericPadKey(vk)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void OSXKeyState::setSecondaryScreen(bool secondary)
+{
+  m_isSecondaryScreen.store(secondary, std::memory_order_relaxed);
+}
+
+void OSXKeyState::notePhysicalFnKey(bool held)
+{
+  m_physicalFnHeld.store(held, std::memory_order_relaxed);
+}
+
+bool OSXKeyState::clearStrayFnFlag()
+{
+  // Secondary-only: the primary keeps its current behaviour (its own physical
+  // fn drives the HID word and nothing here should touch it).
+  if (!m_isSecondaryScreen.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  const uint64_t os = static_cast<uint64_t>(osModifierFlags());
+  if ((os & deskflow::platform::kFlagSecondaryFn) == 0) {
+    return false; // no Fn to clear
+  }
+  if (holdingFnCarryingKey() || m_physicalFnHeld.load(std::memory_order_relaxed)) {
+    return false; // legitimately carried, leave it
+  }
+  const uint64_t cleaned =
+      deskflow::platform::cleanedModifierWord(os, deskflow::platform::kFlagSecondaryFn, holdingNumericPadKey());
+  if (!postModifierResync(0x3F /* kVK_Function */, false, cleaned)) {
+    return false;
+  }
+  LOG_INFO(
+      "[keys] cleared stray fn flag (os 0x%llx -> 0x%llx)", static_cast<unsigned long long>(os),
+      static_cast<unsigned long long>(cleaned)
+  );
+  return true;
+}
+
+bool OSXKeyState::sampleStrayModifiers()
+{
+  // Secondary-only, and never while a password field owns input (hardware
+  // presses are invisible, so "unexplained" cannot be judged and a post
+  // could change the global word under the user's fingers).
+  if (!m_isSecondaryScreen.load(std::memory_order_relaxed) || secureInputEnabled()) {
+    return false;
+  }
+  const uint64_t os = static_cast<uint64_t>(osModifierFlags());
+  const bool numpadKey = holdingNumericPadKey();
+  uint64_t explained = static_cast<uint64_t>(heldModifierFlags());
+  if (holdingFnCarryingKey() || m_physicalFnHeld.load(std::memory_order_relaxed)) {
+    explained |= deskflow::platform::kFlagSecondaryFn;
+  }
+  const uint64_t stray = deskflow::platform::strayModifierBits(os, explained);
+
+  // change-only [cmd-diag] sampler: log when the stray set changes (including
+  // back to 0), at most once per second.
+  const double at = now();
+  if ((!m_haveLoggedStray || stray != m_lastLoggedStray) && (at - m_lastStrayLogAt) >= 1.0) {
+    using namespace deskflow::platform::cmd_diag;
+    LOG_INFO(
+        "[cmd-diag] stray-flags stray=0x%llx os_hid=0x%llx os_sess=0x%llx", static_cast<unsigned long long>(stray),
+        static_cast<unsigned long long>(os), static_cast<unsigned long long>(readSession())
+    );
+    m_lastLoggedStray = stray;
+    m_haveLoggedStray = true;
+    m_lastStrayLogAt = at;
+  }
+
+  // The same unexplained set must survive two samples before we act.
+  if (!m_strayDwell.sample(stray)) {
+    return false;
+  }
+  if ((at - m_lastStrayResyncAt) < 1.0) {
+    return false; // at most one resync per second
+  }
+  const uint64_t cleaned = deskflow::platform::cleanedModifierWord(os, stray, numpadKey);
+  if (!postModifierResync(deskflow::platform::strayResyncKeycode(stray), false, cleaned)) {
+    return false;
+  }
+  m_lastStrayResyncAt = at;
+  LOG_INFO(
+      "[keys] resynced stray modifier flags 0x%llx (os 0x%llx -> 0x%llx)", static_cast<unsigned long long>(stray),
+      static_cast<unsigned long long>(os), static_cast<unsigned long long>(cleaned)
+  );
+  return true;
 }
 
 bool OSXKeyState::secureInputEnabled() const
@@ -1267,10 +1389,21 @@ void OSXKeyState::fakeAllKeysUp()
   // modifier posted outside KeyState's press path. K2 gap b1: this used to
   // clear() the ledger here, forgetting such a modifier instead of
   // releasing it, and nothing downstream ever released it either.
+  const int nonModReleased = static_cast<int>(m_injectedKeys.size());
+  int fnClassReleased = 0;
+  for (const uint8_t vk : m_injectedKeys) {
+    if (deskflow::platform::isFnCarryingKey(vk)) {
+      ++fnClassReleased;
+    }
+  }
   KeyState::fakeAllKeysUp();
   reseedShadowFlagsFromOS();
   releaseLedgeredModifiers(osModifierFlags());
+  m_injectedKeys.clear();
   reseedShadowFlagsFromOS();
+  if (nonModReleased > 0) {
+    LOG_INFO("[keys] leave released %d non-modifier key(s) (%d function-class)", nonModReleased, fnClassReleased);
+  }
 }
 
 void OSXKeyState::setKeyboardModifiers(CGKeyCode virtualKey, bool keyDown)
@@ -1416,6 +1549,26 @@ void OSXKeyState::fakeKey(const Keystroke &keystroke)
       } else {
         m_injectedModifiers.erase(static_cast<uint8_t>(virtualKey));
       }
+    }
+
+    // Track non-modifier holds so modifierEventFlags() and the stray sweep
+    // can tell a legitimate Fn/NumericPad bit (a held function-class or
+    // keypad key) from a stale one. Re-check for a stray Fn flag the OS word
+    // may still carry after an injected modifier release, or after the last
+    // held function-class key is released (secondary only; clearStrayFnFlag()
+    // no-ops elsewhere).
+    if (!isMod && virtualKey <= 0xff) {
+      const auto vk8 = static_cast<uint8_t>(virtualKey);
+      if (keyDown) {
+        m_injectedKeys.insert(vk8);
+      } else {
+        m_injectedKeys.erase(vk8);
+        if (deskflow::platform::isFnCarryingKey(vk8) && !holdingFnCarryingKey()) {
+          clearStrayFnFlag();
+        }
+      }
+    } else if (isMod && !keyDown) {
+      clearStrayFnFlag();
     }
 
     // [cmd-diag] temporary: modifier injects always; non-mod only when Cmd

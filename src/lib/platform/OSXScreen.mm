@@ -1069,6 +1069,11 @@ void OSXScreen::hideCursor()
 
 void OSXScreen::enable()
 {
+  // Only a secondary (client) clears/resyncs stray Fn and other modifier
+  // flags the OS word carries but no key holds; the primary keeps its
+  // current behaviour (see clearStrayFnFlag / sampleStrayModifiers).
+  m_keyState->setSecondaryScreen(!m_isPrimary);
+
   // watch the clipboard (changeCount-gated, see clipboardPollTick)
   m_lastPasteboardChangeCount = -1;
   armClipboardTimer();
@@ -1189,6 +1194,7 @@ void OSXScreen::disable()
   }
 
   cancelSecureInputTimer();
+  cancelStrayModifierTimer();
 
   m_isOnScreen = m_isPrimary;
 }
@@ -1215,6 +1221,12 @@ void OSXScreen::enter()
   } else {
     // reset buttons
     m_buttonState.reset();
+
+    // Fn that macOS left set while the cursor was away (a function key still
+    // "down" in the word) would ride onto the first modifier post here; clear
+    // it now, then watch for a stray modifier flag while we hold the screen.
+    m_keyState->clearStrayFnFlag();
+    armStrayModifierTimer();
 
     // wakes the client screen
     io_registry_entry_t entry =
@@ -1307,6 +1319,13 @@ void OSXScreen::leave()
     clipboardPollTick();
   }
 
+  if (!m_isPrimary) {
+    // stop the sweep and clear any Fn the word still carries as we hand input
+    // back -- the old behaviour only cleared it via fakeAllKeysUp().
+    cancelStrayModifierTimer();
+    m_keyState->clearStrayFnFlag();
+  }
+
   // now off screen
   m_isOnScreen = false;
   if (m_clipboardTimer != nullptr) {
@@ -1374,6 +1393,35 @@ void OSXScreen::cancelSecureInputTimer()
   m_events->removeHandler(EventTypes::Timer, m_secureInputTimer);
   m_events->deleteTimer(m_secureInputTimer);
   m_secureInputTimer = nullptr;
+}
+
+void OSXScreen::armStrayModifierTimer()
+{
+  cancelStrayModifierTimer();
+  m_strayModifierTimer = m_events->newTimer(kStrayModifierPollSec, nullptr);
+  if (m_strayModifierTimer == nullptr) {
+    return; // event queues without timers (test doubles)
+  }
+  m_events->addHandler(EventTypes::Timer, m_strayModifierTimer, [this](const auto &) { strayModifierPollTick(); });
+}
+
+void OSXScreen::cancelStrayModifierTimer()
+{
+  if (m_strayModifierTimer == nullptr) {
+    return;
+  }
+  m_events->removeHandler(EventTypes::Timer, m_strayModifierTimer);
+  m_events->deleteTimer(m_strayModifierTimer);
+  m_strayModifierTimer = nullptr;
+}
+
+void OSXScreen::strayModifierPollTick()
+{
+  // Only while on screen: never post a flag word when the cursor is not here.
+  if (!m_isOnScreen) {
+    return;
+  }
+  m_keyState->sampleStrayModifiers();
 }
 
 void OSXScreen::secureInputPollTick()
@@ -2295,6 +2343,14 @@ OSXScreen::handleCGInputEventSecondary(CGEventTapProxy proxy, CGEventType type, 
     if (type == kCGEventFlagsChanged) {
       const CGEventFlags macMask = CGEventGetFlags(event);
       screen->m_keyState->noteHardwareModifierFlags(macMask, OSXKeyState::monotonicSeconds());
+      // Track the MacBook's own physical fn/Globe key (kVK_Function): a
+      // non-injected flagsChanged for it tells us whether fn is held, so a
+      // modifier post made while fn is down keeps SecondaryFn and the stray
+      // sweep never clears a physically-held fn.
+      if (!deskflow::platform::isInjectedEvent(event) &&
+          CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == 0x3F /* kVK_Function */) {
+        screen->m_keyState->notePhysicalFnKey((macMask & 0x800000) != 0);
+      }
       // [cmd-diag] logging only — observe local modifier edges on the client
       // (unstick via Ctrl/Option/Cmd+Tab shows up here). Rate-limited.
       if (deskflow::platform::cmd_diag::allowFlagsChangedLog()) {

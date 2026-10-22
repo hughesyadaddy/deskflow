@@ -9,6 +9,7 @@
 
 #include "OSXAutoTypes.h"
 #include "deskflow/KeyState.h"
+#include "platform/OSXModifierResync.h"
 
 #include <Carbon/Carbon.h>
 
@@ -148,6 +149,28 @@ public:
 
   //! Virtual keys of modifiers this process has injected and not yet released
   std::set<uint8_t> injectedModifiers() const;
+
+  //! Secondary-only Fn/stray-modifier handling (stuck-Fn incident 2026-10-21).
+  //@{
+  //! Mark this a secondary (client) key state: only there do we clear/resync
+  //! stray Fn and other modifier flags the OS word carries but no key holds.
+  void setSecondaryScreen(bool secondary);
+  //! Record whether the MacBook's own physical fn/Globe key (kVK_Function) is
+  //! held, from a non-injected secondary-tap flagsChanged. Safe from the tap
+  //! thread. A modifier post made while fn is down keeps SecondaryFn, and the
+  //! stray sweep never clears a physically-held fn.
+  void notePhysicalFnKey(bool held);
+  //! Post a cleaned absolute flag word (via postModifierResync, kVK_Function
+  //! up) when the OS word carries SecondaryFn that no held function-class key
+  //! and no physical fn explains. No-op on the primary. Returns true iff it
+  //! posted. Called after a modifier/function-key release and at enter/leave.
+  bool clearStrayFnFlag();
+  //! One stray-modifier timer tick on the secondary while on screen: sample
+  //! the HID word, log stray-set changes, and -- when the same unexplained
+  //! set survives two samples and the 1/s budget allows -- post a cleaned
+  //! absolute word. Skipped under secure input. Returns true iff it posted.
+  bool sampleStrayModifiers();
+  //@}
 
   //! A modifier the OS reports down that no hardware flagsChanged backed
   //! within this many seconds is stale (K2: stranded by a crashed
@@ -302,6 +325,11 @@ private:
   // Index into m_lastHardwareModifierAt for a modifier virtual key, or -1.
   static int hardwareSlotForVirtualKey(uint8_t virtualKey);
 
+  // True iff an injected (still-held) non-modifier key legitimately carries
+  // the SecondaryFn / NumericPad bit macOS sets while it is down.
+  bool holdingFnCarryingKey() const;
+  bool holdingNumericPadKey() const;
+
 private:
   // OS X uses a physical key if 0 for the 'A' key.  deskflow reserves
   // KeyButton 0 so we offset all OS X physical key ids by this much
@@ -341,6 +369,25 @@ private:
   // live flags still showed at the last post (the OS had not adopted it);
   // forced off in modifierEventFlags() until the live flags drop it
   std::set<uint8_t> m_pendingReleases;
+  // non-modifier keys this process posted Down for and has not posted Up for.
+  // modifierEventFlags() keeps the live Fn/NumericPad bits only while one of
+  // these holds them; cleared in fakeAllKeysUp() after the releases.
+  // Event-thread only (fakeKey / the stray timer tick).
+  std::set<uint8_t> m_injectedKeys;
+  // the MacBook's own physical fn/Globe key, tracked from the secondary tap
+  // thread; read when composing/resyncing flags.
+  std::atomic<bool> m_physicalFnHeld{false};
+  // true on a secondary (client) key state: gates the Fn-clear and the
+  // stray-modifier resync so the primary keeps its current behaviour.
+  std::atomic<bool> m_isSecondaryScreen{false};
+  // stray-modifier timer bookkeeping (event-thread only): the two-sample
+  // dwell, the monotonic time of the last resync post (1/s budget), and the
+  // last stray set logged by the change-only [cmd-diag] sampler.
+  deskflow::platform::StrayDwell m_strayDwell;
+  double m_lastStrayResyncAt = std::numeric_limits<double>::lowest();
+  double m_lastStrayLogAt = std::numeric_limits<double>::lowest();
+  uint64_t m_lastLoggedStray = 0;
+  bool m_haveLoggedStray = false;
   // monotonic time a hardware flagsChanged last carried each modifier's
   // side-specific device bit (shift, control, alt, super); written on the
   // event-tap thread, read by sanitizeInjectedKeys()
