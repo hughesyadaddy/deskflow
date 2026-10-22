@@ -990,53 +990,21 @@ void OSXKeyState::notePhysicalFnKey(bool held)
   } while (!m_physicalFn.compare_exchange_weak(cur, next, std::memory_order_relaxed));
 }
 
-bool OSXKeyState::physicalFnDown() const
-{
-  if (m_hooks.physicalFnDown) {
-    return m_hooks.physicalFnDown();
-  }
-  // Limitation (review must-fix #2): CGEventSourceKeyState reflects the HID
-  // system key-state table, not necessarily the live hardware fn/Globe key. On
-  // the MacBook CLIENT this entry was observed persistently stale-TRUE for
-  // 0x3F with nobody touching the keyboard (likely accumulated from injected
-  // events), while the HID flags word carried no Fn; on the Hackintosh it read
-  // false. So the query is trusted ONLY to say "released" (false): a false
-  // positive (stale true) must never pin the latch on -- which is why
-  // reconcilePhysicalFnKey() may only CLEAR, never set. We deliberately do NOT
-  // switch to IOHIDManager, which would trigger a new Input Monitoring TCC
-  // prompt. Fail-safe: a release the tap genuinely missed leaves the latch set
-  // until the next physical fn edge, i.e. pre-fix behaviour -- Fn cleared at
-  // leave() via fakeAllKeysUp() -- never a cleared Fn under a held finger.
-  return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, 0x3F /* kVK_Function */);
-}
-
 void OSXKeyState::reconcilePhysicalFnKey(const char *where)
 {
-  // Only the tap's observed physical fn edges SET the latch; reconcile may only
-  // CLEAR it. A fn release can be missed while off screen or while secure input
-  // blinded the tap, leaving the latch stale-true; if the query now reports the
-  // key released we drop it. The query is never trusted to assert "down" (its
-  // key-state table reads stale-true on the client -- see physicalFnDown()), so
-  // a held latch with a down/unknown query is left alone, and an already-clear
-  // latch is a no-op regardless of the query. Any tap observation landing
-  // between our load and our store wins: the clearing compare_exchange is
-  // against the exact generation we read, so a newer notePhysicalFnKey() makes
-  // it fail (superseded) and the tap's fresher verdict stands.
-  const uint32_t observed = m_physicalFn.load(std::memory_order_acquire);
-  if ((observed & 1u) == 0) {
-    LOG_DEBUG("[keys] physical fn reconcile at %s: held=0", where); // already clear
-    return;
-  }
-  if (physicalFnDown()) {
-    LOG_DEBUG("[keys] physical fn reconcile at %s: held=1", where); // query not trusted to clear
-    return;
-  }
-  uint32_t expected = observed;
-  const uint32_t desired = observed & ~1u; // same generation, held cleared
-  if (m_physicalFn.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
-    LOG_DEBUG("[keys] physical fn reconcile at %s: held=0", where);
-  } else {
-    LOG_DEBUG("[keys] physical fn reconcile at %s: superseded", where);
+  // Diagnostic only: the physical-fn latch is changed ONLY by tap-observed fn
+  // edges (notePhysicalFnKey). A direct key-state query cannot be trusted to
+  // clear it -- on the client CGEventSourceKeyState(0x3F) read persistently
+  // stale-TRUE with nothing held, and no query reliably proves a *release*
+  // either, so clearing from it could drop Fn under a finger the tap saw go
+  // down. Fail-safe: a physical release the tap genuinely missed (e.g. during
+  // secure input) keeps pre-fix behaviour -- the stray Fn is cleared at leave()
+  // via fakeAllKeysUp() -- and Fn is never cleared mid-hold. We log a held
+  // latch so a stale one is visible in the field.
+  const bool held = physicalFnHeld();
+  LOG_DEBUG("[keys] physical fn reconcile at %s: held=%d (tap-only)", where, held ? 1 : 0);
+  if (held) {
+    LOG_INFO("[keys] physical fn latch held at %s; stray-fn cleanup deferred until physical fn release", where);
   }
 }
 

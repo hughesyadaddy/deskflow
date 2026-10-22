@@ -139,10 +139,6 @@ public:
     // input the event tap sees no keyboard events at all, so the freshness
     // clock has no data and the stale-modifier sweep must not judge
     std::function<bool()> secureInputEnabled;
-    // replaces CGEventSourceKeyState(kCGEventSourceStateHIDSystemState,
-    // kVK_Function): a direct physical-state query used to reconcile the
-    // tap-tracked physical-fn latch at boundaries (enter / secure-input off).
-    std::function<bool()> physicalFnDown;
   };
   void setHooks(Hooks hooks);
   //! Primary re-entry resync: post NX_FLAGSCHANGED via IOHIDPostEvent with
@@ -164,11 +160,11 @@ public:
   //! thread. A modifier post made while fn is down keeps SecondaryFn, and the
   //! stray sweep never clears a physically-held fn.
   void notePhysicalFnKey(bool held);
-  //! Reconcile the physical-fn latch at a boundary where a release may have
-  //! been missed (secondary enter, secure-input off): a physical-state query
-  //! (Hooks::physicalFnDown / CGEventSourceKeyState) is authoritative, so the
-  //! latch is set to whatever it reports -- a finger still on fn/Globe keeps
-  //! it, a released one drops it. \p where names the boundary for the log.
+  //! Diagnostic-only boundary hook (secondary enter, secure-input off): the
+  //! physical-fn latch is changed ONLY by tap-observed fn edges, never here.
+  //! Logs the current latch, and when it is held warns that stray-fn cleanup
+  //! is deferred until the next physical fn release. \p where names the
+  //! boundary for the log.
   void reconcilePhysicalFnKey(const char *where);
   //! Whether the physical fn/Globe key is currently believed held (the latch
   //! bit, generation stripped). Exposed for tests.
@@ -359,9 +355,6 @@ private:
   // function-class key has been held past the long-hold threshold with no
   // repeat. Called from the sampler tick.
   void logLongHeldFunctionKeys();
-  // Physical-state query for the fn/Globe key (kVK_Function), hookable; backs
-  // reconcilePhysicalFnKey().
-  bool physicalFnDown() const;
 
 private:
   // OS X uses a physical key if 0 for the 'A' key.  deskflow reserves

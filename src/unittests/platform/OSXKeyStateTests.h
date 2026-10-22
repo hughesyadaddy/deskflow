@@ -72,13 +72,10 @@ private Q_SLOTS:
   void cleanupRollbackOnFailedPost();                // B
   void physicalFnLatchResetAllowsClear();            // C
   // round-3 reviewer follow-ups
-  void physicalFnHeldSurvivesReconcileBoundaries();      // held + query down -> stays held
-  void physicalFnReleasedReconcileClearsLatch();         // held + query up -> cleared
-  void reconcileIgnoresStaleTrueQueryWhenLatchClear();   // clear + stale-true query -> stays clear
-  void echoTokenCancelRemovesExactExpectation();         // MINOR #9
-  // round-4: reconcile loses to a tap observation landing mid-query
-  void reconcileLosesToTapClearingMidQuery();
-  void reconcileLosesToTapSettingMidQuery();
+  void physicalFnHeldSurvivesReconcileBoundaries(); // held latch survives reconcile
+  void reconcileClearLatchStaysClear();             // clear latch stays clear, sampler clears Fn
+  void reconcileNeverChangesTheLatch();             // reconcile is diagnostic-only
+  void echoTokenCancelRemovesExactExpectation();    // MINOR #9
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);

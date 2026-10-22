@@ -199,20 +199,11 @@ struct HookedState
   int capsSetCalls = 0;
   double now = 100.0; // fake monotonic clock, seconds
   bool secureInput = false;
-  bool physFnDown = false;                 // CGEventSourceKeyState(kVK_Function) seam
-  std::function<void()> onPhysicalFnQuery; // fires inside the query (tap landing mid-reconcile)
-
   OSXKeyState::Hooks hooks()
   {
     OSXKeyState::Hooks h;
     h.monotonicNow = [this] { return now; };
     h.secureInputEnabled = [this] { return secureInput; };
-    h.physicalFnDown = [this] {
-      if (onPhysicalFnQuery) {
-        onPhysicalFnQuery();
-      }
-      return physFnDown;
-    };
     h.osModifierFlags = [this] { return osFlags; };
     h.pressedKeys = [this](IKeyState::KeyButtonSet &out) { out = physical; };
     h.postHIDKey = [this](uint8_t vk, bool down, CGEventFlags flags) {
@@ -1673,8 +1664,8 @@ void OSXKeyStateTests::physicalFnLatchResetAllowsClear()
 
 void OSXKeyStateTests::physicalFnHeldSurvivesReconcileBoundaries()
 {
-  // (b) latch held (the tap saw fn go down) + query reports down -> reconcile
-  // leaves it held across both boundaries, so the sampler never clears Fn.
+  // A latch set by a tap-observed fn-down survives both boundary reconciles
+  // (which are diagnostic-only), so the sampler never clears Fn mid-hold.
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -1683,7 +1674,6 @@ void OSXKeyStateTests::physicalFnHeldSurvivesReconcileBoundaries()
   keyState.setSecondaryScreen(true);
 
   keyState.notePhysicalFnKey(true); // the tap observed fn down
-  os.physFnDown = true;             // the query agrees (but is only trusted to clear)
   keyState.reconcilePhysicalFnKey("enter");
   keyState.reconcilePhysicalFnKey("secure-input-off");
   QVERIFY(keyState.physicalFnHeld()); // still held
@@ -1696,11 +1686,10 @@ void OSXKeyStateTests::physicalFnHeldSurvivesReconcileBoundaries()
   QCOMPARE(os.posted.size(), size_t(0));
 }
 
-void OSXKeyStateTests::reconcileIgnoresStaleTrueQueryWhenLatchClear()
+void OSXKeyStateTests::reconcileClearLatchStaysClear()
 {
-  // (a) the live MacBook case: nobody touching the keyboard, the latch is
-  // clear, yet CGEventSourceKeyState(0x3F) reads stale-TRUE. Reconcile must
-  // NOT re-latch from that query, so stray Fn is still cleared by the sampler.
+  // The live MacBook case: nobody touching the keyboard, the latch is clear.
+  // The boundary reconciles must not re-latch, so stray Fn is still cleared.
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -1708,11 +1697,10 @@ void OSXKeyStateTests::reconcileIgnoresStaleTrueQueryWhenLatchClear()
   keyState.setHooks(os.hooks());
   keyState.setSecondaryScreen(true);
 
-  os.physFnDown = true; // stale-true key-state table entry on the client
   // latch starts clear (no tap edge observed)
   keyState.reconcilePhysicalFnKey("enter");
   keyState.reconcilePhysicalFnKey("secure-input-off");
-  QVERIFY(!keyState.physicalFnHeld()); // never set from the query
+  QVERIFY(!keyState.physicalFnHeld());
 
   os.osFlags = kCGEventFlagMaskSecondaryFn;
   os.now = 100.0;
@@ -1723,10 +1711,10 @@ void OSXKeyStateTests::reconcileIgnoresStaleTrueQueryWhenLatchClear()
   QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);
 }
 
-void OSXKeyStateTests::physicalFnReleasedReconcileClearsLatch()
+void OSXKeyStateTests::reconcileNeverChangesTheLatch()
 {
-  // MAJOR #1/#10: when the query reports fn up, the reconcile drops a stale
-  // latch and the sampler clears the stray Fn after the dwell.
+  // reconcile is diagnostic-only: it never flips the latch either way. Only a
+  // tap-observed fn-up clears it (and then the sampler can clear stray Fn).
   deskflow::KeyMap keyMap;
   EventQueue eventQueue;
   InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
@@ -1734,17 +1722,22 @@ void OSXKeyStateTests::physicalFnReleasedReconcileClearsLatch()
   keyState.setHooks(os.hooks());
   keyState.setSecondaryScreen(true);
 
-  os.physFnDown = false;            // the query says fn is NOT down
-  keyState.notePhysicalFnKey(true); // a stale latch from before the boundary
-  keyState.reconcilePhysicalFnKey("enter");
+  keyState.reconcilePhysicalFnKey("enter"); // clear stays clear
+  QVERIFY(!keyState.physicalFnHeld());
+  keyState.notePhysicalFnKey(true);
+  keyState.reconcilePhysicalFnKey("enter"); // held stays held
+  keyState.reconcilePhysicalFnKey("secure-input-off");
+  QVERIFY(keyState.physicalFnHeld());
 
+  // only a tap fn-up changes it, after which stray Fn clears
+  keyState.notePhysicalFnKey(false);
+  QVERIFY(!keyState.physicalFnHeld());
   os.osFlags = kCGEventFlagMaskSecondaryFn;
   os.now = 100.0;
   QVERIFY(!keyState.sampleStrayModifiers());
   os.now = 100.3;
   QVERIFY(keyState.sampleStrayModifiers());
   QCOMPARE(os.posted.back().virtualKey, uint8_t{0x3F});
-  QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);
 }
 
 void OSXKeyStateTests::echoTokenCancelRemovesExactExpectation()
@@ -1762,60 +1755,6 @@ void OSXKeyStateTests::echoTokenCancelRemovesExactExpectation()
   QVERIFY(echo.matches(word, t)); // b still outstanding
   echo.cancel(b);
   QVERIFY(!echo.matches(word, t)); // both gone
-}
-
-void OSXKeyStateTests::reconcileLosesToTapClearingMidQuery()
-{
-  // Round-4 race: the tap lands a fn-UP (notePhysicalFnKey(false)) between the
-  // reconcile's load and its store, while the query still returns down(true).
-  // The tap must win: the latch ends false, so the sampler can clear stray Fn.
-  deskflow::KeyMap keyMap;
-  EventQueue eventQueue;
-  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
-  HookedState os;
-  keyState.setHooks(os.hooks());
-  keyState.setSecondaryScreen(true);
-
-  keyState.notePhysicalFnKey(true); // latched true before the boundary
-  os.physFnDown = true;             // the query would say "still down"...
-  os.onPhysicalFnQuery = [&] { keyState.notePhysicalFnKey(false); }; // ...but a newer tap says up
-  keyState.reconcilePhysicalFnKey("enter");
-
-  QVERIFY(!keyState.physicalFnHeld()); // tap won: latch false
-  // and the sampler now clears the stray Fn after the dwell
-  os.osFlags = kCGEventFlagMaskSecondaryFn;
-  os.now = 100.0;
-  QVERIFY(!keyState.sampleStrayModifiers());
-  os.now = 100.3;
-  QVERIFY(keyState.sampleStrayModifiers());
-  QCOMPARE(os.posted.back().virtualKey, uint8_t{0x3F});
-}
-
-void OSXKeyStateTests::reconcileLosesToTapSettingMidQuery()
-{
-  // Mirror: the latch is held and the query would clear it (reports up), but a
-  // fresh tap fn-DOWN lands mid-query. The clearing compare_exchange is against
-  // the generation read before the query, so it fails (superseded) and the
-  // tap's re-press stands: the latch ends true and the sampler leaves Fn alone.
-  deskflow::KeyMap keyMap;
-  EventQueue eventQueue;
-  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
-  HookedState os;
-  keyState.setHooks(os.hooks());
-  keyState.setSecondaryScreen(true);
-
-  keyState.notePhysicalFnKey(true); // latched true (so reconcile runs the query)
-  os.physFnDown = false;            // the query would clear it...
-  os.onPhysicalFnQuery = [&] { keyState.notePhysicalFnKey(true); }; // ...but a newer tap re-presses
-  keyState.reconcilePhysicalFnKey("secure-input-off");
-
-  QVERIFY(keyState.physicalFnHeld()); // tap won (superseded): latch true
-  os.osFlags = kCGEventFlagMaskSecondaryFn;
-  os.now = 100.0;
-  QVERIFY(!keyState.sampleStrayModifiers());
-  os.now = 100.3;
-  QVERIFY(!keyState.sampleStrayModifiers()); // explained by the kept latch
-  QCOMPARE(os.posted.size(), size_t(0));
 }
 
 QTEST_MAIN(OSXKeyStateTests)
