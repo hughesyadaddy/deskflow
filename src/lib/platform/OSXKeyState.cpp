@@ -891,7 +891,7 @@ void OSXKeyState::carriersHeld(bool &fnHeld, bool &numpadHeld) const
   // it, because it is unconfirmed that the fn/Globe key reports in GetKeys at
   // all. The atomic is instead reset at known-safe points (secondary enter(),
   // secure-input off) so a release missed while the tap was blind cannot latch.
-  fnHeld = m_physicalFnHeld.load(std::memory_order_relaxed);
+  fnHeld = physicalFnHeld();
   numpadHeld = false;
 
   // An injected carrier explains its flag for as long as we hold it (until its
@@ -972,9 +972,22 @@ void OSXKeyState::setSecondaryScreen(bool secondary)
   m_isSecondaryScreen.store(secondary, std::memory_order_relaxed);
 }
 
+bool OSXKeyState::physicalFnHeld() const
+{
+  return (m_physicalFn.load(std::memory_order_relaxed) & 1u) != 0;
+}
+
 void OSXKeyState::notePhysicalFnKey(bool held)
 {
-  m_physicalFnHeld.store(held, std::memory_order_relaxed);
+  // The tap observation must always win a race with a boundary reconcile, so
+  // bump the generation on every write (bit 0 = held, bits 1.. = generation).
+  // A reconcile that read an earlier generation then fails its compare_exchange.
+  uint32_t cur = m_physicalFn.load(std::memory_order_relaxed);
+  uint32_t next;
+  do {
+    const uint32_t gen = cur >> 1;
+    next = ((gen + 1u) << 1) | (held ? 1u : 0u);
+  } while (!m_physicalFn.compare_exchange_weak(cur, next, std::memory_order_relaxed));
 }
 
 bool OSXKeyState::physicalFnDown() const
@@ -982,18 +995,34 @@ bool OSXKeyState::physicalFnDown() const
   if (m_hooks.physicalFnDown) {
     return m_hooks.physicalFnDown();
   }
+  // Limitation (review must-fix #2): CGEventSourceKeyState reflects the HID
+  // system state, not necessarily the live hardware fn/Globe key, and on some
+  // keyboards the fn/Globe key never registers here at all. We deliberately do
+  // NOT switch to IOHIDManager, which would trigger a new Input Monitoring TCC
+  // prompt. Fail-safe: if this ever reports a false negative (fn really down
+  // but reported up), the worst case is a stray Fn cleared a touch early, which
+  // the user's next fn edge corrects; a false positive (reported down) at worst
+  // leaves Fn until the next leave, which fakeAllKeysUp() always clears.
   return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, 0x3F /* kVK_Function */);
 }
 
 void OSXKeyState::reconcilePhysicalFnKey(const char *where)
 {
   // A fn release can be missed while off screen or while secure input blinded
-  // the tap, latching m_physicalFnHeld true; but a finger may also still be on
-  // fn/Globe across the boundary. Let the direct physical-state query decide,
-  // so a real hold survives and only a released one is dropped.
+  // the tap, latching the bit true; but a finger may also still be on fn/Globe
+  // across the boundary. Let the direct physical-state query decide -- yet lose
+  // to any tap observation that lands between our load and our store: read the
+  // generation-tagged word, run the query, then compare_exchange against that
+  // same word. If a newer notePhysicalFnKey() bumped the generation meanwhile,
+  // the exchange fails and we leave the tap's fresher verdict in place.
+  uint32_t observed = m_physicalFn.load(std::memory_order_acquire);
   const bool held = physicalFnDown();
-  m_physicalFnHeld.store(held, std::memory_order_relaxed);
-  LOG_DEBUG("[keys] physical fn reconcile at %s: held=%d", where, held ? 1 : 0);
+  const uint32_t desired = (observed & ~1u) | (held ? 1u : 0u); // same generation, queried held
+  if (m_physicalFn.compare_exchange_strong(observed, desired, std::memory_order_acq_rel)) {
+    LOG_DEBUG("[keys] physical fn reconcile at %s: held=%d", where, held ? 1 : 0);
+  } else {
+    LOG_DEBUG("[keys] physical fn reconcile at %s: superseded", where);
+  }
 }
 
 bool OSXKeyState::clearStrayFnFlag()

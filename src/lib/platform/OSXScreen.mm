@@ -1223,9 +1223,9 @@ void OSXScreen::enter()
     m_buttonState.reset();
 
     // Item C / round-3: a physical fn release can be missed while off screen,
-    // latching m_physicalFnHeld true -- but a finger may still be on fn/Globe
-    // across the crossing. Reconcile against a direct physical-state query so
-    // a real hold survives and only a released one is dropped.
+    // latching the physical-fn bit true -- but a finger may still be on
+    // fn/Globe across the crossing. Reconcile against a direct physical-state
+    // query so a real hold survives and only a released one is dropped.
     m_keyState->reconcilePhysicalFnKey("enter");
     // Fn that macOS left set while the cursor was away (a function key still
     // "down" in the word) would ride onto the first modifier post here; clear

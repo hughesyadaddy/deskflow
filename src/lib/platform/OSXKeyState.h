@@ -170,6 +170,9 @@ public:
   //! latch is set to whatever it reports -- a finger still on fn/Globe keeps
   //! it, a released one drops it. \p where names the boundary for the log.
   void reconcilePhysicalFnKey(const char *where);
+  //! Whether the physical fn/Globe key is currently believed held (the latch
+  //! bit, generation stripped). Exposed for tests.
+  bool physicalFnHeld() const;
   //! Post a cleaned absolute flag word (via postModifierResync, kVK_Function
   //! up) when the OS word carries SecondaryFn that no held function-class key
   //! and no physical fn explains. No-op on the primary. Returns true iff it
@@ -410,8 +413,13 @@ private:
   std::map<uint8_t, double> m_injectedKeyAt;
   std::set<uint8_t> m_longHoldLogged;
   // the MacBook's own physical fn/Globe key, tracked from the secondary tap
-  // thread; read when composing/resyncing flags.
-  std::atomic<bool> m_physicalFnHeld{false};
+  // thread; read when composing/resyncing flags. Generation-tagged so a tap
+  // observation (notePhysicalFnKey) landing mid-reconcile always wins: bit 0 is
+  // "held", bits 1.. are a generation the tap bumps on every write, and the
+  // boundary reconcile only stores its query result if the generation it read
+  // is still current (else the tap's newer observation stands). See
+  // reconcilePhysicalFnKey().
+  std::atomic<uint32_t> m_physicalFn{0};
   // true on a secondary (client) key state: gates the Fn-clear and the
   // stray-modifier resync so the primary keeps its current behaviour.
   std::atomic<bool> m_isSecondaryScreen{false};

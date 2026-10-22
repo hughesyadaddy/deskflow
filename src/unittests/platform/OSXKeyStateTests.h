@@ -75,6 +75,9 @@ private Q_SLOTS:
   void physicalFnHeldSurvivesReconcileBoundaries(); // MAJOR #1/#10
   void physicalFnReleasedReconcileClearsLatch();    // MAJOR #1/#10
   void echoTokenCancelRemovesExactExpectation();    // MINOR #9
+  // round-4: reconcile loses to a tap observation landing mid-query
+  void reconcileLosesToTapClearingMidQuery();
+  void reconcileLosesToTapSettingMidQuery();
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);
