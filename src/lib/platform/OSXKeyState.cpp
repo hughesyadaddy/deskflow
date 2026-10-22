@@ -996,30 +996,45 @@ bool OSXKeyState::physicalFnDown() const
     return m_hooks.physicalFnDown();
   }
   // Limitation (review must-fix #2): CGEventSourceKeyState reflects the HID
-  // system state, not necessarily the live hardware fn/Globe key, and on some
-  // keyboards the fn/Globe key never registers here at all. We deliberately do
-  // NOT switch to IOHIDManager, which would trigger a new Input Monitoring TCC
-  // prompt. Fail-safe: if this ever reports a false negative (fn really down
-  // but reported up), the worst case is a stray Fn cleared a touch early, which
-  // the user's next fn edge corrects; a false positive (reported down) at worst
-  // leaves Fn until the next leave, which fakeAllKeysUp() always clears.
+  // system key-state table, not necessarily the live hardware fn/Globe key. On
+  // the MacBook CLIENT this entry was observed persistently stale-TRUE for
+  // 0x3F with nobody touching the keyboard (likely accumulated from injected
+  // events), while the HID flags word carried no Fn; on the Hackintosh it read
+  // false. So the query is trusted ONLY to say "released" (false): a false
+  // positive (stale true) must never pin the latch on -- which is why
+  // reconcilePhysicalFnKey() may only CLEAR, never set. We deliberately do NOT
+  // switch to IOHIDManager, which would trigger a new Input Monitoring TCC
+  // prompt. Fail-safe: a release the tap genuinely missed leaves the latch set
+  // until the next physical fn edge, i.e. pre-fix behaviour -- Fn cleared at
+  // leave() via fakeAllKeysUp() -- never a cleared Fn under a held finger.
   return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, 0x3F /* kVK_Function */);
 }
 
 void OSXKeyState::reconcilePhysicalFnKey(const char *where)
 {
-  // A fn release can be missed while off screen or while secure input blinded
-  // the tap, latching the bit true; but a finger may also still be on fn/Globe
-  // across the boundary. Let the direct physical-state query decide -- yet lose
-  // to any tap observation that lands between our load and our store: read the
-  // generation-tagged word, run the query, then compare_exchange against that
-  // same word. If a newer notePhysicalFnKey() bumped the generation meanwhile,
-  // the exchange fails and we leave the tap's fresher verdict in place.
-  uint32_t observed = m_physicalFn.load(std::memory_order_acquire);
-  const bool held = physicalFnDown();
-  const uint32_t desired = (observed & ~1u) | (held ? 1u : 0u); // same generation, queried held
-  if (m_physicalFn.compare_exchange_strong(observed, desired, std::memory_order_acq_rel)) {
-    LOG_DEBUG("[keys] physical fn reconcile at %s: held=%d", where, held ? 1 : 0);
+  // Only the tap's observed physical fn edges SET the latch; reconcile may only
+  // CLEAR it. A fn release can be missed while off screen or while secure input
+  // blinded the tap, leaving the latch stale-true; if the query now reports the
+  // key released we drop it. The query is never trusted to assert "down" (its
+  // key-state table reads stale-true on the client -- see physicalFnDown()), so
+  // a held latch with a down/unknown query is left alone, and an already-clear
+  // latch is a no-op regardless of the query. Any tap observation landing
+  // between our load and our store wins: the clearing compare_exchange is
+  // against the exact generation we read, so a newer notePhysicalFnKey() makes
+  // it fail (superseded) and the tap's fresher verdict stands.
+  const uint32_t observed = m_physicalFn.load(std::memory_order_acquire);
+  if ((observed & 1u) == 0) {
+    LOG_DEBUG("[keys] physical fn reconcile at %s: held=0", where); // already clear
+    return;
+  }
+  if (physicalFnDown()) {
+    LOG_DEBUG("[keys] physical fn reconcile at %s: held=1", where); // query not trusted to clear
+    return;
+  }
+  uint32_t expected = observed;
+  const uint32_t desired = observed & ~1u; // same generation, held cleared
+  if (m_physicalFn.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+    LOG_DEBUG("[keys] physical fn reconcile at %s: held=0", where);
   } else {
     LOG_DEBUG("[keys] physical fn reconcile at %s: superseded", where);
   }

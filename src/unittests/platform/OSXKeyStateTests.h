@@ -72,9 +72,10 @@ private Q_SLOTS:
   void cleanupRollbackOnFailedPost();                // B
   void physicalFnLatchResetAllowsClear();            // C
   // round-3 reviewer follow-ups
-  void physicalFnHeldSurvivesReconcileBoundaries(); // MAJOR #1/#10
-  void physicalFnReleasedReconcileClearsLatch();    // MAJOR #1/#10
-  void echoTokenCancelRemovesExactExpectation();    // MINOR #9
+  void physicalFnHeldSurvivesReconcileBoundaries();      // held + query down -> stays held
+  void physicalFnReleasedReconcileClearsLatch();         // held + query up -> cleared
+  void reconcileIgnoresStaleTrueQueryWhenLatchClear();   // clear + stale-true query -> stays clear
+  void echoTokenCancelRemovesExactExpectation();         // MINOR #9
   // round-4: reconcile loses to a tap observation landing mid-query
   void reconcileLosesToTapClearingMidQuery();
   void reconcileLosesToTapSettingMidQuery();
