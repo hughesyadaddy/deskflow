@@ -247,6 +247,9 @@ public:
   using Clock = std::chrono::steady_clock;
   static constexpr std::chrono::milliseconds kWindow{500};
 
+  //! opaque handle to a single outstanding expectation (see expectFull/cancel)
+  using Token = uint64_t;
+
   //! primary resync posts: match on the ordinary-modifier bits only (an IOHID
   //! echo may differ in lock/device noise). Unchanged semantics.
   void expect(uint64_t flags, Clock::time_point now)
@@ -256,19 +259,20 @@ public:
 
   //! secondary Fn cleanup/resync posts: match on the FULL word, SecondaryFn
   //! and NumericPad included, so a physical fn edge (Fn set) within the window
-  //! is not swallowed as our echo (our cleaned word has Fn cleared).
-  void expectFull(uint64_t flags, Clock::time_point now)
+  //! is not swallowed as our echo (our cleaned word has Fn cleared). Returns a
+  //! token so a failed post can cancel exactly this expectation.
+  Token expectFull(uint64_t flags, Clock::time_point now)
   {
-    add(flags, ~uint64_t(0), now);
+    return add(flags, ~uint64_t(0), now);
   }
 
-  //! drop one still-live expectation matching \p flags (rollback when the post
-  //! that was announced failed to go out)
-  void cancel(uint64_t flags, Clock::time_point now)
+  //! drop exactly the expectation \p token identifies (rollback when the post
+  //! that was announced failed to go out); no-op if it already expired/matched
+  void cancel(Token token)
   {
     std::scoped_lock lock(m_mutex);
     for (auto it = m_pending.begin(); it != m_pending.end(); ++it) {
-      if (now - it->at <= kWindow && (flags & it->mask) == it->flags) {
+      if (it->token == token) {
         m_pending.erase(it);
         break;
       }
@@ -325,16 +329,20 @@ private:
     uint64_t flags; //!< expected word already reduced to \c mask
     uint64_t mask;  //!< bits compared against an observed word
     Clock::time_point at;
+    Token token; //!< identity for cancel()
   };
-  void add(uint64_t flags, uint64_t mask, Clock::time_point now)
+  Token add(uint64_t flags, uint64_t mask, Clock::time_point now)
   {
     std::scoped_lock lock(m_mutex);
-    m_pending.push_back({flags & mask, mask, now});
+    const Token token = ++m_nextToken; // never 0, so 0 can mean "no token"
+    m_pending.push_back({flags & mask, mask, now, token});
     m_any.store(true, std::memory_order_release);
+    return token;
   }
   std::mutex m_mutex;
   std::vector<Pending> m_pending;
   std::atomic<bool> m_any{false};
+  Token m_nextToken{0};
 };
 
 //! Synchronous resync driver with injectable I/O (tests fake all three).

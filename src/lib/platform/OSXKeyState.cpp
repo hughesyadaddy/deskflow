@@ -977,6 +977,25 @@ void OSXKeyState::notePhysicalFnKey(bool held)
   m_physicalFnHeld.store(held, std::memory_order_relaxed);
 }
 
+bool OSXKeyState::physicalFnDown() const
+{
+  if (m_hooks.physicalFnDown) {
+    return m_hooks.physicalFnDown();
+  }
+  return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, 0x3F /* kVK_Function */);
+}
+
+void OSXKeyState::reconcilePhysicalFnKey(const char *where)
+{
+  // A fn release can be missed while off screen or while secure input blinded
+  // the tap, latching m_physicalFnHeld true; but a finger may also still be on
+  // fn/Globe across the boundary. Let the direct physical-state query decide,
+  // so a real hold survives and only a released one is dropped.
+  const bool held = physicalFnDown();
+  m_physicalFnHeld.store(held, std::memory_order_relaxed);
+  LOG_DEBUG("[keys] physical fn reconcile at %s: held=%d", where, held ? 1 : 0);
+}
+
 bool OSXKeyState::clearStrayFnFlag()
 {
   // Secondary-only: the primary keeps its current behaviour (its own physical
@@ -1012,9 +1031,10 @@ bool OSXKeyState::clearStrayFnFlag()
   // If the post fails, cancel the expectation so it cannot swallow a later
   // physical edge.
   const auto echoAt = deskflow::platform::ResyncEchoFilter::Clock::now();
-  deskflow::platform::ResyncEchoFilter::instance().expectFull(static_cast<uint64_t>(cleaned), echoAt);
+  const auto echoToken =
+      deskflow::platform::ResyncEchoFilter::instance().expectFull(static_cast<uint64_t>(cleaned), echoAt);
   if (!postModifierResync(0x3F /* kVK_Function */, false, cleaned)) {
-    deskflow::platform::ResyncEchoFilter::instance().cancel(static_cast<uint64_t>(cleaned), echoAt);
+    deskflow::platform::ResyncEchoFilter::instance().cancel(echoToken);
     return false;
   }
   LOG_INFO(
@@ -1073,9 +1093,9 @@ bool OSXKeyState::sampleStrayModifiers()
   // Item 6/B: announce the unmarked IOHID post's FULL word so the secondary
   // tap skips tracking its echo; roll back the expectation if the post fails.
   const auto echoAt = deskflow::platform::ResyncEchoFilter::Clock::now();
-  deskflow::platform::ResyncEchoFilter::instance().expectFull(cleaned, echoAt);
+  const auto echoToken = deskflow::platform::ResyncEchoFilter::instance().expectFull(cleaned, echoAt);
   if (!postModifierResync(deskflow::platform::strayResyncKeycode(stray), false, cleaned)) {
-    deskflow::platform::ResyncEchoFilter::instance().cancel(cleaned, echoAt);
+    deskflow::platform::ResyncEchoFilter::instance().cancel(echoToken);
     return false;
   }
   m_lastStrayResyncAt = at;

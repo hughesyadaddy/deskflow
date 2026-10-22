@@ -365,7 +365,7 @@ void OSXModifierResyncTests::tap_ownFnCleanupEchoIsNotHardwareFn()
   // skips noteHardwareModifierFlags() and physical-fn tracking for it.
   auto &echo = ResyncEchoFilter::instance();
   const uint64_t cleaned = kNC; // Fn already cleared in a cleanup word
-  echo.expect(cleaned, ResyncEchoFilter::Clock::now());
+  echo.expectFull(cleaned, ResyncEchoFilter::Clock::now());
   CGEventRef e = CGEventCreateKeyboardEvent(nullptr, 0x3F /* kVK_Function */, false);
   QVERIFY(e != nullptr);
   CGEventSetType(e, kCGEventFlagsChanged);
@@ -383,15 +383,15 @@ void OSXModifierResyncTests::echo_fullWordMatchExcludesPhysicalFnAndCancels()
   ResyncEchoFilter echo;
   const auto t = ResyncEchoFilter::Clock::now();
   const uint64_t cleaned = kNC | kLCmd; // Fn already cleared in a cleanup word
-  echo.expectFull(cleaned, t);
+  const auto token = echo.expectFull(cleaned, t);
 
   // a physical fn edge over the same base word (Fn set) must NOT match
   QVERIFY(!echo.matches(cleaned | kFlagSecondaryFn, t));
   // the exact announced word still matches (would be consumed as our echo)
   QVERIFY(echo.matches(cleaned, t));
 
-  // cancel removes the expectation
-  echo.cancel(cleaned, t);
+  // cancel(token) removes exactly that expectation
+  echo.cancel(token);
   QVERIFY(!echo.matches(cleaned, t));
 
   // a primary-style (masked) expectation still ignores Fn/device noise

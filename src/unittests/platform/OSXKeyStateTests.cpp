@@ -199,12 +199,14 @@ struct HookedState
   int capsSetCalls = 0;
   double now = 100.0; // fake monotonic clock, seconds
   bool secureInput = false;
+  bool physFnDown = false; // CGEventSourceKeyState(kVK_Function) seam
 
   OSXKeyState::Hooks hooks()
   {
     OSXKeyState::Hooks h;
     h.monotonicNow = [this] { return now; };
     h.secureInputEnabled = [this] { return secureInput; };
+    h.physicalFnDown = [this] { return physFnDown; };
     h.osModifierFlags = [this] { return osFlags; };
     h.pressedKeys = [this](IKeyState::KeyButtonSet &out) { out = physical; };
     h.postHIDKey = [this](uint8_t vk, bool down, CGEventFlags flags) {
@@ -1661,6 +1663,71 @@ void OSXKeyStateTests::physicalFnLatchResetAllowsClear()
   QVERIFY(keyState.sampleStrayModifiers());
   QCOMPARE(os.posted.back().virtualKey, uint8_t{0x3F});
   QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);
+}
+
+void OSXKeyStateTests::physicalFnHeldSurvivesReconcileBoundaries()
+{
+  // MAJOR #1/#10: a finger still on fn/Globe across the boundary must survive
+  // the reconcile (the query reports down), so the sampler never clears Fn.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  os.physFnDown = true;              // the physical-state query says fn is down
+  keyState.notePhysicalFnKey(false); // even if the tap latch was stale/clear
+  keyState.reconcilePhysicalFnKey("enter");
+  keyState.reconcilePhysicalFnKey("secure-input-off");
+
+  os.osFlags = kCGEventFlagMaskSecondaryFn;
+  os.now = 100.0;
+  QVERIFY(!keyState.sampleStrayModifiers());
+  os.now = 100.3;
+  QVERIFY(!keyState.sampleStrayModifiers()); // fn explained by the kept latch
+  QCOMPARE(os.posted.size(), size_t(0));
+}
+
+void OSXKeyStateTests::physicalFnReleasedReconcileClearsLatch()
+{
+  // MAJOR #1/#10: when the query reports fn up, the reconcile drops a stale
+  // latch and the sampler clears the stray Fn after the dwell.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  os.physFnDown = false;            // the query says fn is NOT down
+  keyState.notePhysicalFnKey(true); // a stale latch from before the boundary
+  keyState.reconcilePhysicalFnKey("enter");
+
+  os.osFlags = kCGEventFlagMaskSecondaryFn;
+  os.now = 100.0;
+  QVERIFY(!keyState.sampleStrayModifiers());
+  os.now = 100.3;
+  QVERIFY(keyState.sampleStrayModifiers());
+  QCOMPARE(os.posted.back().virtualKey, uint8_t{0x3F});
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);
+}
+
+void OSXKeyStateTests::echoTokenCancelRemovesExactExpectation()
+{
+  // MINOR #9: two identical outstanding expectations; cancel(token) removes
+  // exactly the one named, leaving the other able to match.
+  auto &echo = deskflow::platform::ResyncEchoFilter::instance();
+  const auto t = deskflow::platform::ResyncEchoFilter::Clock::now();
+  const uint64_t word = kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK | 0x800; // distinctive
+  const auto a = echo.expectFull(word, t);
+  const auto b = echo.expectFull(word, t);
+  QVERIFY(a != b);
+
+  echo.cancel(a);
+  QVERIFY(echo.matches(word, t)); // b still outstanding
+  echo.cancel(b);
+  QVERIFY(!echo.matches(word, t)); // both gone
 }
 
 QTEST_MAIN(OSXKeyStateTests)
