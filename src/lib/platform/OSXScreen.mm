@@ -2342,14 +2342,22 @@ OSXScreen::handleCGInputEventSecondary(CGEventTapProxy proxy, CGEventType type, 
     OSXScreen *screen = (OSXScreen *)refcon;
     if (type == kCGEventFlagsChanged) {
       const CGEventFlags macMask = CGEventGetFlags(event);
-      screen->m_keyState->noteHardwareModifierFlags(macMask, OSXKeyState::monotonicSeconds());
-      // Track the MacBook's own physical fn/Globe key (kVK_Function): a
-      // non-injected flagsChanged for it tells us whether fn is held, so a
-      // modifier post made while fn is down keeps SecondaryFn and the stray
-      // sweep never clears a physically-held fn.
-      if (!deskflow::platform::isInjectedEvent(event) &&
-          CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == 0x3F /* kVK_Function */) {
-        screen->m_keyState->notePhysicalFnKey((macMask & 0x800000) != 0);
+      // Item 6: our own stray-Fn cleanup / resync posts go out through an
+      // unmarked IOHIDPostEvent, so recognise their echo FIRST (marker or
+      // announced flags) and skip both the freshness clock and physical-fn
+      // tracking for it -- otherwise our kVK_Function echo would read as a
+      // hardware fn press and refresh sanitizeInjectedKeys()' timestamps.
+      const bool ownEcho = OSXScreen::isOwnModifierResyncEvent(type, event);
+      if (!ownEcho) {
+        screen->m_keyState->noteHardwareModifierFlags(macMask, OSXKeyState::monotonicSeconds());
+        // Track the MacBook's own physical fn/Globe key (kVK_Function): a
+        // non-injected flagsChanged for it tells us whether fn is held, so a
+        // modifier post made while fn is down keeps SecondaryFn and the stray
+        // sweep never clears a physically-held fn.
+        if (!deskflow::platform::isInjectedEvent(event) &&
+            CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == 0x3F /* kVK_Function */) {
+          screen->m_keyState->notePhysicalFnKey((macMask & 0x800000) != 0);
+        }
       }
       // [cmd-diag] logging only — observe local modifier edges on the client
       // (unstick via Ctrl/Option/Cmd+Tab shows up here). Rate-limited.

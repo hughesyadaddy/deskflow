@@ -1340,6 +1340,7 @@ void OSXKeyStateTests::modifierPostStripsStrayFnAndNumericPad()
   InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
   HookedState os;
   keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
 
   os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
   keyState.fakeKey(stroke(kVK_Shift, true));
@@ -1360,6 +1361,7 @@ void OSXKeyStateTests::modifierPostKeepsFnAndNumericPadWhileArrowHeld()
   InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
   HookedState os;
   keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
 
   os.osFlags = 0;
   keyState.fakeKey(stroke(kVK_LeftArrow, true)); // non-modifier: held in our set
@@ -1401,6 +1403,10 @@ void OSXKeyStateTests::modifierReleasePostsStrayFnResync()
   QCOMPARE(last.virtualKey, uint8_t{0x3F}); // kVK_Function
   QVERIFY(!last.down);
   QVERIFY((last.flags & kCGEventFlagMaskSecondaryFn) == 0);
+  // item 2: the ledger-reconciled cleanup word does not re-assert the Shift we
+  // just released, even though the lagging OS word still shows it.
+  QVERIFY((last.flags & kCGEventFlagMaskShift) == 0);
+  QVERIFY((last.flags & NX_DEVICELSHIFTKEYMASK) == 0);
 
   // and nothing is posted on the primary (role gate)
   deskflow::KeyMap keyMap2;
@@ -1447,6 +1453,160 @@ void OSXKeyStateTests::fakeAllKeysUpClearsFunctionKeySet()
   keyState.fakeKey(stroke(kVK_Command, true));
   QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);
   QVERIFY((os.posted.back().flags & kCGEventFlagMaskNumericPad) == 0);
+}
+
+void OSXKeyStateTests::modifierPostOnPrimaryPreservesFnAndNumericPad()
+{
+  // Item 5: on the primary the strip is gated off, so a modifier post carries
+  // the OS word's Fn/NumericPad exactly as before (the primary never tracks
+  // physical fn, so stripping there could drop a physically-held Fn).
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks()); // setSecondaryScreen never called -> primary
+
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+  keyState.fakeKey(stroke(kVK_Shift, true));
+
+  QCOMPARE(os.posted.size(), size_t(1));
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskSecondaryFn) != 0);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskNumericPad) != 0);
+}
+
+void OSXKeyStateTests::modifierPostKeepsFnAndNumericPadForPhysicalCarrier()
+{
+  // Item 3: the MacBook's own physical arrow (not injected) sets Fn/NumericPad
+  // while held. A modifier post must keep both, and neither cleanup nor the
+  // sampler may clear them.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  os.physical.insert(buttonFor(kVK_LeftArrow)); // user's own key, via GetKeys hook
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+
+  keyState.fakeKey(stroke(kVK_Shift, true));
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) != 0);
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskNumericPad) != 0);
+
+  os.posted.clear();
+  QVERIFY(!keyState.clearStrayFnFlag());
+  QVERIFY(!keyState.sampleStrayModifiers());
+  QVERIFY(!keyState.sampleStrayModifiers());
+  QCOMPARE(os.posted.size(), size_t(0));
+}
+
+void OSXKeyStateTests::samplerClearsUnexplainedFnAfterDwell()
+{
+  // Item 1: the sampler must actually detect a stray Fn (the old explained
+  // word kept every OS bit, so Fn was always "explained"). OS word = Fn only,
+  // nothing held: first sample posts nothing (dwell), the second posts a clean
+  // kVK_Function up.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  os.osFlags = kCGEventFlagMaskSecondaryFn;
+  os.now = 100.0;
+  QVERIFY(!keyState.sampleStrayModifiers()); // once: dwell not satisfied
+  QCOMPARE(os.posted.size(), size_t(0));
+  os.now = 100.3;
+  QVERIFY(keyState.sampleStrayModifiers()); // same set twice: resync
+  QCOMPARE(os.posted.size(), size_t(1));
+  QCOMPARE(os.posted[0].virtualKey, uint8_t{0x3F});
+  QVERIFY(!os.posted[0].down);
+  QVERIFY((os.posted[0].flags & kCGEventFlagMaskSecondaryFn) == 0);
+}
+
+void OSXKeyStateTests::samplerKeepsFnWhileCarrierHeldOrSecureInput()
+{
+  // Items 1/3/4: a held injected arrow explains Fn (no post), and secure input
+  // skips the sampler entirely.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  os.now = 100.0;
+  keyState.fakeKey(stroke(kVK_LeftArrow, true)); // injected carrier, fresh
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+  os.posted.clear();
+  QVERIFY(!keyState.sampleStrayModifiers());
+  QVERIFY(!keyState.sampleStrayModifiers()); // carrier explains Fn -> no post
+  QCOMPARE(os.posted.size(), size_t(0));
+
+  // secure input: skip regardless
+  keyState.fakeKey(stroke(kVK_LeftArrow, false));
+  os.osFlags = kCGEventFlagMaskSecondaryFn;
+  os.secureInput = true;
+  os.posted.clear();
+  QVERIFY(!keyState.sampleStrayModifiers());
+  QVERIFY(!keyState.sampleStrayModifiers());
+  QCOMPARE(os.posted.size(), size_t(0));
+}
+
+void OSXKeyStateTests::cleanupSkippedUnderSecureInput()
+{
+  // Item 4: every cleanup caller posts nothing while a password field owns
+  // input (physical transitions, including fn, are invisible).
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  os.osFlags = kCGEventFlagMaskSecondaryFn;
+  os.secureInput = true;
+  os.posted.clear();
+  QVERIFY(!keyState.clearStrayFnFlag());
+  QVERIFY(!keyState.sampleStrayModifiers());
+  QVERIFY(!keyState.sampleStrayModifiers());
+  QCOMPARE(os.posted.size(), size_t(0));
+}
+
+void OSXKeyStateTests::samplerAgesOutStaleInjectedCarrier()
+{
+  // Item 7: an injected arrow whose key-up was lost keeps "explaining" Fn only
+  // for kCarrierFreshSec; after that the sampler clears Fn even though the OS
+  // key map (GetKeys) still shows the arrow down. A fresh carrier does not.
+  deskflow::KeyMap keyMap;
+  EventQueue eventQueue;
+  InjectingKeyState keyState(&eventQueue, keyMap, {"en"}, true);
+  HookedState os;
+  keyState.setHooks(os.hooks());
+  keyState.setSecondaryScreen(true);
+
+  os.now = 100.0;
+  keyState.fakeKey(stroke(kVK_LeftArrow, true)); // injected down, no later repeat
+  os.physical.insert(buttonFor(kVK_LeftArrow));  // lost key-up: GetKeys still shows it
+  os.osFlags = kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+  os.posted.clear();
+
+  // refreshed 1 s ago -> still fresh -> explains Fn -> no post
+  os.now = 101.0;
+  QVERIFY(!keyState.sampleStrayModifiers());
+  os.now = 101.3;
+  QVERIFY(!keyState.sampleStrayModifiers());
+  QCOMPARE(os.posted.size(), size_t(0));
+
+  // 4 s since the last down, no repeat -> stale -> excluded from the physical
+  // scan too (it is ours) -> Fn unexplained -> cleared after the dwell
+  os.now = 104.0;
+  QVERIFY(!keyState.sampleStrayModifiers());
+  os.now = 104.3;
+  QVERIFY(keyState.sampleStrayModifiers());
+  QCOMPARE(os.posted.back().virtualKey, uint8_t{0x3F});
+  QVERIFY((os.posted.back().flags & kCGEventFlagMaskSecondaryFn) == 0);
 }
 
 QTEST_MAIN(OSXKeyStateTests)

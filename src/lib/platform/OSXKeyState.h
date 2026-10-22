@@ -177,6 +177,12 @@ public:
   //! incarnation) and sanitizeInjectedKeys() releases it.
   static constexpr double kHardwareModifierFreshS = 2.0;
 
+  //! An injected function-class / keypad key stops "explaining" its Fn /
+  //! NumericPad bit this many seconds after its last down/repeat: in the
+  //! incident the Fn was held by an injected key whose key-up never arrived,
+  //! so a stale carrier must not pin the flag on until the next leave.
+  static constexpr double kCarrierFreshSec = 3.0;
+
   //! Monotonic seconds (steady clock); the clock noteHardwareModifierFlags()
   //! stamps are expected in.
   static double monotonicSeconds();
@@ -325,10 +331,27 @@ private:
   // Index into m_lastHardwareModifierAt for a modifier virtual key, or -1.
   static int hardwareSlotForVirtualKey(uint8_t virtualKey);
 
-  // True iff an injected (still-held) non-modifier key legitimately carries
-  // the SecondaryFn / NumericPad bit macOS sets while it is down.
+  // Compose the global flag word a post must carry: the live OS word
+  // reconciled against our ledger -- pending releases forced off, held
+  // modifiers forced on, and (when forcePostedKey) the posted key's new state
+  // applied last. The reconciliation modifierEventFlags() and the Fn cleanup
+  // share, so neither re-asserts a modifier a stale OS read still shows.
+  CGEventFlags composeModifierWord(uint8_t virtualKey, bool down, bool forcePostedKey) const;
+  // Drop a stray SecondaryFn / NumericPad bit from \p flags (secondary only,
+  // item 5): one that no key -- injected (and still fresh) or physically down
+  // -- legitimately holds.
+  void stripStrayFnNumericPad(CGEventFlags &flags) const;
+  // Which carrier bits a key currently holds: an injected carrier counted only
+  // while fresh (a lost key-up must not explain Fn forever), plus the
+  // MacBook's own physical carrier / fn key (GetKeys), excluding keys we
+  // injected ourselves.
+  void carriersHeld(bool &fnHeld, bool &numpadHeld) const;
+  // An injected carrier counts as held only within kCarrierFreshSec of its
+  // last down/repeat.
+  bool carrierFresh(uint8_t vk) const;
+  // True iff an injected (still-held) non-modifier key is Fn-carrying; decides
+  // whether a release was the last injected Fn carrier.
   bool holdingFnCarryingKey() const;
-  bool holdingNumericPadKey() const;
 
 private:
   // OS X uses a physical key if 0 for the 'A' key.  deskflow reserves
@@ -374,6 +397,9 @@ private:
   // these holds them; cleared in fakeAllKeysUp() after the releases.
   // Event-thread only (fakeKey / the stray timer tick).
   std::set<uint8_t> m_injectedKeys;
+  // monotonic time each injected non-modifier key was last posted Down (or
+  // repeated); carrierFresh() ages a lost-key-up carrier out. Event-thread only.
+  std::map<uint8_t, double> m_injectedKeyAt;
   // the MacBook's own physical fn/Globe key, tracked from the secondary tap
   // thread; read when composing/resyncing flags.
   std::atomic<bool> m_physicalFnHeld{false};

@@ -357,4 +357,22 @@ void OSXModifierResyncTests::stray_dwellRequiresSameSetTwice()
   QVERIFY(!d.sample(kFlagCommand)); // back to needing two in a row
 }
 
+void OSXModifierResyncTests::tap_ownFnCleanupEchoIsNotHardwareFn()
+{
+  // Item 6: a secondary Fn-cleanup/resync post registers its cleaned word with
+  // the echo filter before going out on the unmarked IOHID path. Its echo (a
+  // kVK_Function flagsChanged) must be recognised as ours so the secondary tap
+  // skips noteHardwareModifierFlags() and physical-fn tracking for it.
+  auto &echo = ResyncEchoFilter::instance();
+  const uint64_t cleaned = kNC; // Fn already cleared in a cleanup word
+  echo.expect(cleaned, ResyncEchoFilter::Clock::now());
+  CGEventRef e = CGEventCreateKeyboardEvent(nullptr, 0x3F /* kVK_Function */, false);
+  QVERIFY(e != nullptr);
+  CGEventSetType(e, kCGEventFlagsChanged);
+  CGEventSetFlags(e, CGEventFlags(cleaned));
+  QVERIFY(OSXScreen::isOwnModifierResyncEvent(kCGEventFlagsChanged, e)); // ours -> skip tracking
+  QVERIFY(!OSXScreen::isOwnModifierResyncEvent(kCGEventFlagsChanged, e)); // consumed once
+  CFRelease(e);
+}
+
 QTEST_MAIN(OSXModifierResyncTests)

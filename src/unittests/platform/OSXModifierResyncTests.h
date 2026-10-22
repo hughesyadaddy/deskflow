@@ -40,6 +40,7 @@ private Q_SLOTS:
   void stray_numericPadCleaning();
   void stray_resyncKeycodePrefersFn();
   void stray_dwellRequiresSameSetTwice();
+  void tap_ownFnCleanupEchoIsNotHardwareFn();
 
 private:
   Arch m_arch;

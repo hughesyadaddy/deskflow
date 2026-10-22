@@ -61,6 +61,13 @@ private Q_SLOTS:
   void modifierPostKeepsFnAndNumericPadWhileArrowHeld();
   void modifierReleasePostsStrayFnResync();
   void fakeAllKeysUpClearsFunctionKeySet();
+  // reviewer follow-ups
+  void modifierPostOnPrimaryPreservesFnAndNumericPad();      // item 5
+  void modifierPostKeepsFnAndNumericPadForPhysicalCarrier(); // item 3
+  void samplerClearsUnexplainedFnAfterDwell();               // item 1
+  void samplerKeepsFnWhileCarrierHeldOrSecureInput();        // items 1/3/4
+  void cleanupSkippedUnderSecureInput();                     // item 4
+  void samplerAgesOutStaleInjectedCarrier();                 // item 7
 
 private:
   bool isKeyPressed(const OSXKeyState &keyState, KeyButton button);

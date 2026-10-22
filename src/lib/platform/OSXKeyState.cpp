@@ -803,7 +803,7 @@ CGEventFlags OSXKeyState::rightDeviceBitForVirtualKey(uint8_t virtualKey)
   }
 }
 
-CGEventFlags OSXKeyState::modifierEventFlags(uint8_t virtualKey, bool down) const
+CGEventFlags OSXKeyState::composeModifierWord(uint8_t virtualKey, bool down, bool forcePostedKey) const
 {
   CGEventFlags flags = osModifierFlags();
   const auto force = [&flags](uint8_t vk, bool on) {
@@ -830,50 +830,117 @@ CGEventFlags OSXKeyState::modifierEventFlags(uint8_t virtualKey, bool down) cons
 
   // ledger first: what we hold stays on, what we released stays off ...
   for (const uint8_t vk : m_pendingReleases) {
-    if (vk != virtualKey) {
+    if (!forcePostedKey || vk != virtualKey) {
       force(vk, false);
     }
   }
   for (const uint8_t vk : m_injectedModifiers) {
-    if (vk != virtualKey) {
+    if (!forcePostedKey || vk != virtualKey) {
       force(vk, true);
     }
   }
-  // ... and the key being posted takes its new state last
-  force(virtualKey, down);
+  // ... and the key being posted (if any) takes its new state last
+  if (forcePostedKey) {
+    force(virtualKey, down);
+  }
+  return flags;
+}
 
+void OSXKeyState::stripStrayFnNumericPad(CGEventFlags &flags) const
+{
+  // Item 5: the primary keeps its exact previous behaviour. Its tap never
+  // tracks physical fn, so stripping there could drop a Fn the user is
+  // physically holding -- never strip on the primary.
+  if (!m_isSecondaryScreen.load(std::memory_order_relaxed)) {
+    return;
+  }
   // SecondaryFn and NumericPad in the live OS word are transient flags macOS
   // sets while a function-class / keypad key is down; they are never
   // modifiers this process holds. Copying them onto a modifier post
   // re-publishes them globally (kIOHIDSetGlobalEventFlags), and every later
-  // post re-asserts them -- the 34 s stuck-Fn incident (2026-10-21). Strip
-  // them unless a key we injected legitimately carries them, or (Fn) the
-  // MacBook's own physical fn/Globe key is held. Caps and the device bits are
-  // untouched. (The primary never injects an Fn-carrying key, so this only
-  // ever matters on the secondary.)
-  if (!holdingFnCarryingKey() && !m_physicalFnHeld.load(std::memory_order_relaxed)) {
+  // post re-asserts them -- the 34 s stuck-Fn incident (2026-10-21). Keep
+  // them only while a carrier key really holds them (injected and fresh, or
+  // the MacBook's own physical key). Caps and the device bits are untouched.
+  bool fnHeld = false;
+  bool numpadHeld = false;
+  carriersHeld(fnHeld, numpadHeld);
+  if (!fnHeld) {
     flags &= ~kCGEventFlagMaskSecondaryFn;
   }
-  if (!holdingNumericPadKey()) {
+  if (!numpadHeld) {
     flags &= ~kCGEventFlagMaskNumericPad;
   }
+}
+
+CGEventFlags OSXKeyState::modifierEventFlags(uint8_t virtualKey, bool down) const
+{
+  CGEventFlags flags = composeModifierWord(virtualKey, down, /*forcePostedKey=*/true);
+  stripStrayFnNumericPad(flags);
   return flags;
+}
+
+bool OSXKeyState::carrierFresh(uint8_t vk) const
+{
+  const auto it = m_injectedKeyAt.find(vk);
+  if (it == m_injectedKeyAt.end()) {
+    return false;
+  }
+  return (now() - it->second) <= kCarrierFreshSec;
+}
+
+void OSXKeyState::carriersHeld(bool &fnHeld, bool &numpadHeld) const
+{
+  // The tap-tracked physical fn atomic is an extra signal (item 4): keep it,
+  // but the GetKeys query below is the authority when it is fresh.
+  fnHeld = m_physicalFnHeld.load(std::memory_order_relaxed);
+  numpadHeld = false;
+
+  // Injected carriers, counted only while fresh: a carrier whose key-up was
+  // lost (item 7) ages out so the sweep can finally clear its flag.
+  for (const uint8_t vk : m_injectedKeys) {
+    if (!carrierFresh(vk)) {
+      continue;
+    }
+    if (deskflow::platform::isFnCarryingKey(vk)) {
+      fnHeld = true;
+    }
+    if (deskflow::platform::isNumericPadKey(vk)) {
+      numpadHeld = true;
+    }
+  }
+  if (fnHeld && numpadHeld) {
+    return;
+  }
+
+  // Physical carriers -- the MacBook's own arrow / Home-End / F-key / keypad,
+  // and its fn/Globe key (kVK_Function) -- set Fn/NumericPad in the HID word
+  // while held but are not injected. Query the key map once (item 3); exclude
+  // keys we injected (those go through the freshness path above, so a lost
+  // key-up never masquerades as a physical hold).
+  KeyButtonSet pressed;
+  pollPressedKeys(pressed);
+  for (const KeyButton button : pressed) {
+    const uint32_t vk = mapKeyButtonToVirtualKey(button);
+    if (vk > 0xff) {
+      continue;
+    }
+    const auto vk8 = static_cast<uint8_t>(vk);
+    if (m_injectedKeys.count(vk8) != 0) {
+      continue;
+    }
+    if (vk8 == 0x3F /* kVK_Function */ || deskflow::platform::isFnCarryingKey(vk8)) {
+      fnHeld = true;
+    }
+    if (deskflow::platform::isNumericPadKey(vk8)) {
+      numpadHeld = true;
+    }
+  }
 }
 
 bool OSXKeyState::holdingFnCarryingKey() const
 {
   for (const uint8_t vk : m_injectedKeys) {
     if (deskflow::platform::isFnCarryingKey(vk)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool OSXKeyState::holdingNumericPadKey() const
-{
-  for (const uint8_t vk : m_injectedKeys) {
-    if (deskflow::platform::isNumericPadKey(vk)) {
       return true;
     }
   }
@@ -897,21 +964,41 @@ bool OSXKeyState::clearStrayFnFlag()
   if (!m_isSecondaryScreen.load(std::memory_order_relaxed)) {
     return false;
   }
-  const uint64_t os = static_cast<uint64_t>(osModifierFlags());
-  if ((os & deskflow::platform::kFlagSecondaryFn) == 0) {
+  // Item 4: while a password field owns input, physical transitions are
+  // invisible, so we cannot judge what is held -- never post then.
+  if (secureInputEnabled()) {
+    return false;
+  }
+  // Item 2: reconcile the live word against our ledger (released modifiers
+  // forced off, held ones on) BEFORE touching Fn, so a Shift we just released
+  // whose Up the OS has not adopted yet is not re-asserted by this post.
+  CGEventFlags word = composeModifierWord(0, false, /*forcePostedKey=*/false);
+  if ((word & kCGEventFlagMaskSecondaryFn) == 0) {
     return false; // no Fn to clear
   }
-  if (holdingFnCarryingKey() || m_physicalFnHeld.load(std::memory_order_relaxed)) {
+  bool fnHeld = false;
+  bool numpadHeld = false;
+  carriersHeld(fnHeld, numpadHeld);
+  if (fnHeld) {
     return false; // legitimately carried, leave it
   }
-  const uint64_t cleaned =
-      deskflow::platform::cleanedModifierWord(os, deskflow::platform::kFlagSecondaryFn, holdingNumericPadKey());
+  CGEventFlags cleaned = word & ~static_cast<CGEventFlags>(kCGEventFlagMaskSecondaryFn);
+  if (!numpadHeld) {
+    cleaned &= ~static_cast<CGEventFlags>(kCGEventFlagMaskNumericPad);
+  }
+  // Item 6: our IOHID resync post carries no marker, so announce it to the
+  // echo filter; the secondary tap then recognises its echo and skips both
+  // hardware-modifier and physical-fn tracking for it.
+  deskflow::platform::ResyncEchoFilter::instance().expect(
+      static_cast<uint64_t>(cleaned), deskflow::platform::ResyncEchoFilter::Clock::now()
+  );
   if (!postModifierResync(0x3F /* kVK_Function */, false, cleaned)) {
     return false;
   }
   LOG_INFO(
-      "[keys] cleared stray fn flag (os 0x%llx -> 0x%llx)", static_cast<unsigned long long>(os),
-      static_cast<unsigned long long>(cleaned)
+      "[keys] cleared stray fn flag (os 0x%llx -> 0x%llx)",
+      static_cast<unsigned long long>(static_cast<uint64_t>(osModifierFlags())),
+      static_cast<unsigned long long>(static_cast<uint64_t>(cleaned))
   );
   return true;
 }
@@ -925,9 +1012,15 @@ bool OSXKeyState::sampleStrayModifiers()
     return false;
   }
   const uint64_t os = static_cast<uint64_t>(osModifierFlags());
-  const bool numpadKey = holdingNumericPadKey();
-  uint64_t explained = static_cast<uint64_t>(heldModifierFlags());
-  if (holdingFnCarryingKey() || m_physicalFnHeld.load(std::memory_order_relaxed)) {
+  bool fnHeld = false;
+  bool numpadHeld = false;
+  carriersHeld(fnHeld, numpadHeld);
+  // Item 1: heldModifierFlags() passes every non-Shift/Ctrl/Opt/Cmd OS bit
+  // through (SecondaryFn included), so mask it to the four ordinary modifiers
+  // (and their device bits) before deciding what is explained; Fn is explained
+  // only by a held carrier / physical fn.
+  uint64_t explained = static_cast<uint64_t>(heldModifierFlags()) & deskflow::platform::kHeldModifierFlags;
+  if (fnHeld) {
     explained |= deskflow::platform::kFlagSecondaryFn;
   }
   const uint64_t stray = deskflow::platform::strayModifierBits(os, explained);
@@ -953,7 +1046,10 @@ bool OSXKeyState::sampleStrayModifiers()
   if ((at - m_lastStrayResyncAt) < 1.0) {
     return false; // at most one resync per second
   }
-  const uint64_t cleaned = deskflow::platform::cleanedModifierWord(os, stray, numpadKey);
+  const uint64_t cleaned = deskflow::platform::cleanedModifierWord(os, stray, numpadHeld);
+  // Item 6: announce the unmarked IOHID post so the secondary tap skips
+  // tracking its echo (see clearStrayFnFlag).
+  deskflow::platform::ResyncEchoFilter::instance().expect(cleaned, deskflow::platform::ResyncEchoFilter::Clock::now());
   if (!postModifierResync(deskflow::platform::strayResyncKeycode(stray), false, cleaned)) {
     return false;
   }
@@ -1400,6 +1496,7 @@ void OSXKeyState::fakeAllKeysUp()
   reseedShadowFlagsFromOS();
   releaseLedgeredModifiers(osModifierFlags());
   m_injectedKeys.clear();
+  m_injectedKeyAt.clear();
   reseedShadowFlagsFromOS();
   if (nonModReleased > 0) {
     LOG_INFO("[keys] leave released %d non-modifier key(s) (%d function-class)", nonModReleased, fnClassReleased);
@@ -1561,8 +1658,10 @@ void OSXKeyState::fakeKey(const Keystroke &keystroke)
       const auto vk8 = static_cast<uint8_t>(virtualKey);
       if (keyDown) {
         m_injectedKeys.insert(vk8);
+        m_injectedKeyAt[vk8] = now(); // down or auto-repeat: refresh freshness
       } else {
         m_injectedKeys.erase(vk8);
+        m_injectedKeyAt.erase(vk8);
         if (deskflow::platform::isFnCarryingKey(vk8) && !holdingFnCarryingKey()) {
           clearStrayFnFlag();
         }
